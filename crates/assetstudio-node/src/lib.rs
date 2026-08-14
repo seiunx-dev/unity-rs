@@ -299,6 +299,34 @@ pub struct AclTracks {
     pub has_stripped_keyframes: bool,
 }
 
+/// What an injected ACL decoder is asked to decode.
+#[napi(object)]
+pub struct AclDecodeRequest {
+    pub frame_count: u32,
+    pub bone_count: u32,
+    pub sample_rate: f64,
+    pub declared_curve_count: Option<u32>,
+    pub use_fast_sample_mode: Option<bool>,
+    /// The validated compressed-track bytes.
+    pub compressed_tracks: Buffer,
+    /// Tuanjie's decoder map, empty when the clip carries none.
+    pub decoder_map: Vec<u32>,
+}
+
+/// Frame-major scalar curves an injected ACL decoder returns.
+///
+/// `bindingIndices[column]` is the absolute Unity binding scalar index for
+/// `values[frame * bindingIndices.length + column]`, and the indices must be
+/// strictly increasing.
+#[napi(object)]
+pub struct AclDecodedClip {
+    pub times: Vec<f64>,
+    pub binding_indices: Vec<u32>,
+    pub values: Vec<f64>,
+    /// Binding offset for the ordinary streamed curves that follow.
+    pub following_curve_offset: u32,
+}
+
 /// One node of a trusted managed object schema.
 ///
 /// Reconstructed by an offline tool; nothing here executes asset-controlled
@@ -364,6 +392,29 @@ impl AssetStudio {
             studio: Arc::new(studio),
         })
         .map_err(core_error)
+    }
+
+    /// Writes the animated FBX, decoding ACL tracks through a caller-supplied
+    /// decoder.
+    ///
+    /// Core ships no ACL decoder. Without one a clip whose samples are ACL
+    /// compressed contributes nothing to the FBX; with one its tracks are
+    /// validated on the way back in -- shape, ordering and budgets are Core's
+    /// checks, not the caller's promises.
+    ///
+    /// Asynchronous for the same reason as the Oodle entry point: the callback
+    /// runs on the event loop while a worker waits for it.
+    #[napi(ts_return_type = "Promise<Buffer>")]
+    pub fn read_fbx_with_acl_decoder(
+        &self,
+        decoder: AclCallback,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<FbxWithAclTask>> {
+        Ok(AsyncTask::new(FbxWithAclTask {
+            studio: Arc::clone(&self.studio),
+            maximum: byte_limit(maximum_bytes)?,
+            decoder: Arc::new(JsAclDecoder { callback: decoder }),
+        }))
     }
 
     /// Opens a path whose bundles are Oodle-compressed, using a
@@ -1407,6 +1458,69 @@ impl AssetStudio {
     }
 }
 
+/// The JavaScript ACL decoder callback.
+type AclCallback =
+    ThreadsafeFunction<AclDecodeRequest, AclDecodedClip, AclDecodeRequest, Status, false>;
+
+/// Bridges a JavaScript ACL decoder into Core's synchronous animation build.
+///
+/// Same threading constraint as the Oodle bridge: the callback runs on the
+/// event loop while a worker waits for it, so this is only reachable from the
+/// asynchronous entry points.
+struct JsAclDecoder {
+    callback: AclCallback,
+}
+
+impl assetstudio_core::acl::AclDecoder for JsAclDecoder {
+    fn decode(
+        &self,
+        request: &assetstudio_core::acl::AclDecodeRequest<'_>,
+    ) -> assetstudio_core::Result<assetstudio_core::acl::AclDecodedClip> {
+        let payload = AclDecodeRequest {
+            frame_count: request.frame_count,
+            bone_count: request.bone_count,
+            sample_rate: f64::from(request.sample_rate()),
+            declared_curve_count: request.declared_curve_count,
+            use_fast_sample_mode: request.use_fast_sample_mode,
+            compressed_tracks: Buffer::from(request.input.compressed_tracks.clone()),
+            decoder_map: request.input.decoder_map.clone(),
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.callback.call_with_return_value(
+            payload,
+            ThreadsafeFunctionCallMode::Blocking,
+            move |result: Result<AclDecodedClip>, _env| {
+                let _ = sender.send(result.map(|clip| {
+                    (
+                        clip.times,
+                        clip.binding_indices,
+                        clip.values,
+                        clip.following_curve_offset,
+                    )
+                }));
+                Ok(())
+            },
+        );
+        let (times, binding_indices, values, following_curve_offset) = receiver
+            .recv()
+            .map_err(|_| {
+                assetstudio_core::Error::invalid_data("the ACL decoder callback never answered")
+            })?
+            .map_err(|error| {
+                assetstudio_core::Error::invalid_data(format!("the ACL decoder failed: {error}"))
+            })?;
+        // Core validates shape, ordering and budgets on what comes back; the
+        // narrowing here is only f64 to f32, which is what Unity stores.
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(assetstudio_core::acl::AclDecodedClip {
+            times: times.into_iter().map(|value| value as f32).collect(),
+            binding_indices,
+            values: values.into_iter().map(|value| value as f32).collect(),
+            following_curve_offset,
+        })
+    }
+}
+
 /// The JavaScript decoder callback: compressed bytes and the exact expected
 /// output length in, exactly that many bytes out.
 type OodleCallback =
@@ -1458,6 +1572,29 @@ impl assetstudio_core::bundle::OodleDecoder for JsOodleDecoder {
         }
         output.copy_from_slice(&decoded);
         Ok(decoded.len())
+    }
+}
+
+/// Builds the animated FBX on a worker so the ACL callback can run on the
+/// event loop while this waits for it.
+pub struct FbxWithAclTask {
+    studio: Arc<Studio>,
+    maximum: u64,
+    decoder: Arc<JsAclDecoder>,
+}
+
+impl Task for FbxWithAclTask {
+    type Output = Vec<u8>;
+    type JsValue = Buffer;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.studio
+            .read_fbx_with_acl_decoder(self.maximum, Some(self.decoder.as_ref()))
+            .map_err(core_error)
+    }
+
+    fn resolve(&mut self, _env: Env, bytes: Self::Output) -> Result<Self::JsValue> {
+        Ok(bytes.into())
     }
 }
 

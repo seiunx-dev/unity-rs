@@ -629,3 +629,29 @@ testOodleInjection().catch((error) => {
   console.error(error)
   process.exitCode = 1
 })
+
+// ACL decoder injection. Core ships no ACL decoder, so a caller supplies one
+// and Core validates whatever it returns.
+async function testAclInjection() {
+  const barren = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  // No renderable geometry, so the FBX is refused whether or not a decoder is
+  // supplied -- the decoder must not turn an empty scene into a file.
+  let calls = 0
+  await assert.rejects(
+    barren.readFbxWithAclDecoder(() => {
+      calls += 1
+      return { times: [], bindingIndices: [], values: [], followingCurveOffset: 0 }
+    }),
+  )
+  // The clip path is never reached for this input, so the decoder stays unused
+  // rather than being called speculatively.
+  assert.equal(calls, 0)
+  console.log('node api: acl injection ok')
+}
+
+testAclInjection().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
