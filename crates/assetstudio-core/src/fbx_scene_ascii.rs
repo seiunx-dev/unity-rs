@@ -82,7 +82,7 @@ pub(crate) struct StaticScene<'a> {
     pub(crate) geometries: Vec<GeometryPlan<'a>>,
     pub(crate) materials: Vec<MaterialPlan<'a>>,
     pub(crate) textures: Vec<TexturePlan<'a>>,
-    animations: Vec<AnimationPlan<'a>>,
+    pub(crate) animations: Vec<AnimationPlan<'a>>,
 }
 
 /// One `Texture`/`Video` pair, shared by every material that binds it.
@@ -160,33 +160,33 @@ pub(crate) struct ClusterPlan<'a> {
     pub(crate) transform_link: Matrix4,
 }
 
-struct AnimationPlan<'a> {
-    stack_id: i64,
-    layer_id: i64,
-    name: &'a str,
-    stop_time: i64,
-    properties: Vec<AnimationPropertyPlan<'a>>,
-    blend_shapes: Vec<AnimationBlendShapePlan<'a>>,
+pub(crate) struct AnimationPlan<'a> {
+    pub(crate) stack_id: i64,
+    pub(crate) layer_id: i64,
+    pub(crate) name: &'a str,
+    pub(crate) stop_time: i64,
+    pub(crate) properties: Vec<AnimationPropertyPlan<'a>>,
+    pub(crate) blend_shapes: Vec<AnimationBlendShapePlan<'a>>,
 }
 
-struct AnimationPropertyPlan<'a> {
-    node_id: i64,
-    model_id: i64,
-    kind: AnimationProperty,
-    curve_ids: [i64; 3],
-    keys: &'a [ModelVectorKeyframe],
+pub(crate) struct AnimationPropertyPlan<'a> {
+    pub(crate) node_id: i64,
+    pub(crate) model_id: i64,
+    pub(crate) kind: AnimationProperty,
+    pub(crate) curve_ids: [i64; 3],
+    pub(crate) keys: &'a [ModelVectorKeyframe],
 }
 
-struct AnimationBlendShapePlan<'a> {
-    node_id: i64,
-    curve_id: i64,
-    channel_id: i64,
-    channel_name: &'a str,
-    keys: &'a [ModelScalarKeyframe],
+pub(crate) struct AnimationBlendShapePlan<'a> {
+    pub(crate) node_id: i64,
+    pub(crate) curve_id: i64,
+    pub(crate) channel_id: i64,
+    pub(crate) channel_name: &'a str,
+    pub(crate) keys: &'a [ModelScalarKeyframe],
 }
 
 #[derive(Clone, Copy)]
-enum AnimationProperty {
+pub(crate) enum AnimationProperty {
     Translation,
     Rotation,
     Scaling,
@@ -1527,7 +1527,7 @@ fn validate_scalar_animation_keys(keys: &[ModelScalarKeyframe]) -> Result<()> {
     Ok(())
 }
 
-fn fbx_key_time(seconds: f32) -> Result<i64> {
+pub(crate) fn fbx_key_time(seconds: f32) -> Result<i64> {
     if !seconds.is_finite() {
         return Err(Error::invalid_data("FBX animation key time is non-finite"));
     }
@@ -2604,7 +2604,7 @@ fn write_animation_connections(
 }
 
 impl AnimationProperty {
-    const fn token(self) -> &'static str {
+    pub(crate) const fn token(self) -> &'static str {
         match self {
             Self::Translation => "T",
             Self::Rotation => "R",
@@ -2612,7 +2612,7 @@ impl AnimationProperty {
         }
     }
 
-    const fn fbx_property(self) -> &'static str {
+    pub(crate) const fn fbx_property(self) -> &'static str {
         match self {
             Self::Translation => "Lcl Translation",
             Self::Rotation => "Lcl Rotation",
@@ -2620,7 +2620,7 @@ impl AnimationProperty {
         }
     }
 
-    const fn defaults(self) -> [f32; 3] {
+    pub(crate) const fn defaults(self) -> [f32; 3] {
         match self {
             Self::Scaling => [1.0; 3],
             Self::Translation | Self::Rotation => [0.0; 3],
@@ -2628,7 +2628,7 @@ impl AnimationProperty {
     }
 }
 
-const fn animation_component_name(component: usize) -> &'static str {
+pub(crate) const fn animation_component_name(component: usize) -> &'static str {
     match component {
         0 => "X",
         1 => "Y",
