@@ -35,6 +35,7 @@ pub mod live2d_package;
 pub mod live2d_physics;
 pub mod live2d_schema;
 pub mod loader;
+mod managed_number;
 pub mod material;
 pub mod mesh;
 pub mod model_animation;

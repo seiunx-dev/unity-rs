@@ -5,6 +5,13 @@
 # under InvariantGlobalization. Columns are tab separated:
 #   f|d <TAB> IEEE-754 bit pattern as an unsigned integer <TAB> expected text
 #
+# The sweep below produced no value that ties at the last digit, which is the
+# one case where two shortest round-trip renderings both exist and .NET's
+# choice differs from Rust's: .NET rounds such a tie to even, Rust's shortest
+# form rounds it away from zero. The entries at the end are ties, taken from a
+# .NET 10 rendering of 39,927 values, and the test refuses to pass unless at
+# least one of them is present.
+#
 # The list is boundary values followed by a deterministic xorshift sweep over
 # bit patterns, keeping only finite values. Regenerate with the same program
 # rather than editing entries by hand.
@@ -857,3 +864,19 @@ d	2313139295857545316	4.833306365123907E-154
 d	10695273041848250126	-2.779665281263238E-210
 d	8927398792202092605	6.240596124318783E+288
 d	18138884938062950071	-9.998325829783482E+287
+
+# Values that tie at the last digit.
+f	1157088512	1982.1562
+f	1184677024	20062.312
+f	1191085472	32578.812
+f	1193028240	39978.562
+f	1197930640	59128.562
+f	1208124808	133654.12
+f	1209095880	148827.12
+f	1210146600	165244.62
+f	1210280744	167340.62
+f	1210555144	171628.12
+f	1215681640	251729.62
+f	1216441204	265051.62
+f	1217750452	305965.62
+f	1218118948	317481.12
