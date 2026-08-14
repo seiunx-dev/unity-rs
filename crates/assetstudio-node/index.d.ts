@@ -12,6 +12,18 @@ export declare class AssetStudio {
    */
   static openWithVersion(path: string, unityVersion: string): AssetStudio
   /**
+   * Opens a path whose bundles are Oodle-compressed, using a
+   * caller-supplied decoder.
+   *
+   * Asynchronous by necessity, not for convenience: the decoder runs on the
+   * JavaScript event loop while a worker waits for it, so calling this
+   * synchronously would block the loop that has to run the callback.
+   *
+   * The callback receives the compressed bytes and the exact expected output
+   * length, and must return precisely that many bytes.
+   */
+  static openWithOodle(path: string, decoder: OodleCallback): Promise<AssetStudio>
+  /**
    * Opens a path on a libuv worker so container discovery does not block
    * the JavaScript event loop.
    */
