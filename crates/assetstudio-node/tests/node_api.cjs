@@ -495,3 +495,33 @@ console.log('node api: animated fbx and live2d materialization ok')
 }
 
 console.log('node api: textured fbx and acl inspection ok')
+
+// MonoBehaviour schemas, which is how a stripped managed layout is read.
+{
+  // A schema whose class never matches leaves the object at its engine-owned
+  // prefix rather than guessing, and an empty node list is refused outright.
+  const schemaStudio = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  const objects = schemaStudio.objectPage(0)
+  assert.throws(
+    () =>
+      schemaStudio.readMonoBehaviourJsonWithSchemas(0, objects[0].pathId, [
+        { assemblyName: 'A.dll', className: 'A', nodes: [] },
+      ]),
+    /root node/i,
+  )
+  // A TextAsset is not a MonoBehaviour, so the read is refused rather than
+  // producing an object shaped by the schema.
+  assert.throws(() =>
+    schemaStudio.readMonoBehaviourJsonWithSchemas(0, objects[0].pathId, [
+      {
+        assemblyName: 'A.dll',
+        className: 'A',
+        nodes: [{ typeName: 'A', fieldName: 'Base', level: 0, align: false }],
+      },
+    ]),
+  )
+}
+
+console.log('node api: monobehaviour schemas ok')
