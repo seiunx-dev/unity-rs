@@ -19,6 +19,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   MATURIN_VERSION: "1.13.3"
+  VGMSTREAM_VERSION: "r2117"
 
 jobs:
   quality:
@@ -226,6 +227,29 @@ jobs:
         run: dotnet restore oracle/AssetStudioOracle.csproj --ignore-failed-sources -p:NuGetAudit=false -p:AssetStudioRepo="$ASSETSTUDIO_REPO"
       - name: Compare managed and Rust manifests
         run: cargo +1.88.0 test -p assetstudio-core --test dotnet_oracle --locked -- --ignored --nocapture
+
+  audio-oracle:
+    name: vgmstream audio differential
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+      # vgmstream is the decoder oracle for the FSB codecs this crate decodes
+      # itself. Pinned to a release rather than tracking latest, so a change in
+      # its output shows up as a deliberate bump here.
+      - name: Install the vgmstream decoder oracle
+        run: |
+          curl -fsSL -o vgmstream.zip \
+            https://github.com/vgmstream/vgmstream/releases/download/${{ env.VGMSTREAM_VERSION }}/vgmstream-linux.zip
+          unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/vgmstream-cli"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Verify the oracle runs
+        run: vgmstream-cli -h > /dev/null
+      - name: Compare decoded PCM against vgmstream
+        run: cargo +1.88.0 test -p assetstudio-core --lib --locked -- --ignored
 
   unitypy-oracle:
     name: UnityPy differential oracle
