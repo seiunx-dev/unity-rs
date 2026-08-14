@@ -36,13 +36,24 @@ impl<W: Write> JsonWriter<'_, W> {
                     char::from_u32(u32::from(*value)).unwrap_or(char::REPLACEMENT_CHARACTER);
                 self.write_string(&character.to_string())?;
             }
+            // Serialize each at its source width, so a `float` field keeps its
+            // own shortest round-trip form instead of the double expansion of
+            // the widened value.
+            TypeValue::Float32(value) if value.is_finite() => {
+                serde_json::to_writer(&mut self.output, value).map_err(json_error)?;
+            }
             TypeValue::Float(value) if value.is_finite() => {
                 serde_json::to_writer(&mut self.output, value).map_err(json_error)?;
             }
-            TypeValue::Float(value) => {
-                let label = if value.is_nan() {
+            TypeValue::Float32(_) | TypeValue::Float(_) => {
+                let (nan, negative) = match value {
+                    TypeValue::Float32(value) => (value.is_nan(), value.is_sign_negative()),
+                    TypeValue::Float(value) => (value.is_nan(), value.is_sign_negative()),
+                    _ => unreachable!("guarded by the surrounding pattern"),
+                };
+                let label = if nan {
                     "NaN"
-                } else if value.is_sign_negative() {
+                } else if negative {
                     "-Infinity"
                 } else {
                     "Infinity"
@@ -180,6 +191,45 @@ fn json_error(error: serde_json::Error) -> Error {
 mod tests {
     use super::write_type_value_json;
     use crate::type_tree::{TypeField, TypeMapEntry, TypeValue};
+
+    #[test]
+    fn floats_serialize_at_their_source_width() {
+        // A serialized `float` widened to f64 has the double expansion as its
+        // shortest round-trip form, so keeping the source width is what makes
+        // 0.1f read back as 0.1 rather than 0.10000000149011612.
+        let value = TypeValue::Object(vec![
+            TypeField {
+                name: "single".to_owned(),
+                value: TypeValue::Float32(0.1),
+            },
+            TypeField {
+                name: "widened".to_owned(),
+                value: TypeValue::Float(f64::from(0.1_f32)),
+            },
+            TypeField {
+                name: "double".to_owned(),
+                value: TypeValue::Float(0.1),
+            },
+            TypeField {
+                name: "single_nan".to_owned(),
+                value: TypeValue::Float32(f32::NAN),
+            },
+            TypeField {
+                name: "single_negative_infinity".to_owned(),
+                value: TypeValue::Float32(f32::NEG_INFINITY),
+            },
+        ]);
+        let mut output = Vec::new();
+        write_type_value_json(&value, &mut output, false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"single\":0.1,\
+             \"widened\":0.10000000149011612,\
+             \"double\":0.1,\
+             \"single_nan\":\"NaN\",\
+             \"single_negative_infinity\":\"-Infinity\"}"
+        );
+    }
 
     #[test]
     fn writes_ordered_objects_maps_and_special_floats() {

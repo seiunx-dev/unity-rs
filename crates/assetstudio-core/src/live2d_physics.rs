@@ -517,6 +517,7 @@ fn integer_field(value: &TypeValue, name: &str, owner: &str) -> Result<i64> {
 
 fn number_field(value: &TypeValue, name: &str, owner: &str) -> Result<f64> {
     let value = match field(value, name, owner)? {
+        TypeValue::Float32(value) => f64::from(*value),
         TypeValue::Float(value) => *value,
         TypeValue::Signed(value) => value.to_string().parse::<f64>().map_err(|error| {
             Error::invalid_data(format!("{owner} {name} is not numeric: {error}"))

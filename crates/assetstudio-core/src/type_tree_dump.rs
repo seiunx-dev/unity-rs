@@ -215,7 +215,8 @@ impl<W: Write> DumpFormatter<'_, W> {
                     .unwrap_or(char::REPLACEMENT_CHARACTER);
                 write!(self.output, "{character}")?;
             }
-            TypeValue::Float(value) => write_managed_float(self.output, node, *value)?,
+            TypeValue::Float32(value) => write_managed_single(self.output, *value)?,
+            TypeValue::Float(value) => write_managed_double(self.output, *value)?,
             TypeValue::Boolean(value) => {
                 self.output
                     .write_all(if *value { b"True" } else { b"False" })?;
@@ -235,20 +236,49 @@ impl<W: Write> DumpFormatter<'_, W> {
 const SINGLE_ROUND_TRIP_DIGITS: i32 = 9;
 const DOUBLE_ROUND_TRIP_DIGITS: i32 = 17;
 
-fn write_managed_float(output: &mut impl Write, node: &TypeTreeNode, value: f64) -> Result<()> {
-    if value.is_nan() {
-        output.write_all(b"NaN")?;
-    } else if value == f64::INFINITY {
-        output.write_all(b"Infinity")?;
-    } else if value == f64::NEG_INFINITY {
-        output.write_all(b"-Infinity")?;
-    } else if node.type_name == "float" {
-        let value = exact_f32(value)?;
-        write_general_format(output, &format!("{value:e}"), SINGLE_ROUND_TRIP_DIGITS)?;
-    } else {
-        write_general_format(output, &format!("{value:e}"), DOUBLE_ROUND_TRIP_DIGITS)?;
+fn write_managed_single(output: &mut impl Write, value: f32) -> Result<()> {
+    if write_non_finite(
+        output,
+        value.is_nan(),
+        value.is_sign_negative(),
+        value.is_finite(),
+    )? {
+        return Ok(());
     }
-    Ok(())
+    write_general_format(output, &format!("{value:e}"), SINGLE_ROUND_TRIP_DIGITS)
+}
+
+fn write_managed_double(output: &mut impl Write, value: f64) -> Result<()> {
+    if write_non_finite(
+        output,
+        value.is_nan(),
+        value.is_sign_negative(),
+        value.is_finite(),
+    )? {
+        return Ok(());
+    }
+    write_general_format(output, &format!("{value:e}"), DOUBLE_ROUND_TRIP_DIGITS)
+}
+
+/// Writes the invariant text for a non-finite value, reporting whether it did.
+fn write_non_finite(
+    output: &mut impl Write,
+    is_nan: bool,
+    is_negative: bool,
+    is_finite: bool,
+) -> Result<bool> {
+    if is_nan {
+        output.write_all(b"NaN")?;
+    } else if !is_finite {
+        output.write_all(if is_negative {
+            b"-Infinity".as_slice()
+        } else {
+            b"Infinity".as_slice()
+        })?;
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Renders one finite value the way .NET's default `ToString()` does.
@@ -329,20 +359,6 @@ fn write_fixed(output: &mut impl Write, sign: &str, digits: &str, exponent: i32)
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn exact_f32(value: f64) -> Result<f32> {
-    // TypeValue widens serialized f32 values to f64. Reject arbitrary f64
-    // inputs instead of silently rounding values which did not come from that
-    // lossless widening path.
-    let narrowed = value as f32;
-    if f64::from(narrowed).to_bits() == value.to_bits() {
-        Ok(narrowed)
-    } else {
-        Err(Error::invalid_data(
-            "TypeTree float value cannot be represented exactly as f32",
-        ))
-    }
-}
-
 fn array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<usize> {
     let node = &nodes[index];
     let array_level = checked_level(node.level, 1)?;
@@ -484,7 +500,8 @@ fn validate_primitive(node: &TypeTreeNode, value: &TypeValue) -> Result<()> {
                 | "FileSize"
         ),
         TypeValue::Character(_) => node.type_name == "char",
-        TypeValue::Float(_) => matches!(node.type_name.as_str(), "float" | "double"),
+        TypeValue::Float32(_) => node.type_name == "float",
+        TypeValue::Float(_) => node.type_name == "double",
         TypeValue::Boolean(_) => node.type_name == "bool",
         _ => false,
     };
@@ -680,7 +697,7 @@ mod tests {
                 }]),
             ),
             field("blob", TypeValue::TypelessData { offset: 4, size: 3 }),
-            field("positive", TypeValue::Float(1.25)),
+            field("positive", TypeValue::Float32(1.25)),
             field("infinite", TypeValue::Float(f64::INFINITY)),
         ]);
         let mut output = Vec::new();

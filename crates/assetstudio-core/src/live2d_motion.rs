@@ -561,6 +561,7 @@ fn finite_number(value: &TypeValue, field: &str) -> Result<f64> {
 
 fn number(value: &TypeValue, field: &str) -> Result<f64> {
     match value {
+        TypeValue::Float32(value) => Ok(f64::from(*value)),
         TypeValue::Float(value) => Ok(*value),
         TypeValue::Signed(value) => value
             .to_string()
