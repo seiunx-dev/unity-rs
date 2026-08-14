@@ -1,4 +1,9 @@
-//! Differential fixture gate against the checked-in managed implementation.
+//! Differential fixture gate against the managed implementation.
+//!
+//! The managed reader lives in the separate `Team-Haruki/AssetStudio`
+//! repository and is a compatibility oracle only; nothing shipped from this
+//! repository depends on it. Point `ASSETSTUDIO_REPO` at a checkout, or keep
+//! that repository as a sibling directory of this one.
 //!
 //! The matrix deliberately covers v13 big-endian metadata/object payloads and
 //! v22 little-endian assets with external `Texture2D`, `AudioClip`, and
@@ -32,7 +37,7 @@ use containers::{BlocksInfo, BundleEntry};
 use oracle_manifest::rust_manifest;
 
 #[test]
-#[ignore = "requires the .NET 10 SDK and the managed AssetStudio oracle"]
+#[ignore = "requires the .NET 10 SDK and a Team-Haruki/AssetStudio checkout"]
 fn managed_and_rust_manifests_match_for_shared_fixture() {
     let executable = build_managed_oracle().unwrap();
     let fixtures = [
@@ -220,24 +225,40 @@ fn assert_truncated_fixture(executable: &Path) {
     assert_eq!(rust.file_count(), 0);
 }
 
+/// Environment variable pointing at a `Team-Haruki/AssetStudio` checkout.
+///
+/// The managed reader lives in a separate repository and is the compatibility
+/// oracle only, so it is not vendored here. Without this variable the project
+/// falls back to a sibling directory of this repository.
+const ASSETSTUDIO_REPO_ENV: &str = "ASSETSTUDIO_REPO";
+
 fn build_managed_oracle() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let project =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../oracle/AssetStudioOracle.csproj");
-    let build = Command::new("dotnet")
-        .args([
-            "build",
-            project.to_str().ok_or("oracle project path is not UTF-8")?,
-            "--configuration",
-            "Release",
-            "--framework",
-            "net10.0",
-            "--no-restore",
-            "--nologo",
-            "--verbosity",
-            "quiet",
-            "-p:NuGetAudit=false",
-        ])
-        .output()?;
+    let mut arguments = vec![
+        "build".to_owned(),
+        project
+            .to_str()
+            .ok_or("oracle project path is not UTF-8")?
+            .to_owned(),
+        "--configuration".to_owned(),
+        "Release".to_owned(),
+        "--framework".to_owned(),
+        "net10.0".to_owned(),
+        "--no-restore".to_owned(),
+        "--nologo".to_owned(),
+        "--verbosity".to_owned(),
+        "quiet".to_owned(),
+        "-p:NuGetAudit=false".to_owned(),
+    ];
+    if let Some(repository) = std::env::var_os(ASSETSTUDIO_REPO_ENV) {
+        let repository = repository
+            .to_str()
+            .ok_or("ASSETSTUDIO_REPO is not UTF-8")?
+            .to_owned();
+        arguments.push(format!("-p:AssetStudioRepo={repository}"));
+    }
+    let build = Command::new("dotnet").args(&arguments).output()?;
     if !build.status.success() {
         return Err(format!(
             "managed oracle build failed with {}:\n{}\n{}",

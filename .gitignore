@@ -1,0 +1,27 @@
+# Rust
+/target/
+
+# Python extension module and locally built distributions
+crates/assetstudio-python/python/assetstudio/_native.*
+crates/assetstudio-python/dist/
+crates/assetstudio-python/sdist-dist/
+__pycache__/
+*.pyc
+
+# Node addon and dependencies
+crates/assetstudio-node/*.node
+node_modules/
+
+# Managed differential oracle build output
+[Bb]in/
+[Oo]bj/
+
+# Private real-asset corpus; see corpus/README.md
+corpus/private/
+
+# Local desktop cache
+.DS_Store
+
+# Editors
+.idea/
+.vs/

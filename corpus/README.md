@@ -11,16 +11,15 @@ belong in the repository.
 3. Generate the expected snapshot with the checked managed oracle:
 
    ```shell
-   dotnet build rust/oracle/AssetStudioOracle.csproj \
+   dotnet build oracle/AssetStudioOracle.csproj \
      --configuration Release --framework net10.0 --nologo --verbosity quiet
-   dotnet rust/oracle/bin/Release/net10.0/AssetStudioOracle.dll \
+   dotnet oracle/bin/Release/net10.0/AssetStudioOracle.dll \
      /path/to/game_Data > /private/corpus/snapshots/game.json
    ```
 
 4. Run the same input through Rust and compare the complete manifest:
 
    ```shell
-   cd rust
    ASSETSTUDIO_CORPUS_MANIFEST=/private/corpus/manifest.json \
      cargo test -p assetstudio-core --test real_corpus --locked \
        -- --ignored --nocapture

@@ -5,8 +5,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aelurum/AssetStudio.git",
-    "directory": "rust/crates/assetstudio-node"
+    "url": "git+https://github.com/Team-Haruki/unity-rs.git",
+    "directory": "crates/assetstudio-node"
   },
   "main": "index.js",
   "types": "index.d.ts",

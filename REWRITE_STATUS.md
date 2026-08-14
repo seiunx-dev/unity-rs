@@ -18,7 +18,7 @@
 - WinForms 或其他 GUI；
 - 旧版自定义 C ABI 的兼容、发布或语义复刻。
 
-现有 C# 源码暂时保留为差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖。旧 `assetstudio-ffi` 源码已排除在公开 Cargo workspace 之外。
+托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `ASSETSTUDIO_REPO` 或同级目录定位它。旧 `assetstudio-ffi` 源码已排除在 Cargo workspace 之外。
 
 ## 当前阶段
 
