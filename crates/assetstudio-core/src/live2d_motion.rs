@@ -34,17 +34,17 @@ impl Default for CubismFadeMotionReadLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CubismMotionKeyframe {
-    pub time: f64,
-    pub value: f64,
-    pub in_slope: f64,
-    pub out_slope: f64,
+    pub time: f32,
+    pub value: f32,
+    pub in_slope: f32,
+    pub out_slope: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CubismFadeMotionCurve {
     pub parameter_id: String,
-    pub fade_in_time: f64,
-    pub fade_out_time: f64,
+    pub fade_in_time: f32,
+    pub fade_out_time: f32,
     pub keyframes: Vec<CubismMotionKeyframe>,
 }
 
@@ -53,9 +53,9 @@ pub struct CubismFadeMotion {
     pub path_id: i64,
     pub source_name: String,
     pub motion_name: String,
-    pub fade_in_time: f64,
-    pub fade_out_time: f64,
-    pub motion_length: f64,
+    pub fade_in_time: f32,
+    pub fade_out_time: f32,
+    pub motion_length: f32,
     pub curves: Vec<CubismFadeMotionCurve>,
 }
 
@@ -69,23 +69,23 @@ pub struct CubismMotionTargetNames {
 pub(crate) struct MotionCurveView<'a> {
     pub target: &'a str,
     pub id: &'a str,
-    pub fade_in_time: f64,
-    pub fade_out_time: f64,
+    pub fade_in_time: f32,
+    pub fade_out_time: f32,
     pub keyframes: &'a [CubismMotionKeyframe],
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MotionEventView<'a> {
-    pub time: f64,
+    pub time: f32,
     pub value: &'a str,
 }
 
 #[derive(Debug)]
 pub(crate) struct MotionDocumentView<'a> {
-    pub duration: f64,
-    pub fps: f64,
-    pub fade_in_time: f64,
-    pub fade_out_time: f64,
+    pub duration: f32,
+    pub fps: f32,
+    pub fade_in_time: f32,
+    pub fade_out_time: f32,
     pub curves: &'a [MotionCurveView<'a>],
     pub events: &'a [MotionEventView<'a>],
     pub initial_time_is_zero: bool,
@@ -310,9 +310,9 @@ fn project_keyframe(value: &TypeValue) -> Result<CubismMotionKeyframe> {
     })
 }
 
-fn slope_field(value: &TypeValue, name: &str) -> Result<f64> {
+fn slope_field(value: &TypeValue, name: &str) -> Result<f32> {
     let value = number(field(value, name, "motion keyframe")?, name)?;
-    if value.is_nan() || value == f64::NEG_INFINITY {
+    if value.is_nan() || value == f32::NEG_INFINITY {
         return Err(Error::invalid_data(format!(
             "motion keyframe {name} is not supported"
         )));
@@ -323,9 +323,9 @@ fn slope_field(value: &TypeValue, name: &str) -> Result<f64> {
 struct ProjectedCurve<'a> {
     target: &'a str,
     id: &'a str,
-    fade_in_time: f64,
-    fade_out_time: f64,
-    segments: Vec<f64>,
+    fade_in_time: f32,
+    fade_out_time: f32,
+    segments: Vec<f32>,
     segment_count: usize,
     point_count: usize,
 }
@@ -370,7 +370,7 @@ impl<'a> ProjectedCurve<'a> {
                     .checked_add(2)
                     .ok_or_else(|| Error::invalid_data("motion keyframe index overflowed"))?;
                 point_count = checked_add(point_count, 1, "motion points")?;
-            } else if current.in_slope == f64::INFINITY {
+            } else if current.in_slope == f32::INFINITY {
                 segments.extend_from_slice(&[2.0, current.time, current.value]);
                 index += 1;
                 point_count = checked_add(point_count, 1, "motion points")?;
@@ -499,7 +499,7 @@ fn write_curve(writer: &mut impl Write, index: usize, curve: &ProjectedCurve<'_>
         if value_index != 0 {
             writer.write_all(b", ")?;
         }
-        write_number(writer, *value)?;
+        write_segment_number(writer, *value)?;
     }
     writer.write_all(b"]\n    }")?;
     Ok(())
@@ -549,20 +549,26 @@ fn string_field<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a
     }
 }
 
-fn finite_number_field(value: &TypeValue, name: &str, owner: &str) -> Result<f64> {
+fn finite_number_field(value: &TypeValue, name: &str, owner: &str) -> Result<f32> {
     finite_number(field(value, name, owner)?, name)
 }
 
-fn finite_number(value: &TypeValue, field: &str) -> Result<f64> {
+fn finite_number(value: &TypeValue, field: &str) -> Result<f32> {
     let value = number(value, field)?;
     ensure_finite(value, field)?;
     Ok(value)
 }
 
-fn number(value: &TypeValue, field: &str) -> Result<f64> {
+fn number(value: &TypeValue, field: &str) -> Result<f32> {
     match value {
-        TypeValue::Float32(value) => Ok(f64::from(*value)),
-        TypeValue::Float(value) => Ok(*value),
+        TypeValue::Float32(value) => Ok(*value),
+        // A double here is out of spec for these documents already; the format
+        // they are written in is a float format.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the Cubism documents are float documents"
+        )]
+        TypeValue::Float(value) => Ok(*value as f32),
         TypeValue::Signed(value) => value
             .to_string()
             .parse()
@@ -575,7 +581,7 @@ fn number(value: &TypeValue, field: &str) -> Result<f64> {
     }
 }
 
-fn ensure_finite(value: f64, field: &str) -> Result<()> {
+fn ensure_finite(value: f32, field: &str) -> Result<()> {
     if value.is_finite() {
         Ok(())
     } else {
@@ -583,9 +589,25 @@ fn ensure_finite(value: f64, field: &str) -> Result<()> {
     }
 }
 
-fn write_number(output: &mut impl Write, value: f64) -> Result<()> {
+/// Writes a scalar field, which Newtonsoft serializes with its default float
+/// format.
+fn write_number(output: &mut impl Write, value: f32) -> Result<()> {
     ensure_finite(value, "motion JSON number")?;
-    serde_json::to_writer(output, &value)
+    output
+        .write_all(crate::live2d_number::managed_float(value).as_bytes())
+        .map_err(|error| Error::invalid_data(format!("cannot write motion number: {error}")))
+}
+
+/// Writes a segment value, which the managed converter routes through its
+/// `List<float>` converter and .NET's `"0.###"` instead.
+///
+/// Two formats in one document is not an accident of this port: the managed
+/// side registers a converter that only claims `List<float>`, and `Segments` is
+/// the only field of that type.
+fn write_segment_number(output: &mut impl Write, value: f32) -> Result<()> {
+    ensure_finite(value, "motion JSON number")?;
+    output
+        .write_all(crate::live2d_number::three_decimals(value).as_bytes())
         .map_err(|error| Error::invalid_data(format!("cannot write motion number: {error}")))
 }
 
@@ -710,12 +732,12 @@ mod tests {
         )
     }
 
-    fn key(time: f64, value: f64, in_slope: f64, out_slope: f64) -> TypeValue {
+    fn key(time: f32, value: f32, in_slope: f32, out_slope: f32) -> TypeValue {
         object(vec![
-            ("time", TypeValue::Float(time)),
-            ("value", TypeValue::Float(value)),
-            ("inSlope", TypeValue::Float(in_slope)),
-            ("outSlope", TypeValue::Float(out_slope)),
+            ("time", TypeValue::Float32(time)),
+            ("value", TypeValue::Float32(value)),
+            ("inSlope", TypeValue::Float32(in_slope)),
+            ("outSlope", TypeValue::Float32(out_slope)),
         ])
     }
 
@@ -725,7 +747,7 @@ mod tests {
             TypeValue::Array(vec![
                 key(0.0, 0.0, 0.0, 0.0),
                 key(0.5, 1.0, 0.0, 0.0),
-                key(1.0, 0.0, f64::INFINITY, 0.0),
+                key(1.0, 0.0, f32::INFINITY, 0.0),
             ]),
         )]);
         object(vec![
@@ -768,9 +790,17 @@ mod tests {
         assert_eq!(parsed["Meta"]["TotalSegmentCount"], 2);
         assert_eq!(parsed["Meta"]["TotalPointCount"], 3);
         assert_eq!(parsed["Curves"][0]["Target"], "Parameter");
+        // Segments print through .NET's "0.###", so an integral value has no
+        // decimal point. This expectation used to read [0.0, ...] -- which was
+        // this crate's own float formatting rather than the managed
+        // extractor's, and only the differential could tell the two apart.
         assert_eq!(
             parsed["Curves"][0]["Segments"],
-            serde_json::json!([0.0, 0.0, 0.0, 0.5, 1.0, 2.0, 1.0, 0.0])
+            serde_json::json!([0, 0, 0, 0.5, 1, 2, 1, 0])
+        );
+        assert!(
+            String::from_utf8_lossy(&json).contains("\"Segments\": [0, 0, 0, 0.5"),
+            "the segment list is written without trailing .0"
         );
         assert!(
             motion
@@ -800,7 +830,7 @@ mod tests {
         let TypeValue::Object(fields) = &mut value else {
             unreachable!()
         };
-        fields[8].value = TypeValue::Float(f64::NAN);
+        fields[8].value = TypeValue::Float32(f32::NAN);
         assert!(
             project_cubism_fade_motion(1, &value, CubismFadeMotionReadLimits::default()).is_err()
         );

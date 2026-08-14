@@ -206,7 +206,7 @@ impl Live2dPackageMotionSource {
     }
 
     #[must_use]
-    pub const fn fps(&self) -> f64 {
+    pub const fn fps(&self) -> f32 {
         match self {
             Self::Fade(_) => 30.0,
             Self::AnimationClip(motion) => motion.fps,
@@ -1530,14 +1530,7 @@ impl<'a> PackageState<'a> {
                 model.object.file_index,
             )
         });
-        // physics3.json is a float document and the managed extractor passes
-        // this fallback as a float too, so it narrows here rather than inside
-        // the writer.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the physics document's fps field is a float"
-        )]
-        let physics = self.build_physics_file(&name, physics_controller, motion_fps as f32)?;
+        let physics = self.build_physics_file(&name, physics_controller, motion_fps)?;
         let pose_components = components_for_model(&indexes.pose_parts_by_model, model.object);
         let pose = self.build_pose_file(&name, pose_components)?;
         let parameter_components =

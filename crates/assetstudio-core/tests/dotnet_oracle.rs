@@ -58,6 +58,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_crunched_textures(&executable);
     assert_astc_textures(&executable);
     assert_cubism_physics(&executable);
+    assert_cubism_fade_motion(&executable);
     assert_switch_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
@@ -398,6 +399,50 @@ fn assert_cubism_physics(executable: &Path) {
     );
 
     assert_eq!(managed, rust, "Cubism physics conversion");
+}
+
+/// Compares the fade-motion route to motion3.json against the managed
+/// converter.
+///
+/// Like the physics rig this is one behaviour in and one document out, so it
+/// stands on its own without a whole model group around it. The document uses
+/// two different number formats in the same file -- the managed side puts the
+/// segment lists through .NET's `"0.###"` and everything else through
+/// Newtonsoft's default float, which keeps a trailing `.0` on integral values.
+fn assert_cubism_fade_motion(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+
+    let tree = cubism_fixture::cubism_fade_motion_tree();
+    let object = cubism_fixture::cubism_fade_motion_object("oracle-fade-motion");
+    let file = synthetic_mono_behaviour_v22(115, REVISION, &tree, &object);
+    let fixture = TemporaryFixture::new("oracle-cubism-fade-motion.assets", &file)
+        .expect("the fade-motion fixture is writable");
+    let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+    let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+
+    let managed_motion = &managed["Files"][0]["Objects"][0]["Payload"]["Motion"];
+    assert!(
+        managed_motion.is_object(),
+        "the managed converter produced no motion3.json, so nothing was compared: {managed}"
+    );
+    assert_eq!(
+        managed_motion["Meta"]["CurveCount"], 3,
+        "the fixture's three parameter curves did not survive: {managed}"
+    );
+    // Both number formats have to be exercised or half the document is
+    // compared on trivial values.
+    assert_eq!(
+        managed_motion["Meta"]["Duration"], 1.0,
+        "the default float format keeps integral values as x.0"
+    );
+    assert!(
+        managed_motion["Curves"][0]["Segments"]
+            .as_array()
+            .is_some_and(|segments| segments.len() > 4),
+        "the curve produced no segments: {managed}"
+    );
+
+    assert_eq!(managed, rust, "Cubism fade-motion conversion");
 }
 
 /// Compares ASTC decoding against the managed decoder on real encoder output.

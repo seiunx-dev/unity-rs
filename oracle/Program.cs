@@ -242,11 +242,32 @@ static object MonoBehaviourPayload(MonoBehaviour behaviour)
 {
     var parsed = behaviour.ToType();
     string? physics = null;
+    string? motion = null;
     if (parsed != null && parsed.Contains("_rig"))
     {
         // The fps argument is the fallback the converter uses when the rig
         // does not carry one of its own.
         physics = CubismLive2DExtractor.CubismParsers.ParsePhysics(parsed, 30f);
+    }
+    else if (parsed != null && parsed.Contains("ParameterIds"))
+    {
+        // The fade-motion route to motion3.json: one behaviour in, one
+        // document out, which is what makes it comparable on its own.
+        var fade = Newtonsoft.Json.JsonConvert
+            .DeserializeObject<CubismLive2DExtractor.CubismUnityClasses.CubismFadeMotionData>(
+                Newtonsoft.Json.JsonConvert.SerializeObject(parsed));
+        var motionJson = new CubismLive2DExtractor.CubismMotion3Json(
+            fade,
+            // The names a model would supply. Both sides receive the same
+            // pair, which is what lets the comparison reach the Parameter and
+            // PartOpacity branches instead of only the unbound fallback.
+            new System.Collections.Generic.HashSet<string> { "ParamAngleX" },
+            new System.Collections.Generic.HashSet<string> { "PartArmA" },
+            false);
+        motion = Newtonsoft.Json.JsonConvert.SerializeObject(
+            motionJson,
+            Newtonsoft.Json.Formatting.Indented,
+            new CubismLive2DExtractor.MyJsonConverter());
     }
     return new
     {
@@ -254,6 +275,9 @@ static object MonoBehaviourPayload(MonoBehaviour behaviour)
         Physics = physics == null
             ? (JsonElement?)null
             : JsonSerializer.Deserialize<JsonElement>(physics),
+        Motion = motion == null
+            ? (JsonElement?)null
+            : JsonSerializer.Deserialize<JsonElement>(motion),
     };
 }
 
