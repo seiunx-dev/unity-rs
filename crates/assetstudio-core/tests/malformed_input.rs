@@ -19,6 +19,11 @@ use std::path::Path;
 
 use assetstudio_core::audio::{detect_direct_wav, write_direct_wav};
 use assetstudio_core::cubism_moc::{CubismMocReadLimits, try_read_cubism_moc};
+use assetstudio_core::live2d_package::{
+    Live2dPackageLimits, Live2dPackageMaterializeLimits, build_live2d_packages,
+    materialize_live2d_packages,
+};
+use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
 use assetstudio_core::source::Region;
 use assetstudio_core::studio::Studio;
 use assetstudio_core::texture::TextureReadLimits;
@@ -71,6 +76,18 @@ fn exercise(bytes: &[u8]) -> bool {
         let mut sink = Vec::new();
         let _ = resource.write(&mut sink);
     }
+
+    // The collection-wide paths, which assemble a scene from whatever the
+    // object table claims and are far more code than reading one object.
+    // Damaged input reaches them here for free rather than needing its own
+    // corpus of mutations.
+    let _ = studio.scene_hierarchy(SceneHierarchyLimits::default());
+    let _ = studio.read_static_fbx(1 << 20);
+    let _ = studio.read_static_fbx_binary(1 << 20);
+    let _ = studio.read_fbx(1 << 20);
+    let _ = build_live2d_packages(studio.collection(), Live2dPackageLimits::default()).and_then(
+        |set| materialize_live2d_packages(set, Live2dPackageMaterializeLimits::default()),
+    );
     true
 }
 
@@ -102,7 +119,7 @@ fn panics(bytes: &[u8]) -> bool {
 fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     const REVISION: &str = "2022.3.62f1";
     let asset = text_asset_file();
-    let mut seeds = vec![("assets", asset.clone())];
+    let mut seeds = vec![("assets", asset.clone()), ("model", model_file())];
     for (name, layout) in [
         ("unityfs-plain", BundleLayout::v6(REVISION)),
         (
@@ -217,10 +234,17 @@ fn single_byte_flips_never_panic() {
     for (name, seed) in seeds() {
         // The seed itself must parse, or the sweep would be damaging something
         // that was already broken and every result would be a vacuous Err.
-        assert!(
-            Studio::open_region(name, Region::from_bytes(seed.clone())).is_ok(),
-            "the {name} seed does not parse, so mutating it proves nothing"
-        );
+        let studio = Studio::open_region(name, Region::from_bytes(seed.clone()))
+            .unwrap_or_else(|error| panic!("the {name} seed does not parse: {error}"));
+        // The model seed exists so the scene and FBX paths do real work; if it
+        // stopped producing a model the widened sweep would still pass while
+        // exercising none of them.
+        if name == "model" {
+            assert!(
+                studio.read_static_fbx(1 << 20).is_ok(),
+                "the model seed no longer exports, so the scene paths are untested"
+            );
+        }
         let mut still_parsed = 0_usize;
         for _ in 0..MUTATIONS {
             let mut damaged = seed.clone();
@@ -621,4 +645,164 @@ fn mono_script(class_name: &str) -> Vec<u8> {
     push_aligned_string(&mut data, "Live2D.Cubism.Core");
     push_aligned_string(&mut data, "Live2D.Cubism.dll");
     data
+}
+
+/// A minimal but complete model: a game object, its transform, a mesh filter,
+/// a renderer, and a triangle mesh.
+///
+/// The other seeds hold a single `TextAsset`, so the scene, FBX and `Live2D`
+/// entry points bail out immediately on them and prove only that they reject a
+/// model-less file. Damaging this one is what puts mutated bytes through
+/// hierarchy assembly, model IR construction and the FBX writers.
+fn model_file() -> Vec<u8> {
+    objects_file(&[
+        (1, 1, model_game_object(&[11, 21, 31])),
+        (4, 11, model_transform()),
+        (33, 21, model_mesh_filter()),
+        (23, 31, model_renderer()),
+        (43, 51, model_mesh()),
+    ])
+}
+
+fn model_game_object(components: &[i64]) -> Vec<u8> {
+    let mut output = Vec::new();
+    push_i32(&mut output, i32::try_from(components.len()).unwrap());
+    for component in components {
+        push_pptr(&mut output, *component);
+    }
+    push_i32(&mut output, 0);
+    push_aligned_string(&mut output, "root");
+    output
+}
+
+fn model_transform() -> Vec<u8> {
+    let mut output = Vec::new();
+    push_pptr(&mut output, 1);
+    push_floats(&mut output, &[0.0, 0.0, 0.0, 1.0]);
+    push_floats(&mut output, &[2.0, 3.0, 4.0]);
+    push_floats(&mut output, &[1.0, 1.0, 1.0]);
+    push_i32(&mut output, 0);
+    push_pptr(&mut output, 0);
+    output
+}
+
+fn model_mesh_filter() -> Vec<u8> {
+    let mut output = Vec::new();
+    push_pptr(&mut output, 1);
+    push_pptr(&mut output, 51);
+    output
+}
+
+fn model_renderer() -> Vec<u8> {
+    let mut output = Vec::new();
+    push_pptr(&mut output, 1);
+    output.extend_from_slice(&[1, 2, 1, 0, 0, 0, 0, 0, 0, 0]);
+    pad(&mut output);
+    output.extend_from_slice(&u32::MAX.to_le_bytes());
+    push_i32(&mut output, 0);
+    output.extend_from_slice(&[0_u8; 36]);
+    push_i32(&mut output, 0);
+    output.extend_from_slice(&[0_u8; 4]);
+    for _ in 0..3 {
+        push_pptr(&mut output, 0);
+    }
+    output.extend_from_slice(&[0_u8; 8]);
+    pad(&mut output);
+    output
+}
+
+fn model_mesh() -> Vec<u8> {
+    let mut output = Vec::new();
+    push_aligned_string(&mut output, "tri");
+    push_i32(&mut output, 1);
+    for value in [0_u32, 3, 0, 0, 0, 3] {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+    output.extend_from_slice(&[0_u8; 24]);
+    for _ in 0..3 {
+        push_i32(&mut output, 0);
+    }
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    for _ in 0..5 {
+        push_i32(&mut output, 0);
+    }
+    output.extend_from_slice(&[0, 1, 0, 0]);
+    pad(&mut output);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 6);
+    for index in 0..3_u16 {
+        output.extend_from_slice(&index.to_le_bytes());
+    }
+    pad(&mut output);
+
+    // Vertex data: three positions in one stream.
+    output.extend_from_slice(&3_u32.to_le_bytes());
+    push_i32(&mut output, 5);
+    output.extend_from_slice(&[0, 0, 0, 3]);
+    for _ in 0..4 {
+        output.extend_from_slice(&[0_u8; 4]);
+    }
+    push_i32(&mut output, 36);
+    for vertex in [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+        push_floats(&mut output, &vertex);
+    }
+    pad(&mut output);
+
+    // The compressed-mesh block and the tail every version carries.
+    for _ in 0..4 {
+        push_empty_packed_float(&mut output);
+    }
+    for _ in 0..3 {
+        push_empty_packed_int(&mut output);
+    }
+    push_empty_packed_float(&mut output);
+    for _ in 0..2 {
+        push_empty_packed_int(&mut output);
+    }
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    output.extend_from_slice(&[0_u8; 24]);
+    for _ in 0..3 {
+        push_i32(&mut output, 0);
+    }
+    pad(&mut output);
+    push_i32(&mut output, 0);
+    pad(&mut output);
+    output.extend_from_slice(&[0_u8; 8]);
+    pad(&mut output);
+    output.extend_from_slice(&0_i64.to_le_bytes());
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    push_aligned_string(&mut output, "");
+    output
+}
+
+fn push_empty_packed_float(output: &mut Vec<u8>) {
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    push_floats(output, &[0.0, 0.0]);
+    push_i32(output, 0);
+    pad(output);
+    output.push(0);
+    pad(output);
+}
+
+fn push_empty_packed_int(output: &mut Vec<u8>) {
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    push_i32(output, 0);
+    pad(output);
+    output.push(0);
+    pad(output);
+}
+
+fn push_pptr(output: &mut Vec<u8>, path_id: i64) {
+    push_i32(output, 0);
+    output.extend_from_slice(&path_id.to_le_bytes());
+}
+
+fn push_floats(output: &mut Vec<u8>, values: &[f32]) {
+    for value in values {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn push_i32(output: &mut Vec<u8>, value: i32) {
+    output.extend_from_slice(&value.to_le_bytes());
 }
