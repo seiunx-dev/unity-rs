@@ -2673,6 +2673,13 @@ fn decode_bc1_color_block(block: [u8; 8], one_bit_alpha: bool) -> [Rgba8; 16] {
         palette[2] = interpolate_rgba(palette[0], 2, palette[1], 1, 3);
         palette[3] = interpolate_rgba(palette[0], 1, palette[1], 2, 3);
     } else {
+        // Punch-through mode. EXT_texture_compression_s3tc specifies index 3 as
+        // fully transparent black here, which is what a cut-out texture's alpha
+        // was authored to mean. This is a deliberate divergence from the managed
+        // oracle: AssetStudio's native decoder emits opaque black instead,
+        // reproducing NV4x-era hardware behaviour, so a masked region comes out
+        // as a black block there rather than transparent. The compatibility
+        // matrix records the divergence.
         palette[2] = interpolate_rgba(palette[0], 1, palette[1], 1, 2);
         palette[3] = [0, 0, 0, 0];
     }
@@ -3501,6 +3508,10 @@ mod tests {
             .decode_mip_rgba8(0, TextureReadLimits::default())
             .unwrap();
 
+        // The second block has endpoint_0 < endpoint_1, so it decodes in
+        // punch-through mode and its index-3 texel is transparent black per the
+        // s3tc specification. AssetStudio's native decoder would give opaque
+        // black there; the divergence is deliberate and documented.
         let expected_row = [
             255, 0, 0, 255, 0, 255, 0, 255, 170, 85, 0, 255, 85, 170, 0, 255, 0, 0, 0, 255, 255,
             255, 255, 255, 127, 127, 127, 255, 0, 0, 0, 0,
