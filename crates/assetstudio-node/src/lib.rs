@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use assetstudio_core::avatar::AvatarReadLimits;
+use assetstudio_core::export::ExportOptions;
+use assetstudio_core::extraction::ExtractionOptions;
 use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
@@ -149,6 +151,43 @@ pub struct SceneNode {
 pub struct MemoryInput {
     pub name: String,
     pub data: Buffer,
+}
+
+/// One object the exporter wrote.
+#[napi(object)]
+pub struct ExportRecord {
+    pub source: String,
+    pub path_id: BigInt,
+    pub class_id: i32,
+    pub output_path: String,
+    /// What the bytes are, `image_png` or `mesh_obj` for example.
+    pub payload_kind: String,
+}
+
+/// One object the exporter could not write, and why.
+#[napi(object)]
+pub struct ExportFailure {
+    pub source: String,
+    pub path_id: BigInt,
+    pub class_id: i32,
+    pub error: String,
+}
+
+/// What an export run produced. Failures are reported rather than thrown so
+/// one unreadable object does not cost the whole run.
+#[napi(object)]
+pub struct ExportReport {
+    pub exported: Vec<ExportRecord>,
+    pub failures: Vec<ExportFailure>,
+}
+
+/// What an extraction run produced.
+#[napi(object)]
+pub struct ExtractionReport {
+    pub extracted_count: u32,
+    pub skipped_existing_count: u32,
+    pub failure_count: u32,
+    pub output_bytes: BigInt,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -832,6 +871,90 @@ impl AssetStudio {
             });
         }
         Ok(nodes)
+    }
+
+    /// Writes the whole collection as static ASCII FBX 7.4.
+    ///
+    /// Ordinary and skinned renderer geometry, direct and hash-recovered bones
+    /// and static blend shapes. Animation and textures are separate concerns
+    /// and are not included.
+    #[napi]
+    pub fn read_static_fbx(&self, maximum_bytes: Option<i64>) -> Result<Buffer> {
+        self.studio
+            .read_static_fbx(byte_limit(maximum_bytes)?)
+            .map(Into::into)
+            .map_err(core_error)
+    }
+
+    /// Exports every supported object into `outputRoot`.
+    ///
+    /// The Core exporter writes atomically and never overwrites unless asked,
+    /// and a failure on one object is recorded rather than raised so a single
+    /// unreadable asset does not cost the run.
+    // napi marshals JavaScript strings by value; references do not expand.
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn export(&self, output_root: String, overwrite: Option<bool>) -> Result<ExportReport> {
+        let options = ExportOptions {
+            overwrite_existing: overwrite.unwrap_or(false),
+            ..ExportOptions::default()
+        };
+        let report = self
+            .studio
+            .export(&output_root, options)
+            .map_err(core_error)?;
+        Ok(ExportReport {
+            exported: report
+                .exported
+                .into_iter()
+                .map(|record| ExportRecord {
+                    source: record.source,
+                    path_id: BigInt::from(record.path_id),
+                    class_id: record.class_id,
+                    output_path: record.output_path.to_string_lossy().into_owned(),
+                    payload_kind: record.payload_kind.to_owned(),
+                })
+                .collect(),
+            failures: report
+                .failures
+                .into_iter()
+                .map(|failure| ExportFailure {
+                    source: failure.source,
+                    path_id: BigInt::from(failure.path_id),
+                    class_id: failure.class_id,
+                    error: failure.error,
+                })
+                .collect(),
+        })
+    }
+
+    /// Recursively extracts one file or directory tree without loading it.
+    ///
+    /// Child symlinks are never followed and every archive path is made
+    /// relative before it is joined to the output root, so a hostile entry
+    /// cannot escape it.
+    // napi marshals JavaScript strings by value; references do not expand.
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn extract(
+        input: String,
+        output_root: String,
+        overwrite: Option<bool>,
+    ) -> Result<ExtractionReport> {
+        let options = ExtractionOptions {
+            overwrite_existing: overwrite.unwrap_or(false),
+            ..ExtractionOptions::default()
+        };
+        let report = Studio::extract(&input, &output_root, options).map_err(core_error)?;
+        Ok(ExtractionReport {
+            extracted_count: u32::try_from(report.extracted.len())
+                .map_err(|_| invalid_arg("extracted count does not fit u32"))?,
+            skipped_existing_count: u32::try_from(report.skipped_existing.len())
+                .map_err(|_| invalid_arg("skipped count does not fit u32"))?,
+            failure_count: u32::try_from(report.failures.len())
+                .map_err(|_| invalid_arg("failure count does not fit u32"))?,
+            output_bytes: BigInt::from(report.output_bytes),
+        })
     }
 }
 

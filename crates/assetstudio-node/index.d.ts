@@ -85,6 +85,30 @@ export declare class AssetStudio {
   resourceIndexByPath(path: string): number | null
   /** Assembles the `GameObject` hierarchy across every loaded file. */
   scene(maximumGameObjects?: number | undefined | null): Array<SceneNode>
+  /**
+   * Writes the whole collection as static ASCII FBX 7.4.
+   *
+   * Ordinary and skinned renderer geometry, direct and hash-recovered bones
+   * and static blend shapes. Animation and textures are separate concerns
+   * and are not included.
+   */
+  readStaticFbx(maximumBytes?: number | undefined | null): Buffer
+  /**
+   * Exports every supported object into `outputRoot`.
+   *
+   * The Core exporter writes atomically and never overwrites unless asked,
+   * and a failure on one object is recorded rather than raised so a single
+   * unreadable asset does not cost the run.
+   */
+  export(outputRoot: string, overwrite?: boolean | undefined | null): ExportReport
+  /**
+   * Recursively extracts one file or directory tree without loading it.
+   *
+   * Child symlinks are never followed and every archive path is made
+   * relative before it is joined to the output root, so a hostile entry
+   * cannot escape it.
+   */
+  static extract(input: string, outputRoot: string, overwrite?: boolean | undefined | null): ExtractionReport
 }
 
 /** One `AudioClip`'s stored payload and the extension its container implies. */
@@ -116,6 +140,41 @@ export interface BuildSettings {
   levels?: Array<string>
   /** 5.x and newer scene paths, absent on older layouts. */
   scenes?: Array<string>
+}
+
+/** One object the exporter could not write, and why. */
+export interface ExportFailure {
+  source: string
+  pathId: bigint
+  classId: number
+  error: string
+}
+
+/** One object the exporter wrote. */
+export interface ExportRecord {
+  source: string
+  pathId: bigint
+  classId: number
+  outputPath: string
+  /** What the bytes are, `image_png` or `mesh_obj` for example. */
+  payloadKind: string
+}
+
+/**
+ * What an export run produced. Failures are reported rather than thrown so
+ * one unreadable object does not cost the whole run.
+ */
+export interface ExportReport {
+  exported: Array<ExportRecord>
+  failures: Array<ExportFailure>
+}
+
+/** What an extraction run produced. */
+export interface ExtractionReport {
+  extractedCount: number
+  skippedExistingCount: number
+  failureCount: number
+  outputBytes: bigint
 }
 
 export interface FileInfo {
