@@ -244,6 +244,24 @@ pub struct Live2dPackage {
     pub display_info: Option<Live2dPackageJsonFile>,
 }
 
+fn write_optional_reference(
+    writer: &mut impl Write,
+    field: &str,
+    file: Option<&Live2dPackageJsonFile>,
+) -> Result<()> {
+    write!(writer, ",\n    \"{field}\": ").map_err(|error| {
+        Error::invalid_data(format!("cannot write Live2D model manifest: {error}"))
+    })?;
+    match file {
+        Some(file) => {
+            serde_json::to_writer(writer, &file.file_name).map_err(|error| json_error(&error))
+        }
+        None => {
+            serde_json::to_writer(writer, &Option::<&str>::None).map_err(|error| json_error(&error))
+        }
+    }
+}
+
 impl Live2dPackage {
     /// Writes a deterministic Cubism 3 manifest containing only verified files.
     pub fn write_model3_json<W: Write>(
@@ -271,55 +289,53 @@ impl Live2dPackage {
             writer.write_all(b"\n    ")?;
         }
         writer.write_all(b"]")?;
-        if let Some(pose) = &self.pose {
-            writer.write_all(b",\n    \"Pose\": ")?;
-            serde_json::to_writer(&mut writer, &pose.file_name)
-                .map_err(|error| json_error(&error))?;
-        }
-        if let Some(physics) = &self.physics {
-            writer.write_all(b",\n    \"Physics\": ")?;
-            serde_json::to_writer(&mut writer, &physics.file_name)
-                .map_err(|error| json_error(&error))?;
-        }
-        if let Some(display_info) = &self.display_info {
-            writer.write_all(b",\n    \"DisplayInfo\": ")?;
-            serde_json::to_writer(&mut writer, &display_info.file_name)
-                .map_err(|error| json_error(&error))?;
-        }
-        if !self.expressions.is_empty() {
-            writer.write_all(b",\n    \"Expressions\": [")?;
-            for (index, expression) in self.expressions.iter().enumerate() {
-                if index == 0 {
-                    writer.write_all(b"\n      { \"Name\": ")?;
-                } else {
-                    writer.write_all(b",\n      { \"Name\": ")?;
-                }
-                serde_json::to_writer(&mut writer, &expression.name)
-                    .map_err(|error| json_error(&error))?;
-                writer.write_all(b", \"File\": ")?;
-                serde_json::to_writer(&mut writer, &expression.file_name)
-                    .map_err(|error| json_error(&error))?;
-                writer.write_all(b" }")?;
+
+        // The managed document declares all five of these members and writes
+        // them whether or not they have anything in them: an absent file
+        // reference is `null` and an empty collection is `[]` or `{}`. Omitting
+        // them is valid JSON but not the same document, and a consumer that
+        // indexes `Motions` finds nothing rather than an empty map. The order
+        // here is the order that document declares.
+        write_optional_reference(&mut writer, "Physics", self.physics.as_ref())?;
+        write_optional_reference(&mut writer, "Pose", self.pose.as_ref())?;
+        write_optional_reference(&mut writer, "DisplayInfo", self.display_info.as_ref())?;
+
+        writer.write_all(b",\n    \"Motions\": {")?;
+        for (index, motion) in self.motions.iter().enumerate() {
+            if index == 0 {
+                writer.write_all(b"\n      ")?;
+            } else {
+                writer.write_all(b",\n      ")?;
             }
-            writer.write_all(b"\n    ]")?;
+            serde_json::to_writer(&mut writer, &motion.name).map_err(|error| json_error(&error))?;
+            writer.write_all(b": [ { \"File\": ")?;
+            serde_json::to_writer(&mut writer, &motion.file_name)
+                .map_err(|error| json_error(&error))?;
+            writer.write_all(b" } ]")?;
         }
         if !self.motions.is_empty() {
-            writer.write_all(b",\n    \"Motions\": {")?;
-            for (index, motion) in self.motions.iter().enumerate() {
-                if index == 0 {
-                    writer.write_all(b"\n      ")?;
-                } else {
-                    writer.write_all(b",\n      ")?;
-                }
-                serde_json::to_writer(&mut writer, &motion.name)
-                    .map_err(|error| json_error(&error))?;
-                writer.write_all(b": [ { \"File\": ")?;
-                serde_json::to_writer(&mut writer, &motion.file_name)
-                    .map_err(|error| json_error(&error))?;
-                writer.write_all(b" } ]")?;
-            }
-            writer.write_all(b"\n    }")?;
+            writer.write_all(b"\n    ")?;
         }
+        writer.write_all(b"}")?;
+
+        writer.write_all(b",\n    \"Expressions\": [")?;
+        for (index, expression) in self.expressions.iter().enumerate() {
+            if index == 0 {
+                writer.write_all(b"\n      { \"Name\": ")?;
+            } else {
+                writer.write_all(b",\n      { \"Name\": ")?;
+            }
+            serde_json::to_writer(&mut writer, &expression.name)
+                .map_err(|error| json_error(&error))?;
+            writer.write_all(b", \"File\": ")?;
+            serde_json::to_writer(&mut writer, &expression.file_name)
+                .map_err(|error| json_error(&error))?;
+            writer.write_all(b" }")?;
+        }
+        if !self.expressions.is_empty() {
+            writer.write_all(b"\n    ")?;
+        }
+        writer.write_all(b"]")?;
         writer.write_all(b"\n  },\n  \"Groups\": [")?;
         write_parameter_group(&mut writer, "EyeBlink", &self.eye_blink_parameters, true)?;
         write_parameter_group(&mut writer, "LipSync", &self.lip_sync_parameters, false)?;
@@ -3586,7 +3602,16 @@ mod tests {
                 "    \"Moc\": \"Hero.moc3\",\n",
                 "    \"Textures\": [\n",
                 "      \"textures/face.png\"\n",
-                "    ]\n",
+                "    ],\n",
+                // The managed document declares these five whether or not they
+                // carry anything. This expectation used to stop at Textures,
+                // which was this crate agreeing with itself; the managed
+                // differential is what told the two apart.
+                "    \"Physics\": null,\n",
+                "    \"Pose\": null,\n",
+                "    \"DisplayInfo\": null,\n",
+                "    \"Motions\": {},\n",
+                "    \"Expressions\": []\n",
                 "  },\n",
                 "  \"Groups\": [\n",
                 "    { \"Target\": \"Parameter\", \"Name\": \"EyeBlink\", \"Ids\": [] },\n",
@@ -3605,8 +3630,20 @@ mod tests {
         assert_eq!(parsed["Groups"][0]["Ids"], serde_json::json!([]));
         assert_eq!(parsed["Groups"][1]["Name"], "LipSync");
         assert_eq!(parsed["Groups"][1]["Ids"], serde_json::json!([]));
-        assert!(parsed["FileReferences"].get("Motions").is_none());
-        assert!(parsed["FileReferences"].get("Expressions").is_none());
+        // Present and empty rather than absent: the managed document always
+        // declares them, so a consumer that indexes them finds an empty
+        // collection instead of nothing. This pair asserted the opposite until
+        // the managed differential compared a whole package.
+        assert_eq!(
+            parsed["FileReferences"]["Motions"],
+            serde_json::json!({}),
+            "an empty motion map is written, not omitted"
+        );
+        assert_eq!(
+            parsed["FileReferences"]["Expressions"],
+            serde_json::json!([]),
+            "an empty expression list is written, not omitted"
+        );
     }
 
     #[test]

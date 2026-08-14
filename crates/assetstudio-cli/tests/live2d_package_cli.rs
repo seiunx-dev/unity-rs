@@ -63,7 +63,16 @@ fn writes_exact_static_package_moc_manifest_and_unity_order_png() {
             "    \"Moc\": \"Hero.moc3\",\n",
             "    \"Textures\": [\n",
             "      \"textures/face.png\"\n",
-            "    ]\n",
+            "    ],\n",
+            // The managed document declares these five whether or not they
+            // carry anything, so an absent reference is null and an empty
+            // collection is empty rather than missing. This expectation used to
+            // stop at Textures, which was this crate agreeing with itself.
+            "    \"Physics\": null,\n",
+            "    \"Pose\": null,\n",
+            "    \"DisplayInfo\": null,\n",
+            "    \"Motions\": {},\n",
+            "    \"Expressions\": []\n",
             "  },\n",
             "  \"Groups\": [\n",
             "    { \"Target\": \"Parameter\", \"Name\": \"EyeBlink\", \"Ids\": [] },\n",

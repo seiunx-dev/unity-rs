@@ -61,6 +61,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_cubism_fade_motion(&executable);
     assert_cubism_expression(&executable);
     assert_cubism_moc(&executable);
+    assert_cubism_package(&executable);
     assert_switch_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
@@ -403,6 +404,116 @@ fn assert_cubism_physics(executable: &Path) {
     assert_eq!(managed, rust, "Cubism physics conversion");
 }
 
+/// Compares a whole `Live2D` package against the real managed extractor.
+///
+/// The individual document comparisons above each take one behaviour and one
+/// document. This takes a model group -- game objects, transforms, scripts and
+/// several behaviours -- and runs the managed
+/// `Live2DExtractor.ExtractCubismModel` over it, then compares every file it
+/// wrote against the files this crate would materialize.
+///
+/// Driving the real extractor is the point. pose3.json and cdi3.json are built
+/// by walking a model's parts and parameters rather than by converting one
+/// behaviour, so an oracle that restated that walk would compare this
+/// repository against its own reading of the managed code. That is the weak
+/// pattern the sprite rows were corrected for.
+fn assert_cubism_package(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+    // No Texture2D in the group: two PNG encoders will not agree byte for byte,
+    // and decoded pixels are already compared by the texture rows.
+    const ALLOWED: &[&str] = &["No textures found", "No exportable motions found"];
+
+    // Type indexes into the table below.
+    const GAME_OBJECT: usize = 0;
+    const TRANSFORM: usize = 1;
+    const SCRIPT: usize = 2;
+    const MODEL: usize = 3;
+    const POSE_PART: usize = 4;
+    const DISPLAY_INFO: usize = 5;
+    const MOC: usize = 6;
+
+    let types = vec![
+        (1, None),
+        (4, None),
+        (115, None),
+        (
+            114,
+            Some(cubism_fixture::pointer_behaviour_tree(
+                "MonoBehaviour",
+                "_moc",
+            )),
+        ),
+        (114, Some(cubism_fixture::pose_part_tree())),
+        (114, Some(cubism_fixture::display_info_tree())),
+        (114, None),
+    ];
+    let objects = vec![
+        (
+            GAME_OBJECT,
+            1,
+            cubism_fixture::game_object("Hero", &[10, 20, 30]),
+        ),
+        (TRANSFORM, 10, cubism_fixture::transform(1, &[11, 12], 0)),
+        (MODEL, 20, cubism_fixture::pointer_behaviour(1, 100, "", 30)),
+        (MOC, 30, cubism_fixture::cubism_moc_behaviour(1, 102, 4)),
+        // Two pose parts in one group and one in another, so the grouping and
+        // its ordering are both exercised.
+        (
+            GAME_OBJECT,
+            2,
+            cubism_fixture::game_object("PartArmA", &[11, 21]),
+        ),
+        (TRANSFORM, 11, cubism_fixture::transform(2, &[], 10)),
+        (
+            POSE_PART,
+            21,
+            cubism_fixture::pose_part(2, 103, 0, &["PartArmB"]),
+        ),
+        (
+            GAME_OBJECT,
+            3,
+            cubism_fixture::game_object("PartArmB", &[12, 22, 23]),
+        ),
+        (TRANSFORM, 12, cubism_fixture::transform(3, &[], 10)),
+        (POSE_PART, 22, cubism_fixture::pose_part(3, 103, 1, &[])),
+        (
+            DISPLAY_INFO,
+            23,
+            cubism_fixture::display_info(3, 104, "PartArmB", "Left arm"),
+        ),
+        (SCRIPT, 100, cubism_fixture::mono_script("CubismModel")),
+        (SCRIPT, 102, cubism_fixture::mono_script("CubismMoc")),
+        (SCRIPT, 103, cubism_fixture::mono_script("CubismPosePart")),
+        (
+            SCRIPT,
+            104,
+            cubism_fixture::mono_script("CubismDisplayInfoPartName"),
+        ),
+    ];
+
+    let file = synthetic_group_v22(REVISION, &types, &objects);
+    let fixture = TemporaryFixture::new("oracle-cubism-package.assets", &file)
+        .expect("the package fixture is writable");
+    let managed = managed_manifest_allowing(executable, fixture.input_path(), ALLOWED).unwrap();
+    let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+
+    let package = managed["Live2D"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the managed extractor wrote no package: {managed}"));
+    assert!(
+        package.keys().any(|name| name.ends_with("pose3.json")),
+        "the pose parts produced no pose3.json: {:?}",
+        package.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        package.keys().any(|name| name.ends_with("cdi3.json")),
+        "the display info produced no cdi3.json: {:?}",
+        package.keys().collect::<Vec<_>>()
+    );
+
+    assert_eq!(managed["Live2D"], rust["Live2D"], "Live2D package files");
+}
+
 /// Compares the MOC3 header parse against the managed reader.
 ///
 /// The MOC behaviour is the one `Live2D` asset read without a `TypeTree`:
@@ -423,7 +534,14 @@ fn assert_cubism_moc(executable: &Path) {
     );
     let fixture = TemporaryFixture::new("oracle-cubism-moc.assets", &file)
         .expect("the MOC fixture is writable");
-    let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+    // The extractor runs over any file holding a MOC, and this one is a header
+    // and nothing else, so it truthfully reports having nothing to export.
+    let managed = managed_manifest_allowing(
+        executable,
+        fixture.input_path(),
+        &["No textures found", "No exportable motions found"],
+    )
+    .unwrap();
     let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
 
     let objects = managed["Files"][0]["Objects"]
@@ -1063,7 +1181,10 @@ fn assert_truncated_fixture(executable: &Path) {
     bytes.truncate(bytes.len() - 3);
     let fixture = TemporaryFixture::new("oracle-truncated.assets", &bytes).unwrap();
     let managed = managed_manifest(executable, fixture.input_path()).unwrap();
-    assert_eq!(managed, json!({ "Files": [], "Resources": [] }));
+    assert_eq!(
+        managed,
+        json!({ "Files": [], "Resources": [], "Live2D": Value::Null })
+    );
     let rust = Studio::open(fixture.input_path()).unwrap();
     assert_eq!(rust.file_count(), 0);
 }
@@ -1386,6 +1507,76 @@ fn synthetic_mono_behaviour_v22(
     }
     metadata.push(0);
     finish_v22(&metadata, data)
+}
+
+/// A v22 file holding several objects, where any type may carry a `TypeTree`.
+///
+/// The single-object builders above cover one class each; a `Live2D` model is
+/// group -- game objects, transforms, scripts and several behaviours with
+/// different trees -- and neither implementation reaches its model code without
+/// the whole shape present.
+///
+/// Types are `(class id, optional tree)`; objects are `(type index, path id,
+/// payload)`.
+fn synthetic_group_v22(
+    version: &str,
+    types: &[(i32, Option<Vec<Value>>)],
+    objects: &[(usize, i64, Vec<u8>)],
+) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    metadata.extend_from_slice(version.as_bytes());
+    metadata.push(0);
+    push_i32(&mut metadata, 13);
+    // The flag is per file, so every tree-bearing type in the group needs one
+    // and the tree-less types write an empty tree rather than nothing.
+    metadata.push(1);
+    push_i32(&mut metadata, i32::try_from(types.len()).unwrap());
+    for (index, (class_id, nodes)) in types.iter().enumerate() {
+        push_i32(&mut metadata, *class_id);
+        metadata.push(0);
+        // Distinct script type indexes, so two behaviour types are not
+        // conflated by a reader that keys on them.
+        metadata.extend_from_slice(&i16::try_from(index).unwrap().to_le_bytes());
+        if *class_id == 114 {
+            metadata.extend_from_slice(&[0; 16]);
+        }
+        metadata.extend_from_slice(&[0; 16]);
+        if let Some(nodes) = nodes {
+            push_blob_type_tree_v19(&mut metadata, nodes);
+        } else {
+            // An empty tree: a node count and a string buffer size, both zero.
+            // Readers treat this as "no tree" without the record going missing.
+            push_i32(&mut metadata, 0);
+            push_i32(&mut metadata, 0);
+        }
+        push_i32(&mut metadata, 0); // no type dependencies
+    }
+
+    let mut data = Vec::new();
+    let mut records = Vec::new();
+    for (type_index, path_id, payload) in objects {
+        align(&mut data, 4);
+        records.push((
+            *path_id,
+            i64::try_from(data.len()).unwrap(),
+            u32::try_from(payload.len()).unwrap(),
+            i32::try_from(*type_index).unwrap(),
+        ));
+        data.extend_from_slice(payload);
+    }
+    push_i32(&mut metadata, i32::try_from(records.len()).unwrap());
+    for (path_id, offset, size, type_index) in records {
+        align_with_base(&mut metadata, 48, 4);
+        metadata.extend_from_slice(&path_id.to_le_bytes());
+        metadata.extend_from_slice(&offset.to_le_bytes());
+        metadata.extend_from_slice(&size.to_le_bytes());
+        push_i32(&mut metadata, type_index);
+    }
+    for _ in 0..3 {
+        push_i32(&mut metadata, 0);
+    }
+    metadata.push(0);
+    finish_v22(&metadata, &data)
 }
 
 /// The format 19+ blob encoding, whose nodes are 32 bytes rather than 24: they

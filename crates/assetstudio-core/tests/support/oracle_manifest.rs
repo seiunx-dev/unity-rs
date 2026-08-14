@@ -10,6 +10,10 @@ use assetstudio_core::cubism_moc::{CubismMocReadLimits, CubismSdkVersion, try_re
 use assetstudio_core::live2d_motion::{
     CubismFadeMotionReadLimits, CubismMotionTargetNames, project_cubism_fade_motion,
 };
+use assetstudio_core::live2d_package::{
+    Live2dPackageLimits, Live2dPackageMaterializeLimits, build_live2d_packages,
+    materialize_live2d_packages,
+};
 use assetstudio_core::live2d_physics::{CubismPhysicsReadLimits, project_cubism_physics};
 use assetstudio_core::live2d_schema::{CubismExpressionReadLimits, project_cubism_expression};
 use assetstudio_core::material::{MaterialReadLimits, read_material};
@@ -85,7 +89,67 @@ pub fn rust_manifest(
             "Data": bytes.finish(),
         }));
     }
-    Ok(json!({ "Files": files, "Resources": resource_manifest }))
+    Ok(json!({
+        "Files": files,
+        "Resources": resource_manifest,
+        "Live2D": live2d_manifest(&studio)?,
+    }))
+}
+
+/// The files a `Live2D` package would be written as, keyed by relative path.
+///
+/// The managed side runs its real extractor and lists what it wrote; this lists
+/// the same set from the materialized package so the two are comparable as
+/// documents rather than as call sequences.
+fn live2d_manifest(studio: &Studio) -> Result<Value, Box<dyn std::error::Error>> {
+    let set = match build_live2d_packages(studio.collection(), Live2dPackageLimits::default()) {
+        Ok(set) if !set.packages.is_empty() => set,
+        // No model in the file is not a failure; the managed side reports the
+        // same absence by returning nothing.
+        _ => return Ok(Value::Null),
+    };
+    let bytes = materialize_live2d_packages(set, Live2dPackageMaterializeLimits::default())?;
+    let mut documents = serde_json::Map::new();
+    for package in bytes.packages {
+        let mut insert = |name: String, content: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
+            // JSON documents compare as values; anything else compares by size
+            // and hash, since two encoders will not agree byte for byte and the
+            // decoded-pixel rows already cover texture content.
+            // The names are generated, so a plain suffix match is exact here
+            // rather than a guess about casing.
+            let value = if std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                serde_json::from_slice::<Value>(content)?
+            } else {
+                bytes_manifest(content)
+            };
+            documents.insert(name, value);
+            Ok(())
+        };
+        insert(package.moc_file_name.clone(), &package.moc)?;
+        insert(package.manifest_file_name.clone(), &package.manifest)?;
+        for texture in &package.textures {
+            insert(format!("textures/{}", texture.file_name), &texture.png)?;
+        }
+        for expression in &package.expressions {
+            insert(
+                format!("expressions/{}", expression.file_name),
+                &expression.json,
+            )?;
+        }
+        for motion in &package.motions {
+            insert(format!("motions/{}", motion.file_name), &motion.json)?;
+        }
+        for file in [&package.physics, &package.pose, &package.display_info]
+            .into_iter()
+            .flatten()
+        {
+            insert(file.file_name.clone(), &file.bytes)?;
+        }
+    }
+    Ok(Value::Object(documents))
 }
 
 struct StreamingBytesManifest {
