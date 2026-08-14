@@ -29,6 +29,12 @@ format's rules, and does the same for the ASCII form: braces, the counts
 resolving to objects that exist, and arrays holding as many values as they
 claim. The WAV containers go to Python's own `wave` module, which was
 not written for this project and refuses files whose header fields disagree.
+The PNG check is the same idea one layer down: the encoder's chunk framing,
+CRCs and scanline filters are all this project's own, and its unit test checks
+the CRCs with the project's own CRC routine, so a wrong table would produce a
+file the test accepts and every viewer rejects. `zlib` supplies an independent
+CRC-32 and inflate, and the decoded pixels are compared to the source the file
+was built from, bottom-up-to-top-down row flip included.
 
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
@@ -143,6 +149,10 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "WAV containers",
                     ["python3", "tools/validate_wav_output.py"],
+                ),
+                Step(
+                    "PNG containers",
+                    ["python3", "tools/validate_png_output.py"],
                 ),
             ],
         ),
