@@ -43,10 +43,15 @@ pub struct ResourceInfo {
     pub byte_size: BigInt,
 }
 
+/// A decoded RGBA8 image.
 #[napi(object)]
 pub struct RgbaImage {
     pub width: u32,
     pub height: u32,
+    /// Tightly packed RGBA8 rows in display order: the first row is the top
+    /// edge of the image, matching the Python binding and the CLI's encoded
+    /// output. `Texture2D` decoders work bottom-up, so these rows have already
+    /// been flipped.
     pub pixels: Buffer,
 }
 
@@ -395,11 +400,7 @@ impl AssetStudio {
                 },
             )
             .map_err(core_error)?;
-        Ok(RgbaImage {
-            width: image.width,
-            height: image.height,
-            pixels: image.pixels.into(),
-        })
+        convert_decoded_image(image)
     }
 
     #[napi(ts_return_type = "Promise<RgbaImage>")]
@@ -431,7 +432,7 @@ impl AssetStudio {
             .object(file_index, bigint_i64(path_id, "pathId")?)?
             .decode_texture_array_mip0(texture_array_limits(maximum))
             .map_err(core_error)?;
-        convert_images(images)
+        convert_decoded_images(images)
     }
 
     #[napi(ts_return_type = "Promise<Array<RgbaImage>>")]
@@ -621,7 +622,7 @@ impl Task for ReadTextureTask {
     }
 
     fn resolve(&mut self, _env: Env, image: Self::Output) -> Result<Self::JsValue> {
-        Ok(convert_image(image))
+        convert_decoded_image(image)
     }
 }
 
@@ -643,7 +644,7 @@ impl Task for ReadTextureArrayTask {
     }
 
     fn resolve(&mut self, _env: Env, images: Self::Output) -> Result<Self::JsValue> {
-        convert_images(images)
+        convert_decoded_images(images)
     }
 }
 
@@ -707,6 +708,8 @@ fn sprite_limits(maximum: u64) -> SpriteReadLimits {
     }
 }
 
+/// Converts an image Core already returns in display row order, such as a
+/// decoded `Sprite`.
 fn convert_image(image: assetstudio_core::texture::RgbaImage) -> RgbaImage {
     RgbaImage {
         width: image.width,
@@ -715,9 +718,20 @@ fn convert_image(image: assetstudio_core::texture::RgbaImage) -> RgbaImage {
     }
 }
 
-fn convert_images(images: Vec<assetstudio_core::texture::RgbaImage>) -> Result<Vec<RgbaImage>> {
+/// Converts a `Texture2D` decoder result, whose rows run bottom-up, into the
+/// top-down order every other surface hands to callers.
+fn convert_decoded_image(mut image: assetstudio_core::texture::RgbaImage) -> Result<RgbaImage> {
+    assetstudio_core::image_export::flip_rgba_rows(&mut image).map_err(core_error)?;
+    Ok(convert_image(image))
+}
+
+fn convert_decoded_images(
+    images: Vec<assetstudio_core::texture::RgbaImage>,
+) -> Result<Vec<RgbaImage>> {
     let mut output = reserve(images.len(), "Texture2DArray images")?;
-    output.extend(images.into_iter().map(convert_image));
+    for image in images {
+        output.push(convert_decoded_image(image)?);
+    }
     Ok(output)
 }
 

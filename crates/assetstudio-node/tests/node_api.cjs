@@ -34,18 +34,14 @@ function alignedString(value) {
   return align(Buffer.concat([i32(bytes.length), bytes]), 4)
 }
 
-function syntheticTextAsset() {
-  const payload = Buffer.concat([
-    alignedString('node fixture'),
-    i32(10),
-    Buffer.from('hello node'),
-  ])
+// Wraps one tree-less object payload in a v22 little-endian serialized file.
+function finishV22Asset(classId, payload) {
   let metadata = Buffer.concat([
     Buffer.from('2022.3.62f1\0', 'ascii'),
     i32(13),
     Buffer.from([0]),
     i32(1),
-    i32(49),
+    i32(classId),
     Buffer.from([0]),
     Buffer.from([0xff, 0xff]),
     Buffer.alloc(16),
@@ -75,6 +71,53 @@ function syntheticTextAsset() {
     Buffer.alloc(dataOffset - 48 - metadata.length),
     payload,
   ])
+}
+
+function syntheticTextAsset() {
+  const payload = Buffer.concat([
+    alignedString('node fixture'),
+    i32(10),
+    Buffer.from('hello node'),
+  ])
+  return finishV22Asset(49, payload)
+}
+
+// A 2x2 RGBA32 Texture2D. Rows are stored bottom-up, so the first pixel in the
+// payload is the BOTTOM-left one and a correct reader returns it last.
+const TEXTURE_PIXELS = Buffer.from([
+  255, 0, 0, 1, 0, 255, 0, 2, 0, 0, 255, 3, 255, 255, 255, 4,
+])
+
+function syntheticTexture2d() {
+  let payload = Buffer.alloc(0)
+  const push = (...parts) => {
+    payload = Buffer.concat([payload, ...parts])
+  }
+  const pad4 = () => {
+    payload = align(payload, 4)
+  }
+  const alignedStr = (value) => {
+    const bytes = Buffer.from(value, 'utf8')
+    push(i32(bytes.length), bytes)
+    pad4()
+  }
+
+  alignedStr('image')
+  push(i32(0), Buffer.from([0, 0]))
+  pad4()
+  push(i32(2), i32(2), u32(TEXTURE_PIXELS.length))
+  push(i32(0), i32(4), i32(1))
+  push(Buffer.from([0, 0, 0]))
+  pad4()
+  alignedStr('')
+  push(Buffer.from([0]))
+  pad4()
+  push(i32(0), i32(1), i32(2))
+  push(Buffer.alloc(24))
+  push(i32(0), i32(0), i32(0))
+  pad4()
+  push(i32(TEXTURE_PIXELS.length), TEXTURE_PIXELS)
+  return finishV22Asset(28, payload)
 }
 
 function syntheticTypeTreeIntAsset() {
@@ -161,6 +204,24 @@ assert.throws(() => studio.readSprite(0, 7n), /Sprite|class ID/i)
 assert.throws(() => studio.objectPage(0, 0, 1_000_001), /page limit/i)
 assert.throws(() => addon.AssetStudio.fromBuffer(input, 'node.assets', 1), /exceed/i)
 
+// Texture2D rows leave the decoder bottom-up. Every consumer -- the Python
+// binding, the CLI's encoded images and the managed exporter -- hands callers
+// top-down rows, so this binding has to flip them too.
+const DISPLAY_ORDER_PIXELS = Buffer.concat([
+  TEXTURE_PIXELS.subarray(8),
+  TEXTURE_PIXELS.subarray(0, 8),
+])
+const textureInput = syntheticTexture2d()
+const textureStudio = addon.AssetStudio.fromBuffer(
+  textureInput,
+  'texture.assets',
+  textureInput.length,
+)
+const decodedTexture = textureStudio.readTexture(0, 7n)
+assert.equal(decodedTexture.width, 2)
+assert.equal(decodedTexture.height, 2)
+assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
+
 async function testAsyncWorkers() {
   const asyncStudio = await addon.AssetStudio.fromBufferAsync(
     input,
@@ -178,6 +239,15 @@ async function testAsyncWorkers() {
   await assert.rejects(asyncStudio.readTypeTreeDumpAsync(0, 7n), /TypeTree|type tree/i)
   await assert.rejects(asyncStudio.readTextureArrayAsync(0, 7n), /Texture2DArray|class ID/i)
   await assert.rejects(asyncStudio.readSpriteAsync(0, 7n), /Sprite|class ID/i)
+
+  // The worker path has to agree with the synchronous one on row order.
+  const asyncTextureStudio = await addon.AssetStudio.fromBufferAsync(
+    textureInput,
+    'async-texture.assets',
+    textureInput.length,
+  )
+  const asyncTexture = await asyncTextureStudio.readTextureAsync(0, 7n)
+  assert.deepEqual(Buffer.from(asyncTexture.pixels), DISPLAY_ORDER_PIXELS)
 
   const treeInput = syntheticTypeTreeIntAsset()
   const treeStudio = await addon.AssetStudio.fromBufferAsync(

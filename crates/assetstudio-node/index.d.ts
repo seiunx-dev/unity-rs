@@ -66,8 +66,15 @@ export interface ResourceInfo {
   byteSize: bigint
 }
 
+/** A decoded RGBA8 image. */
 export interface RgbaImage {
   width: number
   height: number
+  /**
+   * Tightly packed RGBA8 rows in display order: the first row is the top
+   * edge of the image, matching the Python binding and the CLI's encoded
+   * output. `Texture2D` decoders work bottom-up, so these rows have already
+   * been flipped.
+   */
   pixels: Buffer
 }
