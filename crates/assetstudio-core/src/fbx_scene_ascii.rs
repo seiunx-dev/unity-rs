@@ -1,5 +1,6 @@
 //! General, deterministic static ASCII FBX 7.4 scene emission.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -11,6 +12,7 @@ use crate::model_animation::{
 };
 use crate::model_ir::{ModelCoordinateConvention, ModelIr, ModelLocalTransform, ModelRendererKind};
 use crate::scene_hierarchy::SceneObjectKey;
+use crate::scene_textures::{SceneTextureSet, TextureSlot};
 use crate::{Error, Result};
 
 const MODEL_ID_BASE: i64 = 1_000_000_000;
@@ -26,6 +28,8 @@ const ANIMATION_CURVE_ID_BASE: i64 = 9_000_000_000;
 const BLEND_SHAPE_ID_BASE: i64 = 10_000_000_000;
 const BLEND_SHAPE_CHANNEL_ID_BASE: i64 = 11_000_000_000;
 const SHAPE_GEOMETRY_ID_BASE: i64 = 12_000_000_000;
+const TEXTURE_ID_BASE: i64 = 13_000_000_000;
+const VIDEO_ID_BASE: i64 = 14_000_000_000;
 const FBX_TIME_SECOND: f64 = 46_186_158_000.0;
 const MAXIMUM_NAME_BYTES: usize = 4 * 1024;
 const MAXIMUM_BONE_PATH_BYTES: usize = 16 * 1024 * 1024;
@@ -45,7 +49,17 @@ pub(crate) fn write_model_ir_fbx_ascii_with_animations<W: Write>(
     output: &mut W,
     maximum_output_bytes: u64,
 ) -> Result<u64> {
-    let scene = StaticScene::from_model(model, animations)?;
+    write_model_ir_fbx_ascii_with_textures(model, animations, None, output, maximum_output_bytes)
+}
+
+pub(crate) fn write_model_ir_fbx_ascii_with_textures<W: Write>(
+    model: &ModelIr,
+    animations: Option<&ModelAnimationSet>,
+    textures: Option<&SceneTextureSet>,
+    output: &mut W,
+    maximum_output_bytes: u64,
+) -> Result<u64> {
+    let scene = StaticScene::from_model(model, animations, textures)?;
     let mut bounded = BoundedWriter::new(output, maximum_output_bytes);
     let result = scene.write(&mut bounded);
     if bounded.limit_exceeded {
@@ -67,7 +81,28 @@ struct StaticScene<'a> {
     nodes: Vec<NodePlan<'a>>,
     geometries: Vec<GeometryPlan<'a>>,
     materials: Vec<MaterialPlan<'a>>,
+    textures: Vec<TexturePlan<'a>>,
     animations: Vec<AnimationPlan<'a>>,
+}
+
+/// One `Texture`/`Video` pair, shared by every material that binds it.
+///
+/// FBX carries the UV transform on the texture rather than on the binding, so
+/// a texture bound by two materials with different offsets can only keep one.
+/// The first binding wins, matching the single shared `FbxFileTexture` the
+/// managed exporter creates per texture name.
+struct TexturePlan<'a> {
+    id: i64,
+    video_id: i64,
+    file_name: &'a str,
+    translation: [f32; 2],
+    scaling: [f32; 2],
+}
+
+/// One texture bound to a material channel.
+struct MaterialTexturePlan {
+    texture_id: i64,
+    slot: TextureSlot,
 }
 
 struct NodePlan<'a> {
@@ -160,6 +195,7 @@ enum AnimationProperty {
 struct MaterialPlan<'a> {
     id: i64,
     material: Option<&'a Material>,
+    textures: Vec<MaterialTexturePlan>,
 }
 
 #[derive(Clone, Copy)]
@@ -170,7 +206,11 @@ struct ConvertedTransform {
 }
 
 impl<'a> StaticScene<'a> {
-    fn from_model(model: &'a ModelIr, animations: Option<&'a ModelAnimationSet>) -> Result<Self> {
+    fn from_model(
+        model: &'a ModelIr,
+        animations: Option<&'a ModelAnimationSet>,
+        textures: Option<&'a SceneTextureSet>,
+    ) -> Result<Self> {
         if model.coordinate_convention != ModelCoordinateConvention::UnitySource {
             return Err(Error::unsupported(
                 "ASCII FBX input must use the UnitySource coordinate convention",
@@ -251,7 +291,8 @@ impl<'a> StaticScene<'a> {
         bone_node_indices.sort_unstable();
         bone_node_indices.dedup();
         mark_bone_nodes(&mut nodes, &node_plan_indices, bone_node_indices)?;
-        let materials = build_material_plans(model, &used_materials)?;
+        let mut texture_plans = Vec::new();
+        let materials = build_material_plans(model, &used_materials, textures, &mut texture_plans)?;
         let animations = animations.map_or_else(
             || Ok(Vec::new()),
             |animations| build_animation_plans(model, &geometries, animations),
@@ -260,6 +301,7 @@ impl<'a> StaticScene<'a> {
             nodes,
             geometries,
             materials,
+            textures: texture_plans,
             animations,
         })
     }
@@ -277,6 +319,9 @@ impl<'a> StaticScene<'a> {
         }
         for material in &self.materials {
             write_material(material, output)?;
+        }
+        for texture in &self.textures {
+            write_texture(texture, output)?;
         }
         for geometry in &self.geometries {
             if let Some(skin) = &geometry.skin {
@@ -323,6 +368,20 @@ impl<'a> StaticScene<'a> {
                 }
             }
         }
+        for texture in &self.textures {
+            writeln!(output, "    C: \"OO\",{},{}", texture.video_id, texture.id)?;
+        }
+        for material in &self.materials {
+            for texture in &material.textures {
+                writeln!(
+                    output,
+                    "    C: \"OP\",{},{}, \"{}\"",
+                    texture.texture_id,
+                    material.id,
+                    texture.slot.fbx_property()
+                )?;
+            }
+        }
         for animation in &self.animations {
             write_animation_connections(animation, output)?;
         }
@@ -362,10 +421,12 @@ References:  {{\n\
 }}\n\
 Definitions:  {{\n\
     Version: 100\n\
-    Count: 8\n\
+    Count: 10\n\
     ObjectType: \"Model\" {{ Count: {} }}\n\
     ObjectType: \"Geometry\" {{ Count: {} }}\n\
     ObjectType: \"Material\" {{ Count: {} }}\n\
+    ObjectType: \"Texture\" {{ Count: {} }}\n\
+    ObjectType: \"Video\" {{ Count: {} }}\n\
     ObjectType: \"Deformer\" {{ Count: {} }}\n\
     ObjectType: \"AnimationStack\" {{ Count: {} }}\n\
     ObjectType: \"AnimationLayer\" {{ Count: {} }}\n\
@@ -376,6 +437,8 @@ Objects:  {{\n",
             self.nodes.len(),
             counts.geometries,
             self.materials.len(),
+            self.textures.len(),
+            self.textures.len(),
             counts.deformers,
             self.animations.len(),
             self.animations.len(),
@@ -1147,29 +1210,113 @@ fn geometry_materials(
 fn build_material_plans<'a>(
     model: &'a ModelIr,
     references: &[MaterialReference],
+    textures: Option<&'a SceneTextureSet>,
+    texture_plans: &mut Vec<TexturePlan<'a>>,
 ) -> Result<Vec<MaterialPlan<'a>>> {
     let mut plans = reserve_vec(references.len(), "FBX materials")?;
+    // Only textures a used material actually binds become objects; the set is
+    // built from every material in the model, which is a superset of the
+    // materials this scene renders with.
+    let mut emitted: BTreeMap<usize, i64> = BTreeMap::new();
     for reference in references {
-        let material = match reference {
+        let entry = match reference {
             MaterialReference::Default => None,
             MaterialReference::Model(index) => Some(
-                &model
+                model
                     .materials
                     .get(*index)
-                    .ok_or_else(|| Error::invalid_data("FBX Material index is outside ModelIr"))?
-                    .material,
+                    .ok_or_else(|| Error::invalid_data("FBX Material index is outside ModelIr"))?,
             ),
         };
+        let material = entry.map(|entry| &entry.material);
         if let Some(material) = material {
             validate_name(&material.name, "material")?;
         }
         MaterialProperties::from_material(material).validate()?;
+        let mut material_textures = Vec::new();
+        if let (Some(entry), Some(textures)) = (entry, textures) {
+            for binding in textures.bindings_for(entry.object) {
+                let Some(slot) = binding.slot else {
+                    continue;
+                };
+                let texture_id = if let Some(id) = emitted.get(&binding.texture) {
+                    *id
+                } else {
+                    let texture = textures.textures.get(binding.texture).ok_or_else(|| {
+                        Error::invalid_data("FBX texture index is outside the texture set")
+                    })?;
+                    validate_name(&texture.file_name, "texture")?;
+                    let index = texture_plans.len();
+                    let id = indexed_id(TEXTURE_ID_BASE, index, "FBX texture")?;
+                    texture_plans.push(TexturePlan {
+                        id,
+                        video_id: indexed_id(VIDEO_ID_BASE, index, "FBX video")?,
+                        file_name: &texture.file_name,
+                        translation: binding.offset,
+                        scaling: binding.scale,
+                    });
+                    emitted.insert(binding.texture, id);
+                    id
+                };
+                material_textures.push(MaterialTexturePlan { texture_id, slot });
+            }
+        }
         plans.push(MaterialPlan {
             id: material_id(*reference)?,
             material,
+            textures: material_textures,
         });
     }
     Ok(plans)
+}
+
+/// Writes one `Texture` and its backing `Video` clip.
+///
+/// Both reference the file by name only. The exporter writes textures beside
+/// the FBX, so a relative name keeps the pair portable; an absolute path would
+/// break the moment the directory moved.
+fn write_texture(texture: &TexturePlan<'_>, output: &mut impl Write) -> io::Result<()> {
+    let name = SanitizedName(texture.file_name, "Texture");
+    write!(
+        output,
+        "    Texture: {}, \"Texture::{name}\", \"\" {{\n\
+        Type: \"TextureVideoClip\"\n\
+        Version: 202\n\
+        TextureName: \"Texture::{name}\"\n\
+        Properties70:  {{\n\
+            P: \"UVSet\", \"KString\", \"\", \"\", \"UVChannel_0\"\n\
+            P: \"UseMaterial\", \"bool\", \"\", \"\",1\n\
+            P: \"Translation\", \"Vector\", \"\", \"A\",{},{},0\n\
+            P: \"Scaling\", \"Vector\", \"\", \"A\",{},{},1\n\
+        }}\n\
+        Media: \"Video::{name}\"\n\
+        FileName: \"{name}\"\n\
+        RelativeFilename: \"{name}\"\n\
+        ModelUVTranslation: {},{}\n\
+        ModelUVScaling: {},{}\n\
+        Texture_Alpha_Source: \"None\"\n\
+        Cropping: 0,0,0,0\n\
+    }}\n\
+    Video: {}, \"Video::{name}\", \"Clip\" {{\n\
+        Type: \"Clip\"\n\
+        Properties70:  {{\n\
+            P: \"Path\", \"KString\", \"XRefUrl\", \"\", \"{name}\"\n\
+        }}\n\
+        UseMipMap: 0\n\
+        Filename: \"{name}\"\n\
+        RelativeFilename: \"{name}\"\n\
+    }}\n",
+        texture.id,
+        FbxFloat(texture.translation[0]),
+        FbxFloat(texture.translation[1]),
+        FbxFloat(texture.scaling[0]),
+        FbxFloat(texture.scaling[1]),
+        FbxFloat(texture.translation[0]),
+        FbxFloat(texture.translation[1]),
+        FbxFloat(texture.scaling[0]),
+        FbxFloat(texture.scaling[1]),
+        texture.video_id,
+    )
 }
 
 #[derive(Default)]
@@ -2685,10 +2832,12 @@ mod tests {
     };
     use crate::scene::{Quaternion, Vector3};
     use crate::scene_hierarchy::SceneObjectKey;
+    use crate::scene_textures::{SceneTextureSet, TextureSlot};
 
     use super::{
         ConvertedTransform, GeometryPlan, quaternion_to_euler_degrees, validate_mesh,
         write_geometry, write_model_ir_fbx_ascii, write_model_ir_fbx_ascii_with_animations,
+        write_model_ir_fbx_ascii_with_textures,
     };
 
     /// Tolerance for Euler angle comparisons, in degrees.
@@ -3205,6 +3354,149 @@ mod tests {
             renderers: Vec::new(),
             animator: None,
         }
+    }
+
+    /// A model whose single renderer uses one material.
+    fn textured_model_fixture() -> ModelIr {
+        let root = key(1);
+        let mesh_key = key(51);
+        let material_key = key(61);
+        let mut node = model_node(root, None, Vec::new(), key(11), [0.0, 0.0, 0.0]);
+        node.renderers.push(ModelRendererBinding {
+            component: key(31),
+            kind: ModelRendererKind::MeshRenderer { mesh_filter: None },
+            mesh: Some(mesh_key),
+            materials: vec![Some(material_key)],
+        });
+        let mesh = Mesh {
+            path_id: mesh_key.path_id,
+            name: "quad".to_owned(),
+            vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: None,
+            uv0: None,
+            bind_poses: Vec::new(),
+            bone_name_hashes: Vec::new(),
+            root_bone_name_hash: 0,
+            skin: None,
+            blend_shapes: None,
+            sub_meshes: vec![MeshSubMesh {
+                first_byte: 0,
+                index_count: 3,
+                first_vertex: 0,
+                vertex_count: 3,
+                indices: vec![0, 1, 2],
+            }],
+        };
+        let material = crate::material::Material {
+            path_id: material_key.path_id,
+            name: "skin".to_owned(),
+            shader: crate::serialized::ObjectReference {
+                file_id: 0,
+                path_id: 0,
+            },
+            legacy_shader_keywords: Vec::new(),
+            valid_keywords: Vec::new(),
+            invalid_keywords: Vec::new(),
+            lightmap_flags: None,
+            enable_instancing_variants: None,
+            custom_render_queue: None,
+            string_tags: Vec::new(),
+            disabled_shader_passes: Vec::new(),
+            saved_properties: crate::material::MaterialPropertySheet::default(),
+            trailing_bytes: 0,
+        };
+        ModelIr::from_test_parts(
+            vec![node],
+            vec![root],
+            vec![crate::model_ir::ModelMesh {
+                object: mesh_key,
+                mesh,
+            }],
+            vec![crate::model_ir::ModelMaterial {
+                object: material_key,
+                material,
+            }],
+        )
+    }
+
+    fn texture_set(slot: Option<TextureSlot>) -> SceneTextureSet {
+        use crate::scene_textures::{SceneTexture, SceneTextureBinding};
+
+        let mut set = SceneTextureSet::default();
+        let texture = set.push_texture(SceneTexture {
+            file_name: "Body.png".to_owned(),
+            object: key(71),
+            encoded: vec![0x89, b'P', b'N', b'G'],
+        });
+        set.bind(
+            key(61),
+            SceneTextureBinding {
+                property: "_MainTex".to_owned(),
+                texture,
+                slot,
+                offset: [0.25, 0.5],
+                scale: [2.0, 4.0],
+            },
+        )
+        .unwrap();
+        set
+    }
+
+    #[test]
+    fn writes_texture_and_video_objects_for_a_bound_material() {
+        let model = textured_model_fixture();
+        let set = texture_set(Some(TextureSlot::Diffuse));
+        let mut output = Vec::new();
+        write_model_ir_fbx_ascii_with_textures(&model, None, Some(&set), &mut output, 64 * 1024)
+            .unwrap();
+        let text = std::str::from_utf8(&output).unwrap();
+
+        assert!(text.contains("ObjectType: \"Texture\" { Count: 1 }"));
+        assert!(text.contains("ObjectType: \"Video\" { Count: 1 }"));
+        assert!(text.contains("Texture: 13000000000, \"Texture::Body.png\", \"\" {"));
+        assert!(text.contains("Video: 14000000000, \"Video::Body.png\", \"Clip\" {"));
+        assert!(text.contains("Media: \"Video::Body.png\""));
+        assert!(text.contains("RelativeFilename: \"Body.png\""));
+        // The Unity TexEnv offset and scale reach both the property block and
+        // the model-UV fields.
+        assert!(text.contains("P: \"Translation\", \"Vector\", \"\", \"A\",0.25,0.5,0"));
+        assert!(text.contains("ModelUVScaling: 2,4"));
+        // The Video backs the Texture, and the Texture drives the material's
+        // diffuse property.
+        assert!(text.contains("C: \"OO\",14000000000,13000000000"));
+        assert!(text.contains("C: \"OP\",13000000000,3000000000, \"DiffuseColor\""));
+    }
+
+    #[test]
+    fn leaves_an_unrecognised_property_unconnected() {
+        // A property outside the four channels the managed reader maps still
+        // has no material slot to connect to, so nothing is emitted for it.
+        let model = textured_model_fixture();
+        let set = texture_set(None);
+        let mut output = Vec::new();
+        write_model_ir_fbx_ascii_with_textures(&model, None, Some(&set), &mut output, 64 * 1024)
+            .unwrap();
+        let text = std::str::from_utf8(&output).unwrap();
+        assert!(text.contains("ObjectType: \"Texture\" { Count: 0 }"));
+        assert!(!text.contains("C: \"OP\""));
+        assert!(!text.contains("Texture::Body.png"));
+    }
+
+    #[test]
+    fn omitting_the_texture_set_keeps_the_untextured_output() {
+        let model = textured_model_fixture();
+        let mut with_none = Vec::new();
+        write_model_ir_fbx_ascii(&model, &mut with_none, 64 * 1024).unwrap();
+        let mut with_empty = Vec::new();
+        write_model_ir_fbx_ascii_with_textures(
+            &model,
+            None,
+            Some(&SceneTextureSet::default()),
+            &mut with_empty,
+            64 * 1024,
+        )
+        .unwrap();
+        assert_eq!(with_none, with_empty);
     }
 
     const fn key(path_id: i64) -> SceneObjectKey {

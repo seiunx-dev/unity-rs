@@ -45,6 +45,7 @@ pub mod project_settings;
 pub mod renderer;
 pub mod scene;
 pub mod scene_hierarchy;
+pub mod scene_textures;
 pub mod serialized;
 pub mod serialized_file;
 pub mod shader;

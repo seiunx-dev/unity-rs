@@ -18,22 +18,25 @@ use assetstudio_core::export::{
     AudioExportFormat, ExportMode, ExportOptions, FilenameFormat, export_collection,
 };
 use assetstudio_core::extraction::{ExtractionOptions, extract_path};
-use assetstudio_core::fbx_ascii::write_model_ir_fbx_ascii_with_animations;
+use assetstudio_core::fbx_ascii::{
+    write_model_ir_fbx_ascii_with_animations, write_model_ir_fbx_ascii_with_textures,
+};
 use assetstudio_core::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
 use assetstudio_core::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
 use assetstudio_core::live2d_package::{Live2dPackage, Live2dPackageLimits, build_live2d_packages};
 use assetstudio_core::loader::{AssetCollection, AssetLoadOptions, LoadFailurePolicy};
-use assetstudio_core::model_animation::{ModelAnimationLimits, build_model_animations};
+use assetstudio_core::model_animation::{
+    ModelAnimationLimits, ModelAnimationSet, build_model_animations,
+};
 use assetstudio_core::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
 };
-use assetstudio_core::model_ir::{
-    ModelIr, ModelIrLimits, build_model_ir, build_model_ir_for_game_object,
-};
+use assetstudio_core::model_ir::{ModelIrLimits, build_model_ir, build_model_ir_for_game_object};
 use assetstudio_core::monobehaviour::MONO_BEHAVIOUR_CLASS_ID;
 use assetstudio_core::scene_hierarchy::{
     SceneHierarchy, SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey, build_scene_hierarchy,
 };
+use assetstudio_core::scene_textures::{SceneTextureLimits, SceneTextureNames, SceneTextureSet};
 use assetstudio_core::serialized::SerializedFile;
 use assetstudio_core::source::Region;
 use assetstudio_core::texture::TextureReadLimits;
@@ -425,6 +428,8 @@ fn parse_legacy_fbx_batch(
         },
         maximum_file_bytes: DEFAULT_FBX_OUTPUT_BYTES,
         include_animations: animator,
+        textures: true,
+        texture_format: ImageFormat::Png,
     }))
 }
 
@@ -461,7 +466,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
         "AssetStudio native Rust rewrite\n\n\
          Usage:\n  assetstudio inspect <file-or-directory>\n  assetstudio info <file-or-directory>\n  \
          assetstudio list <file-or-directory>\n  assetstudio scene <file-or-directory>\n  \
-         assetstudio fbx <file-or-directory> <output.fbx> [--maximum-output-bytes <N>]\n  \
+         assetstudio fbx <file-or-directory> <output.fbx> [options]\n  \
          assetstudio split-objects <file-or-directory> <output-directory> [options]\n  \
          assetstudio animator <file-or-directory> <output-directory> [options]\n  \
          assetstudio <file-or-directory>\n  \
@@ -481,10 +486,17 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          triangle meshes, submeshes, material slots, normals, UV0, local TRS, direct/hash bones,\n  \
          skinning, static blend shapes, explicit/packed legacy curves, and streamed/dense/constant\n  \
          Transform or blend-shape samples.\n  \
-         N must be a positive integer no greater than\n  \
-         536870912; the default is 16777216 bytes. Existing files are never overwritten.\n\n\
+         Material textures are decoded and written beside the FBX, which references\n  \
+         them by file name.\n  \
+         FBX options:\n  --maximum-output-bytes <N>  N must be a positive integer no greater\n  \
+         than 536870912; the default is 16777216 bytes\n  \
+         --no-textures                 Write the model without its textures\n  \
+         --texture-format <FORMAT>     jpg|jpeg|png|bmp|tga|webp|raw-rgba; the default is png\n  \
+         Existing files are never overwritten.\n\n\
          Batch FBX options:\n  --maximum-output-bytes <N>  Per-file limit\n  \
-         --no-animations               Omit selected animation clips\n\n\
+         --no-animations               Omit selected animation clips\n  \
+         --no-textures                 Write the models without their textures\n  \
+         --texture-format <FORMAT>     As above; textures are shared across the batch\n\n\
          Export options:\n  --mode <auto|raw|typetree-json|dump-text>\n  \
          --filename <asset-name|asset-name-path-id|path-id>\n  --overwrite\n  \
          --image-format <jpg|jpeg|png|bmp|tga|webp|raw-rgba>\n  \
@@ -525,6 +537,8 @@ struct FbxCommand {
     input: PathBuf,
     output: PathBuf,
     maximum_output_bytes: u64,
+    textures: bool,
+    texture_format: ImageFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +554,8 @@ struct FbxBatchCommand {
     mode: FbxBatchMode,
     maximum_file_bytes: u64,
     include_animations: bool,
+    textures: bool,
+    texture_format: ImageFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -574,6 +590,8 @@ fn parse_fbx_arguments(arguments: &[OsString]) -> Result<FbxCommand> {
     let mut positional = Vec::new();
     let mut maximum_output_bytes = DEFAULT_FBX_OUTPUT_BYTES;
     let mut saw_maximum = false;
+    let mut textures = true;
+    let mut texture_format = ImageFormat::Png;
     let mut parse_options = true;
     let mut index = 0;
     while index < arguments.len() {
@@ -602,6 +620,14 @@ fn parse_fbx_arguments(arguments: &[OsString]) -> Result<FbxCommand> {
                 )));
             }
             saw_maximum = true;
+        } else if parse_options && argument == "--no-textures" {
+            textures = false;
+        } else if parse_options && argument == "--texture-format" {
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| Error::invalid_data("--texture-format requires a value"))?;
+            texture_format = parse_image_format(value)?;
         } else if parse_options
             && argument
                 .to_str()
@@ -632,6 +658,8 @@ fn parse_fbx_arguments(arguments: &[OsString]) -> Result<FbxCommand> {
         input: positional.remove(0),
         output: positional.remove(0),
         maximum_output_bytes,
+        textures,
+        texture_format,
     })
 }
 
@@ -647,6 +675,8 @@ fn parse_fbx_batch_arguments(
     let mut positional = Vec::new();
     let mut maximum_file_bytes = DEFAULT_FBX_OUTPUT_BYTES;
     let mut include_animations = mode == FbxBatchMode::Animator;
+    let mut textures = true;
+    let mut texture_format = ImageFormat::Png;
     let mut parse_options = true;
     let mut index = 0;
     while index < arguments.len() {
@@ -670,6 +700,14 @@ fn parse_fbx_batch_arguments(
             }
         } else if parse_options && argument == "--no-animations" {
             include_animations = false;
+        } else if parse_options && argument == "--no-textures" {
+            textures = false;
+        } else if parse_options && argument == "--texture-format" {
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| Error::invalid_data("--texture-format requires a value"))?;
+            texture_format = parse_image_format(value)?;
         } else if parse_options
             && argument
                 .to_str()
@@ -695,6 +733,8 @@ fn parse_fbx_batch_arguments(
         mode,
         maximum_file_bytes,
         include_animations,
+        textures,
+        texture_format,
     })
 }
 
@@ -972,10 +1012,21 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
     let animations =
         build_model_animations(&collection, &model, &graph, ModelAnimationLimits::default())?;
     let parent = prepare_fbx_output_parent(&command.output)?;
+    let textures = if command.textures {
+        SceneTextureSet::from_model(
+            &collection,
+            &model,
+            command.texture_format,
+            SceneTextureLimits::default(),
+        )?
+    } else {
+        SceneTextureSet::default()
+    };
     let mut temporary = FbxTemporaryFile::create(&parent)?;
-    let written = write_model_ir_fbx_ascii_with_animations(
+    let written = write_model_ir_fbx_ascii_with_textures(
         &model,
         &animations,
+        &textures,
         temporary.file_mut(),
         command.maximum_output_bytes,
     )?;
@@ -983,39 +1034,51 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
     temporary.file_mut().sync_all()?;
     temporary.close()?;
     temporary.persist_no_clobber(&command.output)?;
+    // The FBX references its textures by file name, so they only resolve once
+    // they sit beside it. Written after the model so a failed model export
+    // leaves no orphaned images.
+    let written_textures = textures.write_to_directory(&parent)?;
     writeln!(
         output,
         "exported ASCII FBX 7.4 ({written} bytes, {} animation clips) -> {}",
         animations.clips.len(),
         command.output.display()
     )?;
-    report_dropped_material_textures(&model, output)?;
+    report_model_textures(command.textures, &textures, written_textures.len(), output)?;
     skipped_input_result("FBX export", &collection)
 }
 
-/// Reports the material texture bindings the FBX writer does not emit.
+/// Reports what happened to the model's textures.
 ///
-/// The writer produces phong material colours but no Texture or Video objects,
-/// so a textured model exports untextured. Naming the count keeps that from
-/// being a silent partial result.
-fn report_dropped_material_textures(model: &ModelIr, output: &mut impl Write) -> io::Result<()> {
-    let mut dropped = HashSet::new();
-    for material in &model.materials {
-        for property in &material.material.saved_properties.texture_environments {
-            let texture = property.value.texture;
-            if !texture.is_null() {
-                dropped.insert((texture.file_id, texture.path_id));
-            }
-        }
-    }
-    if dropped.is_empty() {
+/// A texture that resolved to something other than a `Texture2D`, or that
+/// failed to decode, is skipped rather than failing the export, so the count
+/// has to be visible or the result is a silent partial one. A texture already
+/// present in the directory is left alone, which is why the written count can
+/// be lower than the resolved count.
+fn report_model_textures(
+    requested: bool,
+    textures: &SceneTextureSet,
+    written: usize,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    if !requested {
         return Ok(());
     }
-    writeln!(
-        output,
-        "  note: {} material texture binding(s) were not written; ASCII FBX texture output is not implemented",
-        dropped.len()
-    )
+    if !textures.textures.is_empty() {
+        writeln!(
+            output,
+            "  wrote {written} of {} texture file(s) beside the model",
+            textures.textures.len()
+        )?;
+    }
+    for skip in &textures.skipped {
+        writeln!(
+            output,
+            "  note: texture {} of Material {}::{} was skipped: {}",
+            skip.property, skip.material.file_index, skip.material.path_id, skip.reason
+        )?;
+    }
+    Ok(())
 }
 
 fn export_fbx_batch(
@@ -1058,6 +1121,11 @@ fn export_fbx_batch(
     let mut succeeded = 0_usize;
     let mut failures = 0_usize;
     let mut total_bytes = 0_u64;
+    // One allocator across the batch: every model writes into the same
+    // directory, so two textures that share a Unity name must still get
+    // separate files.
+    let mut texture_names = SceneTextureNames::default();
+    let mut texture_files = 0_usize;
     for candidate in &candidates {
         let base = allocate_fbx_batch_name(candidate, &mut names)?;
         let destination = parent.join(format!("{base}.fbx"));
@@ -1069,6 +1137,8 @@ fn export_fbx_batch(
             command,
             &destination,
             total_bytes,
+            &mut texture_names,
+            &mut texture_files,
         ) {
             Ok(written) => {
                 total_bytes = total_bytes.checked_add(written).ok_or_else(|| {
@@ -1099,7 +1169,7 @@ fn export_fbx_batch(
     }
     writeln!(
         output,
-        "FBX batch summary: {succeeded} exported, {failures} failed, {total_bytes} bytes"
+        "FBX batch summary: {succeeded} exported, {failures} failed, {total_bytes} bytes, {texture_files} texture file(s)"
     )?;
     if failures != 0 {
         return Err(CliError::Partial {
@@ -1110,6 +1180,7 @@ fn export_fbx_batch(
     skipped_input_result("FBX batch export", &collection)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_fbx_batch_candidate(
     collection: &AssetCollection,
     hierarchy: &SceneHierarchy,
@@ -1118,6 +1189,8 @@ fn write_fbx_batch_candidate(
     command: &FbxBatchCommand,
     destination: &Path,
     previously_written: u64,
+    texture_names: &mut SceneTextureNames,
+    texture_files: &mut usize,
 ) -> Result<u64> {
     let model = build_model_ir_for_game_object(
         collection,
@@ -1135,19 +1208,43 @@ fn write_fbx_batch_candidate(
             .parent()
             .ok_or_else(|| Error::invalid_data("FBX batch destination has no parent"))?,
     )?;
-    let written = if let Some(animations) = &animations {
-        write_model_ir_fbx_ascii_with_animations(
+    let textures = if command.textures {
+        SceneTextureSet::from_model_with_names(
+            collection,
+            &model,
+            command.texture_format,
+            SceneTextureLimits::default(),
+            texture_names,
+        )?
+    } else {
+        SceneTextureSet::default()
+    };
+    let written = match (&animations, textures.is_empty()) {
+        (Some(animations), false) => write_model_ir_fbx_ascii_with_textures(
+            &model,
+            animations,
+            &textures,
+            temporary.file_mut(),
+            command.maximum_file_bytes,
+        )?,
+        (Some(animations), true) => write_model_ir_fbx_ascii_with_animations(
             &model,
             animations,
             temporary.file_mut(),
             command.maximum_file_bytes,
-        )?
-    } else {
-        assetstudio_core::fbx_ascii::write_model_ir_fbx_ascii(
+        )?,
+        (None, false) => write_model_ir_fbx_ascii_with_textures(
+            &model,
+            &ModelAnimationSet::default(),
+            &textures,
+            temporary.file_mut(),
+            command.maximum_file_bytes,
+        )?,
+        (None, true) => assetstudio_core::fbx_ascii::write_model_ir_fbx_ascii(
             &model,
             temporary.file_mut(),
             command.maximum_file_bytes,
-        )?
+        )?,
     };
     let total = previously_written
         .checked_add(written)
@@ -1161,6 +1258,12 @@ fn write_fbx_batch_candidate(
     temporary.file_mut().sync_all()?;
     temporary.close()?;
     temporary.persist_no_clobber(destination)?;
+    let directory = destination
+        .parent()
+        .ok_or_else(|| Error::invalid_data("FBX batch destination has no parent"))?;
+    *texture_files = texture_files
+        .checked_add(textures.write_to_directory(directory)?.len())
+        .ok_or_else(|| Error::invalid_data("FBX batch texture count overflowed"))?;
     Ok(written)
 }
 
