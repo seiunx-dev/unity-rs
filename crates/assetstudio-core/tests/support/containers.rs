@@ -32,64 +32,110 @@ const AT_END: u32 = 0x80;
 /// `kArchiveNodeFlagsSerializedFile`.
 const SERIALIZED_FILE_ENTRY: u32 = 4;
 
-/// Builds an uncompressed `UnityFS` bundle.
+/// How a bundle's block data or blocks-info table is stored.
 ///
-/// Compression is deliberately left out: `lz4_flex` is built with decode-only
-/// features here, so a compressed fixture could not be produced without adding
-/// a dependency purely for tests. The block table still describes a real block,
-/// so the reader's block mapping is exercised either way.
+/// Only Zstd is offered alongside `None`. `lz4_flex` is built here with
+/// decode-only features and `lzma-rust2` exposes no bulk encoder, so those
+/// would mean taking a dependency purely for fixtures; Zstd already ships an
+/// encoder that the bundle tests use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    None,
+    Zstd,
+}
+
+impl Compression {
+    const fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Zstd => 5,
+        }
+    }
+
+    fn apply(self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            Self::None => bytes.to_vec(),
+            Self::Zstd => zstd::bulk::compress(bytes, 3).expect("zstd fixture compression"),
+        }
+    }
+}
+
+/// How one bundle fixture is laid out.
+pub struct BundleLayout<'a> {
+    pub version: u32,
+    pub revision: &'a str,
+    pub info: BlocksInfo,
+    /// Compression of the block holding the entry payloads.
+    pub blocks: Compression,
+    /// Compression of the blocks-info and directory table.
+    pub directory: Compression,
+}
+
+impl<'a> BundleLayout<'a> {
+    /// An uncompressed v6 bundle with a combined inline blocks-info table.
+    #[must_use]
+    pub const fn v6(revision: &'a str) -> Self {
+        Self {
+            version: 6,
+            revision,
+            info: BlocksInfo::Inline,
+            blocks: Compression::None,
+            directory: Compression::None,
+        }
+    }
+}
+
+/// Builds a `UnityFS` bundle.
 #[must_use]
-pub fn unity_fs(
-    version: u32,
-    revision: &str,
-    entries: &[BundleEntry<'_>],
-    info: BlocksInfo,
-) -> Vec<u8> {
-    bundle("UnityFS", version, revision, entries, info)
+pub fn unity_fs(layout: &BundleLayout<'_>, entries: &[BundleEntry<'_>]) -> Vec<u8> {
+    bundle("UnityFS", layout, entries)
 }
 
 /// Builds a legacy `UnityRaw` v6 bundle, which shares the `UnityFS` body but
 /// carries one extra byte after the archive flags.
 #[must_use]
 pub fn unity_raw_v6(revision: &str, entries: &[BundleEntry<'_>]) -> Vec<u8> {
-    bundle("UnityRaw", 6, revision, entries, BlocksInfo::Inline)
+    bundle("UnityRaw", &BundleLayout::v6(revision), entries)
 }
 
-fn bundle(
-    signature: &str,
-    version: u32,
-    revision: &str,
-    entries: &[BundleEntry<'_>],
-    info: BlocksInfo,
-) -> Vec<u8> {
+fn bundle(signature: &str, layout: &BundleLayout<'_>, entries: &[BundleEntry<'_>]) -> Vec<u8> {
+    let BundleLayout {
+        version,
+        revision,
+        info,
+        blocks,
+        directory,
+    } = *layout;
     assert!(matches!(version, 6 | 7), "bundle fixtures cover v6 and v7");
     let legacy = signature != "UnityFS";
 
     let mut data = Vec::new();
-    let mut directory = Vec::new();
+    let mut entry_table = Vec::new();
     for entry in entries {
-        push_i64(&mut directory, i64::try_from(data.len()).unwrap());
-        push_i64(&mut directory, i64::try_from(entry.bytes.len()).unwrap());
-        push_u32(&mut directory, SERIALIZED_FILE_ENTRY);
-        directory.extend_from_slice(entry.path.as_bytes());
-        directory.push(0);
+        push_i64(&mut entry_table, i64::try_from(data.len()).unwrap());
+        push_i64(&mut entry_table, i64::try_from(entry.bytes.len()).unwrap());
+        push_u32(&mut entry_table, SERIALIZED_FILE_ENTRY);
+        entry_table.extend_from_slice(entry.path.as_bytes());
+        entry_table.push(0);
         data.extend_from_slice(entry.bytes);
     }
+    let stored_data = blocks.apply(&data);
 
     let mut blocks_info = vec![0_u8; 16];
     push_i32(&mut blocks_info, 1);
     push_u32(&mut blocks_info, u32::try_from(data.len()).unwrap());
-    push_u32(&mut blocks_info, u32::try_from(data.len()).unwrap());
-    blocks_info.extend_from_slice(&0_u16.to_be_bytes());
+    push_u32(&mut blocks_info, u32::try_from(stored_data.len()).unwrap());
+    blocks_info.extend_from_slice(&u16::try_from(blocks.code()).unwrap().to_be_bytes());
     push_i32(&mut blocks_info, i32::try_from(entries.len()).unwrap());
-    blocks_info.extend_from_slice(&directory);
+    blocks_info.extend_from_slice(&entry_table);
+    let stored_blocks_info = directory.apply(&blocks_info);
 
-    let flags = match info {
-        BlocksInfo::Inline => COMBINED,
-        BlocksInfo::InlineAligned => 0,
-        BlocksInfo::AtEnd => COMBINED | AT_END,
-    };
-    let blocks_info_size = u32::try_from(blocks_info.len()).unwrap();
+    let flags = directory.code()
+        | match info {
+            BlocksInfo::Inline => COMBINED,
+            BlocksInfo::InlineAligned => 0,
+            BlocksInfo::AtEnd => COMBINED | AT_END,
+        };
 
     let mut output = Vec::new();
     output.extend_from_slice(signature.as_bytes());
@@ -100,8 +146,11 @@ fn bundle(
     output.push(0);
     let size_offset = output.len();
     push_i64(&mut output, 0);
-    push_u32(&mut output, blocks_info_size);
-    push_u32(&mut output, blocks_info_size);
+    push_u32(
+        &mut output,
+        u32::try_from(stored_blocks_info.len()).unwrap(),
+    );
+    push_u32(&mut output, u32::try_from(blocks_info.len()).unwrap());
     push_u32(&mut output, flags);
     if legacy {
         output.push(0);
@@ -109,17 +158,17 @@ fn bundle(
 
     // The reader aligns to 16 for v7 always, and for v6 only when the revision
     // is 2019.4 or newer and the flags are not exactly the combined marker.
-    if version >= 7 || (info != BlocksInfo::Inline && revision_is_2019_4_or_newer(revision)) {
+    if version >= 7 || (flags != COMBINED && revision_is_2019_4_or_newer(revision)) {
         align_to_16(&mut output);
     }
     match info {
         BlocksInfo::Inline | BlocksInfo::InlineAligned => {
-            output.extend_from_slice(&blocks_info);
-            output.extend_from_slice(&data);
+            output.extend_from_slice(&stored_blocks_info);
+            output.extend_from_slice(&stored_data);
         }
         BlocksInfo::AtEnd => {
-            output.extend_from_slice(&data);
-            output.extend_from_slice(&blocks_info);
+            output.extend_from_slice(&stored_data);
+            output.extend_from_slice(&stored_blocks_info);
         }
     }
     let size = i64::try_from(output.len()).unwrap();
