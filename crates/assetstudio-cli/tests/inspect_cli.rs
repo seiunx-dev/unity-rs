@@ -166,6 +166,65 @@ fn missing_extract_and_export_inputs_leave_no_output_directory() {
     assert!(!root.path().join("ASExtract").exists());
 }
 
+#[test]
+fn unity_version_overrides_a_stripped_serialized_file_version() {
+    let root = TestDirectory::new("unity-version");
+    let input = root.path().join("stripped.assets");
+    fs::write(&input, synthetic_v22_text_asset_with_version("0.0.0")).unwrap();
+
+    // Without the flag there is no version to parse against, so the declared
+    // one stands and nothing reports an effective version.
+    let bare = cli(root.path(), ["list".into(), input.as_os_str().into()]);
+    assert_success(&bare);
+    let stdout = String::from_utf8_lossy(&bare.stdout);
+    assert!(stdout.contains("Unity version: 0.0.0"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("effective Unity version"),
+        "stdout: {stdout}"
+    );
+
+    for flag in [
+        vec!["--unity-version".into(), "2022.3.62f1".into()],
+        vec!["--unity-version=2022.3.62f1".into()],
+    ] {
+        let mut arguments: Vec<std::ffi::OsString> = vec!["list".into()];
+        arguments.extend(flag);
+        arguments.push(input.as_os_str().into());
+        let result = cli(root.path(), arguments);
+        assert_success(&result);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("Unity version: 0.0.0"), "stdout: {stdout}");
+        assert!(
+            stdout.contains("effective Unity version: 2022.3.62f1"),
+            "stdout: {stdout}"
+        );
+    }
+
+    // The flag applies to every command that opens a collection, including the
+    // legacy `<input> -m <mode>` spellings.
+    let scene = cli(
+        root.path(),
+        [
+            "scene".into(),
+            "--unity-version".into(),
+            "2022.3.62f1".into(),
+            input.as_os_str().into(),
+        ],
+    );
+    assert_success(&scene);
+
+    for bad in [
+        vec!["--unity-version".into()],
+        vec!["--unity-version".into(), "not-a-version".into()],
+    ] {
+        let mut arguments: Vec<std::ffi::OsString> = vec!["list".into()];
+        arguments.extend(bad);
+        arguments.push(input.as_os_str().into());
+        let result = cli(root.path(), arguments);
+        assert_eq!(result.status.code(), Some(2), "expected a usage error");
+    }
+}
+
 fn cli<I>(current_directory: &Path, arguments: I) -> Output
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -196,6 +255,10 @@ fn directory_entries(path: &Path) -> Vec<String> {
 }
 
 fn synthetic_v22_text_asset() -> Vec<u8> {
+    synthetic_v22_text_asset_with_version("2022.3.62f1")
+}
+
+fn synthetic_v22_text_asset_with_version(unity_version: &str) -> Vec<u8> {
     let mut object = Vec::new();
     push_i32_le(&mut object, 8);
     object.extend_from_slice(b"demo.lua");
@@ -203,7 +266,8 @@ fn synthetic_v22_text_asset() -> Vec<u8> {
     object.extend_from_slice(b"payload");
 
     let mut metadata = Vec::new();
-    metadata.extend_from_slice(b"2022.3.62f1\0");
+    metadata.extend_from_slice(unity_version.as_bytes());
+    metadata.push(0);
     push_i32_le(&mut metadata, 13);
     metadata.push(0);
     push_i32_le(&mut metadata, 1);

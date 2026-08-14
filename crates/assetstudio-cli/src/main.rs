@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use assetstudio_core::animation_graph::{AnimationGraphLimits, build_animation_graph};
 use assetstudio_core::bundle::{BundleHeader, UnityFsBundle};
@@ -21,7 +22,7 @@ use assetstudio_core::fbx_ascii::write_model_ir_fbx_ascii_with_animations;
 use assetstudio_core::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
 use assetstudio_core::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
 use assetstudio_core::live2d_package::{Live2dPackage, Live2dPackageLimits, build_live2d_packages};
-use assetstudio_core::loader::AssetCollection;
+use assetstudio_core::loader::{AssetCollection, AssetLoadOptions};
 use assetstudio_core::model_animation::{ModelAnimationLimits, build_model_animations};
 use assetstudio_core::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
@@ -34,6 +35,7 @@ use assetstudio_core::scene_hierarchy::{
 use assetstudio_core::serialized::SerializedFile;
 use assetstudio_core::source::Region;
 use assetstudio_core::texture::TextureReadLimits;
+use assetstudio_core::unity_version::UnityVersion;
 use assetstudio_core::web_file::WebFile;
 use assetstudio_core::{Error, Result};
 
@@ -133,25 +135,81 @@ fn run(output: &mut impl Write) -> CliResult<()> {
 }
 
 fn run_with_arguments(arguments: &[OsString], output: &mut impl Write) -> CliResult<()> {
-    match parse_cli_arguments(arguments)? {
+    let (arguments, load) = split_load_options(arguments)?;
+    match parse_cli_arguments(&arguments)? {
         CliCommand::Help => print_help(output).map_err(CliError::from),
         CliCommand::Inspect(path) => inspect_path(&path, output),
-        CliCommand::Info(path) => report_collection(&path, false, output).map_err(CliError::from),
-        CliCommand::List(path) => report_collection(&path, true, output).map_err(CliError::from),
-        CliCommand::Scene(path) => report_scene(&path, output).map_err(CliError::from),
-        CliCommand::Fbx(command) => export_fbx(&command, output).map_err(CliError::from),
-        CliCommand::FbxBatch(command) => export_fbx_batch(&command, output),
-        CliCommand::Live2d(command) => export_live2d(&command.input, &command.output, output),
+        CliCommand::Info(path) => {
+            report_collection(&path, false, &load, output).map_err(CliError::from)
+        }
+        CliCommand::List(path) => {
+            report_collection(&path, true, &load, output).map_err(CliError::from)
+        }
+        CliCommand::Scene(path) => report_scene(&path, &load, output).map_err(CliError::from),
+        CliCommand::Fbx(command) => export_fbx(&command, &load, output).map_err(CliError::from),
+        CliCommand::FbxBatch(command) => export_fbx_batch(&command, &load, output),
+        CliCommand::Live2d(command) => {
+            export_live2d(&command.input, &command.output, &load, output)
+        }
         CliCommand::Live2dPackage(command) => {
-            export_live2d_packages(&command.input, &command.output, output)
+            export_live2d_packages(&command.input, &command.output, &load, output)
         }
-        CliCommand::Export(command) => {
-            export_path(&command.input, &command.output, command.options, output)
-        }
+        CliCommand::Export(command) => export_path(
+            &command.input,
+            &command.output,
+            command.options,
+            &load,
+            output,
+        ),
         CliCommand::Extract(command) => {
             extract_path_cli(&command.input, &command.output, command.options, output)
         }
     }
+}
+
+/// Options that apply to how an input is opened, whichever command runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LoadOptions {
+    unity_version: Option<UnityVersion>,
+}
+
+/// Removes the load options from the argument list before command parsing.
+///
+/// These apply to every command that opens a collection, so handling them once
+/// here keeps each command parser unaware of them and makes the flag work with
+/// the legacy `<input> -m <mode>` spellings too.
+fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadOptions)> {
+    const FLAG: &str = "--unity-version";
+    let mut remaining = Vec::new();
+    let mut load = LoadOptions::default();
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        let text = argument.to_str();
+        let value = if text == Some(FLAG) {
+            arguments
+                .next()
+                .ok_or_else(|| {
+                    CliError::Usage(format!("{FLAG} requires a version such as 2022.3.62f1"))
+                })?
+                .to_str()
+        } else if let Some(value) = text.and_then(|text| text.strip_prefix("--unity-version=")) {
+            Some(value)
+        } else {
+            remaining.push(argument.clone());
+            continue;
+        };
+        let value =
+            value.ok_or_else(|| CliError::Usage(format!("{FLAG} value must be valid UTF-8")))?;
+        if load.unity_version.is_some() {
+            return Err(CliError::Usage(format!("{FLAG} was given more than once")));
+        }
+        load.unity_version = Some(UnityVersion::from_str(value).map_err(|error| {
+            CliError::Usage(format!(
+                "{FLAG} value {value:?} is not a Unity version: {error}"
+            ))
+        })?);
+    }
+    Ok((remaining, load))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,6 +475,10 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          info     Summarize serialized files, Unity versions, and class counts\n  \
          list     List every discovered serialized object\n  \
          scene    Print the assembled GameObject hierarchy and model bindings\n\n\
+         Load options (accepted by every command that opens a collection):\n  \
+         --unity-version <VERSION>   Parse against this version, for example 2022.3.62f1.\n  \
+         Required for files whose own version was stripped at build time, and\n  \
+         overrides both the declared version and any enclosing bundle revision.\n\n\
          FBX export:\n  Writes deterministic ASCII FBX 7.4 for transform hierarchies, resident\n  \
          triangle meshes, submeshes, material slots, normals, UV0, local TRS, direct/hash bones,\n  \
          skinning, static blend shapes, explicit/packed legacy curves, and streamed/dense/constant\n  \
@@ -860,9 +922,10 @@ fn export_path(
     input: &Path,
     output_directory: &Path,
     options: ExportOptions,
+    load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(input)?;
+    let collection = load_asset_collection(input, load)?;
     let report = export_collection(&collection, output_directory, options)?;
 
     for record in &report.exported {
@@ -903,8 +966,8 @@ fn export_path(
     Ok(())
 }
 
-fn export_fbx(command: &FbxCommand, output: &mut impl Write) -> Result<()> {
-    let collection = load_asset_collection(&command.input)?;
+fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write) -> Result<()> {
+    let collection = load_asset_collection(&command.input, load)?;
     let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
     let model = build_model_ir(&collection, &hierarchy, ModelIrLimits::default())?;
     let graph = build_animation_graph(&collection, &hierarchy, AnimationGraphLimits::default())?;
@@ -931,8 +994,12 @@ fn export_fbx(command: &FbxCommand, output: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-fn export_fbx_batch(command: &FbxBatchCommand, output: &mut impl Write) -> CliResult<()> {
-    let collection = load_asset_collection(&command.input)?;
+fn export_fbx_batch(
+    command: &FbxBatchCommand,
+    load: &LoadOptions,
+    output: &mut impl Write,
+) -> CliResult<()> {
+    let collection = load_asset_collection(&command.input, load)?;
     let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
     let candidates = match command.mode {
         FbxBatchMode::SplitObjects => {
@@ -1320,8 +1387,13 @@ struct Live2dExportState {
     failures: usize,
 }
 
-fn export_live2d(input: &Path, output_directory: &Path, output: &mut impl Write) -> CliResult<()> {
-    let collection = load_asset_collection(input)?;
+fn export_live2d(
+    input: &Path,
+    output_directory: &Path,
+    load: &LoadOptions,
+    output: &mut impl Write,
+) -> CliResult<()> {
+    let collection = load_asset_collection(input, load)?;
     let candidates = collect_live2d_candidates(&collection)?;
     let read_limits = CubismMocReadLimits {
         maximum_model_bytes: MAX_LIVE2D_MODEL_OUTPUT_BYTES,
@@ -1690,9 +1762,10 @@ struct Live2dPackageExportState {
 fn export_live2d_packages(
     input: &Path,
     output_directory: &Path,
+    load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(input)?;
+    let collection = load_asset_collection(input, load)?;
     let set = build_live2d_packages(&collection, live2d_package_limits())?;
     let mut state = Live2dPackageExportState::default();
     for diagnostic in set.diagnostics {
@@ -2119,8 +2192,14 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_asset_collection(path: &Path) -> Result<AssetCollection> {
-    AssetCollection::load_path(path)
+fn load_asset_collection(path: &Path, load: &LoadOptions) -> Result<AssetCollection> {
+    AssetCollection::load_path_with_options(
+        path,
+        AssetLoadOptions {
+            unity_version_override: load.unity_version.clone(),
+            ..AssetLoadOptions::default()
+        },
+    )
 }
 
 fn inspect_path(path: &Path, output: &mut impl Write) -> CliResult<()> {
@@ -2166,8 +2245,13 @@ fn inspect_path(path: &Path, output: &mut impl Write) -> CliResult<()> {
     Ok(())
 }
 
-fn report_collection(path: &Path, include_objects: bool, output: &mut impl Write) -> Result<()> {
-    let collection = load_asset_collection(path)?;
+fn report_collection(
+    path: &Path,
+    include_objects: bool,
+    load: &LoadOptions,
+    output: &mut impl Write,
+) -> Result<()> {
+    let collection = load_asset_collection(path, load)?;
     let mut total_objects = 0_usize;
     let mut total_object_bytes = 0_u64;
     let mut class_counts = BTreeMap::<i32, usize>::new();
@@ -2199,6 +2283,17 @@ fn report_collection(path: &Path, include_objects: bool, output: &mut impl Write
                 "    Unity version: {}",
                 escape_text(&loaded.file.unity_version_string)
             )?;
+            // A stripped or pre-v7 file is parsed against a version it does not
+            // declare, whether that came from --unity-version or the enclosing
+            // bundle. Report which one the version gates actually used.
+            let effective = loaded.file.unity_version.to_string();
+            if effective != loaded.file.unity_version_string {
+                writeln!(
+                    output,
+                    "    effective Unity version: {}",
+                    escape_text(&effective)
+                )?;
+            }
         }
         for object in &loaded.file.objects {
             total_object_bytes = total_object_bytes
@@ -2247,8 +2342,8 @@ fn report_collection(path: &Path, include_objects: bool, output: &mut impl Write
     Ok(())
 }
 
-fn report_scene(path: &Path, output: &mut impl Write) -> Result<()> {
-    let collection = load_asset_collection(path)?;
+fn report_scene(path: &Path, load: &LoadOptions, output: &mut impl Write) -> Result<()> {
+    let collection = load_asset_collection(path, load)?;
     let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
     writeln!(output, "scene {}", path.display())?;
     writeln!(
