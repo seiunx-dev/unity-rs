@@ -1580,7 +1580,13 @@ impl SpriteObjectReader {
             let (first_vertex, vertex_count) = if self.version.0 >= 3 {
                 let first_vertex = self.reader.read_u32()?;
                 let vertex_count = self.reader.read_u32()?;
-                self.skip(32, "Sprite submesh AABB")?;
+                // Six floats: the AABB's centre and extent. The Mesh reader
+                // gets this right in three places; this one skipped eight,
+                // which shifted every field after the first submesh -- the
+                // index buffer, the vertex data, the texture rect and the
+                // packing settings. Only a sprite carrying a submesh reaches
+                // it, which is every tight-packed sprite.
+                self.skip(24, "Sprite submesh AABB")?;
                 (first_vertex, vertex_count)
             } else {
                 (0, 0)
@@ -3317,7 +3323,7 @@ mod tests {
         push_u32(&mut output, 0);
         push_u32(&mut output, 0);
         push_u32(&mut output, 3);
-        push_floats(&mut output, &[0.0; 8]);
+        push_floats(&mut output, &[0.0; 6]);
         push_i32(&mut output, 6);
         for index in indices {
             output.extend_from_slice(&index.to_le_bytes());

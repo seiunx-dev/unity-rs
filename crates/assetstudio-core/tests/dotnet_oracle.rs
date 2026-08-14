@@ -132,6 +132,11 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
         .unwrap(),
         TemporaryFixture::new("oracle-sprite-2022.assets", &synthetic_sprite_v22()).unwrap(),
         TemporaryFixture::new(
+            "oracle-sprite-tight-2022.assets",
+            &synthetic_tight_sprite_v22(),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
             "oracle-shader-5.2.assets",
             &synthetic_single_v22(48, 48, "5.2.4f1", &shader()),
         )
@@ -1009,6 +1014,41 @@ fn synthetic_sprite_v22() -> Vec<u8> {
     )
 }
 
+/// A tight-packed sprite whose mesh masks part of its texture rect.
+///
+/// The rectangle sprite above never reaches the masking path: a tight sprite
+/// rasterizes its own triangles and clears every texel outside them, which is
+/// where an off-by-one in the raster or a wrong winding shows up.
+fn synthetic_tight_sprite_v22() -> Vec<u8> {
+    synthetic_plain_v22(
+        "2022.3.62f1",
+        &[
+            (213, 213, tight_sprite()),
+            (28, 214, tight_sprite_texture()),
+        ],
+    )
+}
+
+/// An 8x8 RGBA32 texture whose pixels all differ, so a mis-masked texel shows.
+fn tight_sprite_texture() -> Vec<u8> {
+    let mut pixels = Vec::new();
+    for y in 0..8_u8 {
+        for x in 0..8_u8 {
+            pixels.extend_from_slice(&[x * 8 + 4, y * 8 + 4, 128, 255]);
+        }
+    }
+    texture2d_inline(
+        "oracle-tight-sprite-texture",
+        8,
+        8,
+        4,
+        1,
+        "2022.3.62f1",
+        &[],
+        &pixels,
+    )
+}
+
 fn synthetic_plain_v22(version: &str, objects: &[(i32, i64, Vec<u8>)]) -> Vec<u8> {
     let mut classes = Vec::new();
     for (class_id, _, _) in objects {
@@ -1430,6 +1470,65 @@ fn sprite() -> Vec<u8> {
     push_floats(&mut output, &[0.0, 0.0]);
     push_floats(&mut output, &[0.0, 0.0]);
     push_u32(&mut output, 2);
+    push_floats(&mut output, &[0.0, 0.0, 1.0, 1.0, 1.0]);
+    output
+}
+
+/// The modern (5.6 and up) tight sprite layout: submeshes, a vertex stream and
+/// a `u16` index buffer, with `packingMode` left at Tight.
+fn tight_sprite() -> Vec<u8> {
+    let mut output = Vec::new();
+    push_string(&mut output, "oracle-tight-sprite");
+    push_floats(&mut output, &[0.0, 0.0, 8.0, 8.0]);
+    push_floats(&mut output, &[0.0, 0.0]);
+    push_floats(&mut output, &[0.0; 4]);
+    push_floats(&mut output, &[1.0, 0.5, 0.5]);
+    push_u32(&mut output, 0);
+    output.push(0);
+    align(&mut output, 4);
+    output.extend_from_slice(&[0; 16]);
+    output.extend_from_slice(&0_i64.to_le_bytes());
+    push_i32(&mut output, 0);
+    push_pptr(&mut output); // no atlas
+
+    push_i32(&mut output, 0);
+    output.extend_from_slice(&214_i64.to_le_bytes()); // texture
+    push_pptr(&mut output); // no alpha texture
+    push_i32(&mut output, 0); // secondary textures
+
+    push_i32(&mut output, 1); // one submesh
+    push_u32(&mut output, 0); // first byte
+    push_u32(&mut output, 3); // index count
+    push_i32(&mut output, 0); // topology
+    push_u32(&mut output, 0); // base vertex
+    push_u32(&mut output, 0); // first vertex
+    push_u32(&mut output, 3); // vertex count
+    push_floats(&mut output, &[0.0; 6]); // local AABB: centre and extent
+
+    push_i32(&mut output, 6); // index buffer
+    for index in [0_u16, 1, 2] {
+        output.extend_from_slice(&index.to_le_bytes());
+    }
+    align(&mut output, 4);
+
+    push_u32(&mut output, 3); // vertex count
+    push_i32(&mut output, 1); // one channel
+    output.extend_from_slice(&[0, 0, 0, 3]); // stream 0, offset 0, float3
+    push_i32(&mut output, 36); // vertex data
+    // A right triangle covering the lower-left half. The hypotenuse runs
+    // x + y = 7.5 in texture pixels, half a pixel clear of every centre, so no
+    // texel sits on the boundary and a disagreement means a real difference
+    // rather than an edge rule.
+    push_floats(
+        &mut output,
+        &[-4.0, -4.0, 0.0, 3.5, -4.0, 0.0, -4.0, 3.5, 0.0],
+    );
+    align(&mut output, 4);
+    push_i32(&mut output, 0); // no bind pose
+
+    push_floats(&mut output, &[0.0, 0.0, 8.0, 8.0]); // texture rect
+    push_floats(&mut output, &[0.0, 0.0, 0.0, 0.0]); // rect and atlas offsets
+    push_u32(&mut output, 0); // settings: unpacked, Tight
     push_floats(&mut output, &[0.0, 0.0, 1.0, 1.0, 1.0]);
     output
 }
