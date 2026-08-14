@@ -62,7 +62,13 @@ pub struct SerializedParseLimits {
 #[derive(Debug, Clone, Default)]
 pub struct SerializedOpenOptions {
     pub limits: SerializedParseLimits,
+    /// A caller-supplied version, equivalent to the managed reader's
+    /// `CustomUnityVersion`. It outranks everything the file itself declares.
     pub unity_version_override: Option<UnityVersion>,
+    /// The revision recorded by the enclosing bundle, if this file came from
+    /// one. Unlike the override, this is only consulted when the file cannot
+    /// speak for itself: see [`SerializedFile::open_with_options`].
+    pub bundle_version_hint: Option<UnityVersion>,
 }
 
 impl Default for SerializedParseLimits {
@@ -239,10 +245,26 @@ impl SerializedFile {
             SerializedOpenOptions {
                 limits,
                 unity_version_override: None,
+                bundle_version_hint: None,
             },
         )
     }
 
+    /// Opens one serialized file.
+    ///
+    /// The effective Unity version follows the managed reader's precedence: an
+    /// explicit [`SerializedOpenOptions::unity_version_override`] always wins,
+    /// then a [`SerializedOpenOptions::bundle_version_hint`] but only where the
+    /// managed reader would apply one, and otherwise the version the file
+    /// declares. `AssetsManager.LoadAssetsFromMemory` overrides with the bundle
+    /// revision only for format versions below 7, which carry no version string
+    /// of their own.
+    ///
+    /// One deliberate deviation: where the file's own version is stripped and no
+    /// override was supplied, the managed reader raises `NotSupportedException`
+    /// and refuses to load. This reader falls back to the bundle revision, which
+    /// is the value the managed error message itself suggests, and only reports
+    /// a missing version when no source has one.
     // Metadata is deliberately kept as one linear transaction: every version
     // gate changes the byte position consumed by all fields that follow.
     #[allow(clippy::too_many_lines)]
@@ -250,6 +272,7 @@ impl SerializedFile {
         let SerializedOpenOptions {
             limits,
             unity_version_override,
+            bundle_version_hint,
         } = options;
         let mut root_reader = EndianReader::new(region.cursor(), Endian::Big);
         let header = SerializedFileHeader::read(&mut root_reader)?;
@@ -305,6 +328,13 @@ impl SerializedFile {
                 UnityVersion::from_str(&unity_version_string).ok()
             };
         let unity_version = unity_version_override
+            .or_else(|| {
+                if header.version.0 < 7 || detected_unity_version.is_none() {
+                    bundle_version_hint
+                } else {
+                    None
+                }
+            })
             .or(detected_unity_version)
             .unwrap_or_default();
         let target_platform = if header.version.0 >= 8 {
@@ -1646,8 +1676,9 @@ fn read_aligned_string_limited<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{SerializedFile, SerializedParseLimits};
+    use super::{SerializedFile, SerializedOpenOptions, SerializedParseLimits};
     use crate::source::Region;
+    use crate::unity_version::UnityVersion;
 
     #[test]
     fn parses_v22_metadata_object_index_type_tree_and_text_asset() {
@@ -1730,6 +1761,56 @@ mod tests {
             ..SerializedParseLimits::default()
         };
         assert!(SerializedFile::open_with_limits(Region::from_bytes(bytes), limits).is_err());
+    }
+
+    #[test]
+    fn a_bundle_revision_only_overrides_files_that_cannot_state_their_own_version() {
+        let hint = UnityVersion::new(2022, 3, 62);
+        let explicit = UnityVersion::new(6000, 2, 0);
+        let options = |bundle_version_hint, unity_version_override| SerializedOpenOptions {
+            unity_version_override,
+            bundle_version_hint,
+            ..SerializedOpenOptions::default()
+        };
+
+        // Format 6 stores no version string, so the managed reader substitutes
+        // the enclosing bundle's revision and so does this one.
+        let legacy = synthetic_versioned_file(SyntheticOptions {
+            version: 6,
+            ..SyntheticOptions::default()
+        });
+        let file = SerializedFile::open_with_options(
+            Region::from_bytes(legacy.bytes.clone()),
+            options(Some(hint.clone()), None),
+        )
+        .unwrap();
+        assert_eq!(file.unity_version_string, "2.5.0f1");
+        assert_eq!(file.unity_version, hint);
+
+        // Format 13 declares 2018.4.0f1. The managed reader leaves that alone
+        // for anything at or above format 7, so the bundle revision must not
+        // silently shift every downstream version gate.
+        let modern = synthetic_versioned_file(SyntheticOptions {
+            version: 13,
+            ..SyntheticOptions::default()
+        });
+        let file = SerializedFile::open_with_options(
+            Region::from_bytes(modern.bytes.clone()),
+            options(Some(hint.clone()), None),
+        )
+        .unwrap();
+        assert_eq!(file.unity_version_string, "2018.4.0f1");
+        assert_eq!(file.unity_version.full_version, "2018.4.0f1");
+
+        // An explicit caller override outranks both, at either format version.
+        for fixture in [&legacy, &modern] {
+            let file = SerializedFile::open_with_options(
+                Region::from_bytes(fixture.bytes.clone()),
+                options(Some(hint.clone()), Some(explicit.clone())),
+            )
+            .unwrap();
+            assert_eq!(file.unity_version, explicit);
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ criteria, and prioritized gap list live in
 | Checked little/big-endian primitive and string reading | Implemented |
 | Unity version parsing and compatibility ordering | Implemented |
 | AssetStudio file-type detection, including embedded UnityFS offsets | Implemented |
-| SerializedFile v5-v22 metadata, endian, object table, references, and bounded payload regions | Implemented |
+| SerializedFile v5-v22 metadata, endian, object table, references, and bounded payload regions | Implemented; the effective Unity version follows the managed precedence, so a caller-supplied version wins, an enclosing bundle's revision applies only below format 7, and a file at or above format 7 keeps the version it declares. Where a file's own version is stripped and no override was supplied, this reader falls back to the bundle revision instead of refusing to load as the managed reader does |
 | Common UnityWeb/UnityRaw/UnityArchive/UnityFS signature and header dispatch | Implemented |
 | UnityWebData/TuanjieWebData directory and payload access | Implemented |
 | UnityFS v6/v7 block directory, inline/tail metadata, and padding | Implemented |
