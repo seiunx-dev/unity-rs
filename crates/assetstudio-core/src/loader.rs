@@ -464,11 +464,18 @@ impl AssetCollection {
                         });
                     }
                 }
+                // gzip and Brotli wrap exactly one stream, so the decompressed
+                // input keeps the container's own path. Appending a `::gzip`
+                // segment would make the portable name -- which is what
+                // cross-file external references are matched against -- the
+                // literal string "gzip" instead of the file's name, so nothing
+                // could ever reference it. The managed reader keeps the name
+                // too.
                 FileType::GzipFile => {
                     let region = decompress_gzip(&input.region, limits.compression)?;
                     charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
                     pending.push_back(PendingInput {
-                        path: format!("{}::gzip", input.path),
+                        path: input.path,
                         region,
                         depth: input.depth + 1,
                         unity_version_hint: input.unity_version_hint,
@@ -478,7 +485,7 @@ impl AssetCollection {
                     let region = decompress_brotli(&input.region, limits.compression)?;
                     charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
                     pending.push_back(PendingInput {
-                        path: format!("{}::brotli", input.path),
+                        path: input.path,
                         region,
                         depth: input.depth + 1,
                         unity_version_hint: input.unity_version_hint,

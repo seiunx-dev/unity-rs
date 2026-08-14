@@ -18,9 +18,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use assetstudio_core::studio::Studio;
 use serde_json::{Value, json};
 
+#[path = "support/containers.rs"]
+mod containers;
 #[path = "support/oracle_manifest.rs"]
 mod oracle_manifest;
 
+use containers::{BlocksInfo, BundleEntry};
 use oracle_manifest::rust_manifest;
 
 #[test]
@@ -121,7 +124,66 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
         assert_eq!(managed, rust, "fixture {}", fixture.path.display());
     }
 
+    assert_container_fixtures(&executable);
     assert_truncated_fixture(&executable);
+}
+
+/// Runs the same comparison through the container stack.
+///
+/// Every container row in the compatibility matrix used to rest on Rust's own
+/// round trips, because the gate only ever fed the managed oracle bare
+/// `.assets` files. These wrap one in the containers a game actually ships, so
+/// the header dispatch, blocks-info placement, directory table and entry
+/// extraction are compared against the managed reader rather than against the
+/// Rust writer's own assumptions.
+fn assert_container_fixtures(executable: &Path) {
+    // Resident objects only: a bundled fixture has nowhere to put a sibling
+    // `.resS`. Two entries so the directory table itself is compared, not just
+    // the single-entry degenerate case.
+    let mesh_file = synthetic_single_v22(43, 43, "2022.3.62f1", &mesh());
+    let material_file = synthetic_single_v22(21, 21, "2022.3.62f1", &material());
+    let inner = mesh_file.clone();
+    let entries = [
+        BundleEntry {
+            path: "CAB-oracle-mesh",
+            bytes: mesh_file.as_slice(),
+        },
+        BundleEntry {
+            path: "CAB-oracle-material",
+            bytes: material_file.as_slice(),
+        },
+    ];
+    let cases: [(&str, Vec<u8>); 5] = [
+        (
+            "oracle-bundle-v6-inline.unity3d",
+            containers::unity_fs(6, "2022.3.62f1", &entries, BlocksInfo::Inline),
+        ),
+        (
+            "oracle-bundle-v6-tail.unity3d",
+            containers::unity_fs(6, "2022.3.62f1", &entries, BlocksInfo::AtEnd),
+        ),
+        (
+            "oracle-bundle-v7-aligned.unity3d",
+            containers::unity_fs(7, "2022.3.62f1", &entries, BlocksInfo::InlineAligned),
+        ),
+        (
+            "oracle-bundle-raw-v6.unity3d",
+            containers::unity_raw_v6("2022.3.62f1", &entries),
+        ),
+        ("oracle-gzip.assets.gz", containers::gzip(&inner)),
+    ];
+    for (name, bytes) in &cases {
+        let fixture = TemporaryFixture::new(name, bytes).unwrap();
+        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+        assert_eq!(managed, rust, "container fixture {name}");
+        assert!(
+            managed["Files"]
+                .as_array()
+                .is_some_and(|files| !files.is_empty()),
+            "container fixture {name} produced no serialized files: {managed}"
+        );
+    }
 }
 
 fn assert_truncated_fixture(executable: &Path) {

@@ -51,10 +51,11 @@ pub fn rust_manifest(
             }));
         }
         files.push(json!({
-            "Path": Path::new(file.path())
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or("loaded file name is not UTF-8")?,
+            // Core labels a bundled file `<container>::<entry>` for provenance,
+            // while the managed reader keeps only the entry name. Compare the
+            // identity both agree on -- and the one cross-file resolution
+            // actually matches against -- rather than the label.
+            "Path": portable_file_name(file.path()),
             "UnityVersion": file.unity_version(),
             "Objects": objects,
         }));
