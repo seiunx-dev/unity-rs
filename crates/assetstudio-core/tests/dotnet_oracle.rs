@@ -13,7 +13,7 @@
 //! settings fields, and `TypeTree` dumps.
 //!
 //! It also runs the same comparison across every serialized format version from
-//! 13 through 22, and through the containers a game ships: `UnityFS` v6 with
+//! 5 through 22, and through the containers a game ships: `UnityFS` v6 with
 //! inline and tail blocks-info, `UnityFS` v7 with its mandatory alignment,
 //! LZ4/LZ4HC/Zstd-compressed block data and blocks-info tables, legacy
 //! `UnityRaw` v6, and a gzip stream.
@@ -990,7 +990,10 @@ fn assert_compressed_texture_formats(executable: &Path) {
 /// rather than against the Rust writer's own assumptions.
 fn assert_version_matrix(executable: &Path) {
     let trees = text_asset_type_trees();
-    for version in 5..22 {
+    // Through 22 inclusive. The rest of this file's fixtures are v22, but the
+    // matrix stopped at 21, so the newest format was never compared by the one
+    // test whose job is comparing formats.
+    for version in 5..=22 {
         let name = format!("oracle-format-v{version}.assets");
         let bytes = if version < 13 {
             tree_bearing_text_asset(version, &trees)
@@ -1967,8 +1970,8 @@ fn finish_tree_bearing_header(version: u32, metadata: &[u8], data: &[u8]) -> Vec
 /// where a tree is mandatory.
 fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
     assert!(
-        (13..22).contains(&version),
-        "tree-less fixtures cover formats 13 through 21"
+        (13..=22).contains(&version),
+        "tree-less fixtures cover formats 13 through 22"
     );
     let object = text_asset();
     let mut metadata = Vec::new();
@@ -1996,7 +1999,13 @@ fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
         align(&mut metadata, 4);
         metadata.extend_from_slice(&0x0102_0304_0506_0708_i64.to_le_bytes());
     }
-    push_u32(&mut metadata, 0);
+    // 22 is where large-file support widened the object's byte offset from 32
+    // to 64 bits.
+    if version >= 22 {
+        metadata.extend_from_slice(&0_i64.to_le_bytes());
+    } else {
+        push_u32(&mut metadata, 0);
+    }
     push_u32(&mut metadata, u32::try_from(object.len()).unwrap());
     push_i32(&mut metadata, if version < 16 { 49 } else { 0 });
     if version < 16 {
@@ -2020,6 +2029,11 @@ fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
         push_i32(&mut metadata, 0);
     }
     metadata.push(0);
+    // 22 moved the header to its own 48-byte layout; the metadata after it is
+    // unchanged from 21.
+    if version >= 22 {
+        return finish_v22(&metadata, &object);
+    }
     finish_legacy_header(version, &metadata, &object, 0)
 }
 
