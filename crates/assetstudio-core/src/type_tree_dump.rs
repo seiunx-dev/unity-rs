@@ -231,6 +231,10 @@ impl<W: Write> DumpFormatter<'_, W> {
     }
 }
 
+/// Round-trip digit count .NET uses as the general-format precision specifier.
+const SINGLE_ROUND_TRIP_DIGITS: i32 = 9;
+const DOUBLE_ROUND_TRIP_DIGITS: i32 = 17;
+
 fn write_managed_float(output: &mut impl Write, node: &TypeTreeNode, value: f64) -> Result<()> {
     if value.is_nan() {
         output.write_all(b"NaN")?;
@@ -239,9 +243,87 @@ fn write_managed_float(output: &mut impl Write, node: &TypeTreeNode, value: f64)
     } else if value == f64::NEG_INFINITY {
         output.write_all(b"-Infinity")?;
     } else if node.type_name == "float" {
-        write!(output, "{}", exact_f32(value)?)?;
+        let value = exact_f32(value)?;
+        write_general_format(output, &format!("{value:e}"), SINGLE_ROUND_TRIP_DIGITS)?;
     } else {
-        write!(output, "{value}")?;
+        write_general_format(output, &format!("{value:e}"), DOUBLE_ROUND_TRIP_DIGITS)?;
+    }
+    Ok(())
+}
+
+/// Renders one finite value the way .NET's default `ToString()` does.
+///
+/// The managed dump boxes each value and hands it to `AppendFormat`, so the
+/// text follows .NET's general format at round-trip precision: fixed notation
+/// while the decimal exponent satisfies `-5 < exponent < precision`, and
+/// scientific notation with a two-digit-minimum exponent otherwise. Rust's own
+/// `Display` never switches to an exponent, so `float.MaxValue` would come out
+/// as a 39-digit integer where the managed reader writes `3.4028235E+38`.
+///
+/// `exponential` is the value already rendered by Rust's `LowerExp`, which
+/// supplies exactly the shortest round-trip digits and decimal exponent this
+/// needs.
+///
+/// The managed formatter uses `CurrentCulture`, so this targets
+/// `InvariantCulture` deliberately: it is what the managed exporter runs under
+/// (`InvariantGlobalization` is set in the shipped projects) and what a CI
+/// runner without a locale falls back to. Under a culture such as de-DE the
+/// managed text would use a decimal comma and a localized infinity symbol; that
+/// is not reproduced, and the dump is not culture-sensitive.
+fn write_general_format(output: &mut impl Write, exponential: &str, precision: i32) -> Result<()> {
+    let malformed = || Error::invalid_data("float exponential form is malformed");
+    let (mantissa, exponent) = exponential.split_once('e').ok_or_else(malformed)?;
+    let exponent: i32 = exponent.parse().map_err(|_| malformed())?;
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return Err(malformed());
+    }
+    if digits.bytes().all(|digit| digit == b'0') {
+        // Rust renders zero as `0e0`; .NET keeps the sign of negative zero.
+        write!(output, "{sign}0")?;
+        return Ok(());
+    }
+
+    if exponent > -5 && exponent < precision {
+        write_fixed(output, sign, &digits, exponent)?;
+    } else {
+        write!(output, "{sign}{}", &digits[..1])?;
+        if digits.len() > 1 {
+            write!(output, ".{}", &digits[1..])?;
+        }
+        let sign = if exponent < 0 { '-' } else { '+' };
+        write!(output, "E{sign}{:02}", exponent.unsigned_abs())?;
+    }
+    Ok(())
+}
+
+fn write_fixed(output: &mut impl Write, sign: &str, digits: &str, exponent: i32) -> Result<()> {
+    output.write_all(sign.as_bytes())?;
+    if exponent < 0 {
+        // -4 through -1: a leading zero, then the gap before the first digit.
+        let leading_zeros = usize::try_from(-exponent - 1)
+            .map_err(|_| Error::invalid_data("float exponent does not fit this platform"))?;
+        write!(output, "0.")?;
+        for _ in 0..leading_zeros {
+            output.write_all(b"0")?;
+        }
+        output.write_all(digits.as_bytes())?;
+        return Ok(());
+    }
+    let integer_digits = usize::try_from(exponent + 1)
+        .map_err(|_| Error::invalid_data("float exponent does not fit this platform"))?;
+    if digits.len() <= integer_digits {
+        output.write_all(digits.as_bytes())?;
+        for _ in 0..integer_digits - digits.len() {
+            output.write_all(b"0")?;
+        }
+    } else {
+        output.write_all(&digits.as_bytes()[..integer_digits])?;
+        write!(output, ".{}", &digits[integer_digits..])?;
     }
     Ok(())
 }
@@ -507,7 +589,50 @@ impl<W: Write> Write for BoundedDumpWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_type_tree_dump;
+    use super::{
+        DOUBLE_ROUND_TRIP_DIGITS, SINGLE_ROUND_TRIP_DIGITS, write_general_format,
+        write_type_tree_dump,
+    };
+
+    /// Every value formatted by the managed reader on .NET 10. See the file
+    /// header for how it was produced.
+    const MANAGED_FLOAT_FORMAT: &str = include_str!("../tests/fixtures/managed/float_format.txt");
+
+    #[test]
+    fn float_text_matches_the_managed_formatter_for_every_recorded_value() {
+        let mut checked = 0_usize;
+        for line in MANAGED_FLOAT_FORMAT.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let mut columns = line.split('\t');
+            let kind = columns.next().expect("value kind");
+            let bits = columns.next().expect("bit pattern");
+            let expected = columns.next().expect("expected text");
+            assert!(columns.next().is_none(), "unexpected column in {line:?}");
+
+            let mut actual = Vec::new();
+            let (exponential, precision) = match kind {
+                "f" => (
+                    format!("{:e}", f32::from_bits(bits.parse().unwrap())),
+                    SINGLE_ROUND_TRIP_DIGITS,
+                ),
+                "d" => (
+                    format!("{:e}", f64::from_bits(bits.parse().unwrap())),
+                    DOUBLE_ROUND_TRIP_DIGITS,
+                ),
+                other => panic!("unknown value kind {other:?}"),
+            };
+            write_general_format(&mut actual, &exponential, precision).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&actual).unwrap(),
+                expected,
+                "{kind} bits {bits}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 500, "only {checked} values were compared");
+    }
     use crate::serialized::{TypeTree, TypeTreeNode};
     use crate::type_tree::{TypeField, TypeMapEntry, TypeValue};
 
