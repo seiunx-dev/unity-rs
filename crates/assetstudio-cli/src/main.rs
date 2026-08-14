@@ -27,7 +27,9 @@ use assetstudio_core::model_animation::{ModelAnimationLimits, build_model_animat
 use assetstudio_core::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
 };
-use assetstudio_core::model_ir::{ModelIrLimits, build_model_ir, build_model_ir_for_game_object};
+use assetstudio_core::model_ir::{
+    ModelIr, ModelIrLimits, build_model_ir, build_model_ir_for_game_object,
+};
 use assetstudio_core::monobehaviour::MONO_BEHAVIOUR_CLASS_ID;
 use assetstudio_core::scene_hierarchy::{
     SceneHierarchy, SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey, build_scene_hierarchy,
@@ -987,7 +989,33 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
         animations.clips.len(),
         command.output.display()
     )?;
+    report_dropped_material_textures(&model, output)?;
     skipped_input_result("FBX export", &collection)
+}
+
+/// Reports the material texture bindings the FBX writer does not emit.
+///
+/// The writer produces phong material colours but no Texture or Video objects,
+/// so a textured model exports untextured. Naming the count keeps that from
+/// being a silent partial result.
+fn report_dropped_material_textures(model: &ModelIr, output: &mut impl Write) -> io::Result<()> {
+    let mut dropped = HashSet::new();
+    for material in &model.materials {
+        for property in &material.material.saved_properties.texture_environments {
+            let texture = property.value.texture;
+            if !texture.is_null() {
+                dropped.insert((texture.file_id, texture.path_id));
+            }
+        }
+    }
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        output,
+        "  note: {} material texture binding(s) were not written; ASCII FBX texture output is not implemented",
+        dropped.len()
+    )
 }
 
 fn export_fbx_batch(
