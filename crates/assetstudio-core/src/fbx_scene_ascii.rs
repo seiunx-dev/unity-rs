@@ -77,11 +77,11 @@ enum MaterialReference {
     Model(usize),
 }
 
-struct StaticScene<'a> {
-    nodes: Vec<NodePlan<'a>>,
-    geometries: Vec<GeometryPlan<'a>>,
-    materials: Vec<MaterialPlan<'a>>,
-    textures: Vec<TexturePlan<'a>>,
+pub(crate) struct StaticScene<'a> {
+    pub(crate) nodes: Vec<NodePlan<'a>>,
+    pub(crate) geometries: Vec<GeometryPlan<'a>>,
+    pub(crate) materials: Vec<MaterialPlan<'a>>,
+    pub(crate) textures: Vec<TexturePlan<'a>>,
     animations: Vec<AnimationPlan<'a>>,
 }
 
@@ -91,7 +91,7 @@ struct StaticScene<'a> {
 /// a texture bound by two materials with different offsets can only keep one.
 /// The first binding wins, matching the single shared `FbxFileTexture` the
 /// managed exporter creates per texture name.
-struct TexturePlan<'a> {
+pub(crate) struct TexturePlan<'a> {
     id: i64,
     video_id: i64,
     file_name: &'a str,
@@ -105,26 +105,26 @@ struct MaterialTexturePlan {
     slot: TextureSlot,
 }
 
-struct NodePlan<'a> {
-    id: i64,
-    parent_id: i64,
-    name: &'a str,
-    transform: ConvertedTransform,
-    has_geometry: bool,
-    is_bone: bool,
+pub(crate) struct NodePlan<'a> {
+    pub(crate) id: i64,
+    pub(crate) parent_id: i64,
+    pub(crate) name: &'a str,
+    pub(crate) transform: ConvertedTransform,
+    pub(crate) has_geometry: bool,
+    pub(crate) is_bone: bool,
 }
 
-struct GeometryPlan<'a> {
-    id: i64,
-    model_id: i64,
-    mesh: &'a Mesh,
-    material_ids: Vec<i64>,
-    submesh_material_slots: Vec<usize>,
-    skin: Option<SkinPlan<'a>>,
-    morph: Option<MorphPlan<'a>>,
+pub(crate) struct GeometryPlan<'a> {
+    pub(crate) id: i64,
+    pub(crate) model_id: i64,
+    pub(crate) mesh: &'a Mesh,
+    pub(crate) material_ids: Vec<i64>,
+    pub(crate) submesh_material_slots: Vec<usize>,
+    pub(crate) skin: Option<SkinPlan<'a>>,
+    pub(crate) morph: Option<MorphPlan<'a>>,
 }
 
-struct MorphPlan<'a> {
+pub(crate) struct MorphPlan<'a> {
     id: i64,
     name: &'a str,
     channels: Vec<MorphChannelPlan<'a>>,
@@ -144,7 +144,7 @@ struct ShapePlan<'a> {
     vertices: &'a [MeshBlendShapeVertex],
 }
 
-struct SkinPlan<'a> {
+pub(crate) struct SkinPlan<'a> {
     id: i64,
     name: &'a str,
     clusters: Vec<ClusterPlan<'a>>,
@@ -192,21 +192,21 @@ enum AnimationProperty {
     Scaling,
 }
 
-struct MaterialPlan<'a> {
-    id: i64,
-    material: Option<&'a Material>,
+pub(crate) struct MaterialPlan<'a> {
+    pub(crate) id: i64,
+    pub(crate) material: Option<&'a Material>,
     textures: Vec<MaterialTexturePlan>,
 }
 
 #[derive(Clone, Copy)]
-struct ConvertedTransform {
-    translation: [f32; 3],
-    rotation: [f32; 3],
-    scale: [f32; 3],
+pub(crate) struct ConvertedTransform {
+    pub(crate) translation: [f32; 3],
+    pub(crate) rotation: [f32; 3],
+    pub(crate) scale: [f32; 3],
 }
 
 impl<'a> StaticScene<'a> {
-    fn from_model(
+    pub(crate) fn from_model(
         model: &'a ModelIr,
         animations: Option<&'a ModelAnimationSet>,
         textures: Option<&'a SceneTextureSet>,
@@ -2640,18 +2640,18 @@ fn fbx_key_time_for_write(seconds: f32) -> io::Result<i64> {
     fbx_key_time(seconds).map_err(|error| io::Error::other(error.to_string()))
 }
 
-struct MaterialProperties {
-    diffuse: [f32; 3],
-    ambient: [f32; 3],
-    emissive: [f32; 3],
-    specular: [f32; 3],
-    reflection: [f32; 3],
-    shininess: f32,
-    transparency: f32,
+pub(crate) struct MaterialProperties {
+    pub(crate) diffuse: [f32; 3],
+    pub(crate) ambient: [f32; 3],
+    pub(crate) emissive: [f32; 3],
+    pub(crate) specular: [f32; 3],
+    pub(crate) reflection: [f32; 3],
+    pub(crate) shininess: f32,
+    pub(crate) transparency: f32,
 }
 
 impl MaterialProperties {
-    fn from_material(material: Option<&Material>) -> Self {
+    pub(crate) fn from_material(material: Option<&Material>) -> Self {
         let mut value = Self {
             diffuse: [0.8, 0.8, 0.8],
             ambient: [0.2, 0.2, 0.2],
@@ -2731,7 +2731,7 @@ fn material_id(reference: MaterialReference) -> Result<i64> {
     }
 }
 
-fn polygon_end(index: u32) -> i64 {
+pub(crate) fn polygon_end(index: u32) -> i64 {
     -(i64::from(index) + 1)
 }
 
