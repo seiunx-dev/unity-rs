@@ -3,8 +3,11 @@
 Two dependencies produce output this project can show is wrong. Neither can be
 corrected from outside the dependency, so one is fixed by vendoring the code
 that carries it and the other is recorded and left alone. Both are written up
-with the measurement that found them, a reproduction, and the change that fixes
-them, so filing either upstream is a copy rather than a re-investigation.
+with the measurement that found them and a reproduction that does not depend on
+this project, so filing either upstream is a copy rather than a
+re-investigation. The texture defect also has its patch here; the Opus one does
+not, because it has been characterised from the outside but not traced to a
+line.
 
 ---
 
@@ -162,17 +165,23 @@ libopus bindings, which would end this crate's pure-Rust property.
 
 ## Why one is fixed here and the other is not
 
-Both fixes are one expression, and neither can be applied from outside the
-dependency: the conversion is the decoder's last step, and nothing downstream
-can recover what it discarded.
+Neither can be corrected from outside the dependency. For the texture defect
+the reason is precise: the conversion is the decoder's last step, so nothing
+downstream can recover what it discarded. For the Opus one it is that the
+divergence has been characterised from the outside but not located in the
+source -- the measurements above say what `ruopus` does and where it does it
+by packet mode, not which line is responsible.
 
-The texture defect is fixed by vendoring the two decoders that carry it. That
-was worth roughly 3,000 lines because it makes seven texture formats byte-exact
-against the managed implementation, and because the managed differential proves
-the copy correct rather than the copy being taken on trust.
+The texture defect is fixed by vendoring the two decoders that carry it, a
+change of one expression each. That was worth roughly 3,000 lines because it
+makes seven texture formats byte-exact against the managed implementation, and
+because the managed differential proves the copy correct rather than the copy
+being taken on trust.
 
-The Opus defect is not, because the equivalent step would be vendoring or
-replacing an Opus decoder, and the alternatives are libopus bindings, which
+The Opus defect is not, for two reasons. The equivalent step would be vendoring
+or replacing an Opus decoder, and the alternatives are libopus bindings, which
 would end this crate's pure-Rust property for a codec whose CELT path is already
-correct. Its tests hold the current behaviour in place and will fail if the
+correct. And there is no one-line fix to apply: finding it means working through
+`ruopus`'s SILK resampler, which is upstream's work to do with the measurements
+above rather than a patch waiting to be written. Its tests hold the current behaviour in place and will fail if the
 divergence changes shape or disappears.
