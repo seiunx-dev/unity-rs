@@ -785,19 +785,27 @@ pub fn write_mesh_object_obj_with_collection<W: Write>(
 /// normals, triangle winding is reversed, every line ends in CRLF, number
 /// formatting is locale-independent, and `NaN` components are written as `0`.
 ///
-/// Two deliberate departures from the managed writer, both of which make the
-/// output depend on less:
+/// The managed repository holds three writers for this format, and they do not
+/// agree with each other. The headless one -- `AssetStudioSession`, the path
+/// behind the managed library's own object payloads, and so the one this
+/// project replaces -- writes CRLF throughout, formats under the invariant
+/// culture, and substitutes `NaN` per line. This matches it byte for byte, and
+/// the differential compares the two documents directly rather than comparing
+/// only the geometry they are written from.
 ///
-/// * Line endings are CRLF throughout. The managed writer emits its `g` lines
-///   with `StringBuilder.AppendLine`, which uses the platform's newline, while
-///   every other line carries an explicit CRLF -- so its output has mixed line
-///   endings when it runs on Linux or macOS and uniform ones on Windows. This
-///   matches the Windows form everywhere rather than making a mesh's bytes
-///   depend on which machine exported it.
-/// * `NaN` is replaced per value rather than per document. The managed writer
-///   finishes with `sb.Replace("NaN", "0")` over the whole text, which also
-///   rewrites a mesh whose *name* contains `NaN`. Here only numeric components
-///   are substituted, so the name survives.
+/// Against the other two, the exporters behind the GUI and the CLI, two
+/// differences remain, and both make the output depend on less:
+///
+/// * Line endings are CRLF throughout. Those writers emit their `g` lines with
+///   `StringBuilder.AppendLine`, which uses the platform's newline, while
+///   every other line carries an explicit CRLF -- so their output has mixed
+///   line endings on Linux and macOS and uniform ones on Windows. This matches
+///   the Windows form everywhere rather than making a mesh's bytes depend on
+///   which machine exported it.
+/// * `NaN` is replaced per value rather than per document. Those writers finish
+///   with `sb.Replace("NaN", "0")` over the whole text, which also rewrites a
+///   mesh whose *name* contains `NaN`. Here, as in the headless writer, only
+///   numeric components are substituted, so the name survives.
 pub fn write_mesh_obj<W: Write>(
     mesh: &Mesh,
     output: &mut W,
