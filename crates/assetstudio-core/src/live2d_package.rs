@@ -1472,7 +1472,7 @@ impl<'a> PackageState<'a> {
             &indexes.roles,
         )?;
         let (motion_targets, eye_blink_parameters, lip_sync_parameters) =
-            self.parameter_metadata_for_model(model.object, indexes)?;
+            self.parameter_metadata_for_model(model.object, &moc, indexes)?;
         let direct_motions = components_for_model(&indexes.fade_motions_by_model, model.object);
         let mut motions = self.read_model_motions(
             active_model.fade_controller,
@@ -1868,17 +1868,38 @@ impl<'a> PackageState<'a> {
         }))
     }
 
+    /// Resolves the model's parameter and part names, and its blink and
+    /// lip-sync groups.
+    ///
+    /// The managed extractor seeds the name sets from live `CubismParameter`
+    /// and `CubismPart` components and then replaces them with the MOC3's own
+    /// identifier tables once it reads the MOC, because those tables are the
+    /// model's authoritative lists. Deriving the names only from components, as
+    /// this used to, leaves a bundle that ships a MOC without those components
+    /// -- a moc-only bundle or a stripped prefab -- with empty groups where
+    /// `AssetStudio` produces populated ones.
+    ///
+    /// One deliberate difference: the managed override is unconditional, so a
+    /// MOC whose version carries no identifier tables discards the component
+    /// names too. Here the tables only win when the MOC actually has them.
     fn parameter_metadata_for_model(
         &mut self,
         model: SceneObjectKey,
+        moc: &CubismMoc,
         indexes: &ComponentIndexes,
     ) -> Result<(CubismMotionTargetNames, Vec<String>, Vec<String>)> {
         let parameters = components_for_model(&indexes.parameters_by_model, model);
         let parts = components_for_model(&indexes.parts_by_model, model);
-        let targets = CubismMotionTargetNames {
+        let mut targets = CubismMotionTargetNames {
             parameters: self.component_names(parameters)?,
             parts: self.component_names(parts)?,
         };
+        if !moc.parameter_names.is_empty() {
+            targets.parameters = self.charged_names(&moc.parameter_names)?;
+        }
+        if !moc.part_names.is_empty() {
+            targets.parts = self.charged_names(&moc.part_names)?;
+        }
         let mut eye_blink = self.component_names(components_for_model(
             &indexes.eye_blink_parameters_by_model,
             model,
@@ -1894,6 +1915,21 @@ impl<'a> PackageState<'a> {
             lip_sync = self.fallback_parameter_names(&targets.parameters, is_lip_sync_name)?;
         }
         Ok((targets, eye_blink, lip_sync))
+    }
+
+    /// Charges and returns a deduplicated, sorted copy of `values`.
+    fn charged_names(&mut self, values: &[String]) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        names.try_reserve(values.len()).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate Live2D identifier names: {error}"))
+        })?;
+        for value in values {
+            self.charge_name(value)?;
+            names.push(value.clone());
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     fn component_names(&mut self, components: &[ScriptedComponent]) -> Result<Vec<String>> {
@@ -3596,6 +3632,28 @@ mod tests {
     }
 
     #[test]
+    fn moc_identifier_tables_supply_parameter_groups_without_components() {
+        // A moc-only bundle, or one whose prefab was stripped, has no live
+        // CubismParameter or CubismPart components. The managed extractor still
+        // produces populated groups because it takes the names from the MOC3's
+        // own identifier tables; deriving them only from components left this
+        // empty.
+        let collection = moc_identifier_collection();
+        let set = build_live2d_packages(&collection, Live2dPackageLimits::default()).unwrap();
+
+        assert!(set.diagnostics.is_empty(), "{:?}", set.diagnostics);
+        assert_eq!(set.packages.len(), 1);
+        let package = &set.packages[0];
+        assert_eq!(package.motion_targets.parameters, ["ParamAngleX"]);
+        assert_eq!(package.motion_targets.parts, ["PartArm", "PartHead"]);
+
+        let mut manifest = Vec::new();
+        package.write_model3_json(&mut manifest, u64::MAX).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(manifest["FileReferences"]["Moc"], "Owner.moc3");
+    }
+
+    #[test]
     fn writes_explicit_and_inferred_eye_blink_and_lip_sync_groups() {
         for (explicit_markers, expected_eye, expected_mouth) in [
             (true, "BlinkLeft", "MouthValue"),
@@ -3905,6 +3963,40 @@ mod tests {
         AssetCollection::from_loaded_parts(
             vec![LoadedSerializedFile {
                 path: "bundle::active.assets".to_owned(),
+                file,
+            }],
+            Vec::new(),
+        )
+    }
+
+    /// A model carrying only a MOC with identifier tables: no `CubismParameter`
+    /// or `CubismPart` components anywhere.
+    fn moc_identifier_collection() -> AssetCollection {
+        let types = vec![
+            TestType::plain(GAME_OBJECT),
+            TestType::plain(TRANSFORM),
+            TestType::behaviour(0x20, Some(mono_behaviour_tree("CubismMoc", "_moc"))),
+            TestType::behaviour(0x30, None),
+            TestType::plain(MONO_SCRIPT),
+        ];
+        let model = crate::cubism_moc::test_support::synthetic_moc3(false, 5);
+        let objects = vec![
+            TestObject::new(1, 0, game_object("Owner", &[(0, 10), (0, 20), (0, 30)])),
+            TestObject::new(10, 1, transform((0, 1), &[], (0, 0))),
+            TestObject::new(20, 2, mono_behaviour((0, 1), (0, 100), "model", (0, 30))),
+            TestObject::new(
+                30,
+                3,
+                cubism_moc_behaviour_with_model((0, 1), (0, 102), &model),
+            ),
+            TestObject::new(100, 4, mono_script("CubismModel")),
+            TestObject::new(102, 4, mono_script("CubismMoc")),
+        ];
+        let file =
+            SerializedFile::open(Region::from_bytes(synthetic_v22(&types, &objects, &[]))).unwrap();
+        AssetCollection::from_loaded_parts(
+            vec![LoadedSerializedFile {
+                path: "bundle::moc-identifiers.assets".to_owned(),
                 file,
             }],
             Vec::new(),
@@ -4470,9 +4562,18 @@ mod tests {
     }
 
     fn cubism_moc_behaviour(game_object: (i32, i64), script: (i32, i64)) -> Vec<u8> {
+        cubism_moc_behaviour_with_model(game_object, script, b"MOC3\x09")
+    }
+
+    fn cubism_moc_behaviour_with_model(
+        game_object: (i32, i64),
+        script: (i32, i64),
+        model: &[u8],
+    ) -> Vec<u8> {
         let mut output = mono_behaviour_prefix(game_object, script, "moc");
-        push_i32(&mut output, 5);
-        output.extend_from_slice(b"MOC3\x09");
+        push_i32(&mut output, i32::try_from(model.len()).unwrap());
+        output.extend_from_slice(model);
+        align(&mut output, 4);
         output
     }
 

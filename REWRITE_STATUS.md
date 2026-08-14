@@ -141,9 +141,9 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - 除专用 reader 外还缺：export、extract、场景层级、MonoBehaviour/MonoScript、BuildSettings/PlayerSettings、AnimationClip/AnimatorController/Avatar、ACL 检视与注入、Oodle decoder 注入、Unity 版本覆盖、多文件内存加载、`read_resource_range`/按路径读资源；
    - Node 是可选交付面，因此优先级低于 Core 和 Python 的真实语料兼容。
 
-5. **Live2D 参数组来源与散件发现**
-   - `CubismMoc` 的 parameter/part 标识表已解析，但包管线只用它做内存预算；托管 `Live2DExtractor` 用这两张表跑 EyeBlink/LipSync 启发式，因此仅有 MOC、缺少活动组件的包在 Rust 侧会得到空参数组；
-   - 没有针对独立 `CubismExpressionData`/`CubismFadeMotionData`/`CubismPhysicsController` 的容器级发现回退。
+5. **Live2D 散件发现**
+   - MOC3 标识表已接入参数组（与托管一致：MOC 的表覆盖组件推导出的名字），仅有 MOC、缺少活动组件的包不再得到空参数组。与托管的一处有意偏离：托管是无条件覆盖，因此 MOC 版本不带标识表时连组件名也会被清空；这里只在 MOC 确实带表时覆盖；
+   - 仍缺：针对独立 `CubismExpressionData`/`CubismFadeMotionData`/`CubismPhysicsController` 的容器级发现回退。
 
 ### 设计上保留的外部适配器
 
