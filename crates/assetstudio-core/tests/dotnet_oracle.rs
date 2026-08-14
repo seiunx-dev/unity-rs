@@ -1309,8 +1309,22 @@ fn build_managed_oracle() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .join("bin/Release/net10.0/AssetStudioOracle.dll"))
 }
 
+/// Writes the manifest to `ORACLE_DUMP_DIR` when that variable is set.
+///
+/// A mismatch in these manifests is a hash against a hash, which says two
+/// documents differ but not how. Dumping both sides turns that into a diff of
+/// the documents themselves, which is how the Cubism layout divergences were
+/// found and fixed one at a time.
 fn managed_manifest(executable: &Path, path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
-    managed_manifest_allowing(executable, path, &[])
+    let value = managed_manifest_allowing(executable, path, &[]);
+    if let (Ok(directory), Ok(value)) = (std::env::var("ORACLE_DUMP_DIR"), value.as_ref()) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let _ = std::fs::write(
+            format!("{directory}/{name}.managed.json"),
+            serde_json::to_string_pretty(value).unwrap(),
+        );
+    }
+    value
 }
 
 /// Runs the managed oracle, permitting only the diagnostics named in `allowed`.

@@ -101,7 +101,7 @@ impl CubismExpression {
         if !self.parameters.is_empty() {
             writer.write_all(b"\n  ")?;
         }
-        writer.write_all(b"]\n}\n")?;
+        writer.write_all(b"]\n}")?;
         Ok(writer.written)
     }
 }
@@ -350,7 +350,7 @@ pub fn write_cubism_pose3_json<W: Write>(
             }
             write_json_string(&mut writer, &node.id)?;
             writer.write_all(b",\n        \"Link\": [")?;
-            write_string_array(&mut writer, &node.links)?;
+            write_string_array(&mut writer, &node.links, 10)?;
             writer.write_all(b"]\n      }")?;
         }
         if !group.is_empty() {
@@ -361,7 +361,7 @@ pub fn write_cubism_pose3_json<W: Write>(
     if !groups.is_empty() {
         writer.write_all(b"\n  ")?;
     }
-    writer.write_all(b"]\n}\n")?;
+    writer.write_all(b"]\n}")?;
     Ok(writer.written)
 }
 
@@ -377,16 +377,31 @@ pub fn write_cubism_cdi3_json<W: Write>(
     write_display_entries(&mut writer, parameters, true)?;
     writer.write_all(b"],\n  \"ParameterGroups\": [],\n  \"Parts\": [")?;
     write_display_entries(&mut writer, parts, false)?;
-    writer.write_all(b"]\n}\n")?;
+    writer.write_all(b"]\n}")?;
     Ok(writer.written)
 }
 
-fn write_string_array(output: &mut impl Write, values: &[String]) -> Result<()> {
+/// Writes a string array the way `Formatting.Indented` does: one value per
+/// line at `indent` spaces, the closing bracket two spaces out, and `[]` for an
+/// empty array.
+fn write_string_array(output: &mut impl Write, values: &[String], indent: usize) -> Result<()> {
     for (index, value) in values.iter().enumerate() {
         if index != 0 {
-            output.write_all(b", ")?;
+            output.write_all(b",")?;
         }
+        write_newline_indent(output, indent)?;
         write_json_string(output, value)?;
+    }
+    if !values.is_empty() {
+        write_newline_indent(output, indent - 2)?;
+    }
+    Ok(())
+}
+
+fn write_newline_indent(output: &mut impl Write, indent: usize) -> Result<()> {
+    output.write_all(b"\n")?;
+    for _ in 0..indent {
+        output.write_all(b" ")?;
     }
     Ok(())
 }
