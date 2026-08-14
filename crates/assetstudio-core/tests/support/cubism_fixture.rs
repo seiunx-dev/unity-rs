@@ -444,3 +444,101 @@ pub(crate) fn cubism_expression_object(name: &str) -> Vec<u8> {
     }
     data
 }
+
+/// Builds a `CubismMoc` behaviour whose payload is a synthetic MOC3 header.
+///
+/// The MOC behaviour is read without a `TypeTree` on both sides: the managed
+/// reader skips a fixed 28 bytes for the two pointers and the enabled flag,
+/// then the name, then a length-prefixed byte array. Only the header tables
+/// matter, and their offsets are what both implementations key on -- 64 for the
+/// count table, 68 for the canvas block, 76 and 264 for the two identifier
+/// tables, which are the fixed positions the format defines.
+pub(crate) fn cubism_moc_object(name: &str, sdk_version: u8) -> Vec<u8> {
+    const IDENTIFIER: usize = 64;
+    // Far enough past the 268-byte header for the tables to have room.
+    const COUNT_TABLE: usize = 0x120;
+    const CANVAS_INFO: usize = 0x140;
+    const PART_IDS: usize = 0x180;
+
+    let parts = ["PartArmA", "PartArmB", "PartCore"];
+    let parameters = ["ParamAngleX", "ParamAngleY"];
+    let parameter_ids = PART_IDS + parts.len() * IDENTIFIER;
+
+    let mut moc = vec![0_u8; parameter_ids + parameters.len() * IDENTIFIER];
+    moc[..4].copy_from_slice(b"MOC3");
+    moc[4] = sdk_version;
+    moc[5] = 0; // little-endian
+    let put_u32 = |moc: &mut Vec<u8>, offset: usize, value: u32| {
+        moc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    put_u32(&mut moc, 64, u32::try_from(COUNT_TABLE).unwrap());
+    put_u32(&mut moc, 68, u32::try_from(CANVAS_INFO).unwrap());
+    put_u32(&mut moc, 76, u32::try_from(PART_IDS).unwrap());
+    put_u32(&mut moc, 264, u32::try_from(parameter_ids).unwrap());
+    put_u32(&mut moc, COUNT_TABLE, u32::try_from(parts.len()).unwrap());
+    put_u32(
+        &mut moc,
+        COUNT_TABLE + 20,
+        u32::try_from(parameters.len()).unwrap(),
+    );
+
+    // Pixels per unit, then the centre, then the canvas size. Values with more
+    // than three decimals, so a document that rounds them shows it.
+    for (index, value) in [1234.5678_f32, -0.000_4, 0.002_5, 1920.0, 1080.5]
+        .into_iter()
+        .enumerate()
+    {
+        let at = CANVAS_INFO + index * 4;
+        moc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    for (index, identifier) in parts.iter().chain(parameters.iter()).enumerate() {
+        let at = if index < parts.len() {
+            PART_IDS + index * IDENTIFIER
+        } else {
+            parameter_ids + (index - parts.len()) * IDENTIFIER
+        };
+        moc[at..at + identifier.len()].copy_from_slice(identifier.as_bytes());
+    }
+
+    let mut data = Vec::new();
+    push_pptr(&mut data);
+    data.push(1);
+    align(&mut data);
+    push_pptr(&mut data);
+    push_string(&mut data, name);
+    push_i32(&mut data, i32::try_from(moc.len()).unwrap());
+    data.extend_from_slice(&moc);
+    align(&mut data);
+    data
+}
+
+/// A `MonoScript` naming the Cubism class a behaviour belongs to.
+///
+/// The managed extractor classifies `Live2D` behaviours by this name rather
+/// by their contents, so a fixture that leaves it out reaches none of that
+/// code.
+pub(crate) fn mono_script(class_name: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_string(&mut data, class_name);
+    push_i32(&mut data, 0); // m_ExecutionOrder
+    data.extend_from_slice(&[0x55; 16]); // m_PropertiesHash
+    push_string(&mut data, class_name);
+    push_string(&mut data, "Live2D.Cubism.Core");
+    push_string(&mut data, "Live2D.Cubism.dll");
+    data
+}
+
+/// The same MOC behaviour, with its script pointer aimed at `script_path_id`.
+pub(crate) fn cubism_moc_object_with_script(
+    name: &str,
+    sdk_version: u8,
+    script_path_id: i64,
+) -> Vec<u8> {
+    let mut data = cubism_moc_object(name, sdk_version);
+    // The script pointer is the second one, after the game object pointer and
+    // the aligned enabled flag.
+    data[16..20].copy_from_slice(&0_i32.to_le_bytes());
+    data[20..28].copy_from_slice(&script_path_id.to_le_bytes());
+    data
+}
