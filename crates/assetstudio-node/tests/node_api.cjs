@@ -253,6 +253,137 @@ function syntheticOodleBundle(entryName, payload) {
   return bundle
 }
 
+// A MonoBehaviour carrying its own TypeTree, which is the only way a reader can
+// know a Live2D SDK type's layout. Nodes are the format 19+ blob encoding: 32
+// bytes each, then one shared string buffer.
+function typeTreeAsset(classId, nodes, payload) {
+  const strings = []
+  let stringBytes = 0
+  const intern = (value) => {
+    const at = stringBytes
+    strings.push(Buffer.from(`${value}\0`, 'ascii'))
+    stringBytes += value.length + 1
+    return at
+  }
+  const encoded = nodes.map((node, index) => {
+    const typeAt = intern(node.type)
+    const nameAt = intern(node.name)
+    const head = Buffer.alloc(4)
+    head.writeUInt16LE(1, 0) // node version
+    head.writeUInt8(node.level, 2)
+    head.writeUInt8(node.array ? 1 : 0, 3)
+    return Buffer.concat([
+      head,
+      u32(typeAt),
+      u32(nameAt),
+      i32(node.size ?? -1),
+      i32(index),
+      i32(node.align ? 0x4000 : 0),
+      Buffer.alloc(8), // reference type hash
+    ])
+  })
+  const stringBuffer = Buffer.concat(strings)
+
+  let metadata = Buffer.concat([
+    Buffer.from('2022.3.62f1\0', 'ascii'),
+    i32(13),
+    Buffer.from([1]), // the tree is enabled
+    i32(1), // one type
+    i32(classId),
+    Buffer.from([0]), // not stripped
+    Buffer.from([0, 0]), // script type index
+    // A MonoBehaviour record carries the script hash before the type hash.
+    ...(classId === 114 ? [Buffer.alloc(16)] : []),
+    Buffer.alloc(16),
+    i32(nodes.length),
+    i32(stringBuffer.length),
+    ...encoded,
+    stringBuffer,
+    i32(0), // no type dependencies
+    i32(1), // one object
+  ])
+  metadata = align(Buffer.concat([Buffer.alloc(48), metadata]), 4).subarray(48)
+  metadata = Buffer.concat([
+    metadata,
+    i64(11),
+    i64(0),
+    u32(payload.length),
+    i32(0), // type index
+    i32(0),
+    i32(0),
+    i32(0),
+    Buffer.from([0]),
+  ])
+  const dataOffset = Math.ceil((48 + metadata.length) / 16) * 16
+  const header = Buffer.alloc(48)
+  header.writeUInt32BE(22, 8)
+  header.writeUInt32BE(metadata.length, 20)
+  header.writeBigInt64BE(BigInt(dataOffset + payload.length), 24)
+  header.writeBigInt64BE(BigInt(dataOffset), 32)
+  return Buffer.concat([
+    header,
+    metadata,
+    Buffer.alloc(dataOffset - 48 - metadata.length),
+    payload,
+  ])
+}
+
+// The tree and bytes of a CubismExpressionData, whose field names come from the
+// managed CubismUnityClasses/CubismExpressionData.cs.
+function syntheticCubismExpression() {
+  const string = (name, level) => [
+    { type: 'string', name, level, align: true },
+    { type: 'Array', name: 'Array', level: level + 1, array: true, align: true },
+    { type: 'int', name: 'size', size: 4, level: level + 2 },
+    { type: 'char', name: 'data', size: 1, level: level + 2 },
+  ]
+  const pptr = (name, target, level) => [
+    { type: `PPtr<${target}>`, name, size: 12, level },
+    { type: 'int', name: 'm_FileID', size: 4, level: level + 1 },
+    { type: 'SInt64', name: 'm_PathID', size: 8, level: level + 1 },
+  ]
+  const nodes = [
+    { type: 'MonoBehaviour', name: 'Base', level: 0 },
+    ...pptr('m_GameObject', 'GameObject', 1),
+    { type: 'UInt8', name: 'm_Enabled', size: 1, level: 1, align: true },
+    ...pptr('m_Script', 'MonoScript', 1),
+    ...string('m_Name', 1),
+    ...string('Type', 1),
+    { type: 'float', name: 'FadeInTime', size: 4, level: 1 },
+    { type: 'float', name: 'FadeOutTime', size: 4, level: 1 },
+    { type: 'vector', name: 'Parameters', level: 1 },
+    { type: 'Array', name: 'Array', level: 2, array: true, align: true },
+    { type: 'int', name: 'size', size: 4, level: 3 },
+    { type: 'SerializableExpressionParameter', name: 'data', level: 3 },
+    ...string('Id', 4),
+    { type: 'float', name: 'Value', size: 4, level: 4 },
+    { type: 'int', name: 'Blend', size: 4, level: 4 },
+  ]
+
+  const f32 = (value) => {
+    const buffer = Buffer.alloc(4)
+    buffer.writeFloatLE(value)
+    return buffer
+  }
+  const payload = Buffer.concat([
+    Buffer.alloc(12), // m_GameObject
+    Buffer.from([1, 0, 0, 0]), // m_Enabled, aligned
+    Buffer.alloc(12), // m_Script
+    alignedString('node-expression'),
+    alignedString('Live2D Expression'),
+    f32(0.5),
+    f32(1.25),
+    i32(2),
+    alignedString('ParamAngleX'),
+    f32(0.8),
+    i32(0),
+    alignedString('ParamAngleY'),
+    f32(-0.25),
+    i32(1),
+  ])
+  return typeTreeAsset(114, nodes, payload)
+}
+
 function syntheticTypeTreeIntAsset() {
   const payload = i32(42)
   const strings = Buffer.from('int\0value\0', 'ascii')
@@ -460,6 +591,32 @@ testAsyncWorkers().catch((error) => {
 
   // Reading one kind as another must fail rather than return something.
   assert.throws(() => fontStudio.readMovieTexture(0, 7n))
+}
+
+// The Cubism document readers, which had no Node binding: a caller could
+// materialize a whole package but not read one behaviour's document.
+{
+  const cubismStudio = addon.AssetStudio.fromBuffers([
+    { name: 'expression.assets', data: syntheticCubismExpression() },
+  ])
+  const expression = cubismStudio.readCubismExpression(0, 11n)
+  assert.strictEqual(expression.name, 'node-expression')
+  assert.strictEqual(expression.entryCount, 2)
+  const document = JSON.parse(expression.json.toString('utf8'))
+  assert.strictEqual(document.Type, 'Live2D Expression')
+  // The managed extractor writes exp3.json through Newtonsoft's default float
+  // format, so an integral value keeps its decimal point and a fraction keeps
+  // its shortest form.
+  assert.strictEqual(document.FadeInTime, 0.5)
+  assert.strictEqual(document.FadeOutTime, 1.25)
+  assert.deepStrictEqual(document.Parameters, [
+    { Id: 'ParamAngleX', Value: 0.8, Blend: 0 },
+    { Id: 'ParamAngleY', Value: -0.25, Blend: 1 },
+  ])
+  // A behaviour that is not an expression must fail rather than return an
+  // empty document.
+  assert.throws(() => cubismStudio.readCubismPhysics(0, 11n))
+  assert.throws(() => cubismStudio.readCubismFadeMotion(0, 11n))
 }
 
 console.log('node api: additional readers ok')

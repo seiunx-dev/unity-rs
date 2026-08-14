@@ -126,6 +126,17 @@ export declare class AssetStudio {
    */
   readStaticFbxBinary(maximumBytes?: number | undefined | null): Buffer
   /**
+   * Reads a `CubismPhysicsController` and writes its physics3.json.
+   *
+   * `motionFps` is the fallback the converter uses when the rig carries no
+   * frame rate of its own, matching the managed extractor's argument.
+   */
+  readCubismPhysics(fileIndex: number, pathId: bigint, motionFps?: number | undefined | null, maximumBytes?: number | undefined | null): CubismDocument
+  /** Reads a `CubismExpressionData` and writes its exp3.json. */
+  readCubismExpression(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismDocument
+  /** Reads a `CubismFadeMotionData` and writes its motion3.json. */
+  readCubismFadeMotion(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismDocument
+  /**
    * Enumerates the `GameObject` branches a split-objects export would write.
    *
    * The whole-collection FBX calls put every model in one file; these name
@@ -346,6 +357,23 @@ export interface BuildSettings {
   levels?: Array<string>
   /** 5.x and newer scene paths, absent on older layouts. */
   scenes?: Array<string>
+}
+
+/**
+ * One Cubism document produced from a single behaviour.
+ *
+ * The bytes are the document itself; the counts alongside are what a caller
+ * would otherwise have to parse the JSON to learn.
+ */
+export interface CubismDocument {
+  name: string
+  /** The document's own JSON text. */
+  json: Buffer
+  /**
+   * Sub-rigs for physics, parameters for an expression, curves for a
+   * motion. Zero for a document that has no such notion.
+   */
+  entryCount: number
 }
 
 /** One object the exporter could not write, and why. */
