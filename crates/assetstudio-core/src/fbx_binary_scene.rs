@@ -9,10 +9,10 @@
 //! material colours and connections come from code the differential already
 //! covers. What is new here is only how that content is laid out as records.
 //!
-//! This covers models, geometry, materials, textures, skin deformers and the
-//! connections between them. Blend shapes and animation stay on the ASCII path
-//! until each has been laid out and checked in turn; emitting a partial version
-//! of them would produce a file that looks complete and quietly is not.
+//! This covers models, geometry, materials, textures, deformers and the
+//! connections between them, plus skin deformers and blend shapes. Animation
+//! stays on the ASCII path until it has been laid out and checked; emitting a
+//! partial version would produce a file that looks complete and quietly is not.
 
 use std::io::Write;
 
@@ -45,15 +45,6 @@ pub fn write_model_ir_fbx_binary_with_textures<W: Write>(
     maximum_output_bytes: u64,
 ) -> Result<u64> {
     let scene = StaticScene::from_model(model, None, textures)?;
-    if scene
-        .geometries
-        .iter()
-        .any(|geometry| geometry.morph.is_some())
-    {
-        return Err(Error::unsupported(
-            "binary FBX does not yet emit blend shapes",
-        ));
-    }
     let roots = build_scene_nodes(&scene)?;
     let bytes = crate::fbx_binary::read_fbx_binary(&roots, maximum_output_bytes)?;
     output.write_all(&bytes)?;
@@ -84,10 +75,27 @@ fn build_scene_nodes(scene: &StaticScene<'_>) -> Result<Vec<FbxNode>> {
         objects.children.push(video_node(texture));
     }
     for geometry in &scene.geometries {
+        if let Some(morph) = &geometry.morph {
+            for channel in &morph.channels {
+                for shape in &channel.shapes {
+                    objects
+                        .children
+                        .push(shape_geometry_node(geometry.mesh, shape)?);
+                }
+            }
+        }
+    }
+    for geometry in &scene.geometries {
         if let Some(skin) = &geometry.skin {
             objects.children.push(skin_node(skin));
             for cluster in &skin.clusters {
                 objects.children.push(cluster_node(cluster));
+            }
+        }
+        if let Some(morph) = &geometry.morph {
+            objects.children.push(morph_node(morph));
+            for channel in &morph.channels {
+                objects.children.push(morph_channel_node(channel));
             }
         }
     }
@@ -402,12 +410,19 @@ fn video_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
 
 /// Every skin and cluster record the scene will emit.
 fn deformer_count(scene: &StaticScene<'_>) -> usize {
-    scene
+    let skins: usize = scene
         .geometries
         .iter()
         .filter_map(|geometry| geometry.skin.as_ref())
         .map(|skin| 1 + skin.clusters.len())
-        .sum()
+        .sum();
+    let morphs: usize = scene
+        .geometries
+        .iter()
+        .filter_map(|geometry| geometry.morph.as_ref())
+        .map(|morph| 1 + morph.channels.len())
+        .sum();
+    skins + morphs
 }
 
 /// The skin deformer a mesh's clusters hang from.
@@ -455,6 +470,84 @@ fn cluster_node(cluster: &crate::fbx_scene_ascii::ClusterPlan<'_>) -> FbxNode {
         )
 }
 
+/// The blend-shape deformer a mesh's channels hang from.
+fn morph_node(morph: &crate::fbx_scene_ascii::MorphPlan<'_>) -> FbxNode {
+    FbxNode::new("Deformer")
+        .with(FbxProperty::I64(morph.id))
+        .with(FbxProperty::String(format!(
+            "Deformer::{}BlendShape",
+            morph.name
+        )))
+        .with(FbxProperty::String("BlendShape".to_owned()))
+        .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
+}
+
+/// One channel: a named target and the weights at which its shapes apply.
+fn morph_channel_node(channel: &crate::fbx_scene_ascii::MorphChannelPlan<'_>) -> FbxNode {
+    let weights: Vec<f64> = channel
+        .full_weights
+        .iter()
+        .map(|weight| f64::from(*weight))
+        .collect();
+    FbxNode::new("Deformer")
+        .with(FbxProperty::I64(channel.id))
+        .with(FbxProperty::String(format!(
+            "SubDeformer::{}",
+            channel.name
+        )))
+        .with(FbxProperty::String("BlendShapeChannel".to_owned()))
+        .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
+        .child(FbxNode::new("DeformPercent").with(FbxProperty::F64(0.0)))
+        .child(FbxNode::new("FullWeights").with(FbxProperty::F64Array(weights)))
+}
+
+/// One target shape's geometry.
+///
+/// FBX stores a target as per-index offsets from the base control points named
+/// in `Indexes`, not as absolute positions: an importer adds these to the base
+/// vertex. X is mirrored to match the base geometry.
+fn shape_geometry_node(
+    mesh: &crate::mesh::Mesh,
+    shape: &crate::fbx_scene_ascii::ShapePlan<'_>,
+) -> Result<FbxNode> {
+    let mut indices = Vec::with_capacity(shape.vertices.len());
+    let mut offsets = Vec::with_capacity(shape.vertices.len() * 3);
+    for vertex in shape.vertices {
+        let index = usize::try_from(vertex.index)
+            .map_err(|_| Error::invalid_data("FBX target-shape vertex index does not fit usize"))?;
+        if index >= mesh.vertices.len() {
+            return Err(Error::invalid_data(
+                "FBX target-shape vertex index is out of range",
+            ));
+        }
+        indices.push(
+            i32::try_from(vertex.index).map_err(|_| {
+                Error::invalid_data("FBX target-shape vertex index does not fit i32")
+            })?,
+        );
+        offsets.push(f64::from(-vertex.vertex[0]));
+        offsets.push(f64::from(vertex.vertex[1]));
+        offsets.push(f64::from(vertex.vertex[2]));
+    }
+    let mut node = FbxNode::new("Geometry")
+        .with(FbxProperty::I64(shape.id))
+        .with(FbxProperty::String(format!("Geometry::{}", shape.name)))
+        .with(FbxProperty::String("Shape".to_owned()))
+        .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
+        .child(FbxNode::new("Indexes").with(FbxProperty::I32Array(indices)))
+        .child(FbxNode::new("Vertices").with(FbxProperty::F64Array(offsets)));
+    if shape.frame.has_normals {
+        let mut normals = Vec::with_capacity(shape.vertices.len() * 3);
+        for vertex in shape.vertices {
+            normals.push(f64::from(-vertex.normal[0]));
+            normals.push(f64::from(vertex.normal[1]));
+            normals.push(f64::from(vertex.normal[2]));
+        }
+        node = node.child(FbxNode::new("Normals").with(FbxProperty::F64Array(normals)));
+    }
+    Ok(node)
+}
+
 /// Object-to-object links, in the same order the ASCII writer emits them.
 fn connections(scene: &StaticScene<'_>) -> FbxNode {
     let mut connections = FbxNode::new("Connections");
@@ -484,6 +577,15 @@ fn connections(scene: &StaticScene<'_>) -> FbxNode {
             for cluster in &skin.clusters {
                 link(cluster.id, skin.id);
                 link(cluster.bone_model_id, cluster.id);
+            }
+        }
+        if let Some(morph) = &geometry.morph {
+            link(morph.id, geometry.id);
+            for channel in &morph.channels {
+                link(channel.id, morph.id);
+                for shape in &channel.shapes {
+                    link(shape.id, channel.id);
+                }
             }
         }
     }
@@ -975,15 +1077,56 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_scene_this_layout_would_silently_drop() {
-        // Blend shapes stay on the ASCII path. What matters is that a mesh
-        // carrying them is refused rather than written out as plain geometry,
-        // which would look like a successful export and lose the targets.
+    fn emits_blend_shape_targets_as_offsets_from_their_base_vertices() {
         let model = blend_shape_model_fixture();
-        let error = read_model_ir_fbx_binary(&model, 64 * 1024).unwrap_err();
-        assert!(
-            matches!(error, crate::Error::Unsupported(_)),
-            "a blend-shaped model should be unsupported, not invalid: {error}"
+        let bytes = read_model_ir_fbx_binary(&model, 64 * 1024).unwrap();
+        let roots = parse_fbx_binary(&bytes).unwrap();
+        let objects = roots
+            .iter()
+            .find(|node| node.name == "Objects")
+            .expect("an Objects record");
+
+        // The target's own geometry: which control points move, and by how
+        // much. FBX stores offsets, not absolute positions, so a writer that
+        // emitted positions would move every vertex to near the origin.
+        let shape = objects
+            .children
+            .iter()
+            .find(|node| {
+                node.name == "Geometry"
+                    && node.properties.get(2) == Some(&FbxProperty::String("Shape".to_owned()))
+            })
+            .expect("a Shape geometry");
+        assert_eq!(
+            child(shape, "Indexes").properties[0],
+            FbxProperty::I32Array(vec![0])
         );
+        // The fixture's delta is 0.1 along X, which the mirror negates.
+        match &child(shape, "Vertices").properties[0] {
+            FbxProperty::F64Array(values) => {
+                assert_eq!(values.len(), 3);
+                assert!(
+                    (values[0] + 0.1).abs() < 1e-6,
+                    "unexpected delta: {values:?}"
+                );
+            }
+            other => panic!("shape vertices are not a double array: {other:?}"),
+        }
+
+        // The channel names the target and carries the weight it applies at.
+        let channel = objects
+            .children
+            .iter()
+            .find(|node| {
+                node.properties.get(2) == Some(&FbxProperty::String("BlendShapeChannel".to_owned()))
+            })
+            .expect("a BlendShapeChannel");
+        assert_eq!(
+            child(channel, "FullWeights").properties[0],
+            FbxProperty::F64Array(vec![100.0])
+        );
+        assert!(objects.children.iter().any(|node| {
+            node.properties.get(2) == Some(&FbxProperty::String("BlendShape".to_owned()))
+        }));
     }
 }
