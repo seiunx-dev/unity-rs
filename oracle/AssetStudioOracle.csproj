@@ -18,17 +18,23 @@
   <PropertyGroup>
     <AssetStudioRepo Condition="'$(AssetStudioRepo)' == ''">$(MSBuildThisFileDirectory)../../AssetStudio</AssetStudioRepo>
     <AssetStudioProject>$(AssetStudioRepo)/AssetStudio/AssetStudio.csproj</AssetStudioProject>
+    <!-- ShaderConverter, the managed implementation the shader rows compare
+         against, lives here rather than in the core reader project. -->
+    <AssetStudioUtilityProject>$(AssetStudioRepo)/AssetStudioUtility/AssetStudioUtility.csproj</AssetStudioUtilityProject>
   </PropertyGroup>
 
   <Target Name="RequireAssetStudioCheckout" BeforeTargets="PrepareForBuild;CollectPackageReferences">
     <Error
-      Condition="!Exists('$(AssetStudioProject)')"
+      Condition="!Exists('$(AssetStudioProject)') Or !Exists('$(AssetStudioUtilityProject)')"
       Text="The managed oracle needs a Team-Haruki/AssetStudio checkout. Looked for '$(AssetStudioProject)'. Clone it beside this repository, or pass -p:AssetStudioRepo=&lt;path&gt;." />
   </Target>
 
   <ItemGroup>
     <ProjectReference
       Include="$(AssetStudioProject)"
+      SetTargetFramework="TargetFramework=net10.0" />
+    <ProjectReference
+      Include="$(AssetStudioUtilityProject)"
       SetTargetFramework="TargetFramework=net10.0" />
   </ItemGroup>
 

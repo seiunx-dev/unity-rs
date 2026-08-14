@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Buffers.Binary;
 using System.Reflection;
 using AssetStudio;
+using System.Text;
+using K4os.Compression.LZ4;
 
 if (args.Length != 1)
 {
@@ -175,21 +177,54 @@ static object AnimationClipPayload(AnimationClip clip)
     };
 }
 
+// Covers the 5.3-5.4 subprogram blob as well as the legacy direct script. The
+// guard that used to sit here refused the blob, so the converted-text path was
+// compared against nothing.
+//
+// It goes through ShaderProgram rather than ShaderConverter.Convert/WriteTo,
+// which would be the natural entry point, because ShaderConverter's static
+// constructor throws: its HeaderBytes field is initialized from the `header`
+// field declared ~880 lines below it, and C# runs static initializers in
+// declaration order, so `header` is still null. That poisons the whole type,
+// which is why the header bytes are spelled out here. ShaderProgram is a
+// separate type with its own initializer, so the managed reader and exporter --
+// the part this actually needs to compare against -- are still what runs.
+//
+// 5.5+ serialized shaders remain uncovered: reaching them means reproducing
+// more of ConvertSerializedShader here, which is worth doing only once the
+// upstream initializer is fixed and Convert can be called directly.
 static object ShaderPayload(Shader shader)
 {
-    if (shader.m_SubProgramBlob is not null || shader.compressedBlob is not null)
-    {
-        throw new InvalidDataException("Shader oracle direct-byte path only supports legacy scripts");
-    }
     ReadOnlySpan<byte> header = "//////////////////////////////////////////\n//\n// NOTE: This is *not* a valid shader file\n//\n///////////////////////////////////////////\n"u8;
-    var script = shader.m_Script ?? Array.Empty<byte>();
-    var hash = ContinueFnv1a64(script, ContinueFnv1a64(header, 0xcbf29ce484222325UL));
+    if (shader.compressedBlob is not null)
+    {
+        throw new InvalidDataException("Shader oracle does not yet cover 5.5+ serialized shaders");
+    }
+
+    byte[] body;
+    if (shader.m_SubProgramBlob is not null)
+    {
+        var decompressed = new byte[shader.decompressedSize];
+        LZ4Codec.Decode(shader.m_SubProgramBlob, decompressed);
+        using var blobReader = new BinaryReader(new MemoryStream(decompressed));
+        var program = new ShaderProgram(blobReader, shader.version);
+        program.Read(blobReader, 0);
+        var script = Encoding.UTF8.GetString(shader.m_Script ?? Array.Empty<byte>());
+        body = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
+            .GetBytes(program.Export(script));
+    }
+    else
+    {
+        body = shader.m_Script ?? Array.Empty<byte>();
+    }
+
+    var hash = ContinueFnv1a64(body, ContinueFnv1a64(header, 0xcbf29ce484222325UL));
     return new
     {
         Name = shader.m_Name,
         Data = new
         {
-            Size = checked(header.Length + script.LongLength),
+            Size = checked(header.Length + body.LongLength),
             Fnv64 = hash.ToString("x16"),
         },
     };

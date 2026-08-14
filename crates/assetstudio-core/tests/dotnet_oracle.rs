@@ -43,7 +43,21 @@ type ContainerCase = (&'static str, Vec<u8>, &'static [&'static str]);
 #[ignore = "requires the .NET 10 SDK and a Team-Haruki/AssetStudio checkout"]
 fn managed_and_rust_manifests_match_for_shared_fixture() {
     let executable = build_managed_oracle().unwrap();
-    let fixtures = [
+    for fixture in &object_fixtures() {
+        let managed = managed_manifest(&executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+        assert_eq!(managed, rust, "fixture {}", fixture.path.display());
+        assert_converted_shader(fixture, &managed);
+    }
+
+    assert_version_matrix(&executable);
+    assert_container_fixtures(&executable);
+    assert_truncated_fixture(&executable);
+}
+
+/// One fixture per object-level reader the gate compares.
+fn object_fixtures() -> Vec<TemporaryFixture> {
+    vec![
         TemporaryFixture::new("oracle-v13-big-endian.assets", &synthetic_v13_big_endian()).unwrap(),
         TemporaryFixture::new(
             "oracle-movie-2018.assets",
@@ -89,6 +103,11 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
         )
         .unwrap(),
         TemporaryFixture::new(
+            "oracle-shader-5.3.assets",
+            &synthetic_single_v22(48, 48, "5.3.8f2", &subprogram_shader()),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
             "oracle-controller-6000.2.assets",
             &synthetic_single_v22(91, 91, "6000.2.0f1", &animator_controller()),
         )
@@ -130,16 +149,30 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
             &oracle_resource(),
         )
         .unwrap(),
-    ];
-    for fixture in &fixtures {
-        let managed = managed_manifest(&executable, fixture.input_path()).unwrap();
-        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
-        assert_eq!(managed, rust, "fixture {}", fixture.path.display());
-    }
+    ]
+}
 
-    assert_version_matrix(&executable);
-    assert_container_fixtures(&executable);
-    assert_truncated_fixture(&executable);
+/// Confirms the 5.3 fixture really took the converted-text path.
+///
+/// Both readers reach the direct script when the subprogram blob is missing, so
+/// a fixture that lost its blob would still make the two agree while proving
+/// nothing about the conversion. The converted text is far longer than the
+/// header plus the source script, which the direct path would produce exactly.
+fn assert_converted_shader(fixture: &TemporaryFixture, manifest: &Value) {
+    const HEADER_BYTES: i64 = 122;
+    const SCRIPT_BYTES: i64 = 52;
+
+    if !fixture.path.to_string_lossy().contains("shader-5.3") {
+        return;
+    }
+    let size = manifest["Files"][0]["Objects"][0]["Payload"]["Data"]["Size"]
+        .as_i64()
+        .expect("the shader payload reports a size");
+    assert!(
+        size > HEADER_BYTES + SCRIPT_BYTES,
+        "the 5.3 shader fixture produced {size} bytes, which is the direct \
+         script rather than converted text"
+    );
 }
 
 /// Compares one file per serialized format version, 5 through 21.
@@ -1080,6 +1113,69 @@ fn sprite_texture() -> Vec<u8> {
     align(&mut output, 4);
     push_i32(&mut output, i32::try_from(pixels.len()).unwrap());
     output.extend_from_slice(&pixels);
+    output
+}
+
+/// A Unity 5.3 Shader carrying an LZ4 subprogram blob.
+///
+/// The oracle used to refuse anything but the legacy direct script, so both
+/// converted-text paths -- the 5.3-5.4 subprogram blob and the 5.5+ serialized
+/// shader -- were compared against nothing. This covers the first: the blob is
+/// decompressed, its program table walked, and the resulting text hashed by
+/// both readers.
+fn subprogram_shader() -> Vec<u8> {
+    let record = shader_sub_program_record(201_509_030, 1, &["DIRECTIONAL"], b"void main() {}");
+    let segment = shader_program_segment(&[(12, record.len())], &[&record]);
+    let compressed = lz4_flex::block::compress(&segment);
+
+    let mut output = Vec::new();
+    push_string(&mut output, "oracle-subprogram-shader");
+    let script = b"Shader \"Oracle/SubProgram\" { SubShader { Pass { } } }";
+    push_i32(&mut output, i32::try_from(script.len()).unwrap());
+    output.extend_from_slice(script);
+    align(&mut output, 4);
+    push_string(&mut output, "Oracle/SubProgram.shader");
+    push_u32(&mut output, u32::try_from(segment.len()).unwrap());
+    push_i32(&mut output, i32::try_from(compressed.len()).unwrap());
+    output.extend_from_slice(&compressed);
+    output
+}
+
+/// The blob's offset/length table followed by the records it points at.
+fn shader_program_segment(entries: &[(usize, usize)], records: &[&[u8]]) -> Vec<u8> {
+    let mut output = Vec::new();
+    push_i32(&mut output, i32::try_from(entries.len()).unwrap());
+    for (offset, length) in entries {
+        push_i32(&mut output, i32::try_from(*offset).unwrap());
+        push_i32(&mut output, i32::try_from(*length).unwrap());
+    }
+    for record in records {
+        output.extend_from_slice(record);
+    }
+    output
+}
+
+/// One sub-program: version, program type, reserved counters, keywords, code.
+fn shader_sub_program_record(
+    version: i32,
+    program_type: i32,
+    keywords: &[&str],
+    code: &[u8],
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    push_i32(&mut output, version);
+    push_i32(&mut output, program_type);
+    output.extend_from_slice(&[0; 12]);
+    if version >= 201_608_170 {
+        output.extend_from_slice(&[0; 4]);
+    }
+    push_i32(&mut output, i32::try_from(keywords.len()).unwrap());
+    for keyword in keywords {
+        push_string(&mut output, keyword);
+    }
+    push_i32(&mut output, i32::try_from(code.len()).unwrap());
+    output.extend_from_slice(code);
+    align(&mut output, 4);
     output
 }
 
