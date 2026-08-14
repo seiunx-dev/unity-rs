@@ -2149,6 +2149,189 @@ fn uses_internal_block_decoder(format: TextureFormat) -> bool {
     )
 }
 
+/// Which EAC channels a block carries, and whether its base is signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EacLayout {
+    R,
+    RSigned,
+    Rg,
+    RgSigned,
+}
+
+impl EacLayout {
+    const fn block_bytes(self) -> usize {
+        match self {
+            Self::R | Self::RSigned => 8,
+            Self::Rg | Self::RgSigned => 16,
+        }
+    }
+
+    const fn is_signed(self) -> bool {
+        matches!(self, Self::RSigned | Self::RgSigned)
+    }
+}
+
+/// Decodes EAC single- and dual-channel textures.
+///
+/// Implemented here rather than through `texture2ddecoder` because that crate's
+/// standalone EAC entry points read the block's 48-bit index field as a
+/// little-endian integer, while the format packs it most significant bit first.
+/// Its own ETC2 alpha decoder -- the same codec, reached through
+/// `decode_etc2_rgba8` -- reads it big-endian and agrees with the managed
+/// decoder; the standalone path does not, so every `EAC_R` and `EAC_RG` texture
+/// came out with a scrambled index stream. The differential caught it by
+/// feeding one block through both paths and finding the crate disagreeing with
+/// itself.
+///
+/// The arithmetic follows the same crate's ETC2 alpha routine, which is the
+/// half that was already verified against the managed decoder: eight-bit base
+/// plus multiplier times the modifier table entry, clamped.
+fn decode_eac(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    output: &mut [u32],
+    layout: EacLayout,
+) -> std::result::Result<(), &'static str> {
+    /// Maps a block's index position to its pixel slot, as the format's
+    /// column-major order requires.
+    const WRITE_ORDER: [usize; 16] = [15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0];
+    const MODIFIERS: [[i8; 8]; 16] = [
+        [-3, -6, -9, -15, 2, 5, 8, 14],
+        [-3, -7, -10, -13, 2, 6, 9, 12],
+        [-2, -5, -8, -13, 1, 4, 7, 12],
+        [-2, -4, -6, -13, 1, 3, 5, 12],
+        [-3, -6, -8, -12, 2, 5, 7, 11],
+        [-3, -7, -9, -11, 2, 6, 8, 10],
+        [-4, -7, -8, -11, 3, 6, 7, 10],
+        [-3, -5, -8, -11, 2, 4, 7, 10],
+        [-2, -6, -8, -10, 1, 5, 7, 9],
+        [-2, -5, -8, -10, 1, 4, 7, 9],
+        [-2, -4, -8, -10, 1, 3, 7, 9],
+        [-2, -5, -7, -10, 1, 4, 6, 9],
+        [-3, -4, -7, -10, 2, 3, 6, 9],
+        [-1, -2, -3, -10, 0, 1, 2, 9],
+        [-4, -6, -8, -9, 3, 5, 7, 8],
+        [-3, -5, -7, -9, 2, 4, 6, 8],
+    ];
+
+    let block_bytes = layout.block_bytes();
+    let blocks_wide = width.div_ceil(4);
+    let blocks_high = height.div_ceil(4);
+    let required = blocks_wide
+        .checked_mul(blocks_high)
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or("EAC block count overflowed")?;
+    if input.len() < required {
+        return Err("EAC payload is shorter than its block grid");
+    }
+    if output.len() < width.checked_mul(height).ok_or("EAC size overflowed")? {
+        return Err("EAC output buffer is too small");
+    }
+
+    let mut block = [0_u32; 16];
+    for block_y in 0..blocks_high {
+        for block_x in 0..blocks_wide {
+            let offset = (block_y * blocks_wide + block_x) * block_bytes;
+            // Opaque black, so a channel the layout does not carry stays zero.
+            block.fill(0xFF00_0000);
+            decode_eac_channel(
+                &input[offset..offset + 8],
+                &mut block,
+                16,
+                layout.is_signed(),
+                &WRITE_ORDER,
+                &MODIFIERS,
+            );
+            if block_bytes == 16 {
+                decode_eac_channel(
+                    &input[offset + 8..offset + 16],
+                    &mut block,
+                    8,
+                    layout.is_signed(),
+                    &WRITE_ORDER,
+                    &MODIFIERS,
+                );
+            }
+            copy_block_into_image(&block, output, width, height, block_x, block_y);
+        }
+    }
+    Ok(())
+}
+
+/// Decodes one 8-byte EAC channel block into `shift`-positioned bytes.
+///
+/// The arithmetic works in the format's eleven-bit space: the base codeword and
+/// the modifier are scaled by eight, a rounding term is added, and the result is
+/// shifted back down. That matters for the zero-multiplier case, where the
+/// substituted multiplier of one is an eleven-bit step -- an eighth of a level
+/// -- rather than a whole eight-bit one. Collapsing this to eight-bit
+/// arithmetic looks equivalent for every other multiplier and silently widens
+/// that one block's modifier range by eight.
+fn decode_eac_channel(
+    data: &[u8],
+    block: &mut [u32; 16],
+    shift: u32,
+    signed: bool,
+    write_order: &[usize; 16],
+    modifiers: &[[i8; 8]; 16],
+) {
+    let (base, rounding) = if signed {
+        // The signed base is a two's-complement codeword, and the larger
+        // rounding term re-centres the eleven-bit range around zero.
+        #[allow(clippy::cast_possible_wrap)]
+        (i32::from(data[0] as i8), 1023)
+    } else {
+        (i32::from(data[0]), 4)
+    };
+    let multiplier = match i32::from((data[1] >> 1) & 0x78) {
+        0 => 1,
+        value => value,
+    };
+    let table = modifiers[usize::from(data[1] & 0xf)];
+    // Most significant bit first: the index stream is a big-endian bit field,
+    // and reading it little-endian is exactly the upstream defect.
+    let mut indices = u64::from_be_bytes(data[..8].try_into().expect("an eight byte EAC block"));
+
+    for position in write_order {
+        let value = base * 8 + multiplier * i32::from(table[(indices & 7) as usize]) + rounding;
+        #[allow(clippy::cast_sign_loss)]
+        let value = if value < 0 {
+            0
+        } else if value >= 2048 {
+            255
+        } else {
+            (value >> 3) as u32
+        };
+        block[*position] = (block[*position] & !(0xFF << shift)) | (value << shift);
+        indices >>= 3;
+    }
+}
+
+/// Copies a decoded 4x4 block into the image, cropping at the edges.
+fn copy_block_into_image(
+    block: &[u32; 16],
+    output: &mut [u32],
+    width: usize,
+    height: usize,
+    block_x: usize,
+    block_y: usize,
+) {
+    for row in 0..4 {
+        let y = block_y * 4 + row;
+        if y >= height {
+            break;
+        }
+        for column in 0..4 {
+            let x = block_x * 4 + column;
+            if x >= width {
+                break;
+            }
+            output[y * width + x] = block[row * 4 + column];
+        }
+    }
+}
+
 fn decode_external_compressed_pixels(
     format: TextureFormat,
     input: &[u8],
@@ -2191,13 +2374,13 @@ fn decode_external_compressed_pixels(
         TextureFormat::ATC_RGBA8 => {
             texture2ddecoder::decode_atc_rgba8(input, width, height, &mut decoded)
         }
-        TextureFormat::EAC_R => texture2ddecoder::decode_eacr(input, width, height, &mut decoded),
+        TextureFormat::EAC_R => decode_eac(input, width, height, &mut decoded, EacLayout::R),
         TextureFormat::EAC_R_SIGNED => {
-            texture2ddecoder::decode_eacr_signed(input, width, height, &mut decoded)
+            decode_eac(input, width, height, &mut decoded, EacLayout::RSigned)
         }
-        TextureFormat::EAC_RG => texture2ddecoder::decode_eacrg(input, width, height, &mut decoded),
+        TextureFormat::EAC_RG => decode_eac(input, width, height, &mut decoded, EacLayout::Rg),
         TextureFormat::EAC_RG_SIGNED => {
-            texture2ddecoder::decode_eacrg_signed(input, width, height, &mut decoded)
+            decode_eac(input, width, height, &mut decoded, EacLayout::RgSigned)
         }
         TextureFormat::ETC2_RGB => {
             texture2ddecoder::decode_etc2_rgb(input, width, height, &mut decoded)
@@ -2836,6 +3019,7 @@ fn downscale_u16(low: u8, high: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use super::{EacLayout, decode_eac};
     use crate::loader::{AssetCollection, LoadedResource, LoadedSerializedFile};
     use crate::serialized::SerializedFile;
     use crate::source::Region;
@@ -3610,6 +3794,65 @@ mod tests {
                 .count(),
             8
         );
+    }
+
+    #[test]
+    fn eac_reads_its_index_stream_most_significant_bit_first() {
+        // Values verified against the managed decoder. The upstream crate reads
+        // this 48-bit field as a little-endian integer, which selects a
+        // different modifier per pixel and scrambles the whole block; its own
+        // ETC2 alpha decoder reads it big-endian and agrees with these.
+        let block = [0x80_u8, 0x10, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB];
+        let mut decoded = vec![0_u32; 16];
+        decode_eac(&block, 4, 4, &mut decoded, EacLayout::R).unwrap();
+
+        let red: Vec<u8> = decoded
+            .iter()
+            .map(|pixel| ((pixel >> 16) & 0xFF) as u8)
+            .collect();
+        assert_eq!(
+            red,
+            [
+                0x7D, 0x7A, 0x71, 0x82, 0x7D, 0x85, 0x7A, 0x88, 0x77, 0x7D, 0x8E, 0x85, 0x77, 0x85,
+                0x7D, 0x71
+            ]
+        );
+        // Single channel: green and blue stay clear, alpha opaque.
+        assert!(decoded.iter().all(|pixel| pixel.trailing_zeros() >= 16));
+        assert!(decoded.iter().all(|pixel| pixel >> 24 == 0xFF));
+    }
+
+    #[test]
+    fn a_zero_eac_multiplier_steps_in_eleven_bit_units() {
+        // The substituted multiplier of one is an eleven-bit step, an eighth of
+        // a level, not a whole eight-bit one. Doing this in eight-bit
+        // arithmetic looks identical for every other multiplier and widens this
+        // block's range eightfold, which is what the differential caught.
+        let mut block = [0_u8; 8];
+        block[0] = 185; // base
+        block[1] = 0x01; // multiplier nibble 0, modifier table 1
+        block[2..].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        let mut decoded = vec![0_u32; 16];
+        decode_eac(&block, 4, 4, &mut decoded, EacLayout::R).unwrap();
+
+        let red: Vec<u8> = decoded
+            .iter()
+            .map(|pixel| ((pixel >> 16) & 0xFF) as u8)
+            .collect();
+        let low = *red.iter().min().unwrap();
+        let high = *red.iter().max().unwrap();
+        assert!(
+            (183..=187).contains(&low) && (183..=187).contains(&high),
+            "a zero multiplier should stay within a few levels of the base, got {low}..={high}"
+        );
+    }
+
+    #[test]
+    fn eac_rejects_a_payload_shorter_than_its_block_grid() {
+        let mut decoded = vec![0_u32; 64];
+        assert!(decode_eac(&[0_u8; 8], 8, 8, &mut decoded, EacLayout::R).is_err());
+        // Two channels need sixteen bytes per block, not eight.
+        assert!(decode_eac(&[0_u8; 8], 4, 4, &mut decoded, EacLayout::Rg).is_err());
     }
 
     #[test]
