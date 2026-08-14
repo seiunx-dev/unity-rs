@@ -453,3 +453,18 @@ console.log('node api: multi-buffer, resource range and scene ok')
 }
 
 console.log('node api: export, extract and fbx ok')
+
+// Live2D discovery on a collection that has none, which is a fact rather than
+// an error.
+{
+  const emptyStudio = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  assert.deepEqual(emptyStudio.live2DPackages(), [])
+  // A non-clip object must be refused rather than misread as one.
+  const objects = emptyStudio.objectPage(0)
+  assert.throws(() => emptyStudio.readAnimationClipInfo(0, objects[0].pathId))
+  assert.throws(() => emptyStudio.readAnimatorController(0, objects[0].pathId))
+}
+
+console.log('node api: animation and live2d discovery ok')
