@@ -162,6 +162,16 @@ def groups(interpreter: str) -> list[Group]:
                         "sh", "-c", LINUX_WHEEL,
                     ],
                 ),
+                Step(
+                    "Node addon on Linux",
+                    [
+                        "docker", "run", "--rm", "--platform", "linux/amd64",
+                        "-v", f"{ROOT}:/src", "-w", "/src/crates/assetstudio-node",
+                        "-e", "CARGO_TARGET_DIR=/tmp/target",
+                        LINUX_IMAGE,
+                        "sh", "-c", LINUX_NODE,
+                    ],
+                ),
             ],
             requires="docker",
             reason="running the suite on Linux needs a container runtime",
@@ -216,7 +226,8 @@ LINUX_IMAGE = "rust:1.88-slim-bookworm"
 # zstd builds from C sources, so the image needs a compiler.
 LINUX_SETUP = "apt-get update -qq >/dev/null && apt-get install -y -qq gcc >/dev/null"
 
-# The Node addon is excluded: it links libnode, which this image does not carry.
+# The Node addon has its own step, since it needs a Node runtime the image
+# does not carry.
 LINUX_TESTS = (
     f"{LINUX_SETUP} && cargo test -p assetstudio-core -p assetstudio-cli --locked"
 )
@@ -230,6 +241,21 @@ LINUX_WHEEL = (
     " && /tmp/venv/bin/pip install --quiet --force-reinstall --no-deps /tmp/dist/*.whl"
     " && /tmp/venv/bin/python -I tests/installed_wheel.py"
     " && /tmp/venv/bin/python -I tests/python_api.py"
+)
+
+# The image has no Node, and Debian's is older than the one CI uses, so the
+# official build is fetched instead of installed from a package manager.
+LINUX_NODE_VERSION = "24.0.0"
+LINUX_NODE = (
+    f"{LINUX_SETUP} && apt-get install -y -qq curl xz-utils >/dev/null"
+    f" && curl -fsSL https://nodejs.org/dist/v{LINUX_NODE_VERSION}"
+    f"/node-v{LINUX_NODE_VERSION}-linux-x64.tar.xz -o /tmp/node.tar.xz"
+    " && tar -xJf /tmp/node.tar.xz -C /tmp"
+    f" && export PATH=/tmp/node-v{LINUX_NODE_VERSION}-linux-x64/bin:$PATH"
+    " && npm ci --silent && npm run build:debug && npm test"
+    # The addon lands in the mounted tree; leaving a foreign binary behind
+    # would confuse the next host build.
+    " && rm -f assetstudio-node.linux-x64-gnu.node"
 )
 
 INSTALL_WHEEL = (
