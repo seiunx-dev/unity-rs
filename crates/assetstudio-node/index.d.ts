@@ -109,6 +109,49 @@ export declare class AssetStudio {
    * cannot escape it.
    */
   static extract(input: string, outputRoot: string, overwrite?: boolean | undefined | null): ExtractionReport
+  /** Reads an `AnimationClip`'s shape without materializing its keyframes. */
+  readAnimationClipInfo(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AnimationClipInfo
+  /** Reads an `AnimatorController`'s identity and the clips it references. */
+  readAnimatorController(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AnimatorControllerInfo
+  /**
+   * Discovers the Live2D models in the collection.
+   *
+   * Only the shape of each package is returned. Materializing the files --
+   * the MOC, textures and JSON -- is a separate concern and belongs behind
+   * an explicit output budget.
+   */
+  live2DPackages(): Array<Live2DPackageInfo>
+}
+
+/**
+ * An `AnimationClip`'s shape, without materializing its keyframes.
+ *
+ * Separate booleans rather than a bitfield: this is a JavaScript-facing shape
+ * and a bitfield would only move the decoding to the other side.
+ */
+export interface AnimationClipInfo {
+  name: string
+  sampleRate: number
+  wrapMode: number
+  legacy: boolean
+  compressed: boolean
+  rotationCurveCount: number
+  positionCurveCount: number
+  scaleCurveCount: number
+  eulerCurveCount: number
+  floatCurveCount: number
+  /** Present when the clip carries muscle (humanoid) data. */
+  hasMuscleClip: boolean
+  /** Present when the clip's samples live in a sibling resource file. */
+  hasStreamingInfo: boolean
+}
+
+/** An `AnimatorController`'s identity and the clips it references. */
+export interface AnimatorControllerInfo {
+  name: string
+  /** Transform-path strings the controller's bindings resolve through. */
+  tosEntryCount: number
+  animationClipPathIds: Array<bigint>
 }
 
 /** One `AudioClip`'s stored payload and the extension its container implies. */
@@ -182,6 +225,19 @@ export interface FileInfo {
   path: string
   unityVersion: string
   objectCount: number
+}
+
+/** One Live2D model discovered in the collection. */
+export interface Live2DPackageInfo {
+  name: string
+  directoryName: string
+  mocFileName: string
+  textureCount: number
+  expressionCount: number
+  motionCount: number
+  hasPhysics: boolean
+  hasPose: boolean
+  hasDisplayInfo: boolean
 }
 
 /** A `Material`'s shader reference and its named property sheets. */

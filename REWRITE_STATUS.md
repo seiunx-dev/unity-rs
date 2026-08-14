@@ -148,9 +148,9 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - 自动从 managed assembly/dummy DLL 生成 schema 仍是独立的离线可信工具工作，不会在解析进程中加载或执行 DLL。
 
 4. **Node 专用 reader 完整度**
-   - Node 公开面从 15 个同步方法加 9 个 Promise 方法扩到 28 + 9：新增 `readAudio`、`readMonoScript`、`readMaterial`、`readBuildSettings`、`readPlayerSettings`、`readAvatar`、`readResourceRange`、`resourceIndexByPath`、`scene`、`readStaticFbx`、`export`、静态方法 `extract`，以及工厂方法 `openWithVersion` 与 `fromBuffers`。export 的单个对象失败按记录返回而不是抛出，一个读不出来的资产不该拖垮整轮；extract 不跟随子符号链接，归档路径一律先转成相对路径再拼到输出根下。Material 的属性值刻意不摊平到 JS：它们按表分类型，需要值的调用方用 Rust 或 Python API 更合适。
-   - Live2D 仍是完全缺失；FBX 已有静态几何输出，动画与贴图未接；
-   - 除专用 reader 外还缺：MonoBehaviour schema、AnimationClip/AnimatorController、ACL 检视与注入、Oodle decoder 注入；
+   - Node 公开面从 15 个同步方法加 9 个 Promise 方法扩到 31 + 9：新增 `readAudio`、`readMonoScript`、`readMaterial`、`readBuildSettings`、`readPlayerSettings`、`readAvatar`、`readResourceRange`、`resourceIndexByPath`、`scene`、`readStaticFbx`、`export`、静态方法 `extract`、`readAnimationClipInfo`、`readAnimatorController`、`live2DPackages`，以及工厂方法 `openWithVersion` 与 `fromBuffers`。export 的单个对象失败按记录返回而不是抛出；extract 不跟随子符号链接。Material 属性值与 Live2D 包文件都刻意只给形状不给内容：前者按表分类型，后者要落盘得走显式输出预算，硬摊平只会丢信息或绕过预算。
+   - Live2D 已有包发现（只给形状，落盘未接）；FBX 已有静态几何输出，动画与贴图未接；
+   - 除专用 reader 外还缺：MonoBehaviour 外部 schema、ACL 检视与注入、Oodle decoder 注入、Live2D 包落盘；
    - Node 是可选交付面，因此优先级低于 Core 和 Python 的真实语料兼容。
 
 5. **Live2D 散件发现**

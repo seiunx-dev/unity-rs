@@ -2,9 +2,12 @@
 
 use std::sync::Arc;
 
+use assetstudio_core::animation_clip::AnimationClipReadLimits;
+use assetstudio_core::animator_controller::AnimatorControllerReadLimits;
 use assetstudio_core::avatar::AvatarReadLimits;
 use assetstudio_core::export::ExportOptions;
 use assetstudio_core::extraction::ExtractionOptions;
+use assetstudio_core::live2d_package::Live2dPackageLimits;
 use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
@@ -188,6 +191,53 @@ pub struct ExtractionReport {
     pub skipped_existing_count: u32,
     pub failure_count: u32,
     pub output_bytes: BigInt,
+}
+
+/// An `AnimationClip`'s shape, without materializing its keyframes.
+///
+/// Separate booleans rather than a bitfield: this is a JavaScript-facing shape
+/// and a bitfield would only move the decoding to the other side.
+#[allow(clippy::struct_excessive_bools)]
+#[napi(object)]
+pub struct AnimationClipInfo {
+    pub name: String,
+    pub sample_rate: f64,
+    pub wrap_mode: i32,
+    pub legacy: bool,
+    pub compressed: bool,
+    pub rotation_curve_count: u32,
+    pub position_curve_count: u32,
+    pub scale_curve_count: u32,
+    pub euler_curve_count: u32,
+    pub float_curve_count: u32,
+    /// Present when the clip carries muscle (humanoid) data.
+    pub has_muscle_clip: bool,
+    /// Present when the clip's samples live in a sibling resource file.
+    pub has_streaming_info: bool,
+}
+
+/// An `AnimatorController`'s identity and the clips it references.
+#[napi(object)]
+pub struct AnimatorControllerInfo {
+    pub name: String,
+    /// Transform-path strings the controller's bindings resolve through.
+    pub tos_entry_count: u32,
+    pub animation_clip_path_ids: Vec<BigInt>,
+}
+
+/// One Live2D model discovered in the collection.
+#[allow(clippy::struct_excessive_bools)]
+#[napi(object)]
+pub struct Live2dPackageInfo {
+    pub name: String,
+    pub directory_name: String,
+    pub moc_file_name: String,
+    pub texture_count: u32,
+    pub expression_count: u32,
+    pub motion_count: u32,
+    pub has_physics: bool,
+    pub has_pose: bool,
+    pub has_display_info: bool,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -955,6 +1005,96 @@ impl AssetStudio {
                 .map_err(|_| invalid_arg("failure count does not fit u32"))?,
             output_bytes: BigInt::from(report.output_bytes),
         })
+    }
+
+    /// Reads an `AnimationClip`'s shape without materializing its keyframes.
+    #[napi]
+    pub fn read_animation_clip_info(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AnimationClipInfo> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let clip = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_animation_clip(AnimationClipReadLimits {
+                maximum_object_bytes: maximum,
+                ..AnimationClipReadLimits::default()
+            })
+            .map_err(core_error)?;
+        let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        Ok(AnimationClipInfo {
+            name: clip.name,
+            sample_rate: f64::from(clip.sample_rate),
+            wrap_mode: clip.wrap_mode,
+            legacy: clip.legacy,
+            compressed: clip.compressed,
+            rotation_curve_count: count(clip.rotation_curves.len()),
+            position_curve_count: count(clip.position_curves.len()),
+            scale_curve_count: count(clip.scale_curves.len()),
+            euler_curve_count: count(clip.euler_curves.len()),
+            float_curve_count: count(clip.float_curves.len()),
+            has_muscle_clip: clip.muscle_clip.is_some(),
+            has_streaming_info: clip.streaming_info.is_some(),
+        })
+    }
+
+    /// Reads an `AnimatorController`'s identity and the clips it references.
+    #[napi]
+    pub fn read_animator_controller(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AnimatorControllerInfo> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let controller = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_animator_controller(AnimatorControllerReadLimits {
+                maximum_object_bytes: maximum,
+                ..AnimatorControllerReadLimits::default()
+            })
+            .map_err(core_error)?;
+        Ok(AnimatorControllerInfo {
+            name: controller.name,
+            tos_entry_count: u32::try_from(controller.tos.len())
+                .map_err(|_| invalid_arg("TOS entry count does not fit u32"))?,
+            animation_clip_path_ids: controller
+                .animation_clips
+                .iter()
+                .map(|reference| BigInt::from(reference.path_id))
+                .collect(),
+        })
+    }
+
+    /// Discovers the Live2D models in the collection.
+    ///
+    /// Only the shape of each package is returned. Materializing the files --
+    /// the MOC, textures and JSON -- is a separate concern and belongs behind
+    /// an explicit output budget.
+    #[napi]
+    pub fn live2d_packages(&self) -> Result<Vec<Live2dPackageInfo>> {
+        let set = self
+            .studio
+            .live2d_packages(Live2dPackageLimits::default())
+            .map_err(core_error)?;
+        let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        Ok(set
+            .packages
+            .into_iter()
+            .map(|package| Live2dPackageInfo {
+                name: package.name,
+                directory_name: package.directory_name,
+                moc_file_name: package.moc_file_name,
+                texture_count: count(package.textures.len()),
+                expression_count: count(package.expressions.len()),
+                motion_count: count(package.motions.len()),
+                has_physics: package.physics.is_some(),
+                has_pose: package.pose.is_some(),
+                has_display_info: package.display_info.is_some(),
+            })
+            .collect())
     }
 }
 
