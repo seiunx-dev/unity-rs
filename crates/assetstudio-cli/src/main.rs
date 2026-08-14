@@ -21,6 +21,7 @@ use assetstudio_core::extraction::{ExtractionOptions, extract_path};
 use assetstudio_core::fbx_ascii::{
     write_model_ir_fbx_ascii_with_animations, write_model_ir_fbx_ascii_with_textures,
 };
+use assetstudio_core::fbx_binary_scene::write_model_ir_fbx_binary_full;
 use assetstudio_core::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
 use assetstudio_core::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
 use assetstudio_core::live2d_package::{Live2dPackage, Live2dPackageLimits, build_live2d_packages};
@@ -499,12 +500,13 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          than 536870912; the default is 16777216 bytes\n  \
          --no-textures                 Write the model without its textures\n  \
          --texture-format <FORMAT>     jpg|jpeg|png|bmp|tga|webp|raw-rgba; the default is png\n  \
+         --binary                      Write FBX 7.4's binary encoding instead of its text one\n  \
          Existing files are never overwritten.\n\n\
          OBJ export:\n  Writes the whole model as Wavefront OBJ with node transforms baked into\n  \
          world space, a companion .mtl under the same stem, and the same sibling textures.\n  \
          Face references name only the channels the mesh has, unlike the single-mesh\n  \
          .obj the export command writes, which mirrors the managed writer exactly.\n  \
-         It takes the same options as fbx.\n\n\
+         It takes the same options as fbx, except --binary: OBJ has one encoding.\n\n\
          Batch FBX options:\n  --maximum-output-bytes <N>  Per-file limit\n  \
          --no-animations               Omit selected animation clips\n  \
          --no-textures                 Write the models without their textures\n  \
@@ -551,6 +553,10 @@ struct FbxCommand {
     maximum_output_bytes: u64,
     textures: bool,
     texture_format: ImageFormat,
+    /// Write FBX 7.4's binary encoding rather than its text one.
+    ///
+    /// `obj` ignores this; only the FBX writers have two encodings.
+    binary: bool,
 }
 
 /// `obj` takes the same options as `fbx`; only the writer differs.
@@ -607,6 +613,7 @@ fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<F
     let mut saw_maximum = false;
     let mut textures = true;
     let mut texture_format = ImageFormat::Png;
+    let mut binary = false;
     let mut parse_options = true;
     let mut index = 0;
     while index < arguments.len() {
@@ -637,6 +644,15 @@ fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<F
             saw_maximum = true;
         } else if parse_options && argument == "--no-textures" {
             textures = false;
+        } else if parse_options && argument == "--binary" {
+            // Rejected for `obj` rather than ignored: an option that silently
+            // does nothing is worse than one that says it does not apply.
+            if command_name != "fbx" {
+                return Err(Error::invalid_data(
+                    "--binary applies to fbx only; OBJ has a single text encoding",
+                ));
+            }
+            binary = true;
         } else if parse_options && argument == "--texture-format" {
             index += 1;
             let value = arguments
@@ -677,6 +693,7 @@ fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<F
         maximum_output_bytes,
         textures,
         texture_format,
+        binary,
     })
 }
 
@@ -1040,13 +1057,26 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
         SceneTextureSet::default()
     };
     let mut temporary = FbxTemporaryFile::create(&parent)?;
-    let written = write_model_ir_fbx_ascii_with_textures(
-        &model,
-        &animations,
-        &textures,
-        temporary.file_mut(),
-        command.maximum_output_bytes,
-    )?;
+    // Both encodings take the same scene, so the choice is only which writer
+    // consumes it. The binary one takes the animation and texture sets by
+    // option because it shares one entry point where ASCII has three.
+    let written = if command.binary {
+        write_model_ir_fbx_binary_full(
+            &model,
+            Some(&animations),
+            (!textures.is_empty()).then_some(&textures),
+            temporary.file_mut(),
+            command.maximum_output_bytes,
+        )?
+    } else {
+        write_model_ir_fbx_ascii_with_textures(
+            &model,
+            &animations,
+            &textures,
+            temporary.file_mut(),
+            command.maximum_output_bytes,
+        )?
+    };
     temporary.file_mut().flush()?;
     temporary.file_mut().sync_all()?;
     temporary.close()?;
@@ -1057,7 +1087,8 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
     let written_textures = textures.write_to_directory(&parent)?;
     writeln!(
         output,
-        "exported ASCII FBX 7.4 ({written} bytes, {} animation clips) -> {}",
+        "exported {} FBX 7.4 ({written} bytes, {} animation clips) -> {}",
+        if command.binary { "binary" } else { "ASCII" },
         animations.clips.len(),
         command.output.display()
     )?;

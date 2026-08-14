@@ -68,6 +68,104 @@ fn fbx_exports_a_real_static_model_with_the_ascii_contract() {
     assert!(!root.path().join("ASExtract").exists());
 }
 
+/// The binary encoder existed in the library but no caller could reach it, so
+/// this covers the path that makes it reachable rather than the encoder, which
+/// has its own round-trip tests.
+///
+/// Checked against the format rather than against a byte pattern this crate
+/// produced: the 23-byte magic, the version word, and the same geometry the
+/// ASCII writer emits for the same model, read back through the parser.
+#[test]
+fn fbx_writes_the_binary_encoding_when_asked() {
+    let root = TestDirectory::new("binary");
+    let input = root.path().join("model.assets");
+    let destination = root.path().join("model.fbx");
+    let fixture = synthetic_model([0.0, 0.0, 0.0, 1.0]);
+    fs::write(&input, &fixture).unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "fbx".into(),
+            "--binary".into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+    assert_success(&result);
+    let bytes = fs::read(&destination).unwrap();
+    assert!(
+        bytes.starts_with(b"Kaydara FBX Binary  \0"),
+        "the file does not carry the binary FBX magic"
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[23..27].try_into().unwrap()),
+        7400,
+        "the version word is not 7.4"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("binary FBX 7.4"),
+        "the report still says ASCII: {}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+
+    // The same model through the text writer, so the two are known to describe
+    // the same scene rather than merely both existing.
+    let text_destination = root.path().join("text.fbx");
+    assert_success(&cli(
+        root.path(),
+        [
+            "fbx".into(),
+            input.as_os_str().into(),
+            text_destination.as_os_str().into(),
+        ],
+    ));
+    let text = fs::read_to_string(&text_destination).unwrap();
+    assert!(text.contains("PolygonVertexIndex: *3"));
+    let parsed = assetstudio_core::fbx_binary::parse_fbx_binary(&bytes).unwrap();
+    assert!(
+        contains_node(&parsed, "PolygonVertexIndex"),
+        "the binary file has no polygon indices"
+    );
+    assert!(
+        contains_node(&parsed, "Geometry"),
+        "the binary file has no geometry"
+    );
+}
+
+/// `obj` rejects the flag rather than accepting and ignoring it.
+#[test]
+fn obj_rejects_the_binary_flag() {
+    let root = TestDirectory::new("obj-binary");
+    let input = root.path().join("model.assets");
+    let destination = root.path().join("model.obj");
+    fs::write(&input, synthetic_model([0.0, 0.0, 0.0, 1.0])).unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "obj".into(),
+            "--binary".into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+    assert!(!result.status.success(), "obj accepted --binary");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("--binary applies to fbx only"),
+        "the error does not explain why: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!destination.exists(), "a rejected run still wrote a file");
+}
+
+/// Whether any node in the tree carries `name`.
+fn contains_node(nodes: &[assetstudio_core::fbx_binary::FbxNode], name: &str) -> bool {
+    nodes
+        .iter()
+        .any(|node| node.name == name || contains_node(&node.children, name))
+}
+
 #[test]
 fn obj_exports_the_model_with_a_companion_material_library() {
     let root = TestDirectory::new("obj-success");
