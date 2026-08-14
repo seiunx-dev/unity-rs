@@ -1,0 +1,214 @@
+'use strict'
+
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const addon = require('../index.js')
+
+function u32(value) {
+  const output = Buffer.alloc(4)
+  output.writeUInt32LE(value)
+  return output
+}
+
+function i32(value) {
+  const output = Buffer.alloc(4)
+  output.writeInt32LE(value)
+  return output
+}
+
+function i64(value) {
+  const output = Buffer.alloc(8)
+  output.writeBigInt64LE(BigInt(value))
+  return output
+}
+
+function align(buffer, alignment) {
+  const padding = (alignment - (buffer.length % alignment)) % alignment
+  return padding === 0 ? buffer : Buffer.concat([buffer, Buffer.alloc(padding)])
+}
+
+function alignedString(value) {
+  const bytes = Buffer.from(value, 'utf8')
+  return align(Buffer.concat([i32(bytes.length), bytes]), 4)
+}
+
+function syntheticTextAsset() {
+  const payload = Buffer.concat([
+    alignedString('node fixture'),
+    i32(10),
+    Buffer.from('hello node'),
+  ])
+  let metadata = Buffer.concat([
+    Buffer.from('2022.3.62f1\0', 'ascii'),
+    i32(13),
+    Buffer.from([0]),
+    i32(1),
+    i32(49),
+    Buffer.from([0]),
+    Buffer.from([0xff, 0xff]),
+    Buffer.alloc(16),
+    i32(1),
+  ])
+  metadata = align(Buffer.concat([Buffer.alloc(48), metadata]), 4).subarray(48)
+  metadata = Buffer.concat([
+    metadata,
+    i64(7),
+    i64(0),
+    u32(payload.length),
+    i32(0),
+    i32(0),
+    i32(0),
+    i32(0),
+    Buffer.from([0]),
+  ])
+  const dataOffset = Math.ceil((48 + metadata.length) / 16) * 16
+  const header = Buffer.alloc(48)
+  header.writeUInt32BE(22, 8)
+  header.writeUInt32BE(metadata.length, 20)
+  header.writeBigInt64BE(BigInt(dataOffset + payload.length), 24)
+  header.writeBigInt64BE(BigInt(dataOffset), 32)
+  return Buffer.concat([
+    header,
+    metadata,
+    Buffer.alloc(dataOffset - 48 - metadata.length),
+    payload,
+  ])
+}
+
+function syntheticTypeTreeIntAsset() {
+  const payload = i32(42)
+  const strings = Buffer.from('int\0value\0', 'ascii')
+  const node = Buffer.concat([
+    Buffer.from([2, 0, 0, 0]),
+    u32(0),
+    u32(4),
+    i32(4),
+    i32(0),
+    i32(0),
+    Buffer.alloc(8),
+  ])
+  let metadata = Buffer.concat([
+    Buffer.from('2022.3.62f1\0', 'ascii'),
+    i32(13),
+    Buffer.from([1]),
+    i32(1),
+    i32(123456),
+    Buffer.from([0]),
+    Buffer.from([0xff, 0xff]),
+    Buffer.alloc(16),
+    i32(1),
+    i32(strings.length),
+    node,
+    strings,
+    i32(0),
+    i32(1),
+  ])
+  metadata = align(Buffer.concat([Buffer.alloc(48), metadata]), 4).subarray(48)
+  metadata = Buffer.concat([
+    metadata,
+    i64(11),
+    i64(0),
+    u32(payload.length),
+    i32(0),
+    i32(0),
+    i32(0),
+    i32(0),
+    Buffer.from([0]),
+  ])
+  const dataOffset = Math.ceil((48 + metadata.length) / 16) * 16
+  const header = Buffer.alloc(48)
+  header.writeUInt32BE(22, 8)
+  header.writeUInt32BE(metadata.length, 20)
+  header.writeBigInt64BE(BigInt(dataOffset + payload.length), 24)
+  header.writeBigInt64BE(BigInt(dataOffset), 32)
+  return Buffer.concat([
+    header,
+    metadata,
+    Buffer.alloc(dataOffset - 48 - metadata.length),
+    payload,
+  ])
+}
+
+const input = syntheticTextAsset()
+const studio = addon.AssetStudio.fromBuffer(input, 'node.assets', input.length)
+
+assert.equal(studio.fileCount, 1)
+assert.equal(studio.objectCount, 1)
+assert.equal(studio.resourceCount, 0)
+assert.deepEqual(studio.filePage(), [
+  {
+    index: 0,
+    path: 'node.assets',
+    unityVersion: '2022.3.62f1',
+    objectCount: 1,
+  },
+])
+const objects = studio.objectPage(0)
+assert.equal(objects.length, 1)
+assert.equal(objects[0].pathId, 7n)
+assert.equal(objects[0].classId, 49)
+assert.equal(objects[0].name, 'node fixture')
+assert.equal(objects[0].byteSize, BigInt(input.length - Number(input.readBigInt64BE(32))))
+assert.deepEqual(studio.readText(0, 7n), Buffer.from('hello node'))
+assert.equal(studio.readRaw(0, 7n).length, Number(objects[0].byteSize))
+assert.throws(() => studio.readText(0, 7n, 9), /limit|exceed/i)
+assert.throws(() => studio.readTypeTreeJson(0, 7n), /TypeTree|type tree/i)
+assert.throws(() => studio.readTypeTreeDump(0, 7n), /TypeTree|type tree/i)
+assert.throws(() => studio.readTextureArray(0, 7n), /Texture2DArray|class ID/i)
+assert.throws(() => studio.readSprite(0, 7n), /Sprite|class ID/i)
+assert.throws(() => studio.objectPage(0, 0, 1_000_001), /page limit/i)
+assert.throws(() => addon.AssetStudio.fromBuffer(input, 'node.assets', 1), /exceed/i)
+
+async function testAsyncWorkers() {
+  const asyncStudio = await addon.AssetStudio.fromBufferAsync(
+    input,
+    'async-node.assets',
+    input.length,
+  )
+  assert.equal(asyncStudio.fileCount, 1)
+  assert.deepEqual(await asyncStudio.readTextAsync(0, 7n), Buffer.from('hello node'))
+  assert.deepEqual(await asyncStudio.readRawAsync(0, 7n), studio.readRaw(0, 7n))
+  await assert.rejects(asyncStudio.readTextAsync(0, 7n, 9), /limit|exceed/i)
+  await assert.rejects(asyncStudio.readShaderAsync(0, 7n), /Shader|class ID/i)
+  await assert.rejects(asyncStudio.readMeshObjAsync(0, 7n), /Mesh|class ID/i)
+  await assert.rejects(asyncStudio.readTextureAsync(0, 7n), /Texture2D|class ID/i)
+  await assert.rejects(asyncStudio.readTypeTreeJsonAsync(0, 7n), /TypeTree|type tree/i)
+  await assert.rejects(asyncStudio.readTypeTreeDumpAsync(0, 7n), /TypeTree|type tree/i)
+  await assert.rejects(asyncStudio.readTextureArrayAsync(0, 7n), /Texture2DArray|class ID/i)
+  await assert.rejects(asyncStudio.readSpriteAsync(0, 7n), /Sprite|class ID/i)
+
+  const treeInput = syntheticTypeTreeIntAsset()
+  const treeStudio = await addon.AssetStudio.fromBufferAsync(
+    treeInput,
+    'tree.assets',
+    treeInput.length,
+  )
+  assert.equal(treeStudio.readTypeTreeJson(0, 11n).toString('utf8'), '42')
+  assert.match(treeStudio.readTypeTreeDump(0, 11n).toString('utf8'), /42/)
+  assert.equal(
+    (await treeStudio.readTypeTreeJsonAsync(0, 11n)).toString('utf8'),
+    '42',
+  )
+  assert.match(
+    (await treeStudio.readTypeTreeDumpAsync(0, 11n)).toString('utf8'),
+    /42/,
+  )
+
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'assetstudio-node-'))
+  const fixturePath = path.join(directory, 'path.assets')
+  try {
+    fs.writeFileSync(fixturePath, input)
+    const pathStudio = await addon.AssetStudio.openAsync(fixturePath)
+    assert.equal(pathStudio.fileCount, 1)
+    assert.deepEqual(await pathStudio.readTextAsync(0, 7n), Buffer.from('hello node'))
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
+testAsyncWorkers().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})

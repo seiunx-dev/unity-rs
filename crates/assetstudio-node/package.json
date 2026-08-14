@@ -1,0 +1,40 @@
+{
+  "name": "assetstudio-rs-node",
+  "version": "0.1.0",
+  "description": "Native Node.js bindings for the AssetStudio Rust core",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aelurum/AssetStudio.git",
+    "directory": "rust/crates/assetstudio-node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "engines": {
+    "node": ">=20.17"
+  },
+  "scripts": {
+    "build": "napi build --platform --release -- --locked",
+    "build:debug": "napi build --platform -- --locked",
+    "test": "node tests/node_api.cjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.8.6"
+  },
+  "napi": {
+    "binaryName": "assetstudio-node",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ]
+  }
+}

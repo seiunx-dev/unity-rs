@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/assetstudio-cli",
+    "crates/assetstudio-core",
+    "crates/assetstudio-node",
+    "crates/assetstudio-python",
+]
+exclude = ["crates/assetstudio-ffi"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/aelurum/AssetStudio"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
