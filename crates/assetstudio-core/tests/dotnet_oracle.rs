@@ -297,28 +297,62 @@ fn assert_switch_textures(executable: &Path) {
     // out for the same reasons they are absent from the block-format matrix --
     // the recorded s3tc divergence and reserved encodings random bytes reach --
     // neither of which says anything about the swizzle.
-    const CASES: &[(&str, i32, usize, i32)] = &[
-        ("rgba32", 4, 4, 0),
-        ("rgba32-tall", 4, 4, 2),
-        ("bc7", 25, 16, 1),
+    // (name, format code, bytes per texel block, block height exponent,
+    //  width, height)
+    const CASES: &[(&str, i32, usize, i32, i32, i32)] = &[
+        // 64x64 keeps the padded surface a whole number of GOBs at every block
+        // height, so these three depend on nothing about the crop.
+        ("rgba32", 4, 4, 0, 64, 64),
+        ("rgba32-tall", 4, 4, 2, 64, 64),
+        ("bc7", 25, 16, 1, 64, 64),
+        // Sizes that do not fill their GOBs. The swizzle works on a padded
+        // surface and the visible image is cropped back out of it, so a
+        // dimension short of the padding multiple is a different path from the
+        // three above -- and the one a real texture atlas hits constantly.
+        // 40 rows pad to 64 at four GOBs per block; 20 columns of RGBA pad to
+        // 32.
+        ("rgba32-cropped-height", 4, 4, 2, 64, 40),
+        ("rgba32-cropped-both", 4, 4, 1, 20, 12),
+        // Block-compressed with a block count short of the multiple: 24 texels
+        // is six blocks where the GOB wants eight.
+        ("bc7-cropped", 25, 16, 1, 24, 24),
     ];
-    // 64x64 keeps the padded surface a whole number of GOBs at every block
-    // height these cases use, so nothing depends on the crop being lenient.
-    const SIZE: i32 = 64;
 
-    for (index, (name, format, texel_bytes, block_height_log2)) in CASES.iter().enumerate() {
-        let blocks = if *texel_bytes == 4 {
-            (SIZE * SIZE) as usize
+    for (index, (name, format, texel_bytes, block_height_log2, width, height)) in
+        CASES.iter().enumerate()
+    {
+        // A swizzled texture stores the padded surface, not the visible one:
+        // the GOB layout rounds the width up to whole 64-byte rows and the
+        // height up to whole blocks of GOBs, and the image is cropped back out
+        // on decode. Sizing the payload to the visible rectangle instead would
+        // be a texture Unity never wrote.
+        let (block_width, block_height) = if *texel_bytes == 4 {
+            (*width, *height)
         } else {
-            ((SIZE / 4) * (SIZE / 4)) as usize
+            ((width + 3) / 4, (height + 3) / 4)
         };
+        let gob_width_in_blocks = 64 / i32::try_from(*texel_bytes).unwrap();
+        let gobs_per_block = 1 << block_height_log2;
+        let round_up = |value: i32, multiple: i32| (value + multiple - 1) / multiple * multiple;
+        let padded_width = round_up(block_width, gob_width_in_blocks);
+        let padded_height = round_up(block_height, 8 * gobs_per_block);
+        let blocks = usize::try_from(padded_width * padded_height).unwrap();
+        // Three of these cases exist to exercise the crop, so they have to
+        // actually pad. Without this a change to the case table could quietly
+        // turn them into more copies of the aligned ones.
+        assert_eq!(
+            name.contains("cropped"),
+            (padded_width, padded_height) != (block_width, block_height),
+            "Switch case {name} pads to {padded_width}x{padded_height} \
+             from {block_width}x{block_height}"
+        );
         let payload = block_payload(blocks * texel_bytes, 0x5851_F42D_4C95_7F2D ^ index as u64);
         let mut blob = vec![0_u8; 12];
         blob[8..12].copy_from_slice(&block_height_log2.to_le_bytes());
         let object = texture2d_inline(
             &format!("oracle-switch-{name}"),
-            SIZE,
-            SIZE,
+            *width,
+            *height,
             *format,
             1,
             REVISION,
@@ -334,20 +368,12 @@ fn assert_switch_textures(executable: &Path) {
         assert_eq!(managed, rust, "Switch texture {name}");
         assert_eq!(
             managed["Files"][0]["Objects"][0]["Payload"]["Decoded"]["Size"],
-            i64::from(SIZE) * i64::from(SIZE) * 4,
+            i64::from(*width) * i64::from(*height) * 4,
             "Switch texture {name} did not decode a full surface: {managed}"
         );
     }
 }
 
-/// Compares decoded pixels for classic Crunch and `UnityCrunch` payloads.
-///
-/// The unit tests already check these against hashes taken from the bundled
-/// C++ decoder, but only the decoder in isolation. This runs the whole path the
-/// way a caller reaches it -- `Texture2D` parse, header sniff, transcode,
-/// mip-zero decode -- against the managed reader doing the same, so the version
-/// gate that chooses between the two Crunch dialects is compared too rather
-/// than assumed.
 /// Compares the Cubism physics conversion against the managed extractor.
 ///
 /// This is the one asset type in the differential whose layout is not a Unity
@@ -805,6 +831,14 @@ fn assert_astc_textures(executable: &Path) {
     );
 }
 
+/// Compares decoded pixels for classic Crunch and `UnityCrunch` payloads.
+///
+/// The unit tests already check these against hashes taken from the bundled
+/// C++ decoder, but only the decoder in isolation. This runs the whole path the
+/// way a caller reaches it -- `Texture2D` parse, header sniff, transcode,
+/// mip-zero decode -- against the managed reader doing the same, so the version
+/// gate that chooses between the two Crunch dialects is compared too rather
+/// than assumed.
 fn assert_crunched_textures(executable: &Path) {
     // Real CRN payloads; see tests/fixtures/crunch/README.md for provenance.
     // A classic payload needs a pre-2017.3 revision and a UnityCrunch one needs
