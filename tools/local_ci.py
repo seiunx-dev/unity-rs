@@ -20,6 +20,12 @@ suite and the Python wheel inside a container on the toolchain CI pins, which
 is behaviour rather than compilation. Neither covers Windows or macOS at once,
 so CI still has work to do.
 
+The `fbx` group is a second implementation rather than a second run: the
+crate's binary FBX reader and writer were built together, so their agreement
+shows they share assumptions, not that either matches the format. That group
+exports through the CLI and checks the bytes with a parser written from the
+format's rules.
+
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
 UnityPy are all optional. Anything that runs and fails is a failure.
@@ -118,6 +124,15 @@ def groups(interpreter: str) -> list[Group]:
             ],
             requires="vgmstream-cli",
             reason="the audio differential decodes with vgmstream-cli",
+        ),
+        Group(
+            "fbx",
+            [
+                Step(
+                    "binary FBX validity",
+                    ["python3", "tools/validate_fbx_binary.py", "--cli"],
+                )
+            ],
         ),
         Group(
             "cross",
