@@ -92,7 +92,9 @@ pub struct ModelAnimationClip {
     pub blend_shapes: Vec<ModelBlendShapeTrack>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// The clips resolved for a model. `Default` is the empty set, which a model
+/// with no Animator or Animation component legitimately has.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelAnimationSet {
     pub clips: Vec<ModelAnimationClip>,
 }

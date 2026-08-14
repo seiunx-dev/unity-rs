@@ -122,8 +122,8 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 1. **模型/FBX**
    - 当前输出为确定性的 ASCII FBX 7.4；尚无 binary FBX；
-   - **贴图未写出**：材质的贴图 PPtr 已进入 model IR，但 writer 不发射 `Texture`/`Video` 节点，带贴图模型导出为无贴图。`fbx` 命令会报告丢弃的绑定数量，不再静默。要真正写出还需决定图片文件落盘位置，这会改动当前"单文件原子发布"的输出契约；
-   - `CompressedMesh` 打包几何、Unity 6000.2 MeshLOD 和虚拟几何仍会明确报 Unsupported。
+   - **贴图已写出（2026-08-14）**：`scene_textures.rs` 解析材质的贴图 PPtr、按对象去重解码一次、分配稳定文件名，writer 发射连线到 `DiffuseColor`/`NormalMap`/`SpecularColor`/`Bump` 的 `Texture`/`Video` 对，UV offset/scale 取自材质自己的 `TexEnv`，属性名映射沿用托管 reader 的 `_MainTex`/`_BumpMap`/`Specular`/`Normal` 规则。这确实改动了"单文件原子发布"契约：图片写在 FBX 同级目录，`--no-textures` 可退回纯几何，`--texture-format` 可换 PNG 以外的格式。贴图名来自资产因而不可信，一律削成单个路径分量，已存在的文件不覆盖；批量导出共用一个名字分配器，避免两张同名贴图互相顶掉。解析不到 `Texture2D` 或解码失败的引用记为 skip 并报数，不拖垮整个模型；
+   - **`CompressedMesh` 打包几何已解码（2026-08-14）**：`packed_bits.rs` 提供共享的 `PackedFloatVector`/`PackedIntVector` 位流读取，顶点、八面体法线/切线加符号位、UV（读 packed channel descriptor）、31 量化蒙皮权重和索引缓冲全部还原；浮点刻意保持 f32，加宽会让 OBJ 文本与 oracle 分叉。Unity 6000.2 MeshLOD 和虚拟几何仍会明确报 Unsupported。
 
 2. **纹理和音频**
    - Switch 更低 mip、stripped mip 和未进入受验证 GOB 表的格式仍缺；
@@ -161,7 +161,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 1. 把托管差分 oracle 从裸 `.assets` 扩到容器、版本门和已实现的资产解码路径（P0 第 1 项，全部不需要专有样本，且能防止同类缺陷再生）；
 2. 扩充真实 corpus 和 C#→Rust 差分快照，按实际命中率排序缺口；
 3. 裁决 DXT1 punch-through alpha，并让 8 个 vgmstream 音频差分进入 CI、把全零 fixture 换成有内容的样本；
-4. 扩展 FBX 贴图输出（含图片落盘契约）与可选 binary 输出；
+4. 扩展可选 binary FBX 输出（贴图输出已完成）；
 5. 把 MOC3 标识表接入 Live2D 参数组，并补散件发现回退；
 6. 获取样本并实现 Unity 6000.2 MeshLOD/虚拟几何，而不是猜测布局；
 7. 完成许可清晰的纯 Rust Tuanjie ACL 解码；

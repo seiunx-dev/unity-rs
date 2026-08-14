@@ -14,6 +14,7 @@ use crate::mesh::Mesh;
 use crate::model_animation::ModelAnimationSet;
 use crate::model_ir::{ModelCoordinateConvention, ModelIr, ModelLocalTransform, ModelRendererKind};
 use crate::scene::Vector3;
+use crate::scene_textures::SceneTextureSet;
 use crate::{Error, Result};
 
 const MODEL_ID: i64 = 1_000_000;
@@ -52,6 +53,28 @@ pub fn write_model_ir_fbx_ascii_with_animations<W: Write>(
     crate::fbx_scene_ascii::write_model_ir_fbx_ascii_with_animations(
         model,
         Some(animations),
+        output,
+        maximum_output_bytes,
+    )
+}
+
+/// Writes a model, its animations and its material textures as ASCII FBX 7.4.
+///
+/// The `Texture` and `Video` objects reference each image by file name only, so
+/// the caller must write the set beside the FBX with
+/// [`SceneTextureSet::write_to_directory`](crate::scene_textures::SceneTextureSet::write_to_directory)
+/// for the references to resolve.
+pub fn write_model_ir_fbx_ascii_with_textures<W: Write>(
+    model: &ModelIr,
+    animations: &ModelAnimationSet,
+    textures: &SceneTextureSet,
+    output: &mut W,
+    maximum_output_bytes: u64,
+) -> Result<u64> {
+    crate::fbx_scene_ascii::write_model_ir_fbx_ascii_with_textures(
+        model,
+        Some(animations),
+        Some(textures),
         output,
         maximum_output_bytes,
     )
