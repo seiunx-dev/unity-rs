@@ -1430,6 +1430,58 @@ impl<'a> PackageState<'a> {
         Ok(active)
     }
 
+    /// The model's expressions, falling back to loose assets in its own file.
+    ///
+    /// The controller and list route is tried first and kept whenever it
+    /// produces anything: the list defines the expression order, which a file
+    /// scan cannot reproduce.
+    fn model_expressions(
+        &mut self,
+        active_model: &ActiveModel,
+        file_index: usize,
+        indexes: &ComponentIndexes,
+    ) -> Result<Vec<Live2dPackageExpression>> {
+        let expressions = self.read_model_expressions(
+            active_model.expression_controller,
+            &indexes.expression_controllers,
+            &indexes.roles,
+        )?;
+        if expressions.is_empty() {
+            return self.loose_expressions(&indexes.roles, file_index);
+        }
+        Ok(expressions)
+    }
+
+    /// The model's motions, in descending order of faithfulness: the fade
+    /// controller's list, then loose fade-motion assets, then `AnimationClip`s.
+    fn model_motions(
+        &mut self,
+        active_model: &ActiveModel,
+        indexes: &ComponentIndexes,
+        targets: &CubismMotionTargetNames,
+    ) -> Result<Vec<Live2dPackageMotion>> {
+        let model = &active_model.component;
+        let direct = components_for_model(&indexes.fade_motions_by_model, model.object);
+        let motions = self.read_model_motions(
+            active_model.fade_controller,
+            &indexes.fade_controllers,
+            direct,
+            &indexes.roles,
+            targets,
+        )?;
+        if !motions.is_empty() {
+            return Ok(motions);
+        }
+        let motions = self.loose_motions(&indexes.roles, model.object.file_index, targets)?;
+        if !motions.is_empty() {
+            return Ok(motions);
+        }
+        match model.game_object {
+            Some(game_object) => self.read_model_clip_motions(game_object, targets),
+            None => Ok(Vec::new()),
+        }
+    }
+
     fn build_package(
         &mut self,
         active_model: &ActiveModel,
@@ -1466,29 +1518,19 @@ impl<'a> PackageState<'a> {
             .map(|(_, renderers)| renderers.as_slice())
             .unwrap_or_default();
         let textures = self.read_model_textures(model_renderers)?;
-        let expressions = self.read_model_expressions(
-            active_model.expression_controller,
-            &indexes.expression_controllers,
-            &indexes.roles,
-        )?;
+        let expressions = self.model_expressions(active_model, model.object.file_index, indexes)?;
         let (motion_targets, eye_blink_parameters, lip_sync_parameters) =
             self.parameter_metadata_for_model(model.object, &moc, indexes)?;
-        let direct_motions = components_for_model(&indexes.fade_motions_by_model, model.object);
-        let mut motions = self.read_model_motions(
-            active_model.fade_controller,
-            &indexes.fade_controllers,
-            direct_motions,
-            &indexes.roles,
-            &motion_targets,
-        )?;
-        if motions.is_empty()
-            && let Some(game_object) = model.game_object
-        {
-            motions = self.read_model_clip_motions(game_object, &motion_targets)?;
-        }
+        let motions = self.model_motions(active_model, indexes, &motion_targets)?;
         let motion_fps = motions.first().map_or(0.0, |motion| motion.motion.fps());
-        let physics =
-            self.build_physics_file(&name, active_model.physics_controller, motion_fps)?;
+        let physics_controller = active_model.physics_controller.or_else(|| {
+            Self::loose_component(
+                &indexes.roles,
+                CubismRole::PhysicsController,
+                model.object.file_index,
+            )
+        });
+        let physics = self.build_physics_file(&name, physics_controller, motion_fps)?;
         let pose_components = components_for_model(&indexes.pose_parts_by_model, model.object);
         let pose = self.build_pose_file(&name, pose_components)?;
         let parameter_components =
@@ -2280,6 +2322,100 @@ impl<'a> PackageState<'a> {
             file_name,
             motion: Live2dPackageMotionSource::AnimationClip(motion),
         }))
+    }
+
+    /// Projects every loose `CubismFadeMotionData` in `file_index`.
+    ///
+    /// A fade-motion asset is usually a `ScriptableObject` with no `GameObject`, so
+    /// it never lands in the per-model grouping; without a `CubismFadeMotionList`
+    /// to name them, the model would export no motions at all. Tried before the
+    /// `AnimationClip` fallback, because a fade motion is the more faithful source
+    /// when both are present.
+    fn loose_motions(
+        &mut self,
+        roles: &[((usize, usize), CubismRole)],
+        file_index: usize,
+        targets: &CubismMotionTargetNames,
+    ) -> Result<Vec<Live2dPackageMotion>> {
+        let identities = Self::loose_identities(roles, CubismRole::FadeMotionData, file_index);
+        let mut motions = Vec::new();
+        let mut claimed = HashSet::new();
+        for identity in identities {
+            if let Some(motion) = self.project_motion(identity, targets, &mut claimed)? {
+                motions.push(motion);
+            }
+        }
+        Ok(motions)
+    }
+
+    /// Every loose component of `role` in `file_index`, in discovery order.
+    fn loose_identities(
+        roles: &[((usize, usize), CubismRole)],
+        role: CubismRole,
+        file_index: usize,
+    ) -> Vec<(usize, usize)> {
+        roles
+            .iter()
+            .filter(|((identity_file, _), candidate)| {
+                *candidate == role && *identity_file == file_index
+            })
+            .map(|(identity, _)| *identity)
+            .collect()
+    }
+
+    /// The first loose component of `role` in `file_index`, if any.
+    ///
+    /// The managed extractor falls back to whatever carries the right script
+    /// class in the same container group when the model's own component graph
+    /// does not reach one. A serialized file is the closest scope this reader
+    /// has to that group, and it keeps a loose object in one bundle from
+    /// attaching to a model in another.
+    fn loose_component(
+        roles: &[((usize, usize), CubismRole)],
+        role: CubismRole,
+        file_index: usize,
+    ) -> Option<(usize, usize)> {
+        Self::loose_identities(roles, role, file_index)
+            .into_iter()
+            .next()
+    }
+
+    /// Projects every loose `CubismExpressionData` in `file_index`.
+    ///
+    /// Only reached when the controller and list route produced nothing: a
+    /// model whose expressions are reachable through its own graph keeps that
+    /// ordering, which the list defines and a scan cannot reproduce.
+    fn loose_expressions(
+        &mut self,
+        roles: &[((usize, usize), CubismRole)],
+        file_index: usize,
+    ) -> Result<Vec<Live2dPackageExpression>> {
+        let identities = Self::loose_identities(roles, CubismRole::ExpressionData, file_index);
+        let mut expressions = Vec::new();
+        let mut claimed_names = HashSet::new();
+        for (file_index, object_index) in identities {
+            let loaded = self
+                .collection
+                .serialized_files
+                .get(file_index)
+                .ok_or_else(|| {
+                    Error::invalid_data("Cubism expression file index is out of range")
+                })?;
+            let object = loaded.file.objects.get(object_index).ok_or_else(|| {
+                Error::invalid_data("Cubism expression object index is out of range")
+            })?;
+            let target = crate::scene::ResolvedObject {
+                file_index,
+                file_path: loaded.path.as_str(),
+                file: &loaded.file,
+                object_index,
+                object,
+            };
+            if let Some(expression) = self.project_expression_target(&target, &mut claimed_names)? {
+                expressions.push(expression);
+            }
+        }
+        Ok(expressions)
     }
 
     fn build_physics_file(
@@ -3684,6 +3820,62 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_loose_expression_physics_and_fade_assets() {
+        // The GameObject keeps only its Transform and the CubismModel, so no
+        // controller is reachable through the component graph. The expression,
+        // physics and fade-motion assets are still in the file, which is what a
+        // bundle holding loose ScriptableObjects looks like.
+        let collection = expression_package_collection_with(&[(0, 10), (0, 20)]);
+        let set = build_live2d_packages(&collection, Live2dPackageLimits::default()).unwrap();
+
+        assert_eq!(set.packages.len(), 1);
+        let package = &set.packages[0];
+        assert_eq!(
+            package.expressions.len(),
+            1,
+            "the loose CubismExpressionData should be picked up"
+        );
+        assert_eq!(package.expressions[0].object.path_id, 24);
+        assert_eq!(package.expressions[0].name, "smile");
+        assert_eq!(
+            package.motions.len(),
+            1,
+            "the loose CubismFadeMotionData should be picked up"
+        );
+        assert_eq!(package.motions[0].name, "idle.fade");
+        assert!(
+            package.physics.is_some(),
+            "the loose CubismPhysicsController should be picked up"
+        );
+    }
+
+    #[test]
+    fn the_component_graph_wins_over_loose_assets() {
+        // The fallback must not change a model whose controllers are reachable:
+        // the list defines expression ordering, which a file scan cannot
+        // reproduce.
+        let reachable = build_live2d_packages(
+            &expression_package_collection(),
+            Live2dPackageLimits::default(),
+        )
+        .unwrap();
+        let loose = build_live2d_packages(
+            &expression_package_collection_with(&[(0, 10), (0, 20)]),
+            Live2dPackageLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reachable.packages[0].expressions[0].object, loose.packages[0].expressions[0].object,
+            "this fixture has one expression either way, so both routes agree"
+        );
+        assert!(
+            reachable.diagnostics.is_empty(),
+            "{:?}",
+            reachable.diagnostics
+        );
+    }
+
+    #[test]
     fn follows_expression_controller_list_and_materializes_exp3_json() {
         let collection = expression_package_collection();
         let set = build_live2d_packages(&collection, Live2dPackageLimits::default()).unwrap();
@@ -4107,6 +4299,15 @@ mod tests {
     }
 
     fn expression_package_collection() -> AssetCollection {
+        // The model's GameObject owns every controller, so each route is
+        // reachable through the component graph.
+        expression_package_collection_with(&[(0, 10), (0, 20), (0, 22), (0, 28), (0, 29)])
+    }
+
+    /// The same assets with a caller-chosen component list on the model's
+    /// `GameObject`, so a test can make the controllers unreachable while the
+    /// data objects stay in the file.
+    fn expression_package_collection_with(hero_components: &[(i32, i64)]) -> AssetCollection {
         let types = vec![
             TestType::plain(GAME_OBJECT),
             TestType::plain(TRANSFORM),
@@ -4130,11 +4331,7 @@ mod tests {
             TestType::plain(MONO_SCRIPT),
         ];
         let objects = vec![
-            TestObject::new(
-                1,
-                0,
-                game_object("Hero", &[(0, 10), (0, 20), (0, 22), (0, 28), (0, 29)]),
-            ),
+            TestObject::new(1, 0, game_object("Hero", hero_components)),
             TestObject::new(10, 1, transform((0, 1), &[(0, 11)], (0, 0))),
             TestObject::new(
                 2,
