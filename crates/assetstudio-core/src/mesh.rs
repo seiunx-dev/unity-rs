@@ -731,14 +731,14 @@ impl VertexData {
             .channels
             .first()
             .ok_or_else(|| Error::unsupported("Mesh VertexData has no position channel"))?;
-        require_float_channel(*position, 0, 3, 4, "position")?;
+        require_float_channel(*position, 0, 3, 4, "position", version)?;
         let normal_channel = self
             .channels
             .get(1)
             .copied()
             .filter(|channel| channel.dimension != 0);
         if let Some(channel) = normal_channel {
-            require_float_channel(channel, 1, 3, 4, "normal")?;
+            require_float_channel(channel, 1, 3, 4, "normal", version)?;
         }
         let uv0_channel_index = if version.0 < 2018 { 3 } else { 4 };
         let uv0_channel = self
@@ -747,7 +747,7 @@ impl VertexData {
             .copied()
             .filter(|channel| channel.dimension != 0);
         if let Some(channel) = uv0_channel {
-            require_float_channel(channel, uv0_channel_index, 2, 4, "UV0")?;
+            require_float_channel(channel, uv0_channel_index, 2, 4, "UV0", version)?;
         }
         let has_skin_channels = version >= (2018, 2, 0)
             && self
@@ -767,12 +767,12 @@ impl VertexData {
             )));
         }
 
-        let vertices = self.decode_vec3(*position, endian)?;
+        let vertices = self.decode_vec3(*position, endian, version)?;
         let normals = normal_channel
-            .map(|channel| self.decode_vec3(channel, endian))
+            .map(|channel| self.decode_vec3(channel, endian, version))
             .transpose()?;
         let uv0 = uv0_channel
-            .map(|channel| self.decode_vec2(channel, endian))
+            .map(|channel| self.decode_vec2(channel, endian, version))
             .transpose()?;
         let skin = self.decode_skin(version, endian)?;
 
@@ -847,55 +847,37 @@ impl VertexData {
         Ok(Some(skin))
     }
 
-    fn decode_vec3(&self, channel: Channel, endian: Endian) -> Result<Vec<[f32; 3]>> {
+    fn decode_vec3(
+        &self,
+        channel: Channel,
+        endian: Endian,
+        version: (u32, u32, u32),
+    ) -> Result<Vec<[f32; 3]>> {
         let mut values = reserve_vec(self.vertex_count, "Mesh three-component attributes")?;
         for vertex in 0..self.vertex_count {
             values.push([
-                self.read_f32(channel, vertex, 0, endian)?,
-                self.read_f32(channel, vertex, 1, endian)?,
-                self.read_f32(channel, vertex, 2, endian)?,
+                self.read_float_component(channel, vertex, 0, endian, version)?,
+                self.read_float_component(channel, vertex, 1, endian, version)?,
+                self.read_float_component(channel, vertex, 2, endian, version)?,
             ]);
         }
         Ok(values)
     }
 
-    fn decode_vec2(&self, channel: Channel, endian: Endian) -> Result<Vec<[f32; 2]>> {
+    fn decode_vec2(
+        &self,
+        channel: Channel,
+        endian: Endian,
+        version: (u32, u32, u32),
+    ) -> Result<Vec<[f32; 2]>> {
         let mut values = reserve_vec(self.vertex_count, "Mesh two-component attributes")?;
         for vertex in 0..self.vertex_count {
             values.push([
-                self.read_f32(channel, vertex, 0, endian)?,
-                self.read_f32(channel, vertex, 1, endian)?,
+                self.read_float_component(channel, vertex, 0, endian, version)?,
+                self.read_float_component(channel, vertex, 1, endian, version)?,
             ]);
         }
         Ok(values)
-    }
-
-    fn read_f32(
-        &self,
-        channel: Channel,
-        vertex: usize,
-        component: usize,
-        endian: Endian,
-    ) -> Result<f32> {
-        let stream = self.streams[usize::from(channel.stream)];
-        let offset = stream
-            .offset
-            .checked_add(
-                stream
-                    .stride
-                    .checked_mul(vertex)
-                    .ok_or_else(|| Error::invalid_data("Mesh vertex offset overflowed"))?,
-            )
-            .and_then(|value| value.checked_add(usize::from(channel.offset)))
-            .and_then(|value| value.checked_add(component * 4))
-            .ok_or_else(|| Error::invalid_data("Mesh component offset overflowed"))?;
-        let bytes: [u8; 4] = self.bytes[offset..offset + 4]
-            .try_into()
-            .expect("Mesh channel ranges were validated before decoding");
-        Ok(f32::from_bits(match endian {
-            Endian::Little => u32::from_le_bytes(bytes),
-            Endian::Big => u32::from_be_bytes(bytes),
-        }))
     }
 
     fn read_float_component(
@@ -1567,17 +1549,25 @@ fn require_mesh(file: &SerializedFile, object_index: usize) -> Result<&ObjectInf
     Ok(object)
 }
 
+/// Accepts any floating-point channel format, matching the managed reader.
+///
+/// Unity's Vertex Compression player setting stores normals, tangents and
+/// texture coordinates as Float16, and platform meshes also use the normalized
+/// 8- and 16-bit formats, so restricting this to Float32 would reject a large
+/// share of shipped meshes. Integer formats stay unsupported here: they belong
+/// to blend indices, not to positions or texture coordinates.
 fn require_float_channel(
     channel: Channel,
     index: usize,
     minimum_dimension: u8,
     maximum_dimension: u8,
     label: &str,
+    version: (u32, u32, u32),
 ) -> Result<()> {
-    if channel.format != 0 || !(minimum_dimension..=maximum_dimension).contains(&channel.dimension)
-    {
+    let is_float = vertex_format_kind(channel.format, version).is_ok_and(|kind| !kind.is_integer());
+    if !is_float || !(minimum_dimension..=maximum_dimension).contains(&channel.dimension) {
         return Err(Error::unsupported(format!(
-            "Mesh {label} channel {index} uses format {} and dimension {}; expected Float32 with {minimum_dimension}-{maximum_dimension} components",
+            "Mesh {label} channel {index} uses format {} and dimension {}; expected a floating-point format with {minimum_dimension}-{maximum_dimension} components",
             channel.format, channel.dimension
         )));
     }
@@ -1818,8 +1808,8 @@ mod tests {
     use crate::studio::Studio;
 
     use super::{
-        MESH_CLASS_ID, Mesh, MeshReadLimits, MeshSubMesh, read_mesh, read_mesh_with_collection,
-        write_mesh_obj, write_mesh_object_obj,
+        MESH_CLASS_ID, Mesh, MeshReadLimits, MeshSubMesh, STREAM_ALIGNMENT, read_mesh,
+        read_mesh_with_collection, write_mesh_obj, write_mesh_object_obj,
     };
 
     #[test]
@@ -2276,8 +2266,10 @@ mod tests {
                 "streamed Mesh",
             ),
             (
+                // Format 6 is UInt8 from 2019 on. Integer formats belong to
+                // blend indices, never to positions.
                 MeshFixtureOptions {
-                    position_format: 1,
+                    position_format: 6,
                     ..MeshFixtureOptions::default()
                 },
                 "position channel",
@@ -2294,6 +2286,44 @@ mod tests {
                 "expected {expected:?} in {error}"
             );
         }
+    }
+
+    #[test]
+    fn decodes_float16_positions_like_the_managed_reader() {
+        // Unity's Vertex Compression player setting is on by default in many
+        // builds and stores positions, normals and texture coordinates as
+        // Float16, so refusing anything but Float32 would reject a large share
+        // of shipped meshes. The stream stride follows the declared format, so
+        // this also covers the 6-byte-per-vertex position stream.
+        let file = parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+            position_format: 1,
+            ..MeshFixtureOptions::default()
+        }));
+        let mesh = read_mesh(&file, 0, MeshReadLimits::default()).unwrap();
+
+        assert_eq!(mesh.vertices.len(), FIXTURE_VERTICES.len());
+        for (decoded, (expected, _, _)) in mesh.vertices.iter().zip(FIXTURE_VERTICES) {
+            for (decoded, expected) in decoded.iter().zip(expected) {
+                if expected.is_nan() {
+                    assert!(decoded.is_nan());
+                } else {
+                    assert!(
+                        (decoded - expected).abs() < f32::EPSILON,
+                        "expected {expected}, decoded {decoded}"
+                    );
+                }
+            }
+        }
+        // The Float32 normal and UV streams still decode from their own
+        // strides, which shifted because stream 0 is now half the size.
+        assert_eq!(
+            mesh.normals.as_deref(),
+            Some([[1.0, 0.0, 0.0]; 3].as_slice())
+        );
+        assert_eq!(
+            mesh.uv0.as_deref(),
+            Some([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]].as_slice())
+        );
     }
 
     #[test]
@@ -2629,32 +2659,81 @@ mod tests {
         push_i32(output, 0);
     }
 
+    const FIXTURE_VERTICES: [([f32; 3], [f32; 2], [f32; 3]); 3] = [
+        ([1.5, 0.0, 0.0], [0.0, 0.0], [1.0, 0.0, 0.0]),
+        ([f32::NAN, 2.0, 0.0], [1.0, 0.0], [1.0, 0.0, 0.0]),
+        ([0.0, 0.0, 3.0], [0.0, 1.0], [1.0, 0.0, 0.0]),
+    ];
+
+    /// Encodes one component the way the declared channel format stores it.
+    ///
+    /// The reader derives each stream's stride from the channel formats, so a
+    /// fixture that always wrote Float32 could never exercise anything else.
+    fn push_float_component(output: &mut Vec<u8>, value: f32, format: u8) {
+        match format {
+            0 => output.extend_from_slice(&value.to_le_bytes()),
+            1 => output.extend_from_slice(&exact_half_bits(value).to_le_bytes()),
+            // The 2019+ single-byte integer formats appear only in rejection
+            // cases: the reader refuses the channel before reading any of these
+            // bytes, so only the width has to be right.
+            6 | 7 => output.push(0),
+            other => panic!("fixture cannot encode vertex format {other}"),
+        }
+    }
+
+    /// Converts a fixture value to Float16, asserting it survives exactly.
+    fn exact_half_bits(value: f32) -> u16 {
+        if value.is_nan() {
+            return 0x7e00;
+        }
+        let bits = value.to_bits();
+        let sign = u16::try_from((bits >> 16) & 0x8000).unwrap();
+        if value == 0.0 {
+            return sign;
+        }
+        let exponent = i32::try_from((bits >> 23) & 0xff).unwrap() - 127;
+        let mantissa = bits & 0x007f_ffff;
+        assert!(
+            (-14..=15).contains(&exponent),
+            "fixture value {value} is outside the Float16 range"
+        );
+        assert_eq!(
+            mantissa & 0x1fff,
+            0,
+            "fixture value {value} is not exactly representable as Float16"
+        );
+        sign | (u16::try_from(exponent + 15).unwrap() << 10)
+            | u16::try_from(mantissa >> 13).unwrap()
+    }
+
+    /// Pads to the stream alignment the reader assumes between streams.
+    fn pad_vertex_stream(vertex_data: &mut Vec<u8>) {
+        let padded = vertex_data.len().next_multiple_of(STREAM_ALIGNMENT);
+        vertex_data.resize(padded, 0);
+    }
+
     fn resident_vertex_data(options: MeshFixtureOptions) -> Vec<u8> {
         let mut vertex_data = Vec::new();
-        let vertices: [([f32; 3], [f32; 2], [f32; 3]); 3] = [
-            ([1.5, 0.0, 0.0], [0.0, 0.0], [1.0, 0.0, 0.0]),
-            ([f32::NAN, 2.0, 0.0], [1.0, 0.0], [1.0, 0.0, 0.0]),
-            ([0.0, 0.0, 3.0], [0.0, 1.0], [1.0, 0.0, 0.0]),
-        ];
+        let vertices = FIXTURE_VERTICES;
         for (position, _, _) in vertices {
             for value in position {
-                vertex_data.extend_from_slice(&value.to_le_bytes());
+                push_float_component(&mut vertex_data, value, options.position_format);
             }
         }
-        vertex_data.resize(48, 0);
+        pad_vertex_stream(&mut vertex_data);
         for (_, _, normal) in vertices {
             for value in normal {
                 vertex_data.extend_from_slice(&value.to_le_bytes());
             }
         }
-        vertex_data.resize(96, 0);
+        pad_vertex_stream(&mut vertex_data);
         for (_, uv, _) in vertices {
             for value in uv {
                 vertex_data.extend_from_slice(&value.to_le_bytes());
             }
         }
         if options.skinning && options.layout_version >= (2018, 2, 0) {
-            vertex_data.resize(128, 0);
+            pad_vertex_stream(&mut vertex_data);
             for weights in [
                 [1.0_f32, 0.0, 0.0, 0.0],
                 [0.25, 0.75, 0.0, 0.0],
