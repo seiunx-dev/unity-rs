@@ -196,6 +196,77 @@ fn rust_binary_payload(
     })
 }
 
+/// Curve keyframes hashed as a flat little-endian stream: the path, then every
+/// keyframe's time, value and both tangents as raw float bits. Bit patterns
+/// rather than decimal text so a rounding difference cannot hide.
+fn quaternion_curves_manifest(
+    curves: &[assetstudio_core::animation_clip::QuaternionCurve],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut values = Vec::new();
+    for curve in curves {
+        append_path(&mut values, &curve.path);
+        for key in &curve.curve.keyframes {
+            values.push(key.time.to_bits());
+            append_quaternion(&mut values, key.value);
+            append_quaternion(&mut values, key.in_slope);
+            append_quaternion(&mut values, key.out_slope);
+        }
+    }
+    u32_values_manifest(values.into_iter())
+}
+
+fn vector3_curves_manifest(
+    curves: &[assetstudio_core::animation_clip::Vector3Curve],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut values = Vec::new();
+    for curve in curves {
+        append_path(&mut values, &curve.path);
+        for key in &curve.curve.keyframes {
+            values.push(key.time.to_bits());
+            append_vector3(&mut values, key.value);
+            append_vector3(&mut values, key.in_slope);
+            append_vector3(&mut values, key.out_slope);
+        }
+    }
+    u32_values_manifest(values.into_iter())
+}
+
+fn float_curves_manifest(
+    curves: &[assetstudio_core::animation_clip::FloatCurve],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut values = Vec::new();
+    for curve in curves {
+        append_path(&mut values, &curve.path);
+        append_path(&mut values, &curve.attribute);
+        values.push(curve.class_id.cast_unsigned());
+        for key in &curve.curve.keyframes {
+            values.push(key.time.to_bits());
+            values.push(key.value.to_bits());
+            values.push(key.in_slope.to_bits());
+            values.push(key.out_slope.to_bits());
+        }
+    }
+    u32_values_manifest(values.into_iter())
+}
+
+fn append_path(values: &mut Vec<u32>, path: &str) {
+    values.push(u32::try_from(path.chars().count()).expect("a path length fits in u32"));
+    values.extend(path.chars().map(u32::from));
+}
+
+fn append_vector3(values: &mut Vec<u32>, value: assetstudio_core::animation_clip::Vector3) {
+    values.push(value.x.to_bits());
+    values.push(value.y.to_bits());
+    values.push(value.z.to_bits());
+}
+
+fn append_quaternion(values: &mut Vec<u32>, value: assetstudio_core::animation_clip::Vector4) {
+    values.push(value.x.to_bits());
+    values.push(value.y.to_bits());
+    values.push(value.z.to_bits());
+    values.push(value.w.to_bits());
+}
+
 fn animation_clip_manifest(
     studio: &Studio,
     file_index: usize,
@@ -240,6 +311,14 @@ fn animation_clip_manifest(
         "SampleRateBits": clip.sample_rate.to_bits(),
         "WrapMode": clip.wrap_mode,
         "EulerCurveCount": clip.euler_curves.len(),
+        // Keyframe values, not just curve counts. Everything below used to be
+        // compared by shape alone, so the times, values and tangents each
+        // reader produced were only ever checked against its own expectations.
+        "RotationCurves": quaternion_curves_manifest(&clip.rotation_curves)?,
+        "EulerCurves": vector3_curves_manifest(&clip.euler_curves)?,
+        "PositionCurves": vector3_curves_manifest(&clip.position_curves)?,
+        "ScaleCurves": vector3_curves_manifest(&clip.scale_curves)?,
+        "FloatCurves": float_curves_manifest(&clip.float_curves)?,
         "MusclePresent": clip.muscle_clip.is_some(),
         "StreamedCurveCount": clip
             .muscle_clip
