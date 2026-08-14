@@ -3563,7 +3563,7 @@ mod tests {
         Fsb5MpegLayer, Fsb5MpegStream, Fsb5OpusStream, Fsb5PcmStream, Fsb5VagStream,
         Fsb5VorbisStream, PcmSampleFormat, detect_direct_wav, parse_fsb5_dsp, parse_fsb5_fadpcm,
         parse_fsb5_hevag, parse_fsb5_ima, parse_fsb5_mpeg, parse_fsb5_opus, parse_fsb5_pcm,
-        parse_fsb5_vag, parse_fsb5_vorbis, write_direct_wav,
+        parse_fsb5_vag, parse_fsb5_vorbis, parse_mpeg_frame_header, write_direct_wav,
     };
     use crate::source::Region;
 
@@ -4384,8 +4384,15 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for channels in [1_u16, 2] {
-            let fsb_bytes = fsb5_mpeg_silence(channels, 2);
+        // The silent pair verifies framing across both channel counts; the tone
+        // is what makes this a decode comparison at all, since two readers
+        // agree on zeroes whatever their decoders do with the bits.
+        let cases = [
+            ("silence-mono", fsb5_mpeg_silence(1, 2)),
+            ("silence-stereo", fsb5_mpeg_silence(2, 2)),
+            ("tone-mono", fsb5_mpeg_tone()),
+        ];
+        for (channels, fsb_bytes) in cases {
             let region = Region::from_bytes(fsb_bytes.clone());
             let kind = detect_direct_wav(&region, Some(16)).unwrap().unwrap();
             let mut actual = Vec::new();
@@ -4405,7 +4412,30 @@ mod tests {
                 .expect("vgmstream-cli must be installed to run this ignored oracle test");
             assert!(status.success());
             let expected = std::fs::read(&output).unwrap();
-            assert_eq!(wave_data(&actual), wave_data(&expected));
+            let rust = wave_data(&actual);
+            let oracle = wave_data(&expected);
+            assert_eq!(rust.len(), oracle.len(), "{channels} sample count");
+            // Layer III output is not specified bit-exactly: the standard fixes
+            // the algorithm, not the rounding, so two independent decoders
+            // differ in the last place. Measured against this fixture the worst
+            // disagreement is one, on about seven percent of samples. Silence
+            // still has to match exactly, where any difference at all would be
+            // a real defect rather than rounding.
+            let tolerance = if channels.starts_with("silence") {
+                0
+            } else {
+                1
+            };
+            for (index, (rust, oracle)) in
+                rust.chunks_exact(2).zip(oracle.chunks_exact(2)).enumerate()
+            {
+                let rust = i32::from(i16::from_le_bytes(rust.try_into().unwrap()));
+                let oracle = i32::from(i16::from_le_bytes(oracle.try_into().unwrap()));
+                assert!(
+                    (rust - oracle).abs() <= tolerance,
+                    "{channels} sample {index}: {rust} vs {oracle}"
+                );
+            }
             std::fs::remove_file(input).unwrap();
             std::fs::remove_file(output).unwrap();
         }
@@ -4881,6 +4911,47 @@ mod tests {
         fsb.extend_from_slice(&mode.to_le_bytes());
         fsb.extend_from_slice(&data);
         fsb
+    }
+
+    /// The MPEG differential's non-silent payload: real Layer III frames.
+    ///
+    /// The silent fixture below verifies framing and nothing else -- both
+    /// readers agree on zeroes whatever their decoders do with the bits. This
+    /// one carries an actual tone, so a sample-level difference has somewhere
+    /// to show up.
+    const MPEG_TONE: &[u8] = include_bytes!("../tests/fixtures/audio/mpeg-layer3-tone.mp3");
+    /// Thirteen MPEG-1 Layer III frames at 1152 samples each.
+    const MPEG_TONE_FRAMES: u64 = 13;
+
+    fn fsb5_mpeg_tone() -> Vec<u8> {
+        // FSB5 pads every MPEG frame to a four-byte boundary, so a plain
+        // concatenation of the encoder's output is not a valid payload; the
+        // scan loses sync on the first frame whose length is not a multiple
+        // of four.
+        let mut data = Vec::with_capacity(MPEG_TONE.len() + 64);
+        let mut offset = 0_usize;
+        let mut frames = 0_u64;
+        while offset + 4 <= MPEG_TONE.len() {
+            let header = u32::from_be_bytes(
+                MPEG_TONE[offset..offset + 4]
+                    .try_into()
+                    .expect("four header bytes"),
+            );
+            let parsed = parse_mpeg_frame_header(header).expect("a Layer III frame header");
+            let length = usize::try_from(parsed.byte_length).expect("a frame length");
+            data.extend_from_slice(&MPEG_TONE[offset..offset + length]);
+            data.resize(data.len().next_multiple_of(4), 0);
+            offset += length;
+            frames += 1;
+        }
+        assert_eq!(frames, MPEG_TONE_FRAMES, "the fixture frame count changed");
+        fsb5(
+            1,
+            11,
+            0,
+            &[(MPEG_TONE_FRAMES * 1152, 1, 44_100, None)],
+            &data,
+        )
     }
 
     fn fsb5_mpeg_silence(channels: u16, frame_count: usize) -> Vec<u8> {

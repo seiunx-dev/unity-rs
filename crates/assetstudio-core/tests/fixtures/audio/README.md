@@ -13,3 +13,18 @@ comes from the compact, mechanically generated setup table described in
 
 `fsb5-vorbis-stereo-silence.fsb` is a minimal silent development fixture kept
 for parser diagnostics; semantic output tests use the non-silent fixture.
+
+# MPEG Layer III differential fixture
+
+`mpeg-layer3-tone.mp3` is a 0.3-second 440 Hz tone generated with `ffmpeg`'s
+`sine` source and encoded by the system `lame` at 128 kbps CBR, mono, 44.1 kHz,
+with the bit reservoir and the Xing/Info tag disabled so every frame stands
+alone. It is thirteen MPEG-1 Layer III frames and nothing else.
+
+The test repacks those frames into FSB5 framing, padding each to the four-byte
+boundary FSB5 requires. It replaced an all-zero fixture that compared framing
+only: two readers agree on silence whatever their decoders do, so a
+sample-level defect had nowhere to show.
+
+Layer III output is not specified bit-exactly, so the tone is compared with a
+one-unit tolerance; the silent cases alongside it still require exact equality.
