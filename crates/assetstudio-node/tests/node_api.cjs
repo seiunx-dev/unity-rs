@@ -120,6 +120,20 @@ function syntheticTexture2d() {
   return finishV22Asset(28, payload)
 }
 
+function syntheticMonoScript() {
+  // Name, execution order, the 16-byte properties hash, then the identity
+  // triple a MonoBehaviour is resolved through.
+  const payload = Buffer.concat([
+    alignedString('NodeScript'),
+    i32(-42),
+    Buffer.alloc(16),
+    alignedString('CubismMoc'),
+    alignedString('Live2D.Cubism.Core'),
+    alignedString('Live2D.Cubism.Core.dll'),
+  ])
+  return finishV22Asset(115, payload)
+}
+
 function syntheticTypeTreeIntAsset() {
   const payload = i32(42)
   const strings = Buffer.from('int\0value\0', 'ascii')
@@ -282,3 +296,28 @@ testAsyncWorkers().catch((error) => {
   console.error(error)
   process.exitCode = 1
 })
+
+// MonoScript identity, which is how a MonoBehaviour's type is resolved.
+{
+  const scriptDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'assetstudio-node-script-'))
+  try {
+  const scriptPath = path.join(scriptDirectory, 'script.assets')
+  fs.writeFileSync(scriptPath, syntheticMonoScript())
+  const scriptStudio = new addon.AssetStudio(scriptPath)
+  const objects = scriptStudio.objectPage(0)
+  assert.equal(objects.length, 1)
+  assert.equal(objects[0].classId, 115)
+  const script = scriptStudio.readMonoScript(0, objects[0].pathId)
+  assert.equal(script.name, 'NodeScript')
+  assert.equal(script.className, 'CubismMoc')
+  assert.equal(script.namespace, 'Live2D.Cubism.Core')
+  assert.equal(script.assemblyName, 'Live2D.Cubism.Core.dll')
+  assert.equal(script.executionOrder, -42)
+  // A limit below the payload has to be refused rather than truncated.
+  assert.throws(() => scriptStudio.readMonoScript(0, objects[0].pathId, 1))
+  } finally {
+    fs.rmSync(scriptDirectory, { recursive: true, force: true })
+  }
+}
+
+console.log('node api: additional readers ok')
