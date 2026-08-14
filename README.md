@@ -263,6 +263,19 @@ again on CPython 3.14. Tagged and manually dispatched builds also publish the
 verified source distribution, native CLI binaries, and the Rust Core crate as
 workflow artifacts.
 
+A second differential gate runs against
+[`UnityPy`](https://github.com/K0lb3/UnityPy), an independent implementation
+that installs from PyPI and needs no .NET, comparing object order, path IDs,
+class IDs, byte sizes, names and raw payload hashes
+(`crates/assetstudio-python/tests/unitypy_oracle.py`). It deliberately omits
+decoded-pixel and mesh rows: UnityPy decodes through the same upstream
+`texture2ddecoder` this workspace links and transliterates AssetStudio for mesh
+and shader work, so agreement there would not be independent evidence. Where
+UnityPy cannot resolve a name -- its name lookup goes through a bundled
+TypeTree database that does not cover every class and version -- the run
+reports the comparison as skipped rather than treating it as an agreed empty
+string.
+
 The managed-oracle CI job checks out the pinned managed parser and compares it with
 Rust over v13 big-endian/32-bit-PathID and v22
 little-endian/64-bit-PathID fixtures. The manifest locks object order, signed
