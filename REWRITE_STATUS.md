@@ -127,7 +127,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 2. **纹理和音频**
    - Switch 更低 mip、stripped mip 和未进入受验证 GOB 表的格式仍缺；
    - `Texture2D` 的 `m_ImageCount != 1` / `m_TextureDimension != 2` 会在格式分发前拒绝，而托管 converter 直接解首张图；PVRTC 还要求 2 的幂尺寸与 16x8/8x8 下限，因此只能取 mip0。这些拒绝条件此前未见于文档；
-   - **DXT1 punch-through alpha 待裁决**：`q0 <= q1` 模式下 index 3 的 alpha，Rust 与独立解码器（Pillow）给 `(0,0,0,0)`，AssetStudio 原生 `bcn.cpp` 给 `(0,0,0,255)`。该模式在真实 1-bit-alpha 内容中会命中，属于"跟 spec 还是跟参考实现"的取舍，需要显式决定并记录。（同批复核确认 DXT3/DXT5 调色板不是缺陷：Rust 符合 s3tc 规范，原生解码器复刻的是 NV4x 时代硬件行为，且 C# 侧根本没有 DXT3 解码器。）
+   - **DXT1 punch-through alpha 已裁决（2026-08-14）：跟 s3tc 规范**。`q0 <= q1` 模式下 index 3 解为透明黑 `(0,0,0,0)`，与独立解码器（Pillow）一致；AssetStudio 原生 `bcn.cpp` 给不透明黑 `(0,0,0,255)`，复刻的是 NV4x 时代硬件行为。这是对 oracle 的有意偏离——镂空贴图的遮罩区应当透明而非黑块——已在 `texture.rs` 注释、测试和兼容矩阵中记录。UnityPy 无法作为第三方仲裁：它与本项目共用同一个 `texture2ddecoder` 上游。（同批复核确认 DXT3/DXT5 调色板不是缺陷：Rust 符合 s3tc 规范，原生解码器复刻的是 NV4x 时代硬件行为，且 C# 侧根本没有 DXT3 解码器。）
    - multistream MPEG/Opus 和少数平台音频 codec 仍保留原始数据；
    - Opus/MPEG 的 vgmstream 差分目前使用全零 fixture，验证的是分帧而非采样内容；且 8 个音频差分全部 `#[ignore]`，CI 未执行；
    - 新增 codec 必须先有真实样本和独立 oracle，不能只凭推测实现。
