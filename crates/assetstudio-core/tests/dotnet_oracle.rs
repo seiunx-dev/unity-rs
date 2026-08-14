@@ -88,7 +88,8 @@ fn assert_split_group_fixture(executable: &Path) {
 
 /// One fixture per object-level reader the gate compares.
 fn object_fixtures() -> Vec<TemporaryFixture> {
-    vec![
+    let mut fixtures = mesh_fixtures();
+    fixtures.extend(vec![
         TemporaryFixture::new("oracle-v13-big-endian.assets", &synthetic_v13_big_endian()).unwrap(),
         TemporaryFixture::new(
             "oracle-movie-2018.assets",
@@ -116,7 +117,7 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
                 43,
                 43,
                 "6000.1.0f1",
-                &mesh_payload(Some((7, 120, "oracle-mesh.resS")), None),
+                &mesh_payload(Some((7, 120, "oracle-mesh.resS")), None, false),
             ),
             "oracle-mesh.resS",
             &streamed_mesh_resource(),
@@ -178,6 +179,23 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
             &synthetic_v22(),
             "oracle.resS",
             &oracle_resource(),
+        )
+        .unwrap(),
+    ]);
+    fixtures
+}
+
+/// The Mesh fixtures, including both shapes of packed geometry.
+fn mesh_fixtures() -> Vec<TemporaryFixture> {
+    vec![
+        TemporaryFixture::new(
+            "oracle-mesh-compressed.assets",
+            &synthetic_single_v22(43, 43, "2022.3.62f1", &compressed_mesh()),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
+            "oracle-mesh-compressed-only.assets",
+            &synthetic_single_v22(43, 43, "2022.3.62f1", &compressed_only_mesh()),
         )
         .unwrap(),
     ]
@@ -1688,16 +1706,52 @@ fn push_floats(output: &mut Vec<u8>, values: &[f32]) {
 
 #[allow(clippy::too_many_lines)]
 fn mesh() -> Vec<u8> {
-    mesh_payload(None, None)
+    mesh_payload(None, None, false)
 }
+
+/// A mesh whose geometry lives in the packed `CompressedMesh` vectors.
+///
+/// Unity writes this form whenever mesh compression is on in the import
+/// settings. The decode was implemented against the managed reader's source and
+/// verified only by this crate's own expectations, which is the pattern that
+/// produced every silent defect found so far.
+fn compressed_mesh() -> Vec<u8> {
+    mesh_payload(None, None, true)
+}
+
+/// The shape Unity actually writes: packed geometry and an empty vertex stream.
+///
+/// The fixture above keeps both sources populated, which exercises the overlay
+/// rule; this one is the realistic file, where the vertex data contributes
+/// nothing at all.
+fn compressed_only_mesh() -> Vec<u8> {
+    let mut output = mesh_payload(None, None, true);
+    // Blank the vertex-data vertex count in place: it is the u32 that precedes
+    // the channel table, and the managed reader skips the whole block when it
+    // is zero.
+    let marker = VERTEX_DATA_MARKER;
+    let position = output
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("the fixture carries the vertex-data header");
+    output[position..position + 4].copy_from_slice(&0_u32.to_le_bytes());
+    output
+}
+
+/// The vertex count and channel count that open the fixture's vertex data.
+const VERTEX_DATA_MARKER: [u8; 8] = [3, 0, 0, 0, 5, 0, 0, 0];
 
 #[allow(clippy::too_many_lines)]
 fn tuanjie_mesh() -> Vec<u8> {
-    mesh_payload(None, Some(3))
+    mesh_payload(None, Some(3), false)
 }
 
 #[allow(clippy::too_many_lines)]
-fn mesh_payload(stream: Option<(u64, u32, &str)>, tuanjie_revision: Option<u8>) -> Vec<u8> {
+fn mesh_payload(
+    stream: Option<(u64, u32, &str)>,
+    tuanjie_revision: Option<u8>,
+    compressed: bool,
+) -> Vec<u8> {
     let mut output = Vec::new();
     push_string(&mut output, "oracle-mesh");
     push_i32(&mut output, 1);
@@ -1718,7 +1772,7 @@ fn mesh_payload(stream: Option<(u64, u32, &str)>, tuanjie_revision: Option<u8>) 
     push_i32(&mut output, 0);
     push_i32(&mut output, 0);
 
-    output.extend_from_slice(&[0, 1, 0, 0]);
+    output.extend_from_slice(&[u8::from(compressed), 1, 0, 0]);
     if let Some(revision) = tuanjie_revision {
         if revision == 3 {
             align(&mut output, 4);
@@ -1751,17 +1805,33 @@ fn mesh_payload(stream: Option<(u64, u32, &str)>, tuanjie_revision: Option<u8>) 
     }
     align(&mut output, 4);
 
-    for _ in 0..4 {
+    if compressed {
+        // A range of 255 at eight bits makes every packed value decode to
+        // itself, so the expected geometry is readable in the fixture.
+        push_packed_float_data(&mut output, 9, 255.0, 0.0, &[1, 0, 0, 0, 2, 0, 0, 0, 3], 8);
+        push_empty_packed_float(&mut output); // UVs
+        push_empty_packed_float(&mut output); // normals
+        push_empty_packed_float(&mut output); // tangents
+        push_empty_packed_int(&mut output); // weights
+        push_empty_packed_int(&mut output); // normal signs
+        push_empty_packed_int(&mut output); // tangent signs
+        push_empty_packed_float(&mut output); // float colours
+        push_empty_packed_int(&mut output); // bone indices
+        push_packed_int_data(&mut output, &[0, 1, 2], 8);
+        push_u32(&mut output, 0); // UV info
+    } else {
+        for _ in 0..4 {
+            push_empty_packed_float(&mut output);
+        }
+        for _ in 0..3 {
+            push_empty_packed_int(&mut output);
+        }
         push_empty_packed_float(&mut output);
+        for _ in 0..2 {
+            push_empty_packed_int(&mut output);
+        }
+        push_u32(&mut output, 0);
     }
-    for _ in 0..3 {
-        push_empty_packed_int(&mut output);
-    }
-    push_empty_packed_float(&mut output);
-    for _ in 0..2 {
-        push_empty_packed_int(&mut output);
-    }
-    push_u32(&mut output, 0);
 
     output.extend_from_slice(&[0; 24]);
     for _ in 0..4 {
@@ -1835,6 +1905,54 @@ fn streamed_mesh_resource() -> Vec<u8> {
     let mut resource = vec![0xa5; 7];
     resource.extend_from_slice(&mesh_vertex_data());
     resource
+}
+
+/// Writes a `PackedFloatVector` carrying `values` at `bit_size` bits each.
+fn push_packed_float_data(
+    output: &mut Vec<u8>,
+    item_count: u32,
+    range: f32,
+    start: f32,
+    values: &[u32],
+    bit_size: u8,
+) {
+    push_u32(output, item_count);
+    output.extend_from_slice(&range.to_le_bytes());
+    output.extend_from_slice(&start.to_le_bytes());
+    let data = pack_bits(values, bit_size);
+    push_i32(output, i32::try_from(data.len()).unwrap());
+    output.extend_from_slice(&data);
+    align(output, 4);
+    output.push(bit_size);
+    align(output, 4);
+}
+
+/// Writes a `PackedIntVector` carrying `values` at `bit_size` bits each.
+fn push_packed_int_data(output: &mut Vec<u8>, values: &[u32], bit_size: u8) {
+    push_u32(output, u32::try_from(values.len()).unwrap());
+    let data = pack_bits(values, bit_size);
+    push_i32(output, i32::try_from(data.len()).unwrap());
+    output.extend_from_slice(&data);
+    align(output, 4);
+    output.push(bit_size);
+    align(output, 4);
+}
+
+/// Packs `values` little-endian at `bit_size` bits each.
+fn pack_bits(values: &[u32], bit_size: u8) -> Vec<u8> {
+    let mut bits = Vec::new();
+    for value in values {
+        for bit in 0..bit_size {
+            bits.push((value >> bit) & 1 == 1);
+        }
+    }
+    let mut bytes = vec![0_u8; bits.len().div_ceil(8)];
+    for (position, set) in bits.iter().enumerate() {
+        if *set {
+            bytes[position / 8] |= 1 << (position % 8);
+        }
+    }
+    bytes
 }
 
 fn push_empty_packed_float(output: &mut Vec<u8>) {

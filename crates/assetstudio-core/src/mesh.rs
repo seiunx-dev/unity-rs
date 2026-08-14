@@ -202,29 +202,40 @@ impl CompressedMesh {
     /// Tangents and colours are decoded by the managed reader too, but this
     /// type has nowhere to put them, so their vectors are left packed rather
     /// than decoded and dropped.
-    fn decode(&self, limits: MeshReadLimits) -> Result<DecodedVertexData> {
-        let flat = self.vertices.unpack(3, 0, None)?;
-        let vertex_count = flat.len() / 3;
-        if vertex_count == 0 {
-            return Err(Error::invalid_data("compressed Mesh has no vertices"));
+    /// Writes whatever the packed vectors carry over `decoded`, field by field.
+    ///
+    /// An empty vector leaves the vertex-data value in place, which is what the
+    /// managed reader does: each block is guarded on its own item count.
+    fn overlay(&self, decoded: &mut DecodedVertexData, limits: MeshReadLimits) -> Result<()> {
+        if !self.vertices.is_empty() {
+            let flat = self.vertices.unpack(3, 0, None)?;
+            let vertex_count = flat.len() / 3;
+            if vertex_count == 0 {
+                return Err(Error::invalid_data("compressed Mesh has no vertices"));
+            }
+            if vertex_count > limits.maximum_vertices {
+                return Err(Error::invalid_data(format!(
+                    "compressed Mesh has {vertex_count} vertices, exceeding limit {}",
+                    limits.maximum_vertices
+                )));
+            }
+            let mut vertices = reserve_vec(vertex_count, "compressed Mesh vertices")?;
+            for chunk in flat.chunks_exact(3) {
+                vertices.push([chunk[0], chunk[1], chunk[2]]);
+            }
+            decoded.vertices = vertices;
         }
-        if vertex_count > limits.maximum_vertices {
-            return Err(Error::invalid_data(format!(
-                "compressed Mesh has {vertex_count} vertices, exceeding limit {}",
-                limits.maximum_vertices
-            )));
+        let vertex_count = decoded.vertices.len();
+        if let Some(normals) = self.decode_normals()? {
+            decoded.normals = Some(normals);
         }
-        let mut vertices = reserve_vec(vertex_count, "compressed Mesh vertices")?;
-        for chunk in flat.chunks_exact(3) {
-            vertices.push([chunk[0], chunk[1], chunk[2]]);
+        if let Some(uv0) = self.decode_uv0(vertex_count)? {
+            decoded.uv0 = Some(uv0);
         }
-
-        Ok(DecodedVertexData {
-            vertices,
-            normals: self.decode_normals()?,
-            uv0: self.decode_uv0(vertex_count)?,
-            skin: self.decode_skin(vertex_count)?,
-        })
+        if let Some(skin) = self.decode_skin(vertex_count)? {
+            decoded.skin = Some(skin);
+        }
+        Ok(())
     }
 
     /// Rebuilds normals from their octahedral pair plus a sign bit.
@@ -635,7 +646,17 @@ fn read_mesh_inner(
         )));
     }
 
-    let (decoded, index_buffer) = if compressed.has_items() {
+    // The packed vectors overlay the vertex data rather than replacing it.
+    // Unity writes one form or the other, never both, but the managed reader
+    // decodes whatever each source carries and lets the compressed values win
+    // per field. Choosing one source outright would drop the channels the other
+    // holds if a file ever arrived with both.
+    let mut decoded = if vertex_data.has_vertices() {
+        vertex_data.decode(reader.reader.endian(), limits, version)?
+    } else {
+        DecodedVertexData::default()
+    };
+    if compressed.has_items() {
         let indices = compressed.triangles.unpack()?;
         if indices.len() > limits.maximum_indices {
             return Err(Error::invalid_data(format!(
@@ -644,13 +665,15 @@ fn read_mesh_inner(
                 limits.maximum_indices
             )));
         }
-        (compressed.decode(limits)?, indices)
-    } else {
-        (
-            vertex_data.decode(reader.reader.endian(), limits, version)?,
-            index_buffer,
-        )
-    };
+        if !indices.is_empty() {
+            index_buffer = indices;
+        }
+        compressed.overlay(&mut decoded, limits)?;
+    }
+    if decoded.vertices.is_empty() {
+        return Err(Error::invalid_data("Mesh has no vertices"));
+    }
+    let decoded = decoded;
     let vertex_count = decoded.vertices.len();
     if let Some(shapes) = &blend_shapes {
         validate_blend_shapes(shapes, vertex_count)?;
@@ -940,6 +963,7 @@ struct VertexData {
     bytes: Vec<u8>,
 }
 
+#[derive(Default)]
 struct DecodedVertexData {
     vertices: Vec<[f32; 3]>,
     normals: Option<Vec<[f32; 3]>>,
@@ -948,6 +972,11 @@ struct DecodedVertexData {
 }
 
 impl VertexData {
+    /// Whether the uncompressed stream declares any vertices to decode.
+    const fn has_vertices(&self) -> bool {
+        self.vertex_count != 0
+    }
+
     fn decode(
         self,
         endian: Endian,
