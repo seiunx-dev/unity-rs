@@ -3,6 +3,7 @@ use std::io::{self, Write};
 
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::loader::AssetCollection;
+use crate::managed_number::ManagedNumber;
 use crate::packed_bits::{PackedFloatVector, PackedIntVector};
 use crate::serialized::{ObjectInfo, SerializedFile};
 use crate::source::{Region, RegionCursor};
@@ -2094,134 +2095,19 @@ fn reserve_vec<T>(capacity: usize, field: &str) -> Result<Vec<T>> {
 /// that comparison is what the differential is for.
 pub(crate) struct ObjFloat(pub(crate) f32);
 
-/// Room for any `f32` in exponential form: sign, ten mantissa characters,
-/// `e`, sign and two exponent digits.
-struct DecimalBuffer {
-    bytes: [u8; 32],
-    length: usize,
-}
-
-impl DecimalBuffer {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; 32],
-            length: 0,
-        }
-    }
-
-    fn push(&mut self, byte: u8) -> fmt::Result {
-        *self.bytes.get_mut(self.length).ok_or(fmt::Error)? = byte;
-        self.length += 1;
-        Ok(())
-    }
-
-    fn as_str(&self) -> &str {
-        // Filled only through `write_str` and `push`, and `push` is only ever
-        // handed ASCII digits.
-        std::str::from_utf8(&self.bytes[..self.length]).unwrap_or_default()
-    }
-}
-
-impl fmt::Write for DecimalBuffer {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let end = self.length.checked_add(text.len()).ok_or(fmt::Error)?;
-        self.bytes
-            .get_mut(self.length..end)
-            .ok_or(fmt::Error)?
-            .copy_from_slice(text.as_bytes());
-        self.length = end;
-        Ok(())
-    }
-}
-
 impl fmt::Display for ObjFloat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use fmt::Write as _;
-
         let value = self.0;
         if value.is_nan() {
-            // The managed writer substitutes NaN as it writes the line, so the
+            // The managed writer substitutes NaN as it writes each line, so the
             // token never reaches the document.
             return formatter.write_str("0");
         }
         if value.is_infinite() {
             return formatter.write_str(if value < 0.0 { "-Infinity" } else { "Infinity" });
         }
-        if value.is_sign_negative() {
-            formatter.write_str("-")?;
-        }
-        let magnitude = value.abs();
-        if magnitude == 0.0 {
-            return formatter.write_str("0");
-        }
-
-        // The shortest form gives the digit count. Re-rendering at exactly that
-        // many digits gives .NET's rounding: both break ties at the last digit,
-        // but Rust's shortest form breaks them away from zero and its
-        // fixed-precision form breaks them to even, which is what .NET does.
-        // Without the second pass, values like -1298351.25 print as
-        // `-1298351.3` here and `-1298351.2` there.
-        let mut shortest = DecimalBuffer::new();
-        write!(shortest, "{magnitude:e}")?;
-        let significant = shortest
-            .as_str()
-            .split_once('e')
-            .ok_or(fmt::Error)?
-            .0
-            .bytes()
-            .filter(u8::is_ascii_digit)
-            .count();
-        let mut rendered = DecimalBuffer::new();
-        write!(rendered, "{:.*e}", significant.saturating_sub(1), magnitude)?;
-
-        let (mantissa, exponent) = rendered.as_str().split_once('e').ok_or(fmt::Error)?;
-        let exponent: i32 = exponent.parse().map_err(|_| fmt::Error)?;
-        let mut digits = DecimalBuffer::new();
-        for byte in mantissa.bytes().filter(u8::is_ascii_digit) {
-            digits.push(byte)?;
-        }
-        // Rounding up to the next power of ten leaves trailing zeros behind,
-        // and they carry no value once the exponent is written separately.
-        let digits = digits.as_str().trim_end_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
-
-        if !(-4..9).contains(&exponent) {
-            formatter.write_str(digits.get(..1).ok_or(fmt::Error)?)?;
-            if let Some(rest) = digits.get(1..)
-                && !rest.is_empty()
-            {
-                formatter.write_str(".")?;
-                formatter.write_str(rest)?;
-            }
-            formatter.write_str("E")?;
-            formatter.write_str(if exponent < 0 { "-" } else { "+" })?;
-            let magnitude = exponent.unsigned_abs();
-            if magnitude < 10 {
-                formatter.write_str("0")?;
-            }
-            write!(formatter, "{magnitude}")
-        } else if exponent >= 0 {
-            let whole = usize::try_from(exponent).map_err(|_| fmt::Error)? + 1;
-            if let Some(fraction) = digits.get(whole..)
-                && !fraction.is_empty()
-            {
-                formatter.write_str(digits.get(..whole).ok_or(fmt::Error)?)?;
-                formatter.write_str(".")?;
-                formatter.write_str(fraction)
-            } else {
-                formatter.write_str(digits)?;
-                for _ in 0..(whole - digits.len()) {
-                    formatter.write_str("0")?;
-                }
-                Ok(())
-            }
-        } else {
-            formatter.write_str("0.")?;
-            for _ in 0..(-exponent - 1) {
-                formatter.write_str("0")?;
-            }
-            formatter.write_str(digits)
-        }
+        let text = ManagedNumber::single(value).ok_or(fmt::Error)?;
+        formatter.write_str(text.as_str())
     }
 }
 

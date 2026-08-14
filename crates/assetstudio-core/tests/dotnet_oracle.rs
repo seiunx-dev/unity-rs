@@ -1467,6 +1467,18 @@ fn synthetic_v22() -> Vec<u8> {
                     TestNode::new("SInt32", "data", 3, false),
                     TestNode::new("bool", "enabled", 1, false),
                     TestNode::new("float", "weight", 1, false),
+                    // The dump renders numbers as text through .NET's general
+                    // format, and a fixture of well-behaved values compares
+                    // equal no matter how that format is implemented. These
+                    // four do not: one ties at the last digit, one is small
+                    // enough to turn scientific, one double sits in the band
+                    // where doubles stay fixed and floats would not -- so a
+                    // wrong precision for either type shows up -- and the last
+                    // is at a three-digit exponent.
+                    TestNode::new("float", "tie", 1, false),
+                    TestNode::new("float", "tiny", 1, false),
+                    TestNode::new("double", "wide", 1, false),
+                    TestNode::new("double", "huge", 1, false),
                 ],
             );
         } else {
@@ -3246,6 +3258,12 @@ fn dump_object() -> Vec<u8> {
     push_i32(&mut output, 7);
     output.push(1);
     output.extend_from_slice(&1.25_f32.to_le_bytes());
+    // 1298351.25 exactly, which ties between ...2 and ...3 at the last digit.
+    output.extend_from_slice(&f32::from_bits(1_235_123_578).to_le_bytes());
+    output.extend_from_slice(&4.3e-8_f32.to_le_bytes());
+    // A float at this exponent would be scientific; a double is not.
+    output.extend_from_slice(&1e16_f64.to_le_bytes());
+    output.extend_from_slice(&f64::MAX.to_le_bytes());
     output
 }
 
