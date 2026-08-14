@@ -17,6 +17,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
+use assetstudio_core::audio::{detect_direct_wav, write_direct_wav};
+use assetstudio_core::cubism_moc::{CubismMocReadLimits, try_read_cubism_moc};
 use assetstudio_core::source::Region;
 use assetstudio_core::studio::Studio;
 use assetstudio_core::texture::TextureReadLimits;
@@ -138,30 +140,64 @@ fn text_asset_file() -> Vec<u8> {
 
 /// Wraps one object of `class_id` in a v22 serialized file.
 fn single_object_file(class_id: i32, object: &[u8]) -> Vec<u8> {
+    objects_file(&[(class_id, 7, object.to_vec())])
+}
+
+/// Wraps several objects in a v22 serialized file.
+fn objects_file(objects: &[(i32, i64, Vec<u8>)]) -> Vec<u8> {
+    let mut classes: Vec<i32> = Vec::new();
+    for (class_id, _, _) in objects {
+        if !classes.contains(class_id) {
+            classes.push(*class_id);
+        }
+    }
     let mut metadata = Vec::new();
     metadata.extend_from_slice(b"2022.3.62f1\0");
     metadata.extend_from_slice(&13_i32.to_le_bytes());
     metadata.push(0);
-    metadata.extend_from_slice(&1_i32.to_le_bytes());
-    metadata.extend_from_slice(&class_id.to_le_bytes());
-    metadata.push(0);
-    metadata.extend_from_slice(&(-1_i16).to_le_bytes());
-    metadata.extend_from_slice(&[0; 16]);
-    metadata.extend_from_slice(&1_i32.to_le_bytes());
-    while !(48 + metadata.len()).is_multiple_of(4) {
+    metadata.extend_from_slice(&i32::try_from(classes.len()).unwrap().to_le_bytes());
+    for class_id in &classes {
+        metadata.extend_from_slice(&class_id.to_le_bytes());
         metadata.push(0);
+        metadata.extend_from_slice(&(-1_i16).to_le_bytes());
+        // A MonoBehaviour record carries a script hash before the type hash.
+        if *class_id == 114 {
+            metadata.extend_from_slice(&[0; 16]);
+        }
+        metadata.extend_from_slice(&[0; 16]);
     }
-    metadata.extend_from_slice(&7_i64.to_le_bytes());
-    metadata.extend_from_slice(&0_i64.to_le_bytes());
-    metadata.extend_from_slice(&u32::try_from(object.len()).unwrap().to_le_bytes());
-    metadata.extend_from_slice(&0_i32.to_le_bytes());
+
+    let mut data = Vec::new();
+    let mut records = Vec::new();
+    for (class_id, path_id, payload) in objects {
+        while !data.len().is_multiple_of(4) {
+            data.push(0);
+        }
+        records.push((
+            *path_id,
+            i64::try_from(data.len()).unwrap(),
+            u32::try_from(payload.len()).unwrap(),
+            i32::try_from(classes.iter().position(|value| value == class_id).unwrap()).unwrap(),
+        ));
+        data.extend_from_slice(payload);
+    }
+    metadata.extend_from_slice(&i32::try_from(records.len()).unwrap().to_le_bytes());
+    for (path_id, offset, size, type_index) in records {
+        while !(48 + metadata.len()).is_multiple_of(4) {
+            metadata.push(0);
+        }
+        metadata.extend_from_slice(&path_id.to_le_bytes());
+        metadata.extend_from_slice(&offset.to_le_bytes());
+        metadata.extend_from_slice(&size.to_le_bytes());
+        metadata.extend_from_slice(&type_index.to_le_bytes());
+    }
     for _ in 0..3 {
         metadata.extend_from_slice(&0_i32.to_le_bytes());
     }
     metadata.push(0);
 
     let data_offset = (48 + metadata.len()).next_multiple_of(16);
-    let file_size = data_offset + object.len();
+    let file_size = data_offset + data.len();
     let mut output = vec![0_u8; 48];
     output[8..12].copy_from_slice(&22_u32.to_be_bytes());
     output[20..24].copy_from_slice(&u32::try_from(metadata.len()).unwrap().to_be_bytes());
@@ -169,7 +205,7 @@ fn single_object_file(class_id: i32, object: &[u8]) -> Vec<u8> {
     output[32..40].copy_from_slice(&i64::try_from(data_offset).unwrap().to_be_bytes());
     output.extend_from_slice(&metadata);
     output.resize(data_offset, 0);
-    output.extend_from_slice(object);
+    output.extend_from_slice(&data);
     output
 }
 
@@ -393,4 +429,196 @@ fn decodes(bytes: &[u8]) -> bool {
             .decode_texture_mip(0, TextureReadLimits::default())
             .is_ok()
     })
+}
+
+/// Damages real FSB5 audio and converts it, which reaches the codec dispatch
+/// and the Vorbis decoder behind it.
+///
+/// The audio path takes a `Region` directly, so unlike the texture payloads
+/// this needs no object around it -- the public entry point is the one a
+/// caller reaches. Vorbis is the interesting one: its setup header is
+/// reconstructed from a table rather than read from the stream, so a damaged
+/// stream can disagree with a setup that parsed cleanly.
+#[test]
+fn damaged_audio_never_panics() {
+    const MUTATIONS: usize = 600;
+
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audio");
+    let mut rng = Rng(0x5EED_0005);
+    for relative in ["fsb5-vorbis-stereo.fsb", "fsb5-vorbis-stereo-silence.fsb"] {
+        let payload = std::fs::read(directory.join(relative))
+            .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"));
+        assert!(
+            converts(&payload),
+            "{relative} does not convert before damage, so mutating it proves nothing"
+        );
+
+        let mut converted = 0_usize;
+        for _ in 0..MUTATIONS {
+            let mut damaged = payload.clone();
+            let offset = rng.below(damaged.len());
+            damaged[offset] ^= 1 << (rng.next() % 8);
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let result = catch_unwind(AssertUnwindSafe(|| converts(&damaged)));
+            std::panic::set_hook(previous);
+            assert!(
+                result.is_ok(),
+                "{relative}: flipping a bit at offset {offset} panicked"
+            );
+            converted += usize::from(result.unwrap_or(false));
+        }
+        // FSB5 carries sizes and a CRC the reader checks, so most damage is
+        // rejected -- but if nothing converted, the decoder was never reached.
+        assert!(
+            converted > 0,
+            "{relative}: no damaged payload converted, so no decoder ran"
+        );
+    }
+}
+
+/// Converts an audio payload to WAV, reporting success.
+fn converts(bytes: &[u8]) -> bool {
+    let region = Region::from_bytes(bytes.to_vec());
+    let Ok(Some(kind)) = detect_direct_wav(&region, Some(16)) else {
+        return false;
+    };
+    let mut sink = Vec::new();
+    write_direct_wav(&region, kind, 8 << 20, &mut sink).is_ok()
+}
+
+/// Damages a MOC3 header, which is read as offsets into its own payload.
+///
+/// The format puts four table offsets at fixed positions and then slices
+/// fixed-width identifier records at each, so a damaged offset or count is a
+/// direct invitation to read out of bounds -- the one place in this crate where
+/// the payload chooses where the reader looks next.
+#[test]
+fn damaged_moc_headers_never_panic() {
+    const MUTATIONS: usize = 1_500;
+    const SCRIPT_PATH_ID: i64 = 200;
+    const MOC_PATH_ID: i64 = 201;
+
+    let seed = moc_payload();
+    let file = |moc: &[u8]| {
+        objects_file(&[
+            (115, SCRIPT_PATH_ID, mono_script("CubismMoc")),
+            (114, MOC_PATH_ID, moc_behaviour(SCRIPT_PATH_ID, moc)),
+        ])
+    };
+    assert!(
+        reads_moc(&file(&seed)),
+        "the MOC seed does not read, so mutating it proves nothing"
+    );
+
+    let mut rng = Rng(0x5EED_0006);
+    let mut read = 0_usize;
+    for _ in 0..MUTATIONS {
+        let mut damaged = seed.clone();
+        // Bias towards the header, where the offsets and counts live: damage
+        // out in the identifier tables only changes the strings.
+        let offset = if rng.next() % 2 == 0 {
+            rng.below(300)
+        } else {
+            rng.below(damaged.len())
+        };
+        damaged[offset] ^= 1 << (rng.next() % 8);
+        let bytes = file(&damaged);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = catch_unwind(AssertUnwindSafe(|| reads_moc(&bytes)));
+        std::panic::set_hook(previous);
+        assert!(
+            result.is_ok(),
+            "MOC: flipping a bit at offset {offset} panicked"
+        );
+        read += usize::from(result.unwrap_or(false));
+    }
+    assert!(
+        read > 0,
+        "no damaged MOC header was read, so the parser was never reached"
+    );
+}
+
+fn reads_moc(bytes: &[u8]) -> bool {
+    let Ok(studio) = Studio::open_region("damaged", Region::from_bytes(bytes.to_vec())) else {
+        return false;
+    };
+    (0..studio.file_count()).any(|file_index| {
+        studio
+            .objects()
+            .filter(|object| object.file_index() == file_index)
+            .any(|object| {
+                try_read_cubism_moc(
+                    studio.collection(),
+                    file_index,
+                    object.object_index(),
+                    CubismMocReadLimits::default(),
+                )
+                .is_ok_and(|moc| moc.is_some())
+            })
+    })
+}
+
+/// A MOC3 header with both identifier tables populated.
+fn moc_payload() -> Vec<u8> {
+    const IDENTIFIER: usize = 64;
+    const COUNT_TABLE: usize = 0x120;
+    const CANVAS_INFO: usize = 0x140;
+    const PART_IDS: usize = 0x180;
+
+    let parts = ["PartA", "PartB"];
+    let parameters = ["ParamX", "ParamY", "ParamZ"];
+    let parameter_ids = PART_IDS + parts.len() * IDENTIFIER;
+    let mut moc = vec![0_u8; parameter_ids + parameters.len() * IDENTIFIER];
+    moc[..4].copy_from_slice(b"MOC3");
+    moc[4] = 4; // SDK 4.2
+    let put = |moc: &mut Vec<u8>, at: usize, value: u32| {
+        moc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    put(&mut moc, 64, u32::try_from(COUNT_TABLE).unwrap());
+    put(&mut moc, 68, u32::try_from(CANVAS_INFO).unwrap());
+    put(&mut moc, 76, u32::try_from(PART_IDS).unwrap());
+    put(&mut moc, 264, u32::try_from(parameter_ids).unwrap());
+    put(&mut moc, COUNT_TABLE, u32::try_from(parts.len()).unwrap());
+    put(
+        &mut moc,
+        COUNT_TABLE + 20,
+        u32::try_from(parameters.len()).unwrap(),
+    );
+    for (index, identifier) in parts.iter().chain(parameters.iter()).enumerate() {
+        let at = if index < parts.len() {
+            PART_IDS + index * IDENTIFIER
+        } else {
+            parameter_ids + (index - parts.len()) * IDENTIFIER
+        };
+        moc[at..at + identifier.len()].copy_from_slice(identifier.as_bytes());
+    }
+    moc
+}
+
+fn moc_behaviour(script_path_id: i64, moc: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&0_i32.to_le_bytes());
+    data.extend_from_slice(&0_i64.to_le_bytes());
+    data.push(1);
+    pad(&mut data);
+    data.extend_from_slice(&0_i32.to_le_bytes());
+    data.extend_from_slice(&script_path_id.to_le_bytes());
+    push_aligned_string(&mut data, "moc");
+    data.extend_from_slice(&u32::try_from(moc.len()).unwrap().to_le_bytes());
+    data.extend_from_slice(moc);
+    pad(&mut data);
+    data
+}
+
+fn mono_script(class_name: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_aligned_string(&mut data, class_name);
+    data.extend_from_slice(&0_i32.to_le_bytes());
+    data.extend_from_slice(&[0x55; 16]);
+    push_aligned_string(&mut data, class_name);
+    push_aligned_string(&mut data, "Live2D.Cubism.Core");
+    push_aligned_string(&mut data, "Live2D.Cubism.dll");
+    data
 }
