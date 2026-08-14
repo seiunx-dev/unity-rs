@@ -25,7 +25,7 @@ use assetstudio_core::live2d_physics::CubismPhysicsReadLimits;
 use assetstudio_core::live2d_schema::{
     CubismAuxiliaryReadLimits, CubismExpressionBlend, CubismExpressionReadLimits,
 };
-use assetstudio_core::loader::{AssetLoadLimits, AssetLoadOptions};
+use assetstudio_core::loader::{AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy};
 use assetstudio_core::material::{Material, MaterialReadLimits, NamedMaterialProperty};
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
@@ -1538,8 +1538,12 @@ impl PyAssetStudio {
         maximum_input_files=1_000_000,
         maximum_input_directories=1_000_000,
         maximum_directory_entries=2_000_000,
-        oodle_decoder=None
+        oodle_decoder=None,
+        skip_unreadable_inputs=false
     ))]
+    // PyO3 keyword arguments are the Python signature, so they cannot be
+    // grouped into a struct without changing the public API.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         path: PathBuf,
@@ -1548,6 +1552,7 @@ impl PyAssetStudio {
         maximum_input_directories: usize,
         maximum_directory_entries: usize,
         oodle_decoder: Option<Py<PyAny>>,
+        skip_unreadable_inputs: bool,
     ) -> PyResult<Self> {
         let unity_version_override = parse_unity_version_override(unity_version)?;
         let oodle_decoder = python_oodle_decoder(py, oodle_decoder)?;
@@ -1560,6 +1565,7 @@ impl PyAssetStudio {
             },
             unity_version_override,
             oodle_decoder,
+            failure_policy: failure_policy(skip_unreadable_inputs),
         };
         py.detach(move || Studio::open_with_options(path, options))
             .map(|studio| Self { studio })
@@ -1607,8 +1613,12 @@ impl PyAssetStudio {
         maximum_files=DEFAULT_MEMORY_FILE_COUNT,
         maximum_file_bytes=DEFAULT_MEMORY_FILE_LIMIT,
         maximum_total_bytes=DEFAULT_INPUT_LIMIT,
-        oodle_decoder=None
+        oodle_decoder=None,
+        skip_unreadable_inputs=false
     ))]
+    // PyO3 keyword arguments are the Python signature, so they cannot be
+    // grouped into a struct without changing the public API.
+    #[allow(clippy::too_many_arguments)]
     fn from_memory_files(
         py: Python<'_>,
         files: Vec<(String, Py<PyBytes>)>,
@@ -1617,6 +1627,7 @@ impl PyAssetStudio {
         maximum_file_bytes: u64,
         maximum_total_bytes: u64,
         oodle_decoder: Option<Py<PyAny>>,
+        skip_unreadable_inputs: bool,
     ) -> PyResult<Self> {
         let inputs = copy_python_files(
             py,
@@ -1634,6 +1645,7 @@ impl PyAssetStudio {
             },
             unity_version_override: parse_unity_version_override(unity_version)?,
             oodle_decoder: python_oodle_decoder(py, oodle_decoder)?,
+            failure_policy: failure_policy(skip_unreadable_inputs),
         };
         py.detach(move || Studio::open_regions_with_options(inputs, options))
             .map(|studio| Self { studio })
@@ -3288,6 +3300,14 @@ fn python_resource_info(resource: StudioResource<'_>) -> PyResult<PyResourceInfo
         path: try_copy_string(resource.path(), "external resource path")?,
         byte_size: resource.byte_size(),
     })
+}
+
+const fn failure_policy(skip_unreadable_inputs: bool) -> LoadFailurePolicy {
+    if skip_unreadable_inputs {
+        LoadFailurePolicy::SkipInput
+    } else {
+        LoadFailurePolicy::Abort
+    }
 }
 
 fn parse_unity_version_override(value: Option<String>) -> PyResult<Option<UnityVersion>> {

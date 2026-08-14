@@ -66,11 +66,49 @@ impl Default for AssetLoadLimits {
     }
 }
 
+/// What to do when one discovered input cannot be parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadFailurePolicy {
+    /// Fail the whole load. Every input must parse.
+    #[default]
+    Abort,
+    /// Record the failure and keep the inputs that did parse.
+    ///
+    /// A game directory routinely mixes readable assets with encrypted,
+    /// truncated or not-yet-supported containers, and the managed
+    /// `AssetsManager` logs those and carries on. Aborting instead turns one
+    /// unreadable file into an empty collection.
+    SkipInput,
+}
+
+/// One input that was skipped under [`LoadFailurePolicy::SkipInput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadDiagnostic {
+    pub path: String,
+    pub message: String,
+}
+
+/// Upper bound on a recorded diagnostic message, in bytes.
+///
+/// The number of diagnostics is already bounded by the discovered-file limit;
+/// this bounds each message so a pathological input cannot grow the collection
+/// through its error text.
+const MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES: usize = 4096;
+
+/// How one root is opened, shared by every `load*` entry point.
+struct RootLoadSettings<'a> {
+    limits: &'a AssetLoadLimits,
+    unity_version_override: Option<&'a UnityVersion>,
+    oodle_decoder: Option<&'a Arc<dyn OodleDecoder>>,
+    failure_policy: LoadFailurePolicy,
+}
+
 #[derive(Clone, Default)]
 pub struct AssetLoadOptions {
     pub limits: AssetLoadLimits,
     pub unity_version_override: Option<UnityVersion>,
     pub oodle_decoder: Option<Arc<dyn OodleDecoder>>,
+    pub failure_policy: LoadFailurePolicy,
 }
 
 impl fmt::Debug for AssetLoadOptions {
@@ -83,6 +121,7 @@ impl fmt::Debug for AssetLoadOptions {
                 "oodle_decoder",
                 &self.oodle_decoder.as_ref().map(|_| "<configured>"),
             )
+            .field("failure_policy", &self.failure_policy)
             .finish()
     }
 }
@@ -103,6 +142,9 @@ pub struct LoadedResource {
 pub struct AssetCollection {
     pub serialized_files: Vec<LoadedSerializedFile>,
     pub resources: Vec<LoadedResource>,
+    /// Inputs skipped under [`LoadFailurePolicy::SkipInput`], in discovery
+    /// order. Always empty under [`LoadFailurePolicy::Abort`].
+    pub diagnostics: Vec<LoadDiagnostic>,
     pub(crate) object_metadata: BTreeMap<(usize, i64), LoadedObjectMetadata>,
     reference_index: Option<AssetReferenceIndex>,
 }
@@ -140,6 +182,7 @@ impl AssetCollection {
         Self {
             serialized_files,
             resources,
+            diagnostics: Vec::new(),
             object_metadata: BTreeMap::new(),
             reference_index: None,
         }
@@ -173,15 +216,19 @@ impl AssetCollection {
             limits,
             unity_version_override,
             oodle_decoder,
+            failure_policy,
         } = options;
         let mut collection = Self::default();
         let mut budget = AssetLoadBudget::default();
-        collection.load_root(
+        collection.load_root_with_policy(
             path.into(),
             region,
-            &limits,
-            unity_version_override.as_ref(),
-            oodle_decoder.as_ref(),
+            &RootLoadSettings {
+                limits: &limits,
+                unity_version_override: unity_version_override.as_ref(),
+                oodle_decoder: oodle_decoder.as_ref(),
+                failure_policy,
+            },
             &mut budget,
         )?;
         collection.rebuild_object_metadata(&limits)?;
@@ -199,7 +246,14 @@ impl AssetCollection {
             limits,
             unity_version_override,
             oodle_decoder,
+            failure_policy,
         } = options;
+        let settings = RootLoadSettings {
+            limits: &limits,
+            unity_version_override: unity_version_override.as_ref(),
+            oodle_decoder: oodle_decoder.as_ref(),
+            failure_policy,
+        };
         let mut collection = Self::default();
         let mut budget = AssetLoadBudget::default();
         let mut root_count = 0_usize;
@@ -213,14 +267,7 @@ impl AssetCollection {
                     limits.maximum_input_files
                 )));
             }
-            collection.load_root(
-                label,
-                region,
-                &limits,
-                unity_version_override.as_ref(),
-                oodle_decoder.as_ref(),
-                &mut budget,
-            )?;
+            collection.load_root_with_policy(label, region, &settings, &mut budget)?;
         }
         collection.rebuild_object_metadata(&limits)?;
         Ok(collection)
@@ -252,6 +299,7 @@ impl AssetCollection {
             limits,
             unity_version_override,
             oodle_decoder,
+            failure_policy,
         } = options;
         let path = path.as_ref();
         let metadata = fs::metadata(path)?;
@@ -268,16 +316,15 @@ impl AssetCollection {
             )));
         };
 
+        let settings = RootLoadSettings {
+            limits: &limits,
+            unity_version_override: unity_version_override.as_ref(),
+            oodle_decoder: oodle_decoder.as_ref(),
+            failure_policy,
+        };
         let mut collection = Self::default();
         for (label, region) in inputs {
-            collection.load_root(
-                label,
-                region,
-                &limits,
-                unity_version_override.as_ref(),
-                oodle_decoder.as_ref(),
-                &mut budget,
-            )?;
+            collection.load_root_with_policy(label, region, &settings, &mut budget)?;
         }
         collection.rebuild_object_metadata(&limits)?;
         Ok(collection)
@@ -503,6 +550,55 @@ impl AssetCollection {
                 Err(error)
             }
         }
+    }
+
+    /// Loads one root, honouring the configured failure policy.
+    fn load_root_with_policy(
+        &mut self,
+        label: String,
+        region: Region,
+        settings: &RootLoadSettings<'_>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        // load_root appends as it discovers, so a failure part way through
+        // leaves the collection holding half of an input. Remember where this
+        // root started so a skipped one leaves nothing behind.
+        let serialized_files = self.serialized_files.len();
+        let resources = self.resources.len();
+        let result = self.load_root(
+            label.clone(),
+            region,
+            settings.limits,
+            settings.unity_version_override,
+            settings.oodle_decoder,
+            budget,
+        );
+        if let Err(error) = result {
+            if settings.failure_policy == LoadFailurePolicy::Abort {
+                return Err(error);
+            }
+            self.serialized_files.truncate(serialized_files);
+            self.resources.truncate(resources);
+            self.record_skipped_input(label, &error)?;
+        }
+        Ok(())
+    }
+
+    /// Records one skipped input, truncating its message to a bounded length.
+    fn record_skipped_input(&mut self, path: String, error: &Error) -> Result<()> {
+        let mut message = error.to_string();
+        if message.len() > MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES {
+            let mut end = MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES;
+            while end > 0 && !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        self.diagnostics.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow load diagnostics: {error}"))
+        })?;
+        self.diagnostics.push(LoadDiagnostic { path, message });
+        Ok(())
     }
 
     fn rebuild_object_metadata(&mut self, limits: &AssetLoadLimits) -> Result<()> {
@@ -1300,7 +1396,9 @@ mod tests {
     use crate::source::Region;
     use crate::unity_version::UnityVersion;
 
-    use super::{AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadedSerializedFile};
+    use super::{
+        AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy, LoadedSerializedFile,
+    };
 
     #[test]
     fn loads_directory_roots_deterministically_and_limits_input_files() {
@@ -1916,6 +2014,49 @@ mod tests {
         assert!(
             AssetCollection::load_with_limits("input", Region::from_bytes(web), limits).is_err()
         );
+    }
+
+    #[test]
+    fn skipping_unreadable_inputs_keeps_the_rest_of_a_directory() {
+        let directory = temporary_directory("skip-unreadable");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("a-good.assets"), empty_v22_serialized_file()).unwrap();
+        // The kind of file a real game directory mixes in: recognized, and
+        // explicitly refused because its layout has never been verified.
+        let mut archive = Vec::new();
+        archive.extend_from_slice(b"UnityArchive\0");
+        archive.extend_from_slice(&5_u32.to_be_bytes());
+        archive.extend_from_slice(b"5.x.x\0");
+        archive.extend_from_slice(b"5.0.0f4\0");
+        std::fs::write(directory.join("b-archive.unity3d"), &archive).unwrap();
+        std::fs::write(directory.join("c-good.assets"), empty_v22_serialized_file()).unwrap();
+
+        // The default policy still refuses the whole directory, so callers that
+        // depend on an all-or-nothing load are unaffected.
+        let error = AssetCollection::load_path(&directory)
+            .expect_err("the default policy fails the whole load");
+        assert!(error.to_string().contains("UnityArchive"));
+
+        let collection = AssetCollection::load_path_with_options(
+            &directory,
+            AssetLoadOptions {
+                failure_policy: LoadFailurePolicy::SkipInput,
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(collection.serialized_files.len(), 2);
+        assert!(
+            collection
+                .serialized_files
+                .iter()
+                .all(|loaded| loaded.path.contains("good"))
+        );
+        assert_eq!(collection.diagnostics.len(), 1);
+        assert!(collection.diagnostics[0].path.contains("b-archive"));
+        assert!(collection.diagnostics[0].message.contains("UnityArchive"));
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

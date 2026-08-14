@@ -153,6 +153,17 @@ schemas can be collected in `MonoBehaviourSchemas` and passed to Live2D
 package materialization. The assembly name is used only for matching; the
 runtime never loads or executes the DLL.
 
+A game directory routinely mixes readable assets with encrypted, truncated or
+not-yet-supported containers. By default Core refuses the whole load over any
+one of them, which matches the historical Rust behaviour but reports nothing
+where the managed tool reports almost everything. `AssetLoadOptions` therefore
+carries a `failure_policy`: under `LoadFailurePolicy::SkipInput` the inputs that
+did parse are kept and each skipped one is recorded in
+`AssetCollection::diagnostics`. Python exposes this as
+`skip_unreadable_inputs=True`. The CLI always skips, names every skipped input
+on stdout, and exits with the partial-failure status; a load where nothing at
+all parsed is still a hard failure rather than an empty success.
+
 Every command that opens a collection accepts `--unity-version <VERSION>`,
 which parses the input against that version instead of the one it declares. It
 is required for files whose version was stripped at build time, and it outranks

@@ -635,6 +635,7 @@ class AssetStudio:
         maximum_input_directories: int = 1_000_000,
         maximum_directory_entries: int = 2_000_000,
         oodle_decoder: Optional[OodleDecoder] = None,
+        skip_unreadable_inputs: bool = False,
     ) -> AssetStudio: ...
     @staticmethod
     def from_bytes(
@@ -654,6 +655,7 @@ class AssetStudio:
         maximum_file_bytes: int = 536_870_912,
         maximum_total_bytes: int = 4_294_967_296,
         oodle_decoder: Optional[OodleDecoder] = None,
+        skip_unreadable_inputs: bool = False,
     ) -> AssetStudio: ...
     @property
     def file_count(self) -> int: ...
