@@ -258,7 +258,12 @@ fn push_sub_rig(data: &mut Vec<u8>, rig: u8) {
         push_f32(data, 0.000_49);
         push_f32(data, 0.8 + step);
         push_f32(data, -0.000_4);
-        push_f32(data, 0.25 + step);
+        // Eight significant digits, which is one more than a float carries.
+        // "0.###" rounds to the float's seven first and only then to three
+        // decimals, so this prints 1234.568; rounding straight to three
+        // decimals, or to six digits first, gives something else. Nothing else
+        // in these fixtures is long enough to tell those apart.
+        push_f32(data, 1_234.567_8 + step);
     }
 
     // Normalization: Position then Angle, each Maximum/Minimum/Default.
@@ -431,10 +436,17 @@ pub(crate) fn cubism_expression_object(name: &str) -> Vec<u8> {
 
     // One parameter per blend mode, with values that only print the same on
     // both sides if the number format matches.
-    let parameters: [(&str, f32, i32); 3] = [
+    let parameters: [(&str, f32, i32); 5] = [
         ("ParamAngleX", 0.8, 0),
         ("ParamAngleY", -0.000_4, 1),
         ("ParamMouthOpenY", 2.0, 2),
+        // Zero and a value past the point where the default float format
+        // switches to scientific notation. This document's numbers go through
+        // Newtonsoft's default float rather than "0.###", and these are the
+        // two values that show it: zero prints as 0.0 rather than 0, and
+        // 1.5e8 prints in full where one decade further would not.
+        ("ParamZero", 0.0, 0),
+        ("ParamLarge", 1.5e8, 0),
     ];
     push_i32(&mut data, i32::try_from(parameters.len()).unwrap());
     for (id, value, blend) in parameters {
