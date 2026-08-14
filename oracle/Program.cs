@@ -276,49 +276,33 @@ static object ShaderPayload(Shader shader)
     };
 }
 
+// Compares against the managed sprite pipeline itself rather than a crop
+// reimplemented here. GetImage is what AssetStudio exports through: it resolves
+// an atlas render-data entry when there is one, cuts the texture to the
+// sprite's rect, applies the tight-mesh mask and the alpha texture, and
+// downscales. A hand-written rectangle crop -- which is what used to be here --
+// only ever compared this reader against a second copy of its own assumptions
+// and could not reach the tight-mesh path at all.
 static object SpritePayload(Sprite sprite)
 {
-    if (!sprite.m_RD.texture.TryGet(out var texture))
+    using var image = sprite.GetImage(SpriteMaskMode.Export);
+    if (image is null)
     {
-        throw new InvalidDataException($"Sprite {sprite.m_PathID} texture does not resolve");
+        throw new InvalidDataException($"Sprite {sprite.m_PathID} produced no image");
     }
-    if ((int)texture.m_TextureFormat != 4
-        || sprite.m_RD.settingsRaw.packed != 0
-        || sprite.m_RD.settingsRaw.packingMode != SpritePackingMode.Rectangle)
+    var pixels = new byte[checked(image.Width * image.Height * 4)];
+    image.CopyPixelDataTo(pixels);
+    // ImageSharp hands back BGRA; the Rust manifest reports RGBA.
+    for (var offset = 0; offset < pixels.Length; offset += 4)
     {
-        throw new InvalidDataException("Sprite oracle only supports resident rectangle RGBA32");
-    }
-    var source = texture.image_data.GetData();
-    var rect = sprite.m_RD.textureRect;
-    var left = (int)MathF.Floor(rect.x);
-    var top = (int)MathF.Floor(rect.y);
-    var right = Math.Min((int)MathF.Ceiling(rect.x + rect.width), texture.m_Width);
-    var bottom = Math.Min((int)MathF.Ceiling(rect.y + rect.height), texture.m_Height);
-    var width = right - left;
-    var height = bottom - top;
-    if (left < 0 || top < 0 || width <= 0 || height <= 0
-        || source.LongLength != checked((long)texture.m_Width * texture.m_Height * 4))
-    {
-        throw new InvalidDataException("Sprite oracle crop or texture payload is invalid");
-    }
-    long size = 0;
-    var hash = 0xcbf29ce484222325UL;
-    for (var y = 0; y < height; y++)
-    {
-        var sourceY = bottom - 1 - y;
-        for (var x = left; x < right; x++)
-        {
-            var offset = checked((sourceY * texture.m_Width + x) * 4);
-            hash = ContinueFnv1a64(source.AsSpan(offset, 4), hash);
-            size = checked(size + 4);
-        }
+        (pixels[offset], pixels[offset + 2]) = (pixels[offset + 2], pixels[offset]);
     }
     return new
     {
         Name = sprite.m_Name,
-        Width = width,
-        Height = height,
-        Pixels = new { Size = size, Fnv64 = hash.ToString("x16") },
+        Width = image.Width,
+        Height = image.Height,
+        Pixels = Bytes(pixels),
     };
 }
 
