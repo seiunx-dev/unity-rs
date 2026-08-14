@@ -384,8 +384,11 @@ static object MeshPayload(Mesh mesh)
         Name = mesh.m_Name,
         VertexCount = mesh.m_VertexCount,
         Vertices = FloatValues(mesh.m_Vertices),
-        Normals = mesh.m_Normals is null ? null : FloatValues(mesh.m_Normals),
-        Uv0 = mesh.m_UV0 is null ? null : FloatValues(mesh.m_UV0),
+        // An empty channel counts as absent: this reader allocates a zero-length
+        // array where the Rust one leaves the option unset, and both mean the
+        // mesh has no such channel.
+        Normals = mesh.m_Normals is null or { Length: 0 } ? null : FloatValues(mesh.m_Normals),
+        Uv0 = mesh.m_UV0 is null or { Length: 0 } ? null : FloatValues(mesh.m_UV0),
         Indices = UInt32Values(mesh.m_Indices),
     };
 }

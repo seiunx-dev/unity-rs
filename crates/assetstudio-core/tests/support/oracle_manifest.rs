@@ -447,10 +447,14 @@ fn mesh_manifest(
         "Name": mesh.name,
         "VertexCount": mesh.vertices.len(),
         "Vertices": f32_values_manifest(mesh.vertices.iter().flatten().copied())?,
-        "Normals": mesh.normals.as_ref().map(|values| {
+        // An empty channel is reported as absent. The managed reader allocates a
+        // zero-length array where this one leaves the option unset, and both
+        // mean the mesh has no such channel; encoding that allocator detail
+        // into the comparison would say nothing about either reader.
+        "Normals": mesh.normals.as_ref().filter(|values| !values.is_empty()).map(|values| {
             f32_values_manifest(values.iter().flatten().copied())
         }).transpose()?,
-        "Uv0": mesh.uv0.as_ref().map(|values| {
+        "Uv0": mesh.uv0.as_ref().filter(|values| !values.is_empty()).map(|values| {
             f32_values_manifest(values.iter().flatten().copied())
         }).transpose()?,
         "Indices": u32_values_manifest(indices)?,
