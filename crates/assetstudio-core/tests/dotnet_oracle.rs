@@ -29,6 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use assetstudio_core::studio::Studio;
 use serde_json::{Value, json};
 
+#[path = "support/bc6h_fixture.rs"]
+mod bc6h_fixture;
 #[path = "support/containers.rs"]
 mod containers;
 #[path = "support/cubism_fixture.rs"]
@@ -57,6 +59,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_compressed_texture_formats(&executable);
     assert_crunched_textures(&executable);
     assert_astc_textures(&executable);
+    assert_bc6h_textures(&executable);
     assert_cubism_physics(&executable);
     assert_cubism_fade_motion(&executable);
     assert_cubism_expression(&executable);
@@ -654,6 +657,50 @@ fn assert_cubism_fade_motion(executable: &Path) {
     );
 
     assert_eq!(managed, rust, "Cubism fade-motion conversion");
+}
+
+/// Compares BC6H decoding against the managed decoder.
+///
+/// The payload is built rather than borrowed -- see `support/bc6h_fixture.rs`
+/// for why one-subset blocks are enough -- because there is no BC6H encoder to
+/// hand the way `astcenc` covered ASTC.
+fn assert_bc6h_textures(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+    const SIZE: i32 = 8;
+
+    let payload = bc6h_fixture::bc6h_payload();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bc6h");
+    let object = texture2d_inline("oracle-bc6h", SIZE, SIZE, 24, 1, REVISION, &[], &payload);
+    let file = synthetic_single_v22(28, 28, REVISION, &object);
+    let fixture = TemporaryFixture::new("oracle-texture-bc6h.assets", &file)
+        .expect("the BC6H fixture is writable");
+    let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+    let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+    let managed_decoded = &managed["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+    assert_eq!(
+        managed_decoded["Size"],
+        SIZE * SIZE * 4,
+        "BC6H did not decode a full surface: {managed}"
+    );
+
+    // BC6H does not match, for the same reason HDR ASTC does not: the decoder
+    // this crate uses truncates where the managed one rounds. The shape of that
+    // difference is checked byte for byte in `texture.rs` against the blob this
+    // re-earns here, rather than being remembered from a hash recorded once.
+    let blob = fs::read(directory.join("one-subset-managed.rgba"))
+        .expect("the committed managed BC6H output is readable");
+    assert_eq!(
+        managed_decoded["Fnv64"].as_str().unwrap(),
+        format!("{:016x}", fnv1a64(&blob)),
+        "the committed BC6H blob is no longer what the managed decoder produces"
+    );
+    let rust_decoded = &rust["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+    assert_ne!(
+        managed_decoded, rust_decoded,
+        "BC6H now matches the managed decoder; the truncation was fixed upstream, \
+         so compare it exactly and drop \
+         bc6h_differs_from_the_managed_decoder_only_by_truncation"
+    );
 }
 
 /// Compares ASTC decoding against the managed decoder on real encoder output.

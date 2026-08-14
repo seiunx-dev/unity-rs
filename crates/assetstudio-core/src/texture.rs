@@ -3891,6 +3891,64 @@ mod tests {
         }
     }
 
+    /// The same truncation, in the BC6H decoder.
+    ///
+    /// `texture2ddecoder` 0.1.2 has two ports of the reference `f32_to_u8`. The
+    /// ASTC one drops `roundf` for `floor`; this one drops it for a cast, which
+    /// truncates. Both come out a step low wherever the value lands at or above
+    /// a half, and BC6H is HDR-only, so every one of its pixels goes through it.
+    ///
+    /// The blob beside the payload is what the managed decoder produces:
+    /// restoring `roundf` in a local copy of the crate reproduces its hash
+    /// exactly, which is also what confirms the synthetic payload is a valid
+    /// block rather than something the two decoders merely disagree about.
+    ///
+    /// Fixing it here means vendoring the crate to change one call. It is
+    /// recorded instead, and this fails if the divergence ever grows past a
+    /// one-step truncation -- or disappears, which is the cue to compare BC6H
+    /// exactly.
+    #[test]
+    fn bc6h_differs_from_the_managed_decoder_only_by_truncation() {
+        // Every byte of this fixture that differs, differs by exactly one.
+        const EXPECTED_DIFFERENCES: usize = 11;
+
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bc6h");
+        let payload = std::fs::read(directory.join("one-subset.bin")).unwrap();
+        let expected = std::fs::read(directory.join("one-subset-managed.rgba")).unwrap();
+
+        let object = texture_object(8, 8, TextureFormat::BC6H, 1, &payload, None);
+        let file = parse_asset(&object);
+        let collection = collection_with(file.clone(), "unused", b"");
+        let texture = read_texture2d(&collection, &file, 0, TextureReadLimits::default()).unwrap();
+        let actual = texture
+            .decode_mip_rgba8(0, TextureReadLimits::default())
+            .unwrap()
+            .pixels;
+
+        assert_eq!(actual.len(), expected.len(), "BC6H surface size");
+        let differences: Vec<i32> = actual
+            .iter()
+            .zip(&expected)
+            .map(|(mine, managed)| i32::from(*managed) - i32::from(*mine))
+            .filter(|difference| *difference != 0)
+            .collect();
+        assert!(
+            differences.iter().all(|difference| *difference == 1),
+            "BC6H diverges by more than a one-step truncation: {:?}",
+            differences
+                .iter()
+                .filter(|difference| **difference != 1)
+                .take(8)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            differences.len(),
+            EXPECTED_DIFFERENCES,
+            "BC6H truncation count moved"
+        );
+    }
+
     /// Pins the one way HDR ASTC decoding differs from the managed decoder.
     ///
     /// `texture2ddecoder` 0.1.2 ports the reference `select_color_hdr` with
