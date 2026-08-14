@@ -1,6 +1,6 @@
 # AssetStudio Rust 重写进度与缺口
 
-最后更新：2026-08-14
+最后更新：2026-08-15
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -103,6 +103,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - **v5-v12 已补齐（2026-08-14）**：这些格式必然带 TypeTree，13 之后那个可以关掉树的 flag 还不存在，所以 tree-less fixture 做不到；自己编一棵树等于让两个 reader 去比对 Unity 从没写过的形状。改用 `tools/generate_typetree_fixtures.py` 从 UnityPy 自带的 `lzma.tpk` 里取真实的 TextAsset 树，产出 JSON 入库（TPK 本身不 vendor，脚本也不进 CI，只在开发时跑一次；派生链在脚本头部写明）。差分矩阵现在覆盖 5-22（2026-08-15 补上 22：循环原先写的是 `5..22`，把最新那个格式排除在了唯一一个专门比格式的测试之外；补的时候还要给 fixture builder 加上 22 才有的两处变化——48 字节头，以及 large-file 支持把对象的 byte offset 从 32 位放宽到 64 位），首轮全对：9 以下头部在文件尾、7 起才有 Unity 版本串、8 起才有 target platform、11 起 destroyed 字段换成 script type index、树在 10 和 12 从递归编码换成 blob——这些门此前全靠 Rust writer 自己的假设。
    - **Cubism 物理已纳入托管差分（2026-08-15），并因此修掉两处真实的输出偏差**：这是差分里唯一一个布局不来自 Unity 内置类的资产——`CubismPhysicsController` 是 `MonoBehaviour`，形状由 Live2D SDK 自己的 C# 类型决定，两边都只能照文件自带的 TypeTree 走，然后各自用完全独立的代码投影成 physics3.json。fixture 的 TypeTree 按托管仓库 `CubismUnityClasses/CubismPhysics.cs` 里的字段顺序手写（不是本项目对形状的想象），对象字节则另写一遍、不由树驱动，这样树写错时托管侧会立刻炸而不是跟着一起错——第一版就是这么发现 `m_Enabled` 在 Unity 的树里是 `UInt8` 而不是 `bool` 的。查出的两处偏差：（1）`live2d_physics.rs` 把 Unity 的 float 存成 f64，导致 physics3.json 里 `0.8` 写成 `0.800000011920929`——`TypeValue::Float32` 的注释早就警告过加宽在数值上无损、在文本上有损，这里正好踩了；已全部改回 f32（Python 边界处显式加宽，Python 只有 double）。（2）数字格式：托管把每个 float 过一遍 .NET 的 `"0.###"`，本项目写的是 Rust 的最短往返形式，整数值会多出 `.0`、多于三位小数不会收敛。已实现同样的格式（先按 7 位有效数字收，再四舍五入到 3 位小数、逢半远离零，最后去掉尾零；且舍入作用在最短十进制形式上而不是二进制值上——`0.0025f` 实际是 `0.00249999994`，按二进制舍会得到 `0.002` 而 .NET 给 `0.003`），并用 .NET 10 实跑出来的 35 组数据做单元测试。fixture 里特意放了只有格式对得上才会相等的值，并单独断言住，防止字段哪天悄悄消失让两边"都没有所以相等"。顺带修正 oracle 的一处漏报：`Name` 只取 `NamedObject`，而 `MonoBehaviour` 挂在 `Behaviour` 下面却确实解析了 `m_Name`，等于托管侧少报了自己已经知道的东西。
    - **Cubism fade-motion（motion3.json）已纳入托管差分（2026-08-15），同样查出两处偏差**：走的是 `CubismFadeMotionData` 那条路——一个 MonoBehaviour 进、一个文档出，跟物理一样能单独成立，不需要围一整个模型组。fixture 的三条曲线分别落在 Parameter、PartOpacity、Model 三个 target 分支上（参数名/部件名两边喂同一份，真实流程里这份来自模型；不喂的话每条曲线都掉进未绑定回退，target 判定等于没测）。查出的偏差与物理同源：（1）f64 加宽，`FadeOutTime` 写成 `1.2345677614212036` 而托管是 `1.2345678`；（2）同一份文档里有**两种**数字格式——托管只给 `List<float>` 注册了 `0.###` 转换器，而 `Segments` 是唯一的该类型字段，其余标量走 Newtonsoft 默认 float 格式（整数值保留 `.0`，超出 1e9/低于 1e-4 转科学计数法）。两种格式现在都实现在新的 `live2d_number.rs` 里，各自用 .NET 10 / Newtonsoft 13 实跑出来的 32 组和 31 组数据做单元测试（其中一组期望值一开始是我自己写的、不是探针跑出来的，测试当场就把它否掉了）。顺带纠正一处旧单元测试：它把 `Segments` 断言成 `[0.0, ...]`，那是本项目自己的格式而不是托管的——手写期望值又一次只证明了实现跟自己一致。
+   - **Cubism 数字格式已裁决（2026-08-15）：跟托管，不保留全精度**。托管的 `"0.###"` 会把值收到三位小数，看起来是有损的；之所以仍然照做，一是 Cubism 编辑器本身就按这个精度出数，真实数据几乎不会被截到；二是照做之后任意 rig 都能与托管逐字段精确比对，而保留全精度会让差分只能比那些"恰好短到两边打印一样"的值，等于把 oracle 的覆盖面换成一点点用不上的精度。这是有意的取舍，改回全精度只需换掉 `live2d_number.rs` 里的一个函数。
    - **Cubism expression（exp3.json）已纳入托管差分（2026-08-15）**：同样是单个 MonoBehaviour 进、单个文档出。这份文档序列化时**不挂**自定义转换器，因此全篇走 Newtonsoft 默认 float 格式，跟 physics（全篇 `0.###`）和 motion（两种混用）各不相同——三份都进差分之后，任何一份把格式搞反都会单独失败，这个区分才算钉住。查出的偏差还是 f64 加宽那一条，已修；反向验证过：把格式换回 serde_json 的 f64 输出，差分立刻失败。
    - **MOC3 头解析已纳入托管差分（2026-08-15）**：MOC 是 Live2D 里唯一不带 TypeTree 的资产——两边都按固定前缀跳过再走格式钉死的偏移（64 计数表、68 canvas、76 与 264 两张标识符表），它给出的参数名/部件名又是后面动作曲线绑定 target 的依据，所以这一条塌了后面全塌。版本字节、字节序标志、canvas 五个浮点、两张计数与标识符表全部一致。过程中修掉一个 fixture builder 的真实缺陷：`synthetic_plain_v22` 的类型记录对 class 114 少写了那 16 字节 script hash（Unity 只对 MonoBehaviour 写这一份），托管侧直接 EOF——这个 builder 此前从没被用在 114 上，所以一直没暴露。另外自己犯了一次前面刚批评过的错：Rust 侧一开始按"能不能解析出来"识别 MOC，而 MOC 布局没有任何 reader 会拒绝的 magic，于是一个 expression behaviour 被解析成了全零加"Unknown SDK version (50)"；改成跟托管一样按 MonoScript 类名判定。浮点在 manifest 里按位模式比较（跟关键帧那条一样），否则比的是两种语言的格式化器而不是值。
    - **整包差分已建立（2026-08-15），pose3/cdi3/model3 一并覆盖**：不再逐份文档比，而是造一个完整模型组（GameObject/Transform/MonoScript/多个带各自 TypeTree 的 behaviour），直接跑托管的 `Live2DExtractor.ExtractCubismModel`，把它写出来的每个文件跟本项目 materialize 出来的逐个对照。之所以要跑真的 extractor：pose3/cdi3 是遍历模型的 part/parameter 拼出来的，如果在 oracle 里把那段遍历重写一遍，比的就是本项目跟我自己对托管代码的理解，正是 sprite 那条已经纠正过的弱 oracle 模式。首轮 pose3（两个分组、组内顺序、Link 列表）与 cdi3（DisplayName 覆盖 Name）就完全一致；查出的偏差在 model3.json：托管的 `FileReferences` 五个成员无论有没有内容都会写出来（缺的引用是 `null`，空集合是 `[]`/`{}`），本项目是没有就整个省略——省略在 JSON 上合法，但拿到的不是同一份文档，按 `Motions` 取值的调用方会拿到"不存在"而不是空表。已改成照托管的声明顺序全写。顺带把三处手写期望值改对：CLI 和 core 各有一处 model3.json 的逐字符期望、还有一对断言明确断言 `Motions`/`Expressions` **不存在**——三处都只证明了实现跟自己一致，整包差分才把它们区分开。
@@ -204,15 +205,20 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 ## 后续优先顺序
 
-1. 把托管差分 oracle 从裸 `.assets` 扩到容器、版本门和已实现的资产解码路径（P0 第 1 项，全部不需要专有样本，且能防止同类缺陷再生）；
-2. 扩充真实 corpus 和 C#→Rust 差分快照，按实际命中率排序缺口；
-3. 视上游进展处理 `ruopus` SILK 偏离（已定位，非本项目代码，CELT 路径已有精确差分把守）；
-4. 扩展可选 binary FBX 输出（贴图输出已完成）；
-5. 把 MOC3 标识表接入 Live2D 参数组，并补散件发现回退；
-6. 获取样本并实现 Unity 6000.2 MeshLOD/虚拟几何，而不是猜测布局；
-7. 完成许可清晰的纯 Rust Tuanjie ACL 解码；
-8. 补齐高命中率的平台纹理/音频长尾；
-9. 在 Core/Python 稳定后继续提升 Node 专用 API 覆盖。
+前一版的九条里有四条已在 2026-08-15 完成或走到尽头，按本文维护规则移出：托管差分已扩到容器/版本门/已实现的解码路径（含整包 Live2D 与全部块格式）；binary FBX 已在 Core/CLI/Node/Python 全部可达；MOC3 标识表与散件发现回退已接；`ruopus` SILK 已定位为上游缺陷并写进 `docs/upstream-defects.md`，CELT 路径有精确差分把守。剩下的按能否自主推进排序：
+
+**需要外部输入，我这边无法推进：**
+
+1. 让 CI 重新跑起来（GitHub Actions 计费）。本机已把 CI 的每一步复跑过一遍且全绿，唯独 Linux/Windows 复现不了——而这正是上次 Python 侧坏了很久没人发现的原因；
+2. 扩充真实 corpus 与差分快照，按实际命中率排序缺口（需要真实游戏文件）；
+3. 获取样本并实现 Unity 6000.2 MeshLOD/虚拟几何、Tuanjie 虚拟几何 cluster、UnityArchive，而不是猜测布局；
+4. 是否把 `ruopus` 与 `texture2ddecoder` 的缺陷提到上游（补丁已备好，见 `docs/upstream-defects.md`）。
+
+**可以自主推进，但代价与收益需要先掂量：**
+
+5. 纯 Rust Tuanjie ACL 2.x 解码。crates.io 上没有现成实现，属于从零写；而且没有可对照的样本，写出来无法验证，因此在拿到样本之前不宜动手；
+6. 补齐高命中率的平台纹理/音频长尾（新 codec 必须先有真实样本和独立 oracle）；
+7. 继续提升 Node 专用 API 覆盖。
 
 ## 完成判定
 
@@ -226,7 +232,21 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 - 导出/解包保持有界、拒绝路径穿越和符号链接目标，并采用安全原子发布；
 - C# 只需作为历史参考或可选 oracle，不再承担用户运行时功能。
 
-在达到这些条件前，项目可以作为 Beta 使用，但不应把“测试通过”误写成“所有 Unity 游戏都已兼容”。
+### 对照结论（2026-08-15）
+
+逐条对上面七条自评，其中五条已满足、两条未满足：
+
+| 条件 | 状态 |
+|---|---|
+| Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足；C ABI crate 已排除在 workspace 外，只作历史参考 |
+| 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷 |
+| 代表性真实 corpus 稳定通过 | **未满足**；没有真实游戏语料 |
+| 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
+| 跨平台发布任务通过 | **未满足**；CI 自 LZMA 提交起未跑过，本机只能覆盖 macOS |
+| 导出/解包有界、拒绝穿越与符号链接、原子发布 | 满足 |
+| C# 仅作历史参考或可选 oracle | 满足 |
+
+也就是说，剩下的两条恰好就是上面「需要外部输入」里的前两项。在达到这些条件前，项目可以作为 Beta 使用，但不应把「测试通过」误写成「所有 Unity 游戏都已兼容」。
 
 ## 维护规则
 
