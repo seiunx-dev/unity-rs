@@ -1,0 +1,570 @@
+use std::io::{self, Write};
+use std::path::Path;
+
+use assetstudio_core::animation_clip::{AnimationClipReadLimits, read_animation_clip};
+use assetstudio_core::animator_controller::{
+    AnimatorControllerReadLimits, read_animator_controller,
+};
+use assetstudio_core::avatar::{AvatarReadLimits, read_avatar};
+use assetstudio_core::material::{MaterialReadLimits, read_material};
+use assetstudio_core::mesh::{MeshReadLimits, read_mesh_with_collection};
+use assetstudio_core::project_settings::{
+    ProjectSettingsReadLimits, read_build_settings, read_player_settings,
+};
+use assetstudio_core::shader::{ShaderReadLimits, read_shader};
+use assetstudio_core::simple_assets::{
+    SimpleAssetReadLimits, read_audio_clip_asset, read_font, read_movie_texture, read_video_clip,
+};
+use assetstudio_core::sprite::{SpriteReadLimits, decode_sprite_rgba8, read_sprite};
+use assetstudio_core::studio::Studio;
+use assetstudio_core::texture::{TextureReadLimits, read_texture2d};
+use assetstudio_core::type_tree_dump::write_type_tree_dump;
+use serde_json::{Value, json};
+
+pub fn rust_manifest(
+    path: &Path,
+    maximum_object_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let studio = Studio::open(path)?;
+    let mut files = Vec::new();
+    for file in studio.files() {
+        let mut objects = Vec::new();
+        for object in studio
+            .objects()
+            .filter(|object| object.file_index() == file.index())
+        {
+            let payload = rust_payload(
+                &studio,
+                file.index(),
+                object.object_index(),
+                object.class_id(),
+                maximum_object_bytes,
+            )?;
+            let raw = object.read_raw(maximum_object_bytes)?;
+            objects.push(json!({
+                "PathId": object.path_id(),
+                "ClassId": object.class_id(),
+                "ByteSize": object.byte_size(),
+                "Name": object.name(),
+                "Raw": bytes_manifest(&raw),
+                "Payload": payload,
+            }));
+        }
+        files.push(json!({
+            "Path": Path::new(file.path())
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or("loaded file name is not UTF-8")?,
+            "UnityVersion": file.unity_version(),
+            "Objects": objects,
+        }));
+    }
+    let mut resources = studio.resources().collect::<Vec<_>>();
+    resources.sort_by(|left, right| {
+        portable_file_name(left.path())
+            .to_ascii_lowercase()
+            .cmp(&portable_file_name(right.path()).to_ascii_lowercase())
+            .then_with(|| portable_file_name(left.path()).cmp(portable_file_name(right.path())))
+            .then_with(|| left.path().cmp(right.path()))
+    });
+    let mut resource_manifest = Vec::new();
+    resource_manifest.try_reserve_exact(resources.len())?;
+    for resource in resources {
+        let mut bytes = StreamingBytesManifest::new();
+        resource.write(&mut bytes)?;
+        resource_manifest.push(json!({
+            "Path": portable_file_name(resource.path()),
+            "Data": bytes.finish(),
+        }));
+    }
+    Ok(json!({ "Files": files, "Resources": resource_manifest }))
+}
+
+struct StreamingBytesManifest {
+    size: u64,
+    hash: u64,
+}
+
+impl StreamingBytesManifest {
+    const fn new() -> Self {
+        Self {
+            size: 0,
+            hash: 0xcbf2_9ce4_8422_2325,
+        }
+    }
+
+    fn finish(self) -> Value {
+        json!({
+            "Size": self.size,
+            "Fnv64": format!("{:016x}", self.hash),
+        })
+    }
+}
+
+impl Write for StreamingBytesManifest {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.size = self
+            .size
+            .checked_add(u64::try_from(input.len()).map_err(io::Error::other)?)
+            .ok_or_else(|| io::Error::other("resource byte count overflowed"))?;
+        self.hash = input.iter().fold(self.hash, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn portable_file_name(path: &str) -> &str {
+    path.rsplit_once("::")
+        .map_or(path, |(_, name)| name)
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+}
+
+fn rust_payload(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    class_id: i32,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    match class_id {
+        21 | 28 | 43 | 48 | 49 | 74 | 83 | 90 | 91 | 128 | 152 | 213 | 329 => {
+            rust_binary_payload(studio, file_index, object_index, class_id, maximum_bytes)
+        }
+        129 | 141 | 123_456 => {
+            rust_metadata_payload(studio, file_index, object_index, class_id, maximum_bytes)
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+fn rust_binary_payload(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    class_id: i32,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let simple_limits = SimpleAssetReadLimits {
+        maximum_payload_bytes: maximum_bytes,
+        ..SimpleAssetReadLimits::default()
+    };
+    Ok(match class_id {
+        21 => material_manifest(studio, file_index, object_index, maximum_bytes)?,
+        28 => texture_manifest(studio, file_index, object_index, maximum_bytes)?,
+        43 => mesh_manifest(studio, file_index, object_index, maximum_bytes)?,
+        48 => shader_manifest(studio, file_index, object_index, maximum_bytes)?,
+        49 => {
+            let maximum = usize::try_from(maximum_bytes)?;
+            let text = loaded.read_text_asset(object_index, maximum)?;
+            json!({ "Name": text.name, "Script": bytes_manifest(&text.script) })
+        }
+        74 => animation_clip_manifest(studio, file_index, object_index, maximum_bytes)?,
+        83 => {
+            let audio =
+                read_audio_clip_asset(studio.collection(), loaded, object_index, simple_limits)?;
+            json!({
+                "Name": audio.name,
+                "Extension": audio.raw_extension,
+                "Data": bytes_manifest(&audio.payload.read_to_vec(maximum_bytes)?),
+            })
+        }
+        90 => avatar_manifest(studio, file_index, object_index, maximum_bytes)?,
+        91 => animator_controller_manifest(studio, file_index, object_index, maximum_bytes)?,
+        128 => simple_binary_manifest(
+            read_font(loaded, object_index, simple_limits)?,
+            maximum_bytes,
+        )?,
+        152 => simple_binary_manifest(
+            read_movie_texture(loaded, object_index, simple_limits)?,
+            maximum_bytes,
+        )?,
+        213 => sprite_manifest(studio, file_index, object_index, maximum_bytes)?,
+        329 => simple_binary_manifest(
+            read_video_clip(studio.collection(), loaded, object_index, simple_limits)?,
+            maximum_bytes,
+        )?,
+        _ => unreachable!("rust_payload selects binary fixture classes"),
+    })
+}
+
+fn animation_clip_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let clip = read_animation_clip(
+        loaded,
+        object_index,
+        AnimationClipReadLimits {
+            maximum_object_bytes: maximum_bytes,
+            ..AnimationClipReadLimits::default()
+        },
+    )?;
+    let acl = if let Some(acl) = clip
+        .muscle_clip
+        .as_ref()
+        .and_then(|muscle| muscle.clip.acl.as_ref())
+    {
+        Some(json!({
+            "FrameCount": acl.frame_count,
+            "BoneCount": acl.bone_count,
+            "SampleRateBits": acl.sample_rate_bits,
+            "CurveCount": acl.curve_count.unwrap_or(0),
+            "Tracks": bytes_manifest(&acl.tracks.read(maximum_bytes)?),
+            "DecoderMap": acl.decoder_map.read_values(acl.decoder_map.count)?,
+            "UseFastSampleMode": acl.use_fast_sample_mode.unwrap_or(false),
+        }))
+    } else {
+        None
+    };
+    let streaming = clip.streaming_info.as_ref().map(|value| {
+        json!({
+            "Offset": value.offset,
+            "Size": value.size,
+            "Path": value.path,
+        })
+    });
+    Ok(json!({
+        "Name": clip.name,
+        "SampleRateBits": clip.sample_rate.to_bits(),
+        "WrapMode": clip.wrap_mode,
+        "EulerCurveCount": clip.euler_curves.len(),
+        "MusclePresent": clip.muscle_clip.is_some(),
+        "StreamedCurveCount": clip
+            .muscle_clip
+            .as_ref()
+            .map(|muscle| muscle.clip.streamed.curve_count),
+        "Acl": acl,
+        "Streaming": streaming,
+    }))
+}
+
+fn avatar_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let avatar = read_avatar(
+        loaded,
+        object_index,
+        AvatarReadLimits {
+            maximum_object_bytes: maximum_bytes,
+            ..AvatarReadLimits::default()
+        },
+    )?;
+    let tos = avatar
+        .paths
+        .iter()
+        .map(|entry| json!({ "Key": entry.hash, "Value": entry.path }))
+        .collect::<Vec<_>>();
+    Ok(json!({ "Name": avatar.name, "Tos": tos }))
+}
+
+fn animator_controller_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let controller = read_animator_controller(
+        loaded,
+        object_index,
+        AnimatorControllerReadLimits {
+            maximum_object_bytes: maximum_bytes,
+            ..AnimatorControllerReadLimits::default()
+        },
+    )?;
+    let tos = controller
+        .tos
+        .iter()
+        .map(|entry| json!({ "Key": entry.key, "Value": entry.value }))
+        .collect::<Vec<_>>();
+    let animation_clips = controller
+        .animation_clips
+        .iter()
+        .map(|entry| json!({ "FileId": entry.file_id, "PathId": entry.path_id }))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "Name": controller.name,
+        "Tos": tos,
+        "AnimationClips": animation_clips,
+    }))
+}
+
+fn shader_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let shader = read_shader(
+        loaded,
+        object_index,
+        ShaderReadLimits {
+            maximum_script_bytes: maximum_bytes,
+            maximum_output_bytes: maximum_bytes,
+            ..ShaderReadLimits::default()
+        },
+    )?;
+    Ok(json!({
+        "Name": shader.name,
+        "Data": bytes_manifest(&shader.read_to_vec(maximum_bytes)?),
+    }))
+}
+
+fn sprite_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let limits = SpriteReadLimits {
+        maximum_mesh_bytes: maximum_bytes,
+        maximum_output_bytes: maximum_bytes,
+        maximum_working_bytes: maximum_bytes,
+        ..SpriteReadLimits::default()
+    };
+    let texture_limits = TextureReadLimits {
+        maximum_payload_bytes: maximum_bytes,
+        maximum_output_bytes: maximum_bytes,
+        maximum_decoder_working_bytes: maximum_bytes,
+        ..TextureReadLimits::default()
+    };
+    let sprite = read_sprite(loaded, object_index, limits)?;
+    let image = decode_sprite_rgba8(studio.collection(), loaded, &sprite, limits, texture_limits)?;
+    Ok(json!({
+        "Name": sprite.name,
+        "Width": image.width,
+        "Height": image.height,
+        "Pixels": bytes_manifest(&image.pixels),
+    }))
+}
+
+fn material_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let material = read_material(
+        loaded,
+        object_index,
+        MaterialReadLimits {
+            maximum_object_bytes: maximum_bytes,
+            ..MaterialReadLimits::default()
+        },
+    )?;
+    let texture_environments = material
+        .saved_properties
+        .texture_environments
+        .iter()
+        .map(|entry| {
+            json!({
+                "Name": entry.name,
+                "Texture": {
+                    "FileId": entry.value.texture.file_id,
+                    "PathId": entry.value.texture.path_id,
+                },
+                "ScaleBits": entry.value.scale.map(f32::to_bits),
+                "OffsetBits": entry.value.offset.map(f32::to_bits),
+            })
+        })
+        .collect::<Vec<_>>();
+    let integers = material
+        .saved_properties
+        .integers
+        .iter()
+        .map(|entry| json!({ "Name": entry.name, "Value": entry.value }))
+        .collect::<Vec<_>>();
+    let floats = material
+        .saved_properties
+        .floats
+        .iter()
+        .map(|entry| json!({ "Name": entry.name, "ValueBits": entry.value.to_bits() }))
+        .collect::<Vec<_>>();
+    let colors = material
+        .saved_properties
+        .colors
+        .iter()
+        .map(|entry| {
+            json!({
+                "Name": entry.name,
+                "ValueBits": entry.value.map(f32::to_bits),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "Name": material.name,
+        "Shader": {
+            "FileId": material.shader.file_id,
+            "PathId": material.shader.path_id,
+        },
+        "TextureEnvironments": texture_environments,
+        "Integers": integers,
+        "Floats": floats,
+        "Colors": colors,
+    }))
+}
+
+fn mesh_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let mesh = read_mesh_with_collection(
+        studio.collection(),
+        loaded,
+        object_index,
+        MeshReadLimits {
+            maximum_object_bytes: maximum_bytes,
+            ..MeshReadLimits::default()
+        },
+    )?;
+    let indices = mesh
+        .sub_meshes
+        .iter()
+        .flat_map(|sub_mesh| sub_mesh.indices.iter().copied());
+    Ok(json!({
+        "Name": mesh.name,
+        "VertexCount": mesh.vertices.len(),
+        "Vertices": f32_values_manifest(mesh.vertices.iter().flatten().copied())?,
+        "Normals": mesh.normals.as_ref().map(|values| {
+            f32_values_manifest(values.iter().flatten().copied())
+        }).transpose()?,
+        "Uv0": mesh.uv0.as_ref().map(|values| {
+            f32_values_manifest(values.iter().flatten().copied())
+        }).transpose()?,
+        "Indices": u32_values_manifest(indices)?,
+    }))
+}
+
+fn texture_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let limits = TextureReadLimits {
+        maximum_payload_bytes: maximum_bytes,
+        maximum_output_bytes: maximum_bytes,
+        maximum_decoder_working_bytes: maximum_bytes,
+        ..TextureReadLimits::default()
+    };
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let texture = read_texture2d(studio.collection(), loaded, object_index, limits)?;
+    Ok(json!({
+        "Name": texture.name,
+        "Width": texture.width,
+        "Height": texture.height,
+        "TextureFormat": texture.format.0,
+        "MipCount": texture.mip_count,
+        "Data": bytes_manifest(&texture.data.read_to_vec(maximum_bytes)?),
+    }))
+}
+
+fn simple_binary_manifest(
+    asset: assetstudio_core::simple_assets::SimpleBinaryAsset,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let assetstudio_core::simple_assets::SimpleBinaryAsset {
+        name,
+        payload,
+        suggested_extension,
+        ..
+    } = asset;
+    Ok(json!({
+        "Name": name,
+        "Extension": suggested_extension,
+        "Data": bytes_manifest(&payload.read_to_vec(maximum_bytes)?),
+    }))
+}
+
+fn rust_metadata_payload(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    class_id: i32,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    Ok(match class_id {
+        141 => {
+            let build =
+                read_build_settings(loaded, object_index, ProjectSettingsReadLimits::default())?;
+            json!({ "Levels": build.levels, "Scenes": build.scenes })
+        }
+        129 => {
+            let player =
+                read_player_settings(loaded, object_index, ProjectSettingsReadLimits::default())?;
+            json!({
+                "CompanyName": player.company_name,
+                "ProductName": player.product_name,
+            })
+        }
+        123_456 => {
+            let value = loaded.read_type_tree_value(object_index)?;
+            let tree = loaded.object_type_tree(object_index)?;
+            let mut dump = Vec::new();
+            write_type_tree_dump(tree, &value, &mut dump, maximum_bytes)?;
+            json!({ "Dump": String::from_utf8(dump)? })
+        }
+        _ => unreachable!("rust_payload selects metadata fixture classes"),
+    })
+}
+
+fn bytes_manifest(input: &[u8]) -> Value {
+    json!({
+        "Size": input.len(),
+        "Fnv64": format!("{:016x}", fnv1a64(input)),
+    })
+}
+
+fn f32_values_manifest(
+    values: impl Iterator<Item = f32>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    scalar_values_manifest(values.map(f32::to_bits))
+}
+
+fn u32_values_manifest(
+    values: impl Iterator<Item = u32>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    scalar_values_manifest(values)
+}
+
+fn scalar_values_manifest(
+    values: impl Iterator<Item = u32>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut bytes = StreamingBytesManifest::new();
+    let mut count = 0_u64;
+    for value in values {
+        bytes.write_all(&value.to_le_bytes())?;
+        count = count
+            .checked_add(1)
+            .ok_or("scalar value count overflowed")?;
+    }
+    Ok(json!({ "Count": count, "Data": bytes.finish() }))
+}
+
+fn fnv1a64(input: &[u8]) -> u64 {
+    input.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}

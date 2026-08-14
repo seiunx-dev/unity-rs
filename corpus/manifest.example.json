@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "replace-with-a-private-unity-corpus-case",
+      "input": "private/game_Data",
+      "expected": "private/snapshots/game.json",
+      "maximum_object_bytes": 536870912,
+      "enabled": false
+    }
+  ]
+}
