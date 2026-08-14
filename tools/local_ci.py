@@ -34,7 +34,12 @@ CRCs and scanline filters are all this project's own, and its unit test checks
 the CRCs with the project's own CRC routine, so a wrong table would produce a
 file the test accepts and every viewer rejects. `zlib` supplies an independent
 CRC-32 and inflate, and the decoded pixels are compared to the source the file
-was built from, bottom-up-to-top-down row flip included.
+was built from, bottom-up-to-top-down row flip included. BMP and TGA are the
+same problem again and are checked the same way, decoded from the two formats'
+rules: the row order comes from the header rather than being assumed, and the
+BMP channel layout comes from the masks the file declares rather than from the
+convention every reader falls back on, so a file whose header disagrees with
+its own pixels is caught rather than silently read correctly.
 
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
@@ -153,6 +158,10 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "PNG containers",
                     ["python3", "tools/validate_png_output.py"],
+                ),
+                Step(
+                    "BMP and TGA containers",
+                    ["python3", "tools/validate_image_output.py"],
                 ),
             ],
         ),
