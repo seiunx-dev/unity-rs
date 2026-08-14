@@ -6,6 +6,9 @@ use assetstudio_core::animator_controller::{
     AnimatorControllerReadLimits, read_animator_controller,
 };
 use assetstudio_core::avatar::{AvatarReadLimits, read_avatar};
+use assetstudio_core::live2d_motion::{
+    CubismFadeMotionReadLimits, CubismMotionTargetNames, project_cubism_fade_motion,
+};
 use assetstudio_core::live2d_physics::{CubismPhysicsReadLimits, project_cubism_physics};
 use assetstudio_core::material::{MaterialReadLimits, read_material};
 use assetstudio_core::mesh::{MeshReadLimits, read_mesh_with_collection};
@@ -649,6 +652,22 @@ fn mono_behaviour_manifest(
         _ => String::new(),
     };
 
+    let motion = match project_cubism_fade_motion(0, &value, CubismFadeMotionReadLimits::default())
+    {
+        Ok(fade) => {
+            let mut document = Vec::new();
+            // The same names the managed side is given; in the real flow the
+            // model supplies them, and without them every curve falls to the
+            // unbound branch and the target logic goes untested.
+            let names = CubismMotionTargetNames {
+                parameters: vec!["ParamAngleX".to_owned()],
+                parts: vec!["PartArmA".to_owned()],
+            };
+            fade.write_motion3_json(&names, false, &mut document, 1024 * 1024)?;
+            Some(serde_json::from_slice::<Value>(&document)?)
+        }
+        Err(_) => None,
+    };
     let physics = match project_cubism_physics(0, &value, CubismPhysicsReadLimits::default()) {
         Ok(rig) => {
             let mut document = Vec::new();
@@ -660,7 +679,7 @@ fn mono_behaviour_manifest(
         // managed side reports the same absence by leaving the field null.
         Err(_) => None,
     };
-    Ok(json!({ "Name": name, "Physics": physics }))
+    Ok(json!({ "Name": name, "Physics": physics, "Motion": motion }))
 }
 
 fn bytes_manifest(input: &[u8]) -> Value {

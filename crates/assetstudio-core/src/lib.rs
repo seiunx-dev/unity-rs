@@ -30,6 +30,7 @@ pub mod legacy_bundle;
 pub mod live2d;
 pub mod live2d_clip_motion;
 pub mod live2d_motion;
+mod live2d_number;
 pub mod live2d_package;
 pub mod live2d_physics;
 pub mod live2d_schema;

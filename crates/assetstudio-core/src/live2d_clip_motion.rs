@@ -61,7 +61,7 @@ pub struct CubismClipMotionCurve {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CubismClipMotionEvent {
-    pub time: f64,
+    pub time: f32,
     pub value: String,
 }
 
@@ -69,8 +69,8 @@ pub struct CubismClipMotionEvent {
 pub struct CubismClipMotion {
     pub object: SceneObjectKey,
     pub name: String,
-    pub duration: f64,
-    pub fps: f64,
+    pub duration: f32,
+    pub fps: f32,
     pub curves: Vec<CubismClipMotionCurve>,
     pub events: Vec<CubismClipMotionEvent>,
 }
@@ -903,19 +903,19 @@ fn calculate_next_in_slope(
     d2 / dx
 }
 
-fn finite_f32(value: f32, field: &str) -> Result<f64> {
+fn finite_f32(value: f32, field: &str) -> Result<f32> {
     if value.is_finite() {
-        Ok(f64::from(value))
+        Ok(value)
     } else {
         Err(Error::invalid_data(format!("{field} is not finite")))
     }
 }
 
-fn slope_f32(value: f32, field: &str) -> Result<f64> {
+fn slope_f32(value: f32, field: &str) -> Result<f32> {
     if value.is_nan() || value == f32::NEG_INFINITY {
         Err(Error::invalid_data(format!("{field} is not supported")))
     } else {
-        Ok(f64::from(value))
+        Ok(value)
     }
 }
 
@@ -1043,15 +1043,15 @@ mod tests {
         assert_eq!(builder.curves[0].keyframes.len(), 2);
         assert_eq!(
             builder.curves[0].keyframes[0].value.to_bits(),
-            1.25_f64.to_bits()
+            1.25_f32.to_bits()
         );
         assert_eq!(
             builder.curves[0].keyframes[1].time.to_bits(),
-            0.5_f64.to_bits()
+            0.5_f32.to_bits()
         );
         assert_eq!(
             builder.curves[0].keyframes[1].value.to_bits(),
-            2.5_f64.to_bits()
+            2.5_f32.to_bits()
         );
     }
 

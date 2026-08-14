@@ -106,6 +106,22 @@ impl TreeBuilder {
         self.push(element, "data", -1, level + 2, 0);
     }
 
+    /// A `float[] field`, whose element needs no children of its own.
+    fn float_vector(&mut self, field: &str, level: i32) {
+        self.push("vector", field, -1, level, 0);
+        self.push_node("Array", "Array", -1, level + 1, 1, ALIGN);
+        self.int("size", level + 2);
+        self.float("data", level + 2);
+    }
+
+    /// A `string[] field`.
+    fn string_vector(&mut self, field: &str, level: i32) {
+        self.push("vector", field, -1, level, 0);
+        self.push_node("Array", "Array", -1, level + 1, 1, ALIGN);
+        self.int("size", level + 2);
+        self.string("data", level + 2);
+    }
+
     pub(crate) fn finish(self) -> Vec<Value> {
         self.nodes
     }
@@ -282,4 +298,97 @@ fn align(data: &mut Vec<u8>) {
     while !data.len().is_multiple_of(4) {
         data.push(0);
     }
+}
+
+/// The tree for a `CubismFadeMotionData` behaviour.
+///
+/// The field names and order come from the managed
+/// `CubismUnityClasses/CubismFadeMotionData.cs`, and the curve shape from
+/// Unity's own `AnimationCurve`/`Keyframe`: this is the layout the SDK's
+/// serializer writes, not a shape invented here.
+pub(crate) fn cubism_fade_motion_tree() -> Vec<Value> {
+    let mut tree = TreeBuilder::new();
+    tree.push("MonoBehaviour", "Base", -1, 0, 0);
+    pptr(&mut tree, "m_GameObject", "GameObject", 1);
+    tree.byte("m_Enabled", 1);
+    pptr(&mut tree, "m_Script", "MonoScript", 1);
+    tree.string("m_Name", 1);
+
+    tree.string("MotionName", 1);
+    tree.float("FadeInTime", 1);
+    tree.float("FadeOutTime", 1);
+    tree.string_vector("ParameterIds", 1);
+
+    tree.open_vector("AnimationCurve", "ParameterCurves", 1);
+    let curve = 4;
+    tree.open_vector("Keyframe", "m_Curve", curve);
+    let key = curve + 3;
+    tree.float("time", key);
+    tree.float("value", key);
+    tree.float("inSlope", key);
+    tree.float("outSlope", key);
+    tree.int("weightedMode", key);
+    tree.float("inWeight", key);
+    tree.float("outWeight", key);
+    tree.int("m_PreInfinity", curve);
+    tree.int("m_PostInfinity", curve);
+    tree.int("m_RotationOrder", curve);
+
+    tree.float_vector("ParameterFadeInTimes", 1);
+    tree.float_vector("ParameterFadeOutTimes", 1);
+    tree.float("MotionLength", 1);
+    tree.finish()
+}
+
+/// Writes the bytes `cubism_fade_motion_tree` describes.
+pub(crate) fn cubism_fade_motion_object(name: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_pptr(&mut data);
+    data.push(1);
+    align(&mut data);
+    push_pptr(&mut data);
+    push_string(&mut data, name);
+
+    push_string(&mut data, "Idle");
+    push_f32(&mut data, 0.5);
+    push_f32(&mut data, 1.234_567_8);
+
+    // One bound parameter, one bound part and one of the reserved names, so
+    // all three target branches of the converter are reached.
+    let parameters = ["ParamAngleX", "PartArmA", "Opacity"];
+    push_i32(&mut data, i32::try_from(parameters.len()).unwrap());
+    for parameter in parameters {
+        push_string(&mut data, parameter);
+    }
+
+    push_i32(&mut data, i32::try_from(parameters.len()).unwrap());
+    for (index, _) in parameters.iter().enumerate() {
+        // Three keys, so the converter has both an opening segment and an
+        // interior one to emit.
+        push_i32(&mut data, 3);
+        for key in 0..3_u8 {
+            let step = f32::from(key);
+            push_f32(&mut data, step * 0.5);
+            push_f32(&mut data, if index == 0 { step * 0.25 } else { 0.002_5 });
+            push_f32(&mut data, step * 1.5);
+            push_f32(&mut data, step * -1.5);
+            push_i32(&mut data, 0); // weightedMode
+            push_f32(&mut data, 0.333_333_3);
+            push_f32(&mut data, 0.333_333_3);
+        }
+        push_i32(&mut data, 0); // m_PreInfinity
+        push_i32(&mut data, 0); // m_PostInfinity
+        push_i32(&mut data, 0); // m_RotationOrder
+    }
+
+    push_i32(&mut data, i32::try_from(parameters.len()).unwrap());
+    push_f32(&mut data, 0.000_49);
+    push_f32(&mut data, -0.000_4);
+    push_f32(&mut data, 0.5);
+    push_i32(&mut data, i32::try_from(parameters.len()).unwrap());
+    push_f32(&mut data, 0.25);
+    push_f32(&mut data, 2.0);
+    push_f32(&mut data, 0.75);
+    push_f32(&mut data, 1.0);
+    data
 }
