@@ -471,6 +471,13 @@ fn texture_manifest(
     };
     let loaded = &studio.collection().serialized_files[file_index].file;
     let texture = read_texture2d(studio.collection(), loaded, object_index, limits)?;
+    // Mip zero only: the managed decoder exposes one decoded surface, and a
+    // format it cannot handle decodes to null on both sides rather than failing
+    // the comparison.
+    let decoded = match texture.decode_mip_rgba8(0, limits) {
+        Ok(image) => bytes_manifest(&image.pixels),
+        Err(_) => Value::Null,
+    };
     Ok(json!({
         "Name": texture.name,
         "Width": texture.width,
@@ -478,6 +485,7 @@ fn texture_manifest(
         "TextureFormat": texture.format.0,
         "MipCount": texture.mip_count,
         "Data": bytes_manifest(&texture.data.read_to_vec(maximum_bytes)?),
+        "Decoded": decoded,
     }))
 }
 

@@ -52,15 +52,7 @@ static object OracleObject(AssetStudio.Object value)
 {
     object? payload = value switch
     {
-        Texture2D texture => new
-        {
-            Name = texture.m_Name,
-            Width = texture.m_Width,
-            Height = texture.m_Height,
-            TextureFormat = (int)texture.m_TextureFormat,
-            MipCount = texture.m_MipCount,
-            Data = Bytes(texture.image_data.GetData()),
-        },
+        Texture2D texture => TexturePayload(texture),
         Material material => MaterialPayload(material),
         Mesh mesh => MeshPayload(mesh),
         Sprite sprite => SpritePayload(sprite),
@@ -193,6 +185,60 @@ static object AnimationClipPayload(AnimationClip clip)
 // 5.5+ serialized shaders remain uncovered: reaching them means reproducing
 // more of ConvertSerializedShader here, which is worth doing only once the
 // upstream initializer is fixed and Convert can be called directly.
+// Compares the decoded pixels, not only the stored payload.
+//
+// Every block decoder -- BC1 through BC7, ETC, EAC, ASTC, PVRTC, the Crunch
+// variants and the Switch deswizzle -- used to be compared against nothing at
+// all here, because only the raw `image_data` bytes were hashed and those come
+// straight off disk. The managed decoder is the original C++ implementation and
+// the Rust one is an independent port of it, so this is a real cross-check.
+//
+// Rows come out in Unity's own bottom-up order because `ConvertToImage`'s flip
+// is not applied, matching what the Rust reader returns. Pixels are normalized
+// from BGRA to RGBA, and a Switch-swizzled texture is cropped from its padded
+// stride to the declared width.
+static object TexturePayload(Texture2D texture)
+{
+    object decoded;
+    using (var pixels = texture.DecodeBgra32())
+    {
+        if (pixels is null)
+        {
+            decoded = null;
+        }
+        else
+        {
+            var rgba = new byte[checked(pixels.Width * pixels.Height * 4)];
+            var source = pixels.Pixels;
+            var destination = 0;
+            for (var row = 0; row < pixels.Height; row++)
+            {
+                var rowStart = row * pixels.SourceWidth * 4;
+                for (var column = 0; column < pixels.Width; column++)
+                {
+                    var offset = rowStart + column * 4;
+                    rgba[destination] = source[offset + 2];
+                    rgba[destination + 1] = source[offset + 1];
+                    rgba[destination + 2] = source[offset];
+                    rgba[destination + 3] = source[offset + 3];
+                    destination += 4;
+                }
+            }
+            decoded = Bytes(rgba);
+        }
+    }
+    return new
+    {
+        Name = texture.m_Name,
+        Width = texture.m_Width,
+        Height = texture.m_Height,
+        TextureFormat = (int)texture.m_TextureFormat,
+        MipCount = texture.m_MipCount,
+        Data = Bytes(texture.image_data.GetData()),
+        Decoded = decoded,
+    };
+}
+
 static object ShaderPayload(Shader shader)
 {
     ReadOnlySpan<byte> header = "//////////////////////////////////////////\n//\n// NOTE: This is *not* a valid shader file\n//\n///////////////////////////////////////////\n"u8;

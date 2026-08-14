@@ -51,6 +51,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     }
 
     assert_version_matrix(&executable);
+    assert_compressed_texture_formats(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
     assert_truncated_fixture(&executable);
@@ -202,6 +203,81 @@ fn assert_converted_shader(fixture: &TemporaryFixture, manifest: &Value) {
         size > HEADER_BYTES + SCRIPT_BYTES,
         "the 5.3 shader fixture produced {size} bytes, which is the direct \
          script rather than converted text"
+    );
+}
+
+/// Compares decoded pixels across the block-compressed texture formats.
+///
+/// Only the stored payload was ever compared here, and that comes straight off
+/// disk, so every block decoder was verified by this crate's own round trips
+/// alone. The managed decoder is the original C++ implementation and the Rust
+/// one is an independent port, which makes this a real cross-check rather than
+/// two views of the same code.
+///
+/// Three formats are deliberately absent, each for a different reason.
+///
+/// `DXT1` and `DXT5` share the recorded s3tc divergence: the managed decoder's
+/// colour palette reproduces NV4x-era hardware where this reader follows the
+/// specification. `DXT1`'s punch-through mode is the visible half of it -- index
+/// 3 under `q0 <= q1` gives transparent black here and opaque black there -- and
+/// `DXT5` carries the same colour block, which is why its alpha half, `BC4`,
+/// agrees while the whole format does not.
+///
+/// `BC6H` and `ASTC` are excluded because random bytes are the wrong input for
+/// them, not because a divergence was chosen. Both formats reserve encodings
+/// that no encoder emits, and the two implementations handle those differently:
+/// `ASTC` decodes to an error colour in the managed decoder and fails outright
+/// here. Settling those two needs fixtures from a real encoder rather than a
+/// byte generator.
+fn assert_compressed_texture_formats(executable: &Path) {
+    // (name, format code, bytes per 4x4 block)
+    const FORMATS: &[(&str, i32, usize)] = &[
+        ("bc4", 26, 8),
+        ("bc5", 27, 16),
+        ("bc7", 25, 16),
+        ("etc-rgb4", 34, 8),
+        ("etc2-rgb", 45, 8),
+        ("etc2-rgba1", 46, 8),
+        ("etc2-rgba8", 47, 16),
+        ("eac-r", 41, 8),
+        ("eac-r-signed", 42, 8),
+        ("eac-rg", 43, 16),
+        ("eac-rg-signed", 44, 16),
+    ];
+    // Eight by eight is four blocks, so a fixture exercises block-to-block
+    // placement as well as the decode of one block.
+    const SIZE: i32 = 8;
+    const BLOCKS: usize = 4;
+
+    let mut disagreed = Vec::new();
+    for (index, (name, format, block_bytes)) in FORMATS.iter().enumerate() {
+        let payload = block_payload(BLOCKS * block_bytes, 0x9E37_79B9_7F4A_7C15 ^ index as u64);
+        let object = texture2d_inline(&format!("oracle-{name}"), SIZE, SIZE, *format, &payload);
+        let file = synthetic_single_v22(28, 28, "2022.3.62f1", &object);
+        let fixture = TemporaryFixture::new(&format!("oracle-texture-{name}.assets"), &file)
+            .expect("the texture fixture is writable");
+        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+        let managed_decoded = &managed["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+        let rust_decoded = &rust["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+        if managed_decoded != rust_decoded {
+            disagreed.push(format!(
+                "{name} ({format}): managed {managed_decoded} vs Rust {rust_decoded}"
+            ));
+            continue;
+        }
+        assert_eq!(managed, rust, "texture format {name} ({format})");
+        assert!(
+            !managed_decoded.is_null(),
+            "texture format {name} decoded to nothing on both sides, so the \
+             comparison proved nothing: {managed}"
+        );
+    }
+    assert!(
+        disagreed.is_empty(),
+        "decoded pixels disagree for {} format(s):\n{}",
+        disagreed.len(),
+        disagreed.join("\n")
     );
 }
 
@@ -1776,6 +1852,63 @@ fn push_empty_packed_int(output: &mut Vec<u8>) {
     align(output, 4);
     output.push(0);
     align(output, 4);
+}
+
+/// Builds a `Texture2D` with inline pixel data at a caller-chosen format.
+///
+/// Inline rather than streamed so one fixture file is self-contained, which
+/// lets the differential carry a texture per compressed format without a
+/// sibling `.resS` for each.
+fn texture2d_inline(name: &str, width: i32, height: i32, format: i32, data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    push_string(&mut output, name);
+    push_i32(&mut output, 0);
+    output.extend_from_slice(&[0, 0]);
+    align(&mut output, 4);
+    push_i32(&mut output, width);
+    push_i32(&mut output, height);
+    output.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+    push_i32(&mut output, 0);
+    push_i32(&mut output, format);
+    push_i32(&mut output, 1);
+    output.extend_from_slice(&[1, 0, 0]);
+    align(&mut output, 4);
+    push_string(&mut output, "");
+    output.push(0);
+    align(&mut output, 4);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 1);
+    push_i32(&mut output, 2);
+    output.extend_from_slice(&[0; 24]);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, i32::try_from(data.len()).unwrap());
+    output.extend_from_slice(data);
+    output.extend_from_slice(&0_i64.to_le_bytes());
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    push_string(&mut output, "");
+    output
+}
+
+/// Deterministic pseudo-random bytes for a block-compressed payload.
+///
+/// Any byte pattern is a valid block to a decoder, so arbitrary content is the
+/// point: it walks the interpolation modes, partition tables and endpoint
+/// encodings a hand-written block would never reach, and both implementations
+/// have to agree on whatever it means. The generator is a plain LCG so the
+/// fixture is identical on every run and platform.
+fn block_payload(byte_count: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    let mut output = Vec::with_capacity(byte_count);
+    for _ in 0..byte_count {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        #[allow(clippy::cast_possible_truncation)]
+        output.push((state >> 33) as u8);
+    }
+    output
 }
 
 fn texture2d() -> Vec<u8> {
