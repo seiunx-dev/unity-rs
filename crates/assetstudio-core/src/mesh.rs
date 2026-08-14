@@ -162,6 +162,71 @@ pub fn read_mesh_with_collection(
     read_mesh_inner(Some(collection), file, object_index, limits)
 }
 
+/// Expands a submesh's index run into a triangle list.
+///
+/// Unity still emits quads, and imported models bring strips, so refusing a
+/// non-triangle topology outright failed the whole mesh read rather than just
+/// the triangle-oriented output. Follows the managed reader: before Unity 4
+/// every topology is treated as a strip, degenerate strip triangles are
+/// dropped, odd strip positions flip their winding, and a quad becomes two
+/// triangles sharing a diagonal. Lines and points stay explicitly unsupported
+/// because there is no triangle to make from them.
+fn triangulate(
+    source: &[u32],
+    topology: i32,
+    version: (u32, u32, u32),
+    limits: MeshReadLimits,
+) -> Result<Vec<u32>> {
+    const TRIANGLES: i32 = 0;
+    const TRIANGLE_STRIP: i32 = 1;
+    const QUADS: i32 = 2;
+
+    if topology == TRIANGLES && version.0 >= 4 {
+        let mut indices = reserve_vec(source.len(), "Mesh submesh indices")?;
+        indices.extend_from_slice(source);
+        return Ok(indices);
+    }
+    if version.0 >= 4 && !matches!(topology, TRIANGLE_STRIP | QUADS) {
+        return Err(Error::unsupported(format!(
+            "Mesh topology {topology}; lines and points have no triangles"
+        )));
+    }
+
+    // A strip of n indices yields at most n - 2 triangles; a quad run grows by
+    // half. Charge the upper bound before allocating.
+    let expanded = if version.0 < 4 || topology == TRIANGLE_STRIP {
+        source.len().saturating_sub(2).saturating_mul(3)
+    } else {
+        source.len() / 4 * 6
+    };
+    if expanded > limits.maximum_indices {
+        return Err(Error::invalid_data(format!(
+            "Mesh triangulation needs {expanded} indices, exceeding limit {}",
+            limits.maximum_indices
+        )));
+    }
+    let mut indices = reserve_vec(expanded, "Mesh triangulated indices")?;
+
+    if version.0 < 4 || topology == TRIANGLE_STRIP {
+        for (position, window) in source.windows(3).enumerate() {
+            let [first, second, third] = [window[0], window[1], window[2]];
+            if first == second || first == third || second == third {
+                continue;
+            }
+            if position % 2 == 1 {
+                indices.extend_from_slice(&[second, first, third]);
+            } else {
+                indices.extend_from_slice(&[first, second, third]);
+            }
+        }
+    } else {
+        for quad in source.chunks_exact(4) {
+            indices.extend_from_slice(&[quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]);
+        }
+    }
+    Ok(indices)
+}
+
 #[allow(clippy::too_many_lines)]
 fn read_mesh_inner(
     collection: Option<&AssetCollection>,
@@ -205,11 +270,6 @@ fn read_mesh_inner(
         let first_byte = reader.reader.read_u32()?;
         let index_count = reader.reader.read_u32()?;
         let topology = reader.reader.read_i32()?;
-        if topology != 0 {
-            return Err(Error::unsupported(format!(
-                "Mesh topology {topology}; only triangle lists are implemented"
-            )));
-        }
         let base_vertex = reader.reader.read_u32()?;
         if base_vertex != 0 {
             return Err(Error::unsupported(format!(
@@ -240,6 +300,7 @@ fn read_mesh_inner(
             index_count,
             first_vertex,
             vertex_count,
+            topology,
         });
     }
 
@@ -448,11 +509,12 @@ fn read_mesh_inner(
                 "Mesh submesh vertex range ends at {vertex_end}, beyond vertex count {vertex_count}"
             )));
         }
-        let mut indices = reserve_vec(source_indices.len(), "Mesh submesh indices")?;
-        indices.extend_from_slice(source_indices);
+        let indices = triangulate(source_indices, raw.topology, version, limits)?;
+        let index_count = u32::try_from(indices.len())
+            .map_err(|_| Error::invalid_data("Mesh triangulated index count does not fit u32"))?;
         sub_meshes.push(MeshSubMesh {
             first_byte: raw.first_byte,
-            index_count: raw.index_count,
+            index_count,
             first_vertex: raw.first_vertex,
             vertex_count: raw.vertex_count,
             indices,
@@ -655,6 +717,7 @@ struct RawSubMesh {
     index_count: u32,
     first_vertex: u32,
     vertex_count: u32,
+    topology: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1809,7 +1872,7 @@ mod tests {
 
     use super::{
         MESH_CLASS_ID, Mesh, MeshReadLimits, MeshSubMesh, STREAM_ALIGNMENT, read_mesh,
-        read_mesh_with_collection, write_mesh_obj, write_mesh_object_obj,
+        read_mesh_with_collection, triangulate, write_mesh_obj, write_mesh_object_obj,
     };
 
     #[test]
@@ -2208,6 +2271,52 @@ mod tests {
     }
 
     #[test]
+    fn expands_strip_and_quad_topology_into_triangles() {
+        // A three-index submesh as a strip is one triangle with the source
+        // winding; the same run as a quad is not a whole quad, so nothing is
+        // emitted. Refusing these outright used to fail the entire mesh read.
+        let strip = resident_mesh_fixture(MeshFixtureOptions {
+            topology: 1,
+            ..MeshFixtureOptions::default()
+        });
+        let mesh = read_mesh(&parse_v22_mesh(&strip), 0, MeshReadLimits::default()).unwrap();
+        assert_eq!(mesh.sub_meshes[0].indices, [0, 1, 2]);
+        assert_eq!(mesh.sub_meshes[0].index_count, 3);
+
+        let quads = resident_mesh_fixture(MeshFixtureOptions {
+            topology: 2,
+            ..MeshFixtureOptions::default()
+        });
+        let mesh = read_mesh(&parse_v22_mesh(&quads), 0, MeshReadLimits::default()).unwrap();
+        assert!(mesh.sub_meshes[0].indices.is_empty());
+        assert_eq!(mesh.sub_meshes[0].index_count, 0);
+    }
+
+    #[test]
+    fn triangulation_drops_degenerates_and_flips_odd_strip_winding() {
+        // Position 1 is odd, so its winding flips; a run containing a repeated
+        // index contributes no triangle.
+        let source = [0_u32, 1, 2, 3];
+        let expanded = triangulate(&source, 1, (2022, 3, 62), MeshReadLimits::default()).unwrap();
+        assert_eq!(expanded, [0, 1, 2, 2, 1, 3]);
+
+        let degenerate = [0_u32, 0, 1, 2];
+        let expanded =
+            triangulate(&degenerate, 1, (2022, 3, 62), MeshReadLimits::default()).unwrap();
+        assert_eq!(expanded, [1, 0, 2]);
+
+        // Before Unity 4 every topology is a strip, whatever the field says.
+        let legacy = triangulate(&source, 0, (3, 5, 0), MeshReadLimits::default()).unwrap();
+        assert_eq!(legacy, [0, 1, 2, 2, 1, 3]);
+
+        let quad = triangulate(&[0, 1, 2, 3], 2, (2022, 3, 62), MeshReadLimits::default()).unwrap();
+        assert_eq!(quad, [0, 1, 2, 0, 2, 3]);
+
+        let error = triangulate(&source, 4, (2022, 3, 62), MeshReadLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("lines and points"));
+    }
+
+    #[test]
     fn supports_32_bit_indices_and_rejects_unsupported_layouts() {
         let object = resident_mesh_fixture(MeshFixtureOptions {
             index_width: 4,
@@ -2230,8 +2339,9 @@ mod tests {
 
         for (options, expected) in [
             (
+                // Lines. There is no triangle to make from them.
                 MeshFixtureOptions {
-                    topology: 1,
+                    topology: 3,
                     ..MeshFixtureOptions::default()
                 },
                 "topology",
