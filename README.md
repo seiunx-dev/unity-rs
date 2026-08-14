@@ -74,6 +74,19 @@ criteria, and prioritized gap list live in
 
 ## Build and test
 
+Everything the CI workflow runs is also runnable here, on any platform:
+
+```shell
+# The whole gate: formatting, Clippy, rustdoc, the packaged crate, the
+# workspace tests, the Node addon, the Python wheel, and the differentials.
+# Groups whose tool is missing are reported as skipped rather than failed.
+python3 tools/local_ci.py --interpreter /path/to/venv/bin/python
+python3 tools/local_ci.py --list          # what it would run
+python3 tools/local_ci.py quality rust    # only these groups
+```
+
+Or step by step:
+
 ```shell
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Runs every step the CI workflow runs, on this machine.
+
+CI has not run since the LZMA commit, and the gap was not harmless: the Python
+suite had been failing the whole time and nothing surfaced it until the wheel
+was built by hand. This exists so that "run what CI runs" is one command on any
+platform rather than a sequence someone has to reconstruct from the workflow
+file.
+
+It is not a replacement for CI. CI runs this matrix on Linux, Windows and
+macOS; this runs it wherever you are. The value is that a contributor on a
+platform the maintainer cannot reach can produce the same evidence.
+
+Steps are grouped, and a group that cannot run because a tool is missing is
+reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
+UnityPy are all optional. Anything that runs and fails is a failure.
+
+    python3 tools/local_ci.py             # everything available
+    python3 tools/local_ci.py --list      # what would run
+    python3 tools/local_ci.py rust python # only these groups
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+NODE = ROOT / "crates" / "assetstudio-node"
+PYTHON = ROOT / "crates" / "assetstudio-python"
+
+
+@dataclass
+class Step:
+    name: str
+    command: list[str]
+    cwd: Path = ROOT
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Group:
+    name: str
+    steps: list[Step]
+    # A tool that must exist for the group to mean anything. None means the
+    # group only needs cargo, which the runner requires up front.
+    requires: str | None = None
+    reason: str = ""
+
+
+def groups(interpreter: str) -> list[Group]:
+    return [
+        Group(
+            "quality",
+            [
+                Step("format", ["cargo", "fmt", "--all", "--", "--check"]),
+                Step(
+                    "clippy",
+                    [
+                        "cargo", "clippy", "--workspace", "--all-targets",
+                        "--locked", "--", "-D", "warnings",
+                    ],
+                ),
+                Step(
+                    "rustdoc",
+                    ["cargo", "doc", "--workspace", "--no-deps", "--locked"],
+                    env={"RUSTDOCFLAGS": "-D warnings"},
+                ),
+                Step(
+                    "package the core crate",
+                    ["cargo", "package", "--locked", "-p", "assetstudio-core"],
+                ),
+            ],
+        ),
+        Group(
+            "rust",
+            [Step("workspace tests", ["cargo", "test", "--workspace", "--locked"])],
+        ),
+        Group(
+            "oracle",
+            [
+                Step(
+                    "managed differential",
+                    [
+                        "cargo", "test", "-p", "assetstudio-core", "--test",
+                        "dotnet_oracle", "--locked", "--", "--ignored",
+                    ],
+                )
+            ],
+            requires="dotnet",
+            reason="the managed differential needs the .NET SDK and an AssetStudio checkout",
+        ),
+        Group(
+            "audio",
+            [
+                Step(
+                    "audio differential",
+                    [
+                        "cargo", "test", "-p", "assetstudio-core", "--lib",
+                        "--locked", "--", "--ignored",
+                    ],
+                )
+            ],
+            requires="vgmstream-cli",
+            reason="the audio differential decodes with vgmstream-cli",
+        ),
+        Group(
+            "node",
+            [
+                Step("install", ["npm", "ci"], cwd=NODE),
+                Step("build addon", ["npm", "run", "build:debug"], cwd=NODE),
+                Step("addon tests", ["npm", "test"], cwd=NODE),
+                Step("package contents", ["npm", "pack", "--dry-run"], cwd=NODE),
+            ],
+            requires="npm",
+            reason="the Node addon needs npm",
+        ),
+        Group(
+            "python",
+            [
+                Step(
+                    "build wheel",
+                    [
+                        "maturin", "build", "--release", "--locked",
+                        "--interpreter", interpreter, "--out", "dist",
+                    ],
+                    cwd=PYTHON,
+                ),
+                Step("install wheel", [interpreter, "-c", INSTALL_WHEEL], cwd=PYTHON),
+                Step("wheel surface", [interpreter, "-I", "tests/installed_wheel.py"], cwd=PYTHON),
+                Step("python api", [interpreter, "-I", "tests/python_api.py"], cwd=PYTHON),
+            ],
+            requires="maturin",
+            reason="the Python wheel needs maturin",
+        ),
+        Group(
+            "unitypy",
+            [
+                Step(
+                    "UnityPy differential",
+                    [interpreter, "-I", "tests/unitypy_oracle.py"],
+                    cwd=PYTHON,
+                )
+            ],
+            requires="maturin",
+            reason="needs the built wheel and UnityPy in the same interpreter",
+        ),
+    ]
+
+
+INSTALL_WHEEL = (
+    "import glob, subprocess, sys; "
+    "wheels = glob.glob('dist/*.whl'); "
+    "assert len(wheels) == 1, wheels; "
+    "subprocess.check_call([sys.executable, '-m', 'pip', 'install', "
+    "'--force-reinstall', '--no-deps', wheels[0]])"
+)
+
+
+def run(step: Step) -> tuple[bool, str]:
+    environment = dict(os.environ)
+    environment.update(step.env)
+    result = subprocess.run(
+        step.command,
+        cwd=step.cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    tail = (result.stderr or result.stdout).strip().splitlines()
+    return False, "\n".join(tail[-25:])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("groups", nargs="*", help="only run these groups")
+    parser.add_argument("--list", action="store_true", help="list groups and exit")
+    parser.add_argument(
+        "--interpreter",
+        default=sys.executable,
+        help="Python used to build and test the wheel; use a virtualenv so the "
+        "wheel is not installed into a system interpreter",
+    )
+    arguments = parser.parse_args()
+
+    available = groups(arguments.interpreter)
+    if arguments.groups:
+        names = set(arguments.groups)
+        unknown = names - {group.name for group in available}
+        if unknown:
+            print(f"unknown group(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+            return 2
+        available = [group for group in available if group.name in names]
+
+    if arguments.list:
+        for group in available:
+            note = f"  (needs {group.requires})" if group.requires else ""
+            print(f"{group.name}{note}")
+            for step in group.steps:
+                print(f"    {' '.join(step.command)}")
+        return 0
+
+    if shutil.which("cargo") is None:
+        print("cargo is required", file=sys.stderr)
+        return 2
+
+    failures: list[str] = []
+    skipped: list[str] = []
+    for group in available:
+        if group.requires and shutil.which(group.requires) is None:
+            skipped.append(f"{group.name}: {group.reason}")
+            print(f"skip {group.name}: {group.requires} not found")
+            continue
+        for step in group.steps:
+            label = f"{group.name}/{step.name}"
+            print(f"run  {label}", flush=True)
+            ok, tail = run(step)
+            if not ok:
+                failures.append(label)
+                print(f"FAIL {label}\n{tail}\n", file=sys.stderr)
+                # Later steps in a group generally depend on earlier ones.
+                break
+
+    print()
+    for note in skipped:
+        print(f"skipped {note}")
+    if failures:
+        print(f"\n{len(failures)} step(s) failed: {', '.join(failures)}")
+        return 1
+    print(f"all steps passed ({len(skipped)} group(s) skipped)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
