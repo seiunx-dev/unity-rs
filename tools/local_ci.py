@@ -20,14 +20,15 @@ suite and the Python wheel inside a container on the toolchain CI pins, which
 is behaviour rather than compilation. Neither covers Windows or macOS at once,
 so CI still has work to do.
 
-The `fbx` group is a second implementation rather than a second run: the
+The `outputs` group is a second implementation rather than a second run: the
 crate's binary FBX reader and writer were built together, so their agreement
 shows they share assumptions, not that either matches the format. That group
 exports through the CLI and checks the bytes with a parser written from the
 format's rules, and does the same for the ASCII form: braces, the counts
 `Definitions` declares against the objects actually written, connections
 resolving to objects that exist, and arrays holding as many values as they
-claim.
+claim. The WAV containers go to Python's own `wave` module, which was
+not written for this project and refuses files whose header fields disagree.
 
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
@@ -129,7 +130,7 @@ def groups(interpreter: str) -> list[Group]:
             reason="the audio differential decodes with vgmstream-cli",
         ),
         Group(
-            "fbx",
+            "outputs",
             [
                 Step(
                     "binary FBX validity",
@@ -138,6 +139,10 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "ASCII FBX consistency",
                     ["python3", "tools/validate_fbx_ascii.py", "--cli"],
+                ),
+                Step(
+                    "WAV containers",
+                    ["python3", "tools/validate_wav_output.py"],
                 ),
             ],
         ),
