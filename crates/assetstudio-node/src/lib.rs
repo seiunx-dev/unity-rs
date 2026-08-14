@@ -13,10 +13,12 @@ use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMateria
 use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
+use assetstudio_core::mono_schema::{MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry};
 use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
 use assetstudio_core::scene_textures::SceneTextureLimits;
+use assetstudio_core::serialized::{TypeTree, TypeTreeNode};
 use assetstudio_core::simple_assets::SimpleAssetReadLimits;
 use assetstudio_core::source::Region;
 use assetstudio_core::sprite::SpriteReadLimits;
@@ -294,6 +296,31 @@ pub struct AclTracks {
     pub is_wrap_optimized: bool,
     pub has_database: bool,
     pub has_stripped_keyframes: bool,
+}
+
+/// One node of a trusted managed object schema.
+///
+/// Reconstructed by an offline tool; nothing here executes asset-controlled
+/// code. `align` sets the four-byte alignment flag Unity's own trees carry.
+#[napi(object)]
+pub struct SchemaNode {
+    pub type_name: String,
+    pub field_name: String,
+    /// Nesting depth, zero for the root.
+    pub level: u32,
+    pub align: bool,
+}
+
+/// A complete object schema for one managed script type.
+#[napi(object)]
+pub struct MonoBehaviourSchema {
+    pub assembly_name: String,
+    pub class_name: String,
+    pub namespace: Option<String>,
+    /// Exact Unity version this schema was generated for. Omit for a schema
+    /// that applies to every version.
+    pub unity_version: Option<String>,
+    pub nodes: Vec<SchemaNode>,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -1308,6 +1335,34 @@ impl AssetStudio {
             has_stripped_keyframes: tracks.has_stripped_keyframes(),
         })
     }
+
+    /// Reads a `MonoBehaviour` as JSON, resolving its stripped managed fields
+    /// through caller-supplied schemas.
+    ///
+    /// A shipped build strips the managed type layout, so without a schema only
+    /// the engine-owned prefix can be read. The schemas are data: they are
+    /// matched by assembly, namespace, class and optionally Unity version, and
+    /// nothing in them is executed.
+    #[napi]
+    pub fn read_mono_behaviour_json_with_schemas(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        schemas: Vec<MonoBehaviourSchema>,
+        pretty: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<Buffer> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let registry = build_schema_registry(schemas)?;
+        let limits = MonoBehaviourReadLimits {
+            maximum_json_bytes: usize::try_from(maximum).unwrap_or(usize::MAX),
+            ..MonoBehaviourReadLimits::default()
+        };
+        self.object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_mono_behaviour_json(&registry, pretty.unwrap_or(false), limits)
+            .map(Into::into)
+            .map_err(core_error)
+    }
 }
 
 impl AssetStudio {
@@ -1505,6 +1560,68 @@ fn studio_object(studio: &Studio, file_index: usize, path_id: i64) -> Result<Stu
             "object path ID {path_id} was not found in file index {file_index}"
         ))
     })
+}
+
+/// Converts caller-supplied schema descriptions into a lookup registry.
+///
+/// Bounded on both node count and total string bytes, because these arrive
+/// from JavaScript and nothing else checks them.
+fn build_schema_registry(schemas: Vec<MonoBehaviourSchema>) -> Result<MonoBehaviourSchemaRegistry> {
+    const MAXIMUM_NODES: usize = 100_000;
+    const MAXIMUM_STRING_BYTES: usize = 16 * 1024 * 1024;
+
+    let mut registry = MonoBehaviourSchemaRegistry::new();
+    let mut total_string_bytes = 0_usize;
+    for schema in schemas {
+        if schema.nodes.is_empty() {
+            return Err(invalid_arg("a MonoBehaviour schema needs a root node"));
+        }
+        if schema.nodes.len() > MAXIMUM_NODES {
+            return Err(invalid_arg(format!(
+                "a MonoBehaviour schema has {} nodes; the maximum is {MAXIMUM_NODES}",
+                schema.nodes.len()
+            )));
+        }
+        let mut nodes = Vec::with_capacity(schema.nodes.len());
+        for (index, node) in schema.nodes.into_iter().enumerate() {
+            total_string_bytes = total_string_bytes
+                .checked_add(node.type_name.len())
+                .and_then(|value| value.checked_add(node.field_name.len()))
+                .ok_or_else(|| invalid_arg("MonoBehaviour schema strings overflowed"))?;
+            if total_string_bytes > MAXIMUM_STRING_BYTES {
+                return Err(invalid_arg(format!(
+                    "MonoBehaviour schema strings exceed {MAXIMUM_STRING_BYTES} bytes"
+                )));
+            }
+            nodes.push(TypeTreeNode {
+                type_name: node.type_name,
+                field_name: node.field_name,
+                byte_size: -1,
+                index: i32::try_from(index)
+                    .map_err(|_| invalid_arg("schema node index exceeds i32"))?,
+                type_flags: 0,
+                version: 1,
+                meta_flags: if node.align { 0x4000 } else { 0 },
+                level: node.level,
+                type_string_offset: None,
+                name_string_offset: None,
+                reference_type_hash: 0,
+            });
+        }
+        registry
+            .push(MonoBehaviourSchemaEntry {
+                assembly_name: schema.assembly_name,
+                namespace: schema.namespace.unwrap_or_default(),
+                class_name: schema.class_name,
+                unity_version: schema.unity_version,
+                tree: TypeTree {
+                    nodes,
+                    string_buffer: Vec::new(),
+                },
+            })
+            .map_err(core_error)?;
+    }
+    Ok(registry)
 }
 
 /// Settings objects are small; one budget covers the payload and its strings.

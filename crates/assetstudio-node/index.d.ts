@@ -154,6 +154,16 @@ export declare class AssetStudio {
    * whether its own decoder can handle the blob before asking for it.
    */
   readAclTracks(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AclTracks
+  /**
+   * Reads a `MonoBehaviour` as JSON, resolving its stripped managed fields
+   * through caller-supplied schemas.
+   *
+   * A shipped build strips the managed type layout, so without a schema only
+   * the engine-owned prefix can be read. The schemas are data: they are
+   * matched by assembly, namespace, class and optionally Unity version, and
+   * nothing in them is executed.
+   */
+  readMonoBehaviourJsonWithSchemas(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): Buffer
 }
 
 /**
@@ -328,6 +338,19 @@ export interface MemoryInput {
   data: Buffer
 }
 
+/** A complete object schema for one managed script type. */
+export interface MonoBehaviourSchema {
+  assemblyName: string
+  className: string
+  namespace?: string
+  /**
+   * Exact Unity version this schema was generated for. Omit for a schema
+   * that applies to every version.
+   */
+  unityVersion?: string
+  nodes: Array<SchemaNode>
+}
+
 /**
  * The identity fields of a `MonoScript`, which name the type a
  * `MonoBehaviour` deserializes as.
@@ -394,6 +417,20 @@ export interface SceneNode {
   hasMeshRenderer: boolean
   hasSkinnedMeshRenderer: boolean
   hasAnimator: boolean
+}
+
+/**
+ * One node of a trusted managed object schema.
+ *
+ * Reconstructed by an offline tool; nothing here executes asset-controlled
+ * code. `align` sets the four-byte alignment flag Unity's own trees carry.
+ */
+export interface SchemaNode {
+  typeName: string
+  fieldName: string
+  /** Nesting depth, zero for the root. */
+  level: number
+  align: boolean
 }
 
 /** An FBX plus the texture files it references by name. */
