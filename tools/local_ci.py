@@ -24,7 +24,10 @@ The `fbx` group is a second implementation rather than a second run: the
 crate's binary FBX reader and writer were built together, so their agreement
 shows they share assumptions, not that either matches the format. That group
 exports through the CLI and checks the bytes with a parser written from the
-format's rules.
+format's rules, and does the same for the ASCII form: braces, the counts
+`Definitions` declares against the objects actually written, connections
+resolving to objects that exist, and arrays holding as many values as they
+claim.
 
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
@@ -131,7 +134,11 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "binary FBX validity",
                     ["python3", "tools/validate_fbx_binary.py", "--cli"],
-                )
+                ),
+                Step(
+                    "ASCII FBX consistency",
+                    ["python3", "tools/validate_fbx_ascii.py", "--cli"],
+                ),
             ],
         ),
         Group(
