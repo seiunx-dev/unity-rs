@@ -629,8 +629,8 @@ fn assert_cubism_expression(executable: &Path) {
         .expect("the expression has parameters");
     assert_eq!(
         parameters.len(),
-        3,
-        "one parameter per blend mode: {managed}"
+        5,
+        "one parameter per blend mode, plus two that pin the number format: {managed}"
     );
     // The default float format keeps a trailing .0 where "0.###" would not,
     // which is the distinction this document exists to hold down.
@@ -641,6 +641,17 @@ fn assert_cubism_expression(executable: &Path) {
     assert_eq!(
         managed_expression["FadeOutTime"], 1.234_567_8,
         "this document does not round to three decimals"
+    );
+    // Pinned because a value comparison cannot see the difference between 0
+    // and 0.0, and the byte row that can is a hash: without these, the
+    // fixture could stop covering either case and nothing would say so.
+    assert_eq!(
+        managed_expression["Parameters"][3]["Value"], 0.0,
+        "zero is in the fixture to hold down the trailing .0"
+    );
+    assert_eq!(
+        managed_expression["Parameters"][4]["Value"], 1.5e8,
+        "a value one decade below the scientific threshold is in the fixture"
     );
 
     assert_eq!(managed, rust, "Cubism expression conversion");
