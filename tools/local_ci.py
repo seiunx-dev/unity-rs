@@ -64,6 +64,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 NODE = ROOT / "crates" / "assetstudio-node"
 PYTHON = ROOT / "crates" / "assetstudio-python"
+# The wheel is installed here rather than into whatever interpreter happens to
+# be on PATH. A Homebrew or distribution Python refuses `pip install` outright
+# under PEP 668, and one that does not would be left carrying a build of this
+# project afterwards. System site packages stay visible so an already-installed
+# UnityPy is still importable for the differential.
+VENV = PYTHON / ".ci-venv"
 
 
 @dataclass
@@ -82,6 +88,13 @@ class Group:
     # group only needs cargo, which the runner requires up front.
     requires: str | None = None
     reason: str = ""
+
+
+def venv_interpreter() -> str:
+    """The interpreter inside `VENV`, wherever this platform puts it."""
+    if os.name == "nt":
+        return str(VENV / "Scripts" / "python.exe")
+    return str(VENV / "bin" / "python")
 
 
 def groups(interpreter: str) -> list[Group]:
@@ -250,9 +263,18 @@ def groups(interpreter: str) -> list[Group]:
                     ],
                     cwd=PYTHON,
                 ),
-                Step("install wheel", [interpreter, "-c", INSTALL_WHEEL], cwd=PYTHON),
-                Step("wheel surface", [interpreter, "-I", "tests/installed_wheel.py"], cwd=PYTHON),
-                Step("python api", [interpreter, "-I", "tests/python_api.py"], cwd=PYTHON),
+                Step(
+                    "create venv",
+                    [interpreter, "-m", "venv", "--clear",
+                     "--system-site-packages", str(VENV)],
+                ),
+                Step("install wheel", [venv_interpreter(), "-c", INSTALL_WHEEL], cwd=PYTHON),
+                Step(
+                    "wheel surface",
+                    [venv_interpreter(), "-I", "tests/installed_wheel.py"],
+                    cwd=PYTHON,
+                ),
+                Step("python api", [venv_interpreter(), "-I", "tests/python_api.py"], cwd=PYTHON),
             ],
             requires="maturin",
             reason="the Python wheel needs maturin",
@@ -262,7 +284,7 @@ def groups(interpreter: str) -> list[Group]:
             [
                 Step(
                     "UnityPy differential",
-                    [interpreter, "-I", "tests/unitypy_oracle.py"],
+                    [venv_interpreter(), "-I", "tests/unitypy_oracle.py"],
                     cwd=PYTHON,
                 )
             ],
@@ -342,8 +364,8 @@ def main() -> int:
     parser.add_argument(
         "--interpreter",
         default=sys.executable,
-        help="Python used to build and test the wheel; use a virtualenv so the "
-        "wheel is not installed into a system interpreter",
+        help="Python the wheel is built against and the throwaway virtualenv is "
+        "created from; the wheel itself is never installed into it",
     )
     arguments = parser.parse_args()
 
