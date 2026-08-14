@@ -9,11 +9,10 @@
 //! material colours and connections come from code the differential already
 //! covers. What is new here is only how that content is laid out as records.
 //!
-//! This covers the static scene: models, geometry, materials and the
-//! connections between them. Skinning, blend shapes, animation and textures
-//! stay on the ASCII path until each has been laid out and checked in turn;
-//! emitting a partial version of them would produce a file that looks complete
-//! and quietly is not.
+//! This covers models, geometry, materials, textures, skin deformers and the
+//! connections between them. Blend shapes and animation stay on the ASCII path
+//! until each has been laid out and checked in turn; emitting a partial version
+//! of them would produce a file that looks complete and quietly is not.
 
 use std::io::Write;
 
@@ -46,15 +45,6 @@ pub fn write_model_ir_fbx_binary_with_textures<W: Write>(
     maximum_output_bytes: u64,
 ) -> Result<u64> {
     let scene = StaticScene::from_model(model, None, textures)?;
-    if scene
-        .geometries
-        .iter()
-        .any(|geometry| geometry.skin.is_some())
-    {
-        return Err(Error::unsupported(
-            "binary FBX does not yet emit skin deformers",
-        ));
-    }
     if scene
         .geometries
         .iter()
@@ -92,6 +82,14 @@ fn build_scene_nodes(scene: &StaticScene<'_>) -> Result<Vec<FbxNode>> {
     for texture in &scene.textures {
         objects.children.push(texture_node(texture));
         objects.children.push(video_node(texture));
+    }
+    for geometry in &scene.geometries {
+        if let Some(skin) = &geometry.skin {
+            objects.children.push(skin_node(skin));
+            for cluster in &skin.clusters {
+                objects.children.push(cluster_node(cluster));
+            }
+        }
     }
 
     Ok(vec![
@@ -168,13 +166,14 @@ fn documents() -> FbxNode {
 fn definitions(scene: &StaticScene<'_>) -> FbxNode {
     let mut definitions = FbxNode::new("Definitions")
         .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
-        .child(FbxNode::new("Count").with(FbxProperty::I32(5)));
+        .child(FbxNode::new("Count").with(FbxProperty::I32(6)));
     for (name, count) in [
         ("Model", scene.nodes.len()),
         ("Geometry", scene.geometries.len()),
         ("Material", scene.materials.len()),
         ("Texture", scene.textures.len()),
         ("Video", scene.textures.len()),
+        ("Deformer", deformer_count(scene)),
     ] {
         definitions.children.push(
             FbxNode::new("ObjectType")
@@ -401,6 +400,61 @@ fn video_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
         )
 }
 
+/// Every skin and cluster record the scene will emit.
+fn deformer_count(scene: &StaticScene<'_>) -> usize {
+    scene
+        .geometries
+        .iter()
+        .filter_map(|geometry| geometry.skin.as_ref())
+        .map(|skin| 1 + skin.clusters.len())
+        .sum()
+}
+
+/// The skin deformer a mesh's clusters hang from.
+fn skin_node(skin: &crate::fbx_scene_ascii::SkinPlan<'_>) -> FbxNode {
+    FbxNode::new("Deformer")
+        .with(FbxProperty::I64(skin.id))
+        .with(FbxProperty::String(format!("Deformer::{}", skin.name)))
+        .with(FbxProperty::String("Skin".to_owned()))
+        .child(FbxNode::new("Version").with(FbxProperty::I32(101)))
+        .child(FbxNode::new("Link_DeformAcuracy").with(FbxProperty::F64(50.0)))
+}
+
+/// One cluster: the vertices a bone influences, their weights, and the two
+/// matrices that place the bone against the mesh at bind time.
+fn cluster_node(cluster: &crate::fbx_scene_ascii::ClusterPlan<'_>) -> FbxNode {
+    let indices: Vec<i32> = cluster
+        .indices
+        .iter()
+        .map(|index| i32::try_from(*index).unwrap_or(i32::MAX))
+        .collect();
+    let weights: Vec<f64> = cluster
+        .weights
+        .iter()
+        .map(|weight| f64::from(*weight))
+        .collect();
+    FbxNode::new("Deformer")
+        .with(FbxProperty::I64(cluster.id))
+        .with(FbxProperty::String(format!(
+            "SubDeformer::{}Cluster",
+            cluster.bone_name
+        )))
+        .with(FbxProperty::String("Cluster".to_owned()))
+        .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
+        .child(
+            FbxNode::new("UserData")
+                .with(FbxProperty::String(String::new()))
+                .with(FbxProperty::String(String::new())),
+        )
+        .child(FbxNode::new("Indexes").with(FbxProperty::I32Array(indices)))
+        .child(FbxNode::new("Weights").with(FbxProperty::F64Array(weights)))
+        .child(FbxNode::new("Transform").with(FbxProperty::F64Array(cluster.transform.0.to_vec())))
+        .child(
+            FbxNode::new("TransformLink")
+                .with(FbxProperty::F64Array(cluster.transform_link.0.to_vec())),
+        )
+}
+
 /// Object-to-object links, in the same order the ASCII writer emits them.
 fn connections(scene: &StaticScene<'_>) -> FbxNode {
     let mut connections = FbxNode::new("Connections");
@@ -423,6 +477,15 @@ fn connections(scene: &StaticScene<'_>) -> FbxNode {
     }
     for texture in &scene.textures {
         link(texture.video_id, texture.id);
+    }
+    for geometry in &scene.geometries {
+        if let Some(skin) = &geometry.skin {
+            link(skin.id, geometry.id);
+            for cluster in &skin.clusters {
+                link(cluster.id, skin.id);
+                link(cluster.bone_model_id, cluster.id);
+            }
+        }
     }
     // Object-to-property links name the material channel the texture drives.
     for material in &scene.materials {
@@ -584,6 +647,37 @@ mod tests {
         )
     }
 
+    /// A mesh carrying a blend shape, which this layout does not emit.
+    fn blend_shape_model_fixture() -> ModelIr {
+        use crate::mesh::{
+            MeshBlendShapeChannel, MeshBlendShapeFrame, MeshBlendShapeVertex, MeshBlendShapes,
+        };
+
+        let mut mesh = triangle_mesh(None);
+        mesh.blend_shapes = Some(MeshBlendShapes {
+            vertices: vec![MeshBlendShapeVertex {
+                vertex: [0.1, 0.0, 0.0],
+                normal: [0.0, 0.0, 0.0],
+                tangent: [0.0, 0.0, 0.0],
+                index: 0,
+            }],
+            frames: vec![MeshBlendShapeFrame {
+                first_vertex: 0,
+                vertex_count: 1,
+                has_normals: false,
+                has_tangents: false,
+            }],
+            channels: vec![MeshBlendShapeChannel {
+                name: "smile".to_owned(),
+                name_hash: 1,
+                frame_index: 0,
+                frame_count: 1,
+            }],
+            full_weights: vec![100.0],
+        });
+        model_with(mesh, ModelRendererKind::MeshRenderer { mesh_filter: None })
+    }
+
     /// A skinned model whose bone is a separate node, so the scene builder
     /// resolves a skin rather than refusing the model outright.
     fn skinned_model_fixture() -> ModelIr {
@@ -627,8 +721,9 @@ mod tests {
         };
         root_node.renderers.push(ModelRendererBinding {
             component: key(31),
+            // The renderer names Transform components, not GameObjects.
             kind: ModelRendererKind::SkinnedMeshRenderer {
-                bones: vec![Some(bone)],
+                bones: vec![Some(key(12))],
             },
             mesh: Some(key(51)),
             materials: Vec::new(),
@@ -835,23 +930,60 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_scene_this_layout_would_silently_drop() {
-        // Skinning and blend shapes stay on the ASCII path. What matters is
-        // that a skinned model is refused rather than written out as plain
-        // geometry, which would look like a successful export and lose the
-        // rig. The message is not pinned because the refusal can legitimately
-        // come from either the scene builder or this layout's own guard,
-        // depending on how the model resolves its bones.
+    fn emits_a_skin_deformer_and_its_clusters() {
         let model = skinned_model_fixture();
-        assert!(read_model_ir_fbx_binary(&model, 64 * 1024).is_err());
+        let bytes = read_model_ir_fbx_binary(&model, 64 * 1024).unwrap();
+        let roots = parse_fbx_binary(&bytes).unwrap();
+        let objects = roots
+            .iter()
+            .find(|node| node.name == "Objects")
+            .expect("an Objects record");
 
-        // The guard itself is what stops a resolvable skin, so assert it reads
-        // as unsupported rather than as malformed input: the file is fine, this
-        // writer simply does not cover it yet.
+        let deformers: Vec<&crate::fbx_binary::FbxNode> = objects
+            .children
+            .iter()
+            .filter(|node| node.name == "Deformer")
+            .collect();
+        // One skin plus one cluster for the single bone.
+        assert_eq!(deformers.len(), 2);
+        assert_eq!(
+            deformers[0].properties[2],
+            FbxProperty::String("Skin".to_owned())
+        );
+        let cluster = deformers[1];
+        assert_eq!(
+            cluster.properties[2],
+            FbxProperty::String("Cluster".to_owned())
+        );
+        // Every vertex is fully weighted to the one bone, so all three appear.
+        assert_eq!(
+            child(cluster, "Indexes").properties[0],
+            FbxProperty::I32Array(vec![0, 1, 2])
+        );
+        assert_eq!(
+            child(cluster, "Weights").properties[0],
+            FbxProperty::F64Array(vec![1.0, 1.0, 1.0])
+        );
+        // Both bind matrices are sixteen values, which is what a reader indexes
+        // into; a short one would be read as garbage rather than rejected.
+        for name in ["Transform", "TransformLink"] {
+            match &child(cluster, name).properties[0] {
+                FbxProperty::F64Array(values) => assert_eq!(values.len(), 16),
+                other => panic!("{name} is not a double array: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_a_scene_this_layout_would_silently_drop() {
+        // Blend shapes stay on the ASCII path. What matters is that a mesh
+        // carrying them is refused rather than written out as plain geometry,
+        // which would look like a successful export and lose the targets.
+        let model = blend_shape_model_fixture();
         let error = read_model_ir_fbx_binary(&model, 64 * 1024).unwrap_err();
         assert!(
             matches!(error, crate::Error::Unsupported(_)),
-            "a skinned model should be unsupported, not invalid: {error}"
+            "a blend-shaped model should be unsupported, not invalid: {error}"
         );
     }
 }

@@ -145,19 +145,19 @@ struct ShapePlan<'a> {
 }
 
 pub(crate) struct SkinPlan<'a> {
-    id: i64,
-    name: &'a str,
-    clusters: Vec<ClusterPlan<'a>>,
+    pub(crate) id: i64,
+    pub(crate) name: &'a str,
+    pub(crate) clusters: Vec<ClusterPlan<'a>>,
 }
 
-struct ClusterPlan<'a> {
-    id: i64,
-    bone_model_id: i64,
-    bone_name: &'a str,
-    indices: Vec<u32>,
-    weights: Vec<f32>,
-    transform: Matrix4,
-    transform_link: Matrix4,
+pub(crate) struct ClusterPlan<'a> {
+    pub(crate) id: i64,
+    pub(crate) bone_model_id: i64,
+    pub(crate) bone_name: &'a str,
+    pub(crate) indices: Vec<u32>,
+    pub(crate) weights: Vec<f32>,
+    pub(crate) transform: Matrix4,
+    pub(crate) transform_link: Matrix4,
 }
 
 struct AnimationPlan<'a> {
@@ -1582,7 +1582,7 @@ fn rounded_f64_to_i64(value: f64) -> Result<i64> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Matrix4([f64; 16]);
+pub(crate) struct Matrix4(pub(crate) [f64; 16]);
 
 impl Matrix4 {
     fn from_unity_transform(transform: ModelLocalTransform) -> Result<Self> {
