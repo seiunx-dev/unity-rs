@@ -413,3 +413,43 @@ console.log('node api: settings and version override ok')
 }
 
 console.log('node api: multi-buffer, resource range and scene ok')
+
+// Export and extraction, both of which write to disk.
+{
+  const outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'assetstudio-node-export-'))
+  try {
+    const exportStudio = addon.AssetStudio.fromBuffers([
+      { name: 'text.assets', data: syntheticTextAsset() },
+    ])
+    const report = exportStudio.export(outputDirectory)
+    assert.equal(report.failures.length, 0)
+    assert.equal(report.exported.length, 1)
+    assert.equal(report.exported[0].classId, 49)
+    assert.ok(fs.existsSync(report.exported[0].outputPath))
+
+    // A second run without overwrite must not clobber what the first wrote.
+    const again = exportStudio.export(outputDirectory)
+    assert.equal(again.exported.length, 0)
+
+    // Extraction of a plain file copies it through unchanged.
+    const source = path.join(outputDirectory, 'input.assets')
+    fs.writeFileSync(source, syntheticTextAsset())
+    const extractRoot = path.join(outputDirectory, 'extracted')
+    const extraction = addon.AssetStudio.extract(source, extractRoot)
+    assert.equal(extraction.failureCount, 0)
+    assert.ok(extraction.outputBytes > 0n)
+  } finally {
+    fs.rmSync(outputDirectory, { recursive: true, force: true })
+  }
+}
+
+// Static FBX for a collection with no renderable geometry is refused rather
+// than emitting an empty scene.
+{
+  const fbxStudio = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  assert.throws(() => fbxStudio.readStaticFbx())
+}
+
+console.log('node api: export, extract and fbx ok')
