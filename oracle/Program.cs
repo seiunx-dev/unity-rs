@@ -240,6 +240,39 @@ static void AppendQuaternion(List<uint> values, Quaternion value)
 // what the comparison is about.
 static object MonoBehaviourPayload(MonoBehaviour behaviour)
 {
+    // A CubismMoc behaviour is read raw rather than through a TypeTree, so it
+    // is recognised by its script rather than by a field name.
+    if (behaviour.m_Script.TryGet(out var script) && script.m_ClassName == "CubismMoc")
+    {
+        using var moc = new AssetStudio.CubismMoc(behaviour);
+        return new
+        {
+            Name = behaviour.m_Name,
+            Moc = new
+            {
+                Version = (int)moc.Version,
+                moc.VersionDescription,
+                // Bit patterns, matching how the curve rows carry keyframes:
+                // comparing the JSON spelling of a float would compare two
+                // languages' formatters rather than the value.
+                CanvasWidth = BitConverter.SingleToUInt32Bits(moc.CanvasWidth),
+                CanvasHeight = BitConverter.SingleToUInt32Bits(moc.CanvasHeight),
+                CentralPosX = BitConverter.SingleToUInt32Bits(moc.CentralPosX),
+                CentralPosY = BitConverter.SingleToUInt32Bits(moc.CentralPosY),
+                PixelPerUnit = BitConverter.SingleToUInt32Bits(moc.PixelPerUnit),
+                moc.PartCount,
+                moc.ParamCount,
+                // Sorted because the managed side collects these into hash
+                // sets, which have no order to compare.
+                PartNames = moc.PartNames.OrderBy(name => name, StringComparer.Ordinal).ToArray(),
+                ParamNames = moc.ParamNames.OrderBy(name => name, StringComparer.Ordinal).ToArray(),
+            },
+            Physics = (JsonElement?)null,
+            Motion = (JsonElement?)null,
+            Expression = (JsonElement?)null,
+        };
+    }
+
     var parsed = behaviour.ToType();
     string? physics = null;
     string? motion = null;
@@ -283,6 +316,7 @@ static object MonoBehaviourPayload(MonoBehaviour behaviour)
     return new
     {
         Name = behaviour.m_Name,
+        Moc = (object?)null,
         Physics = physics == null
             ? (JsonElement?)null
             : JsonSerializer.Deserialize<JsonElement>(physics),

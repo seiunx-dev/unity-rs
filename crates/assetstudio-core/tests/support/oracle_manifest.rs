@@ -6,6 +6,7 @@ use assetstudio_core::animator_controller::{
     AnimatorControllerReadLimits, read_animator_controller,
 };
 use assetstudio_core::avatar::{AvatarReadLimits, read_avatar};
+use assetstudio_core::cubism_moc::{CubismMocReadLimits, CubismSdkVersion, try_read_cubism_moc};
 use assetstudio_core::live2d_motion::{
     CubismFadeMotionReadLimits, CubismMotionTargetNames, project_cubism_fade_motion,
 };
@@ -617,7 +618,7 @@ fn rust_metadata_payload(
                 "ProductName": player.product_name,
             })
         }
-        114 => mono_behaviour_manifest(loaded, object_index)?,
+        114 => mono_behaviour_manifest(studio, file_index, loaded, object_index)?,
         123_456 => {
             let value = loaded.read_type_tree_value(object_index)?;
             let tree = loaded.object_type_tree(object_index)?;
@@ -637,9 +638,71 @@ fn rust_metadata_payload(
 /// readers have to take it from the file's `TypeTree` rather than from anything
 /// built in.
 fn mono_behaviour_manifest(
+    studio: &Studio,
+    file_index: usize,
     loaded: &assetstudio_core::serialized::SerializedFile,
     object_index: usize,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    // The MOC behaviour comes first because it is the one Live2D asset that
+    // carries no TypeTree: reading one would fail before anything else ran.
+    //
+    // It is keyed on the script class, the same signal the managed side uses.
+    // A raw parse is not a test for this -- the MOC layout has no magic a
+    // reader rejects, so an unrelated behaviour parses into zeros and an
+    // unknown version rather than failing, which is what happened when this
+    // first tried it that way.
+    let parsed_moc = try_read_cubism_moc(
+        studio.collection(),
+        file_index,
+        object_index,
+        CubismMocReadLimits::default(),
+    )
+    .ok()
+    .flatten();
+    if let Some(moc) = parsed_moc {
+        let mut parts = moc.part_names.clone();
+        let mut parameters = moc.parameter_names.clone();
+        // The managed side collects these into hash sets, so only the sorted
+        // contents are comparable.
+        parts.sort_unstable();
+        parts.dedup();
+        parameters.sort_unstable();
+        parameters.dedup();
+        return Ok(json!({
+            "Name": moc.name,
+            "Moc": {
+                // The managed enum is 1-based with 0 for an unrecognised
+                // byte, which is exactly what it reports for a version it
+                // cannot name.
+                "Version": match moc.sdk_version {
+                    CubismSdkVersion::V30 => 1,
+                    CubismSdkVersion::V33 => 2,
+                    CubismSdkVersion::V40 => 3,
+                    CubismSdkVersion::V42 => 4,
+                    CubismSdkVersion::V50 => 5,
+                    CubismSdkVersion::Unknown(_) => 0,
+                },
+                "VersionDescription": moc.sdk_version.description(),
+                // Bit patterns rather than decimals, the same way the curve
+                // rows carry keyframes: these are floats on both sides, and
+                // comparing their JSON spellings would compare two languages'
+                // formatters instead of the values.
+                "CanvasWidth": moc.canvas_width.to_bits(),
+                "CanvasHeight": moc.canvas_height.to_bits(),
+                "CentralPosX": moc.central_position_x.to_bits(),
+                "CentralPosY": moc.central_position_y.to_bits(),
+                "PixelPerUnit": moc.pixels_per_unit.to_bits(),
+                "PartCount": moc.part_count,
+                "ParamCount": moc.parameter_count,
+                "PartNames": parts,
+                "ParamNames": parameters,
+            },
+            "Physics": Value::Null,
+            "Motion": Value::Null,
+            "Expression": Value::Null,
+        }));
+    }
+
     let value = loaded.read_type_tree_value(object_index)?;
     let name = match &value {
         TypeValue::Object(fields) => fields
@@ -689,7 +752,13 @@ fn mono_behaviour_manifest(
         // managed side reports the same absence by leaving the field null.
         Err(_) => None,
     };
-    Ok(json!({ "Name": name, "Physics": physics, "Motion": motion, "Expression": expression }))
+    Ok(json!({
+        "Name": name,
+        "Moc": Value::Null,
+        "Physics": physics,
+        "Motion": motion,
+        "Expression": expression,
+    }))
 }
 
 fn bytes_manifest(input: &[u8]) -> Value {

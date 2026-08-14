@@ -60,6 +60,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_cubism_physics(&executable);
     assert_cubism_fade_motion(&executable);
     assert_cubism_expression(&executable);
+    assert_cubism_moc(&executable);
     assert_switch_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
@@ -400,6 +401,53 @@ fn assert_cubism_physics(executable: &Path) {
     );
 
     assert_eq!(managed, rust, "Cubism physics conversion");
+}
+
+/// Compares the MOC3 header parse against the managed reader.
+///
+/// The MOC behaviour is the one `Live2D` asset read without a `TypeTree`:
+/// implementations skip a fixed prefix and then walk header offsets the format
+/// fixes at 64, 68, 76 and 264. Everything downstream depends on it, since the
+/// parameter and part names it yields are what bind motion curves to targets.
+fn assert_cubism_moc(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+    const SCRIPT_PATH_ID: i64 = 200;
+
+    // 4 is the SDK 4.2 generation; the byte is the only version signal in the
+    // format and an unrecognised one is reported rather than rejected.
+    let object = cubism_fixture::cubism_moc_object_with_script("oracle-moc", 4, SCRIPT_PATH_ID);
+    let script = cubism_fixture::mono_script("CubismMoc");
+    let file = synthetic_plain_v22(
+        REVISION,
+        &[(115, SCRIPT_PATH_ID, script), (114, 201, object)],
+    );
+    let fixture = TemporaryFixture::new("oracle-cubism-moc.assets", &file)
+        .expect("the MOC fixture is writable");
+    let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+    let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+
+    let objects = managed["Files"][0]["Objects"]
+        .as_array()
+        .expect("the fixture has objects");
+    let moc = objects
+        .iter()
+        .find_map(|object| object["Payload"]["Moc"].as_object())
+        .unwrap_or_else(|| panic!("the managed reader parsed no MOC header: {managed}"));
+    assert_eq!(moc["ParamCount"], 2, "the parameter table was not read");
+    assert_eq!(moc["PartCount"], 3, "the part table was not read");
+    assert_eq!(
+        moc["VersionDescription"], "SDK4.2/Cubism4.2",
+        "the SDK version byte was not mapped"
+    );
+    // Canvas values with more than three decimals, so this document being
+    // unrounded is visible rather than assumed.
+    assert_eq!(
+        moc["PixelPerUnit"],
+        1234.5678_f32.to_bits(),
+        "the canvas block was not read"
+    );
+
+    assert_eq!(managed, rust, "Cubism MOC header");
 }
 
 /// Compares exp3.json against the managed projection.
@@ -1436,6 +1484,12 @@ fn synthetic_plain_v22(version: &str, objects: &[(i32, i64, Vec<u8>)]) -> Vec<u8
         push_i32(&mut metadata, *class_id);
         metadata.push(0);
         metadata.extend_from_slice(&(-1_i16).to_le_bytes());
+        // A MonoBehaviour type record carries a script hash before the type
+        // hash. Leaving it out desynchronizes the rest of the metadata, which
+        // is why this builder had never been used with class 114.
+        if *class_id == 114 {
+            metadata.extend_from_slice(&[0; 16]);
+        }
         metadata.extend_from_slice(&[0; 16]);
     }
 
