@@ -8,6 +8,7 @@ use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
+use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
 use assetstudio_core::simple_assets::SimpleAssetReadLimits;
 use assetstudio_core::source::Region;
 use assetstudio_core::sprite::SpriteReadLimits;
@@ -121,6 +122,33 @@ pub struct Avatar {
     /// first-hit behaviour.
     pub path_count: u32,
     pub has_human_description: bool,
+}
+
+/// One `GameObject` in the assembled hierarchy.
+///
+/// The component flags are separate booleans rather than a bitfield because
+/// this is a JavaScript-facing shape and a bitfield would need decoding on the
+/// other side.
+#[allow(clippy::struct_excessive_bools)]
+#[napi(object)]
+pub struct SceneNode {
+    pub file_index: u32,
+    pub path_id: BigInt,
+    pub name: String,
+    /// Absent for a `GameObject` with no `Transform`, which cannot be placed.
+    pub parent_path_id: Option<BigInt>,
+    pub child_count: u32,
+    pub has_transform: bool,
+    pub has_mesh_renderer: bool,
+    pub has_skinned_mesh_renderer: bool,
+    pub has_animator: bool,
+}
+
+/// One in-memory input for a multi-file open.
+#[napi(object)]
+pub struct MemoryInput {
+    pub name: String,
+    pub data: Buffer,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -713,6 +741,98 @@ impl AssetStudio {
             has_human_description: avatar.human_description.is_some(),
         })
     }
+
+    /// Opens several in-memory inputs as one collection.
+    ///
+    /// A serialized file and the `.resS` its textures and audio stream from are
+    /// separate files; opening them one at a time leaves every streamed payload
+    /// unresolvable, so a caller holding both in memory needs to pass them
+    /// together.
+    #[napi(factory)]
+    pub fn from_buffers(inputs: Vec<MemoryInput>, maximum_bytes: Option<i64>) -> Result<Self> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let mut total = 0_u64;
+        let mut regions = Vec::new();
+        for input in inputs {
+            let length = u64::try_from(input.data.len())
+                .map_err(|_| invalid_arg("buffer length does not fit u64"))?;
+            total = total
+                .checked_add(length)
+                .ok_or_else(|| invalid_arg("input buffer sizes overflowed"))?;
+            if total > maximum {
+                return Err(invalid_arg(format!(
+                    "input buffers total {total} bytes, exceeding limit {maximum}"
+                )));
+            }
+            regions.push((input.name, Region::from_bytes(input.data.to_vec())));
+        }
+        Studio::open_regions(regions)
+            .map(|studio| Self {
+                studio: Arc::new(studio),
+            })
+            .map_err(core_error)
+    }
+
+    /// Reads one checked byte range of a resource without materializing the
+    /// rest, which is how a caller pulls a single texture out of a large
+    /// `.resS`.
+    #[napi]
+    pub fn read_resource_range(
+        &self,
+        resource_index: u32,
+        offset: BigInt,
+        length: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<Buffer> {
+        let index = usize::try_from(resource_index).expect("u32 fits usize");
+        let resource = self.studio.resource(index).ok_or_else(|| {
+            invalid_arg(format!("resource index {resource_index} is out of range"))
+        })?;
+        let offset = bigint_u64(offset, "offset")?;
+        let length = bigint_u64(length, "length")?;
+        resource
+            .read_range(offset, length, byte_limit(maximum_bytes)?)
+            .map(Into::into)
+            .map_err(core_error)
+    }
+
+    /// Finds a resource by the path a serialized file references it through.
+    // napi marshals a JavaScript string by value; a reference does not expand.
+    #[allow(clippy::needless_pass_by_value)]
+    #[must_use]
+    #[napi]
+    pub fn resource_index_by_path(&self, path: String) -> Option<u32> {
+        self.studio
+            .resource_by_path(&path)
+            .and_then(|resource| u32::try_from(resource.index()).ok())
+    }
+
+    /// Assembles the `GameObject` hierarchy across every loaded file.
+    #[napi]
+    pub fn scene(&self, maximum_game_objects: Option<u32>) -> Result<Vec<SceneNode>> {
+        let mut limits = SceneHierarchyLimits::default();
+        if let Some(maximum) = maximum_game_objects {
+            limits.maximum_game_objects = usize::try_from(maximum).expect("u32 fits usize");
+        }
+        let hierarchy = self.studio.scene_hierarchy(limits).map_err(core_error)?;
+        let mut nodes = Vec::with_capacity(hierarchy.nodes.len());
+        for node in &hierarchy.nodes {
+            nodes.push(SceneNode {
+                file_index: u32::try_from(node.object.file_index)
+                    .map_err(|_| invalid_arg("file index does not fit u32"))?,
+                path_id: BigInt::from(node.object.path_id),
+                name: node.name.clone(),
+                parent_path_id: node.parent.map(|parent| BigInt::from(parent.path_id)),
+                child_count: u32::try_from(node.children.len())
+                    .map_err(|_| invalid_arg("child count does not fit u32"))?,
+                has_transform: node.transform.is_some(),
+                has_mesh_renderer: node.mesh_renderer.is_some(),
+                has_skinned_mesh_renderer: node.skinned_mesh_renderer.is_some(),
+                has_animator: node.animator.is_some(),
+            });
+        }
+        Ok(nodes)
+    }
 }
 
 impl AssetStudio {
@@ -1035,6 +1155,21 @@ fn usize_limit(value: Option<i64>) -> Result<usize> {
 
 fn count_u32(value: usize, field: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::from_reason(format!("{field} does not fit u32")))
+}
+
+/// A non-negative `BigInt`, for offsets and lengths.
+fn bigint_u64(value: BigInt, field: &str) -> Result<u64> {
+    let BigInt { sign_bit, words } = value;
+    if sign_bit {
+        return Err(invalid_arg(format!("{field} must not be negative")));
+    }
+    match words.len() {
+        0 => Ok(0),
+        1 => Ok(words[0]),
+        _ => Err(invalid_arg(format!(
+            "{field} does not fit unsigned 64 bits"
+        ))),
+    }
 }
 
 fn bigint_i64(value: BigInt, field: &str) -> Result<i64> {
