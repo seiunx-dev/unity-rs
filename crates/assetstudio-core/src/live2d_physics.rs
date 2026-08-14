@@ -39,8 +39,8 @@ impl Default for CubismPhysicsReadLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CubismPhysicsVec2 {
-    pub x: f64,
-    pub y: f64,
+    pub x: f32,
+    pub y: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +62,9 @@ impl CubismPhysicsSourceComponent {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CubismPhysicsNormalizationValue {
-    pub minimum: f64,
-    pub default: f64,
-    pub maximum: f64,
+    pub minimum: f32,
+    pub default: f32,
+    pub maximum: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,7 +76,7 @@ pub struct CubismPhysicsNormalization {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CubismPhysicsInput {
     pub source_id: String,
-    pub weight: f64,
+    pub weight: f32,
     pub source_component: CubismPhysicsSourceComponent,
     pub inverted: bool,
 }
@@ -85,8 +85,8 @@ pub struct CubismPhysicsInput {
 pub struct CubismPhysicsOutput {
     pub destination_id: String,
     pub particle_index: i32,
-    pub scale: f64,
-    pub weight: f64,
+    pub scale: f32,
+    pub weight: f32,
     pub source_component: CubismPhysicsSourceComponent,
     pub inverted: bool,
 }
@@ -94,10 +94,10 @@ pub struct CubismPhysicsOutput {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CubismPhysicsParticle {
     pub initial_position: CubismPhysicsVec2,
-    pub mobility: f64,
-    pub delay: f64,
-    pub acceleration: f64,
-    pub radius: f64,
+    pub mobility: f32,
+    pub delay: f32,
+    pub acceleration: f32,
+    pub radius: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,14 +115,14 @@ pub struct CubismPhysicsRig {
     pub sub_rigs: Vec<CubismPhysicsSubRig>,
     pub gravity: CubismPhysicsVec2,
     pub wind: CubismPhysicsVec2,
-    pub fps: f64,
+    pub fps: f32,
 }
 
 impl CubismPhysicsRig {
     /// Writes the semantic equivalent of `AssetStudio`'s `physics3.json`.
     pub fn write_physics3_json<W: Write>(
         &self,
-        motion_fps: f64,
+        motion_fps: f32,
         output: &mut W,
         maximum_bytes: u64,
     ) -> Result<u64> {
@@ -515,14 +515,24 @@ fn integer_field(value: &TypeValue, name: &str, owner: &str) -> Result<i64> {
     }
 }
 
-fn number_field(value: &TypeValue, name: &str, owner: &str) -> Result<f64> {
+/// Reads a numeric field, staying at the width Unity serialized.
+///
+/// Widening to `f64` here is numerically lossless and textually not: the
+/// shortest form that round-trips a widened `0.8f` is `0.800000011920929`,
+/// which is what physics3.json then carries where every other tool writes
+/// `0.8`. `TypeValue` keeps the two widths apart for this reason.
+fn number_field(value: &TypeValue, name: &str, owner: &str) -> Result<f32> {
     let value = match field(value, name, owner)? {
-        TypeValue::Float32(value) => f64::from(*value),
-        TypeValue::Float(value) => *value,
-        TypeValue::Signed(value) => value.to_string().parse::<f64>().map_err(|error| {
+        TypeValue::Float32(value) => *value,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "physics3.json is a float document; a double field is out of spec already"
+        )]
+        TypeValue::Float(value) => *value as f32,
+        TypeValue::Signed(value) => value.to_string().parse::<f32>().map_err(|error| {
             Error::invalid_data(format!("{owner} {name} is not numeric: {error}"))
         })?,
-        TypeValue::Unsigned(value) => value.to_string().parse::<f64>().map_err(|error| {
+        TypeValue::Unsigned(value) => value.to_string().parse::<f32>().map_err(|error| {
             Error::invalid_data(format!("{owner} {name} is not numeric: {error}"))
         })?,
         _ => {
@@ -565,7 +575,7 @@ fn source_component(value: &TypeValue, owner: &str) -> Result<CubismPhysicsSourc
     }
 }
 
-fn finite(value: f64, field: &str) -> Result<()> {
+fn finite(value: f32, field: &str) -> Result<()> {
     if value.is_finite() {
         Ok(())
     } else {
@@ -573,10 +583,152 @@ fn finite(value: f64, field: &str) -> Result<()> {
     }
 }
 
-fn write_number(output: &mut impl Write, value: f64) -> Result<()> {
+fn write_number(output: &mut impl Write, value: f32) -> Result<()> {
     finite(value, "Cubism physics JSON number")?;
-    serde_json::to_writer(output, &value)
+    output
+        .write_all(format_physics_number(value).as_bytes())
         .map_err(|error| Error::invalid_data(format!("cannot write physics number: {error}")))
+}
+
+/// Formats a number the way the managed extractor writes physics3.json.
+///
+/// It serializes every float through .NET's `"0.###"`, so matching it is what
+/// makes the documents comparable rather than merely equivalent. Three rules
+/// fall out of that format, and none of them is what Rust's own float
+/// formatting does:
+///
+/// * the value is first reduced to seven significant digits, .NET's legacy
+///   single-precision display width;
+/// * then rounded to at most three decimals, with halves going away from zero
+///   rather than to even;
+/// * then trailing zeros and a bare decimal point are dropped, so an integral
+///   value prints without one.
+///
+/// The rounding works on the shortest decimal form rather than on the binary
+/// value, which is visible at a half: 0.0025f is really 0.00249999994, and
+/// rounding the binary value gives 0.002 where .NET gives 0.003.
+///
+/// A negative value keeps its sign even when it rounds to zero, which is
+/// `-0.0004` printing as `-0` and not `0`.
+fn format_physics_number(value: f32) -> String {
+    const SIGNIFICANT: usize = 7;
+    const DECIMALS: i32 = 3;
+
+    let text = format!("{value}");
+    let (negative, magnitude) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.as_str()),
+    };
+    let (whole, fraction) = match magnitude.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (magnitude, ""),
+    };
+
+    // Normalize to `0.d1d2... * 10^point` with a nonzero leading digit, so that
+    // rounding by significant digits and by decimal place are the same
+    // operation at different offsets.
+    let mut digits: Vec<u8> = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .map(|byte| byte - b'0')
+        .collect();
+    let mut point = i32::try_from(whole.len()).expect("a formatted float is short");
+    let leading = digits.iter().take_while(|digit| **digit == 0).count();
+    digits.drain(..leading);
+    point -= i32::try_from(leading).expect("a formatted float is short");
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        return if negative {
+            "-0".to_owned()
+        } else {
+            "0".to_owned()
+        };
+    }
+
+    round_significant(&mut digits, &mut point, SIGNIFICANT);
+    let keep = point + DECIMALS;
+    let keep = usize::try_from(keep.max(0)).expect("a clamped count fits");
+    if keep == 0 && point + DECIMALS == 0 {
+        // Exactly at the rounding position: the first digit decides whether
+        // anything survives at all.
+        if digits[0] >= 5 {
+            digits = vec![1];
+            point += 1;
+        } else {
+            digits.clear();
+        }
+    } else if point + DECIMALS < 0 {
+        digits.clear();
+    } else {
+        round_significant(&mut digits, &mut point, keep);
+    }
+
+    render_decimal(negative, &digits, point)
+}
+
+/// Rounds `digits` to `keep` significant digits, halves away from zero.
+fn round_significant(digits: &mut Vec<u8>, point: &mut i32, keep: usize) {
+    if keep >= digits.len() {
+        return;
+    }
+    let round_up = digits[keep] >= 5;
+    digits.truncate(keep);
+    if round_up {
+        let mut index = keep;
+        loop {
+            if index == 0 {
+                digits.insert(0, 1);
+                *point += 1;
+                break;
+            }
+            index -= 1;
+            if digits[index] == 9 {
+                digits[index] = 0;
+            } else {
+                digits[index] += 1;
+                break;
+            }
+        }
+    }
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+}
+
+/// Renders `0.digits * 10^point` in plain decimal, without trailing zeros.
+fn render_decimal(negative: bool, digits: &[u8], point: i32) -> String {
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+    if digits.is_empty() {
+        output.push('0');
+        return output;
+    }
+    if point <= 0 {
+        output.push_str("0.");
+        for _ in 0..-point {
+            output.push('0');
+        }
+        for digit in digits {
+            output.push(char::from(b'0' + digit));
+        }
+        return output;
+    }
+
+    let whole = usize::try_from(point).expect("a positive point fits");
+    for index in 0..whole {
+        output.push(char::from(b'0' + digits.get(index).copied().unwrap_or(0)));
+    }
+    if digits.len() > whole {
+        output.push('.');
+        for digit in &digits[whole..] {
+            output.push(char::from(b'0' + digit));
+        }
+    }
+    output
 }
 
 fn write_json_string(output: &mut impl Write, value: &str) -> Result<()> {
@@ -726,8 +878,72 @@ impl<W: Write> Write for BoundedWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CubismPhysicsReadLimits, project_cubism_physics};
+    use super::{CubismPhysicsReadLimits, format_physics_number, project_cubism_physics};
     use crate::type_tree::{TypeField, TypeValue};
+
+    /// Every case below is `float.ToString("0.###", InvariantCulture)` run on
+    /// .NET 10, which is the formatter the managed extractor hands to
+    /// Newtonsoft for physics3.json. The expectations are that program's
+    /// output, not a reading of the documentation.
+    #[test]
+    fn physics_numbers_format_like_the_managed_extractor() {
+        const CASES: &[(f32, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (1.0, "1"),
+            (-1.0, "-1"),
+            (100.0, "100"),
+            (0.8, "0.8"),
+            (0.95, "0.95"),
+            (1.5, "1.5"),
+            (0.25, "0.25"),
+            // Rounding happens at three decimals, halves away from zero.
+            (0.1234, "0.123"),
+            (0.1235, "0.124"),
+            (0.12349, "0.123"),
+            (2.0005, "2.001"),
+            (2.0015, "2.002"),
+            (1.0005, "1.001"),
+            (-2.0005, "-2.001"),
+            // On the shortest decimal form, not the binary value: 0.0025f is
+            // really 0.00249999994, which would round the other way.
+            (0.0015, "0.002"),
+            (0.0025, "0.003"),
+            (0.0005, "0.001"),
+            // Below half a thousandth nothing survives, but the sign does.
+            (0.00049, "0"),
+            (1e-5, "0"),
+            (1e-10, "0"),
+            (-0.0004, "-0"),
+            // Seven significant digits first, which only shows above a million.
+            (1234.5678, "1234.568"),
+            (99999.99, "99999.99"),
+            (1_000_000.06, "1000000"),
+            (1_234_567.8, "1234568"),
+            (12_345_678.0, "12345680"),
+            (16_777_216.0, "16777220"),
+            (123_456_792.0, "123456800"),
+            (1e10, "10000000000"),
+            (2.5, "2.5"),
+            (3.5, "3.5"),
+            (0.5, "0.5"),
+        ];
+
+        let wrong: Vec<String> = CASES
+            .iter()
+            .filter_map(|(value, expected)| {
+                let actual = format_physics_number(*value);
+                (actual != *expected)
+                    .then(|| format!("{value:?}: expected {expected}, produced {actual}"))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{} case(s) differ:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
 
     fn object(fields: Vec<(&str, TypeValue)>) -> TypeValue {
         TypeValue::Object(

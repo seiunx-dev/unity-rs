@@ -31,6 +31,8 @@ use serde_json::{Value, json};
 
 #[path = "support/containers.rs"]
 mod containers;
+#[path = "support/cubism_fixture.rs"]
+mod cubism_fixture;
 #[path = "support/oracle_manifest.rs"]
 mod oracle_manifest;
 
@@ -55,6 +57,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_compressed_texture_formats(&executable);
     assert_crunched_textures(&executable);
     assert_astc_textures(&executable);
+    assert_cubism_physics(&executable);
     assert_switch_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
@@ -338,6 +341,65 @@ fn assert_switch_textures(executable: &Path) {
 /// mip-zero decode -- against the managed reader doing the same, so the version
 /// gate that chooses between the two Crunch dialects is compared too rather
 /// than assumed.
+/// Compares the Cubism physics conversion against the managed extractor.
+///
+/// This is the one asset type in the differential whose layout is not a Unity
+/// built-in: `CubismPhysicsController` is a `MonoBehaviour` shaped by the
+/// `Live2D` SDK's C# types, so neither reader has anything to fall back on and
+/// both must walk the `TypeTree` the file carries. What they produce from it --
+/// physics3.json -- then goes through entirely separate projection code on each
+/// side, including the per-setting identifiers, the input and output totals,
+/// the source-component enum and the fps fallback.
+fn assert_cubism_physics(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+
+    let tree = cubism_fixture::cubism_physics_tree();
+    let object = cubism_fixture::cubism_physics_object("oracle-physics");
+    let file = synthetic_mono_behaviour_v22(114, REVISION, &tree, &object);
+    let fixture = TemporaryFixture::new("oracle-cubism-physics.assets", &file)
+        .expect("the Cubism fixture is writable");
+    let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+    let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+
+    let managed_physics = &managed["Files"][0]["Objects"][0]["Payload"]["Physics"];
+    // Without this the comparison passes when both sides fail to recognise the
+    // behaviour and report nothing, which is the failure mode this whole
+    // fixture exists to rule out.
+    assert!(
+        managed_physics.is_object(),
+        "the managed extractor produced no physics3.json, so nothing was compared: {managed}"
+    );
+    assert_eq!(
+        managed_physics["Meta"]["PhysicsSettingCount"], 2,
+        "the fixture's two sub-rigs did not survive the managed conversion: {managed}"
+    );
+
+    // The fixture carries values chosen so the documents only match if the
+    // number format matches too -- the managed extractor puts every float
+    // through .NET's "0.###". Pinning them here keeps the fixture from
+    // quietly losing that property: without these, a change that dropped the
+    // fields entirely would still compare equal on both sides.
+    let setting = &managed_physics["PhysicsSettings"][0];
+    assert_eq!(
+        setting["Input"][0]["Weight"], 1.235,
+        "1.2345678 rounds to three decimals"
+    );
+    assert_eq!(
+        setting["Output"][0]["Scale"], 0.003,
+        "0.0025 rounds away from zero"
+    );
+    assert_eq!(
+        setting["Vertices"][0]["Mobility"], 0,
+        "0.00049 falls below the last decimal"
+    );
+    assert_eq!(
+        setting["Vertices"][0]["Acceleration"], -0.0,
+        "a negative value keeps its sign when it rounds to zero"
+    );
+
+    assert_eq!(managed, rust, "Cubism physics conversion");
+}
+
 /// Compares ASTC decoding against the managed decoder on real encoder output.
 ///
 /// ASTC sat outside this comparison because the other formats are fed
@@ -1146,6 +1208,83 @@ fn synthetic_single_v22_on_platform(
     }
     metadata.push(0);
     finish_v22(&metadata, data)
+}
+
+/// A v22 file holding one `MonoBehaviour` with its `TypeTree` embedded.
+///
+/// Unlike the built-in classes the rest of these fixtures use, a
+/// `MonoBehaviour` type record carries a second 16-byte hash identifying the
+/// script, and the tree itself has to be present: without it neither reader has
+/// any way to know the layout of a `Live2D` SDK type.
+fn synthetic_mono_behaviour_v22(
+    path_id: i64,
+    version: &str,
+    nodes: &[Value],
+    data: &[u8],
+) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    metadata.extend_from_slice(version.as_bytes());
+    metadata.push(0);
+    push_i32(&mut metadata, 13);
+    metadata.push(1); // the tree is enabled, which is the point of this fixture
+    push_i32(&mut metadata, 1);
+    push_i32(&mut metadata, 114);
+    metadata.push(0);
+    metadata.extend_from_slice(&0_i16.to_le_bytes());
+    // MonoBehaviour records carry the script hash before the type hash.
+    metadata.extend_from_slice(&[0; 16]);
+    metadata.extend_from_slice(&[0; 16]);
+    push_blob_type_tree_v19(&mut metadata, nodes);
+    push_i32(&mut metadata, 0); // no type dependencies
+
+    push_i32(&mut metadata, 1);
+    align_with_base(&mut metadata, 48, 4);
+    metadata.extend_from_slice(&path_id.to_le_bytes());
+    metadata.extend_from_slice(&0_i64.to_le_bytes());
+    metadata.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+    push_i32(&mut metadata, 0);
+    for _ in 0..3 {
+        push_i32(&mut metadata, 0);
+    }
+    metadata.push(0);
+    finish_v22(&metadata, data)
+}
+
+/// The format 19+ blob encoding, whose nodes are 32 bytes rather than 24: they
+/// end with a reference type hash the older layout has no room for.
+fn push_blob_type_tree_v19(output: &mut Vec<u8>, nodes: &[Value]) {
+    let mut buffer = Vec::new();
+    let mut offsets: Vec<(u32, u32)> = Vec::new();
+    let intern = |value: &str, buffer: &mut Vec<u8>| -> u32 {
+        let offset = u32::try_from(buffer.len()).unwrap();
+        buffer.extend_from_slice(value.as_bytes());
+        buffer.push(0);
+        offset
+    };
+    for node in nodes {
+        let type_offset = intern(node["type"].as_str().unwrap(), &mut buffer);
+        let name_offset = intern(node["name"].as_str().unwrap(), &mut buffer);
+        offsets.push((type_offset, name_offset));
+    }
+
+    push_i32(output, i32::try_from(nodes.len()).unwrap());
+    push_i32(output, i32::try_from(buffer.len()).unwrap());
+    for (node, (type_offset, name_offset)) in nodes.iter().zip(&offsets) {
+        output.extend_from_slice(
+            &u16::try_from(node_field(node, "version"))
+                .unwrap()
+                .to_le_bytes(),
+        );
+        output.push(u8::try_from(node_field(node, "level")).unwrap());
+        output.push(u8::try_from(node_field(node, "is_array")).unwrap());
+        push_u32(output, *type_offset);
+        push_u32(output, *name_offset);
+        push_i32(output, node_field(node, "byte_size"));
+        push_i32(output, node_field(node, "index"));
+        push_i32(output, node_field(node, "meta_flags"));
+        output.extend_from_slice(&0_u64.to_le_bytes());
+    }
+    output.extend_from_slice(&buffer);
 }
 
 fn synthetic_sprite_v22() -> Vec<u8> {

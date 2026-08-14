@@ -69,6 +69,7 @@ static object OracleObject(AssetStudio.Object value)
             Data = Bytes(audio.m_AudioData.GetData()),
         },
         AnimationClip clip => AnimationClipPayload(clip),
+        MonoBehaviour behaviour => MonoBehaviourPayload(behaviour),
         Avatar avatar => new
         {
             Name = avatar.m_Name,
@@ -131,7 +132,17 @@ static object OracleObject(AssetStudio.Object value)
         PathId = value.m_PathID,
         ClassId = value.classID,
         ByteSize = value.byteSize,
-        Name = value is NamedObject named ? named.m_Name : null,
+        // MonoBehaviour carries m_Name and the managed reader parses it, but
+        // the class sits under Behaviour rather than NamedObject, so the base
+        // class alone under-reports what this implementation knows about the
+        // file. This is not a shim to make the sides agree: it reports the
+        // managed parse, which is what the oracle is for.
+        Name = value switch
+        {
+            NamedObject named => named.m_Name,
+            MonoBehaviour behaviour => behaviour.m_Name,
+            _ => null,
+        },
         Raw = Bytes(value.GetRawData()),
         Payload = payload,
     };
@@ -219,6 +230,31 @@ static void AppendQuaternion(List<uint> values, Quaternion value)
     values.Add(BitConverter.SingleToUInt32Bits(value.Y));
     values.Add(BitConverter.SingleToUInt32Bits(value.Z));
     values.Add(BitConverter.SingleToUInt32Bits(value.W));
+}
+
+// Cubism data is a MonoBehaviour whose layout comes from the Live2D SDK's own
+// types, so a reader has to take it from the TypeTree the file carries. When
+// the tree describes a physics rig, this runs the managed conversion the CLI
+// would run and hands back the physics3.json it produces, parsed rather than as
+// text: the two implementations format JSON differently, and formatting is not
+// what the comparison is about.
+static object MonoBehaviourPayload(MonoBehaviour behaviour)
+{
+    var parsed = behaviour.ToType();
+    string? physics = null;
+    if (parsed != null && parsed.Contains("_rig"))
+    {
+        // The fps argument is the fallback the converter uses when the rig
+        // does not carry one of its own.
+        physics = CubismLive2DExtractor.CubismParsers.ParsePhysics(parsed, 30f);
+    }
+    return new
+    {
+        Name = behaviour.m_Name,
+        Physics = physics == null
+            ? (JsonElement?)null
+            : JsonSerializer.Deserialize<JsonElement>(physics),
+    };
 }
 
 static object AnimationClipPayload(AnimationClip clip)

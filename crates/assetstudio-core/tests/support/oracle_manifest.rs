@@ -6,6 +6,7 @@ use assetstudio_core::animator_controller::{
     AnimatorControllerReadLimits, read_animator_controller,
 };
 use assetstudio_core::avatar::{AvatarReadLimits, read_avatar};
+use assetstudio_core::live2d_physics::{CubismPhysicsReadLimits, project_cubism_physics};
 use assetstudio_core::material::{MaterialReadLimits, read_material};
 use assetstudio_core::mesh::{MeshReadLimits, read_mesh_with_collection};
 use assetstudio_core::project_settings::{
@@ -18,6 +19,7 @@ use assetstudio_core::simple_assets::{
 use assetstudio_core::sprite::{SpriteReadLimits, decode_sprite_rgba8, read_sprite};
 use assetstudio_core::studio::Studio;
 use assetstudio_core::texture::{TextureReadLimits, read_texture2d};
+use assetstudio_core::type_tree::TypeValue;
 use assetstudio_core::type_tree_dump::write_type_tree_dump;
 use serde_json::{Value, json};
 
@@ -138,7 +140,7 @@ fn rust_payload(
         21 | 28 | 43 | 48 | 49 | 74 | 83 | 90 | 91 | 128 | 152 | 213 | 329 => {
             rust_binary_payload(studio, file_index, object_index, class_id, maximum_bytes)
         }
-        129 | 141 | 123_456 => {
+        114 | 129 | 141 | 123_456 => {
             rust_metadata_payload(studio, file_index, object_index, class_id, maximum_bytes)
         }
         _ => Ok(Value::Null),
@@ -611,6 +613,7 @@ fn rust_metadata_payload(
                 "ProductName": player.product_name,
             })
         }
+        114 => mono_behaviour_manifest(loaded, object_index)?,
         123_456 => {
             let value = loaded.read_type_tree_value(object_index)?;
             let tree = loaded.object_type_tree(object_index)?;
@@ -620,6 +623,44 @@ fn rust_metadata_payload(
         }
         _ => unreachable!("rust_payload selects metadata fixture classes"),
     })
+}
+
+/// A `MonoBehaviour`, plus physics3.json when the behaviour is a Cubism rig.
+///
+/// The managed side runs the `Live2D` converter and hands back the same
+/// document, parsed rather than as text so that whitespace and key order do not
+/// enter into it. The `Live2D` SDK's own types define the layout, so both
+/// readers have to take it from the file's `TypeTree` rather than from anything
+/// built in.
+fn mono_behaviour_manifest(
+    loaded: &assetstudio_core::serialized::SerializedFile,
+    object_index: usize,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let value = loaded.read_type_tree_value(object_index)?;
+    let name = match &value {
+        TypeValue::Object(fields) => fields
+            .iter()
+            .find(|field| field.name == "m_Name")
+            .and_then(|field| match &field.value {
+                TypeValue::String(name) => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    let physics = match project_cubism_physics(0, &value, CubismPhysicsReadLimits::default()) {
+        Ok(rig) => {
+            let mut document = Vec::new();
+            // 30 is the fallback the managed converter passes in.
+            rig.write_physics3_json(30.0, &mut document, 1024 * 1024)?;
+            Some(serde_json::from_slice::<Value>(&document)?)
+        }
+        // A behaviour that is not a physics rig is not an error here; the
+        // managed side reports the same absence by leaving the field null.
+        Err(_) => None,
+    };
+    Ok(json!({ "Name": name, "Physics": physics }))
 }
 
 fn bytes_manifest(input: &[u8]) -> Value {
