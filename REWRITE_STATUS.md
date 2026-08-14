@@ -97,8 +97,8 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 1. **托管差分 oracle 覆盖面仍不足（系统性根因）**
    - 这不是理论风险：2026-08-14 修掉的 FBX blend shape 增量、FBX 矩阵约定、Node 纹理行序、bundle 版本覆盖四个缺陷，全部被手写的测试期望值锁死，正是因为它们从未与 C# 对照过。
-   - **已补齐**：serialized format v13-v22 全部版本门；UnityFS v6 内联 blocks-info、UnityFS v6 尾部 blocks-info、UnityFS v7 强制 16 字节对齐、legacy UnityRaw v6、gzip 流。容器差分首轮即发现两处命名分歧（bundle 条目标签、gzip/brotli 把可移植名变成字面量 `"gzip"`，后者会让压缩序列化文件永远无法被外部引用按名匹配），均已修复。
-   - **仍缺**：v5-v12（需要真实 TypeTree，tree-less fixture 做不到）；bundle 内块压缩（`lz4_flex` 当前只开解码 feature）；LZMA/Zstd 块；UnityWebData、ZIP、split 组；压缩纹理、Crunch、Switch、tight-mesh sprite；Cubism 模型；AnimationClip 关键帧值；Shader 只覆盖了 5.2 直连脚本，5.3-5.4 与 5.5+ 序列化程序未对照（`oracle/Program.cs` 目前遇到 subprogram blob 会直接抛错，要先解除这个 guard）。
+   - **已补齐**：serialized format v13-v22 全部版本门；UnityFS v6 内联 blocks-info、UnityFS v6 尾部 blocks-info、UnityFS v7 强制 16 字节对齐、Zstd 压缩块与 Zstd 压缩 blocks-info（含二者同时压缩 + 尾部布局）、legacy UnityRaw v6、gzip 流。容器差分首轮即发现两处命名分歧（bundle 条目标签、gzip/brotli 把可移植名变成字面量 `"gzip"`，后者会让压缩序列化文件永远无法被外部引用按名匹配），均已修复。
+   - **仍缺**：v5-v12（需要真实 TypeTree，tree-less fixture 做不到）；LZ4/LZ4HC 与 LZMA 块（`lz4_flex` 当前只开解码 feature，`lzma-rust2` 无 bulk encoder，补这两个要为 fixture 单独引依赖）；UnityWebData、ZIP、split 组；压缩纹理、Crunch、Switch、tight-mesh sprite；Cubism 模型；AnimationClip 关键帧值；Shader 只覆盖了 5.2 直连脚本，5.3-5.4 与 5.5+ 序列化程序未对照（`oracle/Program.cs` 目前遇到 subprogram blob 会直接抛错，要先解除这个 guard）。
    - oracle harness 接受任意输入路径，上述补强全部不需要专有样本。
 
 2. **真实游戏语料覆盖不足**

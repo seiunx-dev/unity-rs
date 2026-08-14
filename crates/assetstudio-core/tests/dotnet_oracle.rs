@@ -15,7 +15,8 @@
 //! It also runs the same comparison across every serialized format version from
 //! 13 through 22, and through the containers a game ships: `UnityFS` v6 with
 //! inline and tail blocks-info, `UnityFS` v7 with its mandatory alignment,
-//! legacy `UnityRaw` v6, and a gzip stream.
+//! Zstd-compressed block data and blocks-info tables, legacy `UnityRaw` v6, and
+//! a gzip stream.
 //!
 //! Run with:
 //! `cargo test -p assetstudio-core --test dotnet_oracle -- --ignored`
@@ -33,7 +34,7 @@ mod containers;
 #[path = "support/oracle_manifest.rs"]
 mod oracle_manifest;
 
-use containers::{BlocksInfo, BundleEntry};
+use containers::{BlocksInfo, BundleEntry, BundleLayout, Compression};
 use oracle_manifest::rust_manifest;
 
 #[test]
@@ -166,6 +167,12 @@ fn assert_version_matrix(executable: &Path) {
 /// extraction are compared against the managed reader rather than against the
 /// Rust writer's own assumptions.
 fn assert_container_fixtures(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+    // The managed reader calls Zstd "non-standard" and then decodes it anyway.
+    // Listing the exact wording keeps the harness strict about every other
+    // diagnostic while documenting this one.
+    const ZSTD_BLOCK_WARNING: &str = "Non-standard block compression type: 5";
+    const ZSTD_INFO_WARNING: &str = "Non-standard blockInfo compression type: 5";
     // Resident objects only: a bundled fixture has nowhere to put a sibling
     // `.resS`. Two entries so the directory table itself is compared, not just
     // the single-entry degenerate case.
@@ -182,28 +189,84 @@ fn assert_container_fixtures(executable: &Path) {
             bytes: material_file.as_slice(),
         },
     ];
-    let cases: [(&str, Vec<u8>); 5] = [
+    let cases: [(&str, Vec<u8>, &[&str]); 8] = [
         (
             "oracle-bundle-v6-inline.unity3d",
-            containers::unity_fs(6, "2022.3.62f1", &entries, BlocksInfo::Inline),
+            containers::unity_fs(&BundleLayout::v6(REVISION), &entries),
+            &[],
         ),
         (
             "oracle-bundle-v6-tail.unity3d",
-            containers::unity_fs(6, "2022.3.62f1", &entries, BlocksInfo::AtEnd),
+            containers::unity_fs(
+                &BundleLayout {
+                    info: BlocksInfo::AtEnd,
+                    ..BundleLayout::v6(REVISION)
+                },
+                &entries,
+            ),
+            &[],
         ),
         (
             "oracle-bundle-v7-aligned.unity3d",
-            containers::unity_fs(7, "2022.3.62f1", &entries, BlocksInfo::InlineAligned),
+            containers::unity_fs(
+                &BundleLayout {
+                    version: 7,
+                    info: BlocksInfo::InlineAligned,
+                    ..BundleLayout::v6(REVISION)
+                },
+                &entries,
+            ),
+            &[],
+        ),
+        // Compressed blocks and a compressed directory: the decompression path
+        // and the block mapping that depends on compressed-versus-uncompressed
+        // sizes differing.
+        (
+            "oracle-bundle-zstd-blocks.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    blocks: Compression::Zstd,
+                    ..BundleLayout::v6(REVISION)
+                },
+                &entries,
+            ),
+            &[ZSTD_BLOCK_WARNING],
+        ),
+        (
+            "oracle-bundle-zstd-directory.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    directory: Compression::Zstd,
+                    ..BundleLayout::v6(REVISION)
+                },
+                &entries,
+            ),
+            &[ZSTD_INFO_WARNING],
+        ),
+        (
+            "oracle-bundle-zstd-both-v7.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    version: 7,
+                    info: BlocksInfo::AtEnd,
+                    blocks: Compression::Zstd,
+                    directory: Compression::Zstd,
+                    ..BundleLayout::v6(REVISION)
+                },
+                &entries,
+            ),
+            &[ZSTD_BLOCK_WARNING, ZSTD_INFO_WARNING],
         ),
         (
             "oracle-bundle-raw-v6.unity3d",
-            containers::unity_raw_v6("2022.3.62f1", &entries),
+            containers::unity_raw_v6(REVISION, &entries),
+            &[],
         ),
-        ("oracle-gzip.assets.gz", containers::gzip(&inner)),
+        ("oracle-gzip.assets.gz", containers::gzip(&inner), &[]),
     ];
-    for (name, bytes) in &cases {
+    for (name, bytes, allowed) in &cases {
         let fixture = TemporaryFixture::new(name, bytes).unwrap();
-        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let managed = managed_manifest_allowing(executable, fixture.input_path(), allowed).unwrap();
         let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
         assert_eq!(managed, rust, "container fixture {name}");
         assert!(
@@ -275,6 +338,21 @@ fn build_managed_oracle() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn managed_manifest(executable: &Path, path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+    managed_manifest_allowing(executable, path, &[])
+}
+
+/// Runs the managed oracle, permitting only the diagnostics named in `allowed`.
+///
+/// Any managed diagnostic is a failure by default, because a warning usually
+/// means the managed reader fell back to something the Rust side does not know
+/// about. A few inputs legitimately make it log and continue -- it calls Zstd a
+/// "non-standard" block compression even though it decodes it -- so those are
+/// listed per fixture rather than ignored wholesale.
+fn managed_manifest_allowing(
+    executable: &Path,
+    path: &Path,
+    allowed: &[&str],
+) -> Result<Value, Box<dyn std::error::Error>> {
     let output = Command::new("dotnet")
         .args([
             executable
@@ -291,10 +369,16 @@ fn managed_manifest(executable: &Path, path: &Path) -> Result<Value, Box<dyn std
         )
         .into());
     }
-    if !output.stderr.is_empty() {
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    let unexpected: Vec<&str> = diagnostics
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !allowed.iter().any(|permitted| line.contains(permitted)))
+        .collect();
+    if !unexpected.is_empty() {
         return Err(format!(
-            "managed oracle emitted diagnostics:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            "managed oracle emitted unexpected diagnostics:\n{}",
+            unexpected.join("\n")
         )
         .into());
     }
