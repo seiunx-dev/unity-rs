@@ -382,7 +382,12 @@ def synthetic_tight_sprite() -> bytes:
     push_u32(sprite, 0)
     push_u32(sprite, 0)
     push_u32(sprite, 3)
-    push_f32s(sprite, (0.0,) * 8)
+    # The submesh's localAABB is six floats -- a centre and an extent -- not
+    # eight. This fixture encoded eight to match a reader that skipped 32 bytes
+    # here, and kept doing so after that was corrected, so every field after it
+    # was misread. The managed differential is what found the reader defect; the
+    # Python suite kept the old shape because nothing had run it since.
+    push_f32s(sprite, (0.0,) * 6)
     push_i32(sprite, 6)
     sprite.extend(struct.pack("<HHH", 0, 1, 2))
     align(sprite, 4)
@@ -1610,6 +1615,193 @@ def finish_v22(metadata: bytearray, data: bytearray) -> bytes:
     return bytes(output)
 
 
+# Meta flag for "align the stream to four bytes after this field".
+ALIGN = 0x4000
+
+
+class TreeBuilder:
+    """Accumulates TypeTree nodes in serialized (depth-first) order."""
+
+    def __init__(self) -> None:
+        self.nodes: list[dict[str, int | str]] = []
+
+    def push(
+        self,
+        type_name: str,
+        field: str,
+        byte_size: int,
+        level: int,
+        *,
+        is_array: int = 0,
+        flags: int = 0,
+    ) -> None:
+        self.nodes.append(
+            {
+                "type": type_name,
+                "name": field,
+                "byte_size": byte_size,
+                "index": len(self.nodes),
+                "is_array": is_array,
+                "version": 1,
+                "meta_flags": flags,
+                "level": level,
+            }
+        )
+
+    def string(self, field: str, level: int) -> None:
+        self.push("string", field, -1, level, flags=ALIGN)
+        self.push("Array", "Array", -1, level + 1, is_array=1, flags=ALIGN)
+        self.push("int", "size", 4, level + 2)
+        self.push("char", "data", 1, level + 2)
+
+    def vector(self, element: str, field: str, level: int) -> None:
+        self.push("vector", field, -1, level)
+        self.push("Array", "Array", -1, level + 1, is_array=1, flags=ALIGN)
+        self.push("int", "size", 4, level + 2)
+        self.push(element, "data", -1, level + 2)
+
+
+def type_tree_probe_tree() -> list[dict[str, int | str]]:
+    """A tree covering the shapes a reader can get wrong.
+
+    Alignment after a one-byte field, a length-prefixed string, an array of
+    primitives, and an array of structs that themselves contain a string and a
+    byte -- the last being where a misplaced align shows up as garbage rather
+    than as a wrong number.
+    """
+    tree = TreeBuilder()
+    tree.push("MonoBehaviour", "Base", -1, 0)
+    tree.push("PPtr<GameObject>", "m_GameObject", 12, 1)
+    tree.push("int", "m_FileID", 4, 2)
+    tree.push("SInt64", "m_PathID", 8, 2)
+    tree.push("UInt8", "m_Enabled", 1, 1, flags=ALIGN)
+    tree.push("PPtr<MonoScript>", "m_Script", 12, 1)
+    tree.push("int", "m_FileID", 4, 2)
+    tree.push("SInt64", "m_PathID", 8, 2)
+    tree.string("m_Name", 1)
+
+    tree.push("SInt8", "Signed8", 1, 1, flags=ALIGN)
+    tree.push("UInt16", "Unsigned16", 2, 1, flags=ALIGN)
+    tree.push("SInt64", "Signed64", 8, 1)
+    tree.push("float", "Single", 4, 1)
+    tree.push("double", "Double", 8, 1)
+    tree.push("bool", "Flag", 1, 1, flags=ALIGN)
+    tree.vector("int", "Numbers", 1)
+    tree.string("Label", 1)
+    tree.vector("Entry", "Entries", 1)
+    tree.string("Id", 4)
+    tree.push("bool", "Enabled", 1, 4, flags=ALIGN)
+    tree.push("float", "Weight", 4, 4)
+    return tree.nodes
+
+
+def synthetic_type_tree_object() -> bytes:
+    """A MonoBehaviour carrying the tree above and the bytes it describes."""
+    payload = bytearray()
+    push_i32(payload, 0)
+    payload.extend(struct.pack("<q", 0))
+    payload.append(1)
+    align(payload, 4)
+    push_i32(payload, 0)
+    payload.extend(struct.pack("<q", 0))
+    push_aligned_string(payload, "tree-probe")
+
+    payload.extend(struct.pack("<b", -7))
+    align(payload, 4)
+    payload.extend(struct.pack("<H", 65000))
+    align(payload, 4)
+    payload.extend(struct.pack("<q", -1234567890123))
+    payload.extend(struct.pack("<f", 0.8))
+    payload.extend(struct.pack("<d", -0.1))
+    payload.append(1)
+    align(payload, 4)
+    numbers = (5, -6, 7)
+    push_i32(payload, len(numbers))
+    for number in numbers:
+        push_i32(payload, number)
+    push_aligned_string(payload, "label with spaces")
+    entries = (("first", 1, 0.5), ("second", 0, -2.25))
+    push_i32(payload, len(entries))
+    for identifier, enabled, weight in entries:
+        push_aligned_string(payload, identifier)
+        payload.append(enabled)
+        align(payload, 4)
+        payload.extend(struct.pack("<f", weight))
+
+    return finish_v22_tree_asset(114, type_tree_probe_tree(), payload)
+
+
+def push_blob_type_tree(metadata: bytearray, nodes: list[dict[str, int | str]]) -> None:
+    """The format 19+ blob encoding: 32-byte nodes, then the string buffer."""
+    buffer = bytearray()
+    offsets = []
+    for node in nodes:
+        type_offset = len(buffer)
+        buffer.extend(str(node["type"]).encode("ascii") + b"\0")
+        name_offset = len(buffer)
+        buffer.extend(str(node["name"]).encode("ascii") + b"\0")
+        offsets.append((type_offset, name_offset))
+
+    push_i32(metadata, len(nodes))
+    push_i32(metadata, len(buffer))
+    for node, (type_offset, name_offset) in zip(nodes, offsets):
+        metadata.extend(struct.pack("<H", int(node["version"])))
+        metadata.append(int(node["level"]))
+        metadata.append(int(node["is_array"]))
+        push_u32(metadata, type_offset)
+        push_u32(metadata, name_offset)
+        push_i32(metadata, int(node["byte_size"]))
+        push_i32(metadata, int(node["index"]))
+        push_i32(metadata, int(node["meta_flags"]))
+        metadata.extend(bytes(8))  # reference type hash
+    metadata.extend(buffer)
+
+
+def finish_v22_tree_asset(
+    class_id: int,
+    nodes: list[dict[str, int | str]],
+    payload: bytearray,
+    unity_version: str = "2022.3.62f1",
+) -> bytes:
+    """The same file as `finish_v22_asset`, with the TypeTree embedded."""
+    metadata = bytearray(unity_version.encode("ascii") + b"\0")
+    push_i32(metadata, 13)
+    metadata.append(1)  # the tree is enabled
+    push_i32(metadata, 1)
+    push_i32(metadata, class_id)
+    metadata.append(0)
+    metadata.extend(struct.pack("<h", 0))
+    if class_id == 114:
+        # A MonoBehaviour type record carries the script hash first.
+        metadata.extend(bytes(16))
+    metadata.extend(bytes(16))
+    push_blob_type_tree(metadata, nodes)
+    push_i32(metadata, 0)  # no type dependencies
+
+    push_i32(metadata, 1)
+    align_with_base(metadata, 48, 4)
+    metadata.extend(struct.pack("<q", 7))
+    metadata.extend(struct.pack("<q", 0))
+    metadata.extend(struct.pack("<I", len(payload)))
+    push_i32(metadata, 0)
+    for _ in range(3):
+        push_i32(metadata, 0)
+    metadata.append(0)
+
+    metadata_size = len(metadata)
+    data_offset = ((48 + metadata_size + 15) // 16) * 16
+    file_size = data_offset + len(payload)
+    output = bytearray(48)
+    output[8:12] = struct.pack(">I", 22)
+    output[20:24] = struct.pack(">I", metadata_size)
+    output[24:32] = struct.pack(">q", file_size)
+    output[32:40] = struct.pack(">q", data_offset)
+    output.extend(metadata)
+    output.extend(bytes(data_offset - len(output)))
+    output.extend(payload)
+    return bytes(output)
+
+
 def finish_v22_asset(
     class_id: int,
     payload: bytearray,
@@ -2791,7 +2983,10 @@ def main() -> None:
         assert physics.input_count == 1
         assert physics.output_count == 1
         assert physics.particle_count == 1
-        assert b'"Fps": 60.0' in physics.json
+        # physics3.json goes through .NET's "0.###", where an integral value
+        # has no decimal point. This read 60.0 until the managed differential
+        # established the format.
+        assert b'"Fps": 60' in physics.json
         assert b'"Destination": { "Target": "Parameter", "Id": "ParamHair" }' in physics.json
 
         motion_path = Path(directory) / "motion.assets"
