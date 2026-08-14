@@ -1686,9 +1686,18 @@ mod tests {
     fn rejects_parent_and_absolute_entries_but_continues_safe_siblings() {
         let root = TestDirectory::new("traversal");
         let output = root.path().join("output");
+        // The Windows spellings matter as much as the POSIX ones: an archive
+        // is data, so a backslash path escapes on Windows whatever host wrote
+        // it, and a drive or UNC prefix is absolute there. The sanitiser
+        // normalises separators and rejects both, and nothing exercised that
+        // until this list grew.
         let web = web_file(&[
             ("../escape.bin", b"escape"),
             ("/absolute.bin", b"absolute"),
+            ("..\\escape-backslash.bin", b"escape"),
+            ("sub\\..\\..\\escape-mixed.bin", b"escape"),
+            ("C:\\drive.bin", b"drive"),
+            ("//unc-share.bin", b"unc"),
             ("safe/data.bin", b"safe"),
         ]);
 
@@ -1701,13 +1710,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.extracted.len(), 1);
-        assert_eq!(report.failures.len(), 2);
+        assert_eq!(report.failures.len(), 6);
+        // Each rejection has to be the one intended: a path that merely failed
+        // to parse would count the same and prove nothing about the guard.
+        let reasons: Vec<&str> = report
+            .failures
+            .iter()
+            .map(|failure| failure.error.as_str())
+            .collect();
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.contains("contains '..'"))
+                .count(),
+            3,
+            "{reasons:?}"
+        );
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.contains("must be relative"))
+                .count(),
+            2,
+            "{reasons:?}"
+        );
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.contains("Windows drive prefix"))
+                .count(),
+            1,
+            "{reasons:?}"
+        );
         assert_eq!(
             fs::read(output.join("web.data_unpacked/safe/data.bin")).unwrap(),
             b"safe"
         );
         assert!(!root.path().join("escape.bin").exists());
         assert!(!output.join("absolute.bin").exists());
+        for escaped in [
+            "escape-backslash.bin",
+            "escape-mixed.bin",
+            "drive.bin",
+            "unc-share.bin",
+        ] {
+            assert!(
+                !root.path().join(escaped).exists() && !output.join(escaped).exists(),
+                "{escaped} was written outside the extraction root"
+            );
+        }
+        // The tree below the output root holds exactly the one safe file, so
+        // nothing landed under a mangled name either.
+        let mut written = Vec::new();
+        let mut queue = vec![output.clone()];
+        while let Some(directory) = queue.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    queue.push(path);
+                } else {
+                    written.push(path);
+                }
+            }
+        }
+        assert_eq!(written.len(), 1, "{written:?}");
     }
 
     #[test]
