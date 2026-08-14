@@ -92,7 +92,7 @@ pub fn rust_manifest(
     Ok(json!({
         "Files": files,
         "Resources": resource_manifest,
-        "Live2D": live2d_manifest(&studio)?,
+        "Live2D": live2d_manifest(&studio, maximum_object_bytes)?,
     }))
 }
 
@@ -101,14 +101,27 @@ pub fn rust_manifest(
 /// The managed side runs its real extractor and lists what it wrote; this lists
 /// the same set from the materialized package so the two are comparable as
 /// documents rather than as call sequences.
-fn live2d_manifest(studio: &Studio) -> Result<Value, Box<dyn std::error::Error>> {
+fn live2d_manifest(
+    studio: &Studio,
+    maximum_object_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
     let set = match build_live2d_packages(studio.collection(), Live2dPackageLimits::default()) {
         Ok(set) if !set.packages.is_empty() => set,
         // No model in the file is not a failure; the managed side reports the
         // same absence by returning nothing.
         _ => return Ok(Value::Null),
     };
-    let bytes = materialize_live2d_packages(set, Live2dPackageMaterializeLimits::default())?;
+    // Bounded by the caller's ceiling rather than the library default, which is
+    // four gigabytes. The synthetic fixtures are tiny, but this manifest is
+    // also what the real-corpus gate runs, and that gate's contract is that a
+    // case raises its own limit deliberately rather than inheriting a global
+    // one large enough not to bind.
+    let limits = Live2dPackageMaterializeLimits {
+        maximum_file_bytes: maximum_object_bytes,
+        maximum_total_bytes: maximum_object_bytes,
+        ..Live2dPackageMaterializeLimits::default()
+    };
+    let bytes = materialize_live2d_packages(set, limits)?;
     let mut documents = serde_json::Map::new();
     for package in bytes.packages {
         let mut insert = |name: String, content: &[u8]| -> Result<(), Box<dyn std::error::Error>> {

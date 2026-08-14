@@ -37,11 +37,25 @@ layout, Unity 6000.1 resident and external-stream `Mesh` geometry, Unity 6000.2 
 tail/reference alignment, the Unity
 6000.2 `Avatar` prefix through TOS (the managed reader
 does not consume its HumanDescription tail), `BuildSettings`, `PlayerSettings`, and the
-synthetic TypeTree dump class used by the checked oracle test. Other classes
-still participate through their object metadata and raw bytes, with a `null`
-parsed payload.
+synthetic TypeTree dump class used by the checked oracle test. `MonoBehaviour`
+objects additionally carry their Cubism projections where the file's own
+`TypeTree` describes one -- physics3.json, motion3.json, exp3.json -- and a
+`CubismMoc` behaviour carries its MOC3 header fields. Other classes still
+participate through their object metadata and raw bytes, with a `null` parsed
+payload.
+
+A snapshot also carries a `Live2D` section: every file a Live2D package would
+be written as, keyed by relative path, with JSON documents compared as values
+and other files by size and hash. On the managed side that comes from running
+the real `Live2DExtractor`, so a corpus case containing a Cubism model compares
+the whole package rather than one document at a time.
+
+Regenerate snapshots after updating this repository. The manifest has grown
+several times -- most recently with the Cubism and Live2D rows above -- and an
+older snapshot will differ from a current run for that reason rather than
+because anything is wrong.
 
 `maximum_object_bytes` is a per-object materialization ceiling for the trusted
-gate. Raise it explicitly for a known large sample instead of disabling bounds
-globally. A manifest must have at least one enabled case when the ignored test
+gate, and also bounds the Live2D section's file and total sizes. Raise it
+explicitly for a known large sample instead of disabling bounds globally. A manifest must have at least one enabled case when the ignored test
 is executed.
