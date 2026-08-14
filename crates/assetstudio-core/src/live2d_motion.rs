@@ -195,7 +195,7 @@ pub(crate) fn write_motion_document(
     if !document.events.is_empty() {
         writer.write_all(b"\n  ")?;
     }
-    writer.write_all(b"]\n}\n")?;
+    writer.write_all(b"]\n}")?;
     Ok(writer.written)
 }
 
@@ -497,9 +497,15 @@ fn write_curve(writer: &mut impl Write, index: usize, curve: &ProjectedCurve<'_>
     writer.write_all(b",\n      \"Segments\": [")?;
     for (value_index, value) in curve.segments.iter().enumerate() {
         if value_index != 0 {
-            writer.write_all(b", ")?;
+            writer.write_all(b",")?;
         }
+        // The managed converter writes each value through the JSON writer, so
+        // indentation applies to them the same as to any other array element.
+        writer.write_all(b"\n        ")?;
         write_segment_number(writer, *value)?;
+    }
+    if !curve.segments.is_empty() {
+        writer.write_all(b"\n      ")?;
     }
     writer.write_all(b"]\n    }")?;
     Ok(())
@@ -799,8 +805,9 @@ mod tests {
             serde_json::json!([0, 0, 0, 0.5, 1, 2, 1, 0])
         );
         assert!(
-            String::from_utf8_lossy(&json).contains("\"Segments\": [0, 0, 0, 0.5"),
-            "the segment list is written without trailing .0"
+            String::from_utf8_lossy(&json)
+                .contains("\"Segments\": [\n        0,\n        0,\n        0,\n        0.5,"),
+            "the segment list is written one value per line and without trailing .0"
         );
         assert!(
             motion

@@ -32,7 +32,28 @@ use assetstudio_core::type_tree::TypeValue;
 use assetstudio_core::type_tree_dump::write_type_tree_dump;
 use serde_json::{Value, json};
 
+/// Writes this side's manifest to `ORACLE_DUMP_DIR` when that variable is set.
+///
+/// A mismatch in these manifests is a hash against a hash, which says two
+/// documents differ but not how. Dumping both sides turns that into a diff of
+/// the documents themselves, which is how the Cubism layout divergences were
+/// found and fixed one at a time.
 pub fn rust_manifest(
+    path: &Path,
+    maximum_object_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let value = rust_manifest_inner(path, maximum_object_bytes);
+    if let (Ok(directory), Ok(value)) = (std::env::var("ORACLE_DUMP_DIR"), value.as_ref()) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let _ = std::fs::write(
+            format!("{directory}/{name}.rust.json"),
+            serde_json::to_string_pretty(value).unwrap(),
+        );
+    }
+    value
+}
+
+fn rust_manifest_inner(
     path: &Path,
     maximum_object_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
@@ -134,7 +155,15 @@ fn live2d_manifest(
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
             {
-                serde_json::from_slice::<Value>(content)?
+                // Both rows earn their place. The parsed value makes a
+                // content difference readable; the byte row is what makes the
+                // document's layout and number spellings part of the
+                // comparison at all, and those are most of what these writers
+                // do.
+                serde_json::json!({
+                    "Value": serde_json::from_slice::<Value>(content)?,
+                    "Text": bytes_manifest(content),
+                })
             } else {
                 bytes_manifest(content)
             };
@@ -795,6 +824,9 @@ fn mono_behaviour_manifest(
             "Physics": Value::Null,
             "Motion": Value::Null,
             "Expression": Value::Null,
+            "PhysicsText": Value::Null,
+            "MotionText": Value::Null,
+            "ExpressionText": Value::Null,
         }));
     }
 
@@ -811,17 +843,42 @@ fn mono_behaviour_manifest(
         _ => String::new(),
     };
 
+    let (expression, motion, physics) = cubism_documents(&value)?;
+    Ok(json!({
+        "Name": name,
+        "Moc": Value::Null,
+        "Physics": physics.as_ref().map(|(value, _)| value.clone()),
+        "Motion": motion.as_ref().map(|(value, _)| value.clone()),
+        "Expression": expression.as_ref().map(|(value, _)| value.clone()),
+        "PhysicsText": physics.map(|(_, text)| bytes_manifest(text.as_bytes())),
+        "MotionText": motion.map(|(_, text)| bytes_manifest(text.as_bytes())),
+        "ExpressionText": expression.map(|(_, text)| bytes_manifest(text.as_bytes())),
+    }))
+}
+
+/// The three Cubism documents one behaviour can project into, each as the value
+/// it parses to and the bytes it was written as.
+///
+/// A behaviour that is not one of the three is not an error; the managed side
+/// reports the same absence by leaving the field null.
+type CubismDocument = Option<(Value, String)>;
+
+fn cubism_documents(
+    value: &TypeValue,
+) -> Result<(CubismDocument, CubismDocument, CubismDocument), Box<dyn std::error::Error>> {
     let expression =
-        match project_cubism_expression(0, &value, CubismExpressionReadLimits::default()) {
+        match project_cubism_expression(0, value, CubismExpressionReadLimits::default()) {
             Ok(expression) => {
                 let mut document = Vec::new();
                 expression.write_exp3_json(&mut document, 1024 * 1024)?;
-                Some(serde_json::from_slice::<Value>(&document)?)
+                Some((
+                    serde_json::from_slice::<Value>(&document)?,
+                    String::from_utf8(document)?,
+                ))
             }
             Err(_) => None,
         };
-    let motion = match project_cubism_fade_motion(0, &value, CubismFadeMotionReadLimits::default())
-    {
+    let motion = match project_cubism_fade_motion(0, value, CubismFadeMotionReadLimits::default()) {
         Ok(fade) => {
             let mut document = Vec::new();
             // The same names the managed side is given; in the real flow the
@@ -832,28 +889,28 @@ fn mono_behaviour_manifest(
                 parts: vec!["PartArmA".to_owned()],
             };
             fade.write_motion3_json(&names, false, &mut document, 1024 * 1024)?;
-            Some(serde_json::from_slice::<Value>(&document)?)
+            Some((
+                serde_json::from_slice::<Value>(&document)?,
+                String::from_utf8(document)?,
+            ))
         }
         Err(_) => None,
     };
-    let physics = match project_cubism_physics(0, &value, CubismPhysicsReadLimits::default()) {
+    let physics = match project_cubism_physics(0, value, CubismPhysicsReadLimits::default()) {
         Ok(rig) => {
             let mut document = Vec::new();
             // 30 is the fallback the managed converter passes in.
             rig.write_physics3_json(30.0, &mut document, 1024 * 1024)?;
-            Some(serde_json::from_slice::<Value>(&document)?)
+            Some((
+                serde_json::from_slice::<Value>(&document)?,
+                String::from_utf8(document)?,
+            ))
         }
         // A behaviour that is not a physics rig is not an error here; the
         // managed side reports the same absence by leaving the field null.
         Err(_) => None,
     };
-    Ok(json!({
-        "Name": name,
-        "Moc": Value::Null,
-        "Physics": physics,
-        "Motion": motion,
-        "Expression": expression,
-    }))
+    Ok((expression, motion, physics))
 }
 
 fn bytes_manifest(input: &[u8]) -> Value {

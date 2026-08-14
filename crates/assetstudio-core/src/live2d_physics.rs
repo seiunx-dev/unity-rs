@@ -148,9 +148,9 @@ impl CubismPhysicsRig {
         writer.write_all(b"    \"Fps\": ")?;
         write_number(&mut writer, fps)?;
         writer.write_all(b",\n    \"EffectiveForces\": {\n      \"Gravity\": ")?;
-        write_vec2(&mut writer, self.gravity)?;
+        write_vec2(&mut writer, self.gravity, 8)?;
         writer.write_all(b",\n      \"Wind\": ")?;
-        write_vec2(&mut writer, self.wind)?;
+        write_vec2(&mut writer, self.wind, 8)?;
         writer.write_all(b"\n    },\n    \"PhysicsDictionary\": [")?;
         for index in 0..self.sub_rigs.len() {
             if index == 0 {
@@ -175,7 +175,7 @@ impl CubismPhysicsRig {
         if !self.sub_rigs.is_empty() {
             writer.write_all(b"\n  ")?;
         }
-        writer.write_all(b"]\n}\n")?;
+        writer.write_all(b"]\n}")?;
         Ok(writer.written)
     }
 }
@@ -378,15 +378,17 @@ fn write_sub_rig(writer: &mut impl Write, index: usize, rig: &CubismPhysicsSubRi
 
 fn write_input(writer: &mut impl Write, index: usize, input: &CubismPhysicsInput) -> Result<()> {
     entry_start(writer, index)?;
-    writer.write_all(b"        \"Source\": { \"Target\": \"Parameter\", \"Id\": ")?;
+    writer.write_all(
+        b"          \"Source\": {\n            \"Target\": \"Parameter\",\n            \"Id\": ",
+    )?;
     write_json_string(writer, &input.source_id)?;
-    writer.write_all(b" },\n        \"Weight\": ")?;
+    writer.write_all(b"\n          },\n          \"Weight\": ")?;
     write_number(writer, input.weight)?;
-    writer.write_all(b",\n        \"Type\": ")?;
+    writer.write_all(b",\n          \"Type\": ")?;
     write_json_string(writer, input.source_component.name())?;
     write!(
         writer,
-        ",\n        \"Reflect\": {}\n      }}",
+        ",\n          \"Reflect\": {}\n        }}",
         input.inverted
     )?;
     Ok(())
@@ -394,21 +396,23 @@ fn write_input(writer: &mut impl Write, index: usize, input: &CubismPhysicsInput
 
 fn write_output(writer: &mut impl Write, index: usize, output: &CubismPhysicsOutput) -> Result<()> {
     entry_start(writer, index)?;
-    writer.write_all(b"        \"Destination\": { \"Target\": \"Parameter\", \"Id\": ")?;
+    writer.write_all(
+        b"          \"Destination\": {\n            \"Target\": \"Parameter\",\n            \"Id\": ",
+    )?;
     write_json_string(writer, &output.destination_id)?;
     write!(
         writer,
-        " }},\n        \"VertexIndex\": {},\n        \"Scale\": ",
+        "\n          }},\n          \"VertexIndex\": {},\n          \"Scale\": ",
         output.particle_index
     )?;
     write_number(writer, output.scale)?;
-    writer.write_all(b",\n        \"Weight\": ")?;
+    writer.write_all(b",\n          \"Weight\": ")?;
     write_number(writer, output.weight)?;
-    writer.write_all(b",\n        \"Type\": ")?;
+    writer.write_all(b",\n          \"Type\": ")?;
     write_json_string(writer, output.source_component.name())?;
     write!(
         writer,
-        ",\n        \"Reflect\": {}\n      }}",
+        ",\n          \"Reflect\": {}\n        }}",
         output.inverted
     )?;
     Ok(())
@@ -420,18 +424,18 @@ fn write_particle(
     particle: CubismPhysicsParticle,
 ) -> Result<()> {
     entry_start(writer, index)?;
-    writer.write_all(b"        \"Position\": ")?;
-    write_vec2(writer, particle.initial_position)?;
+    writer.write_all(b"          \"Position\": ")?;
+    write_vec2(writer, particle.initial_position, 12)?;
     for (name, value) in [
         ("Mobility", particle.mobility),
         ("Delay", particle.delay),
         ("Acceleration", particle.acceleration),
         ("Radius", particle.radius),
     ] {
-        write!(writer, ",\n        \"{name}\": ")?;
+        write!(writer, ",\n          \"{name}\": ")?;
         write_number(writer, value)?;
     }
-    writer.write_all(b"\n      }")?;
+    writer.write_all(b"\n        }")?;
     Ok(())
 }
 
@@ -439,30 +443,43 @@ fn write_normalization(
     writer: &mut impl Write,
     value: CubismPhysicsNormalizationValue,
 ) -> Result<()> {
-    writer.write_all(b"{ \"Minimum\": ")?;
+    writer.write_all(b"{\n          \"Minimum\": ")?;
     write_number(writer, value.minimum)?;
-    writer.write_all(b", \"Default\": ")?;
+    writer.write_all(b",\n          \"Default\": ")?;
     write_number(writer, value.default)?;
-    writer.write_all(b", \"Maximum\": ")?;
+    writer.write_all(b",\n          \"Maximum\": ")?;
     write_number(writer, value.maximum)?;
-    writer.write_all(b" }")?;
+    writer.write_all(b"\n        }")?;
     Ok(())
 }
 
-fn write_vec2(writer: &mut impl Write, value: CubismPhysicsVec2) -> Result<()> {
-    writer.write_all(b"{ \"X\": ")?;
+/// Writes a vector as an indented object whose members sit at `indent` spaces.
+fn write_vec2(writer: &mut impl Write, value: CubismPhysicsVec2, indent: usize) -> Result<()> {
+    let gap = |writer: &mut dyn Write, columns: usize| -> Result<()> {
+        writer.write_all(b"\n")?;
+        for _ in 0..columns {
+            writer.write_all(b" ")?;
+        }
+        Ok(())
+    };
+    writer.write_all(b"{")?;
+    gap(writer, indent)?;
+    writer.write_all(b"\"X\": ")?;
     write_number(writer, value.x)?;
-    writer.write_all(b", \"Y\": ")?;
+    writer.write_all(b",")?;
+    gap(writer, indent)?;
+    writer.write_all(b"\"Y\": ")?;
     write_number(writer, value.y)?;
-    writer.write_all(b" }")?;
+    gap(writer, indent - 2)?;
+    writer.write_all(b"}")?;
     Ok(())
 }
 
 fn entry_start(writer: &mut impl Write, index: usize) -> Result<()> {
     if index == 0 {
-        writer.write_all(b"\n      {\n")?;
+        writer.write_all(b"\n        {\n")?;
     } else {
-        writer.write_all(b",\n      {\n")?;
+        writer.write_all(b",\n        {\n")?;
     }
     Ok(())
 }

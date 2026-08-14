@@ -264,6 +264,23 @@ fn write_optional_reference(
 
 impl Live2dPackage {
     /// Writes a deterministic Cubism 3 manifest containing only verified files.
+    /// Writes `model3.json`.
+    ///
+    /// # Layout
+    ///
+    /// Every Cubism document this crate writes reproduces Newtonsoft's
+    /// `Formatting.Indented`, which is what the managed extractor serializes
+    /// all six of them through: two spaces per level, every object member and
+    /// every array element on its own line, `[]` and `{}` for empty ones, and
+    /// no trailing newline at the end of the file. The two custom converters
+    /// the managed side registers change how *numbers* are spelled, not how
+    /// the document is laid out.
+    ///
+    /// This is not a house style, and a compact form is not a free choice: the
+    /// differential compares these documents byte for byte. It did not always
+    /// -- it compared what they parsed to, which is why several of these
+    /// writers spent a long time emitting single-line objects and inline
+    /// arrays that no managed document has ever contained.
     pub fn write_model3_json<W: Write>(
         &self,
         output: &mut W,
@@ -308,10 +325,10 @@ impl Live2dPackage {
                 writer.write_all(b",\n      ")?;
             }
             serde_json::to_writer(&mut writer, &motion.name).map_err(|error| json_error(&error))?;
-            writer.write_all(b": [ { \"File\": ")?;
+            writer.write_all(b": [\n        {\n          \"File\": ")?;
             serde_json::to_writer(&mut writer, &motion.file_name)
                 .map_err(|error| json_error(&error))?;
-            writer.write_all(b" } ]")?;
+            writer.write_all(b"\n        }\n      ]")?;
         }
         if !self.motions.is_empty() {
             writer.write_all(b"\n    ")?;
@@ -321,16 +338,16 @@ impl Live2dPackage {
         writer.write_all(b",\n    \"Expressions\": [")?;
         for (index, expression) in self.expressions.iter().enumerate() {
             if index == 0 {
-                writer.write_all(b"\n      { \"Name\": ")?;
+                writer.write_all(b"\n      {\n        \"Name\": ")?;
             } else {
-                writer.write_all(b",\n      { \"Name\": ")?;
+                writer.write_all(b",\n      {\n        \"Name\": ")?;
             }
             serde_json::to_writer(&mut writer, &expression.name)
                 .map_err(|error| json_error(&error))?;
-            writer.write_all(b", \"File\": ")?;
+            writer.write_all(b",\n        \"File\": ")?;
             serde_json::to_writer(&mut writer, &expression.file_name)
                 .map_err(|error| json_error(&error))?;
-            writer.write_all(b" }")?;
+            writer.write_all(b"\n      }")?;
         }
         if !self.expressions.is_empty() {
             writer.write_all(b"\n    ")?;
@@ -339,7 +356,7 @@ impl Live2dPackage {
         writer.write_all(b"\n  },\n  \"Groups\": [")?;
         write_parameter_group(&mut writer, "EyeBlink", &self.eye_blink_parameters, true)?;
         write_parameter_group(&mut writer, "LipSync", &self.lip_sync_parameters, false)?;
-        writer.write_all(b"\n  ]\n}\n")?;
+        writer.write_all(b"\n  ]\n}")?;
         Ok(writer.written)
     }
 }
@@ -351,19 +368,23 @@ fn write_parameter_group<W: Write>(
     first: bool,
 ) -> Result<()> {
     writer.write_all(if first {
-        b"\n    { \"Target\": \"Parameter\", \"Name\": "
+        b"\n    {\n      \"Target\": \"Parameter\",\n      \"Name\": "
     } else {
-        b",\n    { \"Target\": \"Parameter\", \"Name\": "
+        b",\n    {\n      \"Target\": \"Parameter\",\n      \"Name\": "
     })?;
     serde_json::to_writer(&mut *writer, name).map_err(|error| json_error(&error))?;
-    writer.write_all(b", \"Ids\": [")?;
+    writer.write_all(b",\n      \"Ids\": [")?;
     for (index, id) in ids.iter().enumerate() {
         if index != 0 {
-            writer.write_all(b", ")?;
+            writer.write_all(b",")?;
         }
+        writer.write_all(b"\n        ")?;
         serde_json::to_writer(&mut *writer, id).map_err(|error| json_error(&error))?;
     }
-    writer.write_all(b"] }")?;
+    if !ids.is_empty() {
+        writer.write_all(b"\n      ")?;
+    }
+    writer.write_all(b"]\n    }")?;
     Ok(())
 }
 
@@ -3614,10 +3635,22 @@ mod tests {
                 "    \"Expressions\": []\n",
                 "  },\n",
                 "  \"Groups\": [\n",
-                "    { \"Target\": \"Parameter\", \"Name\": \"EyeBlink\", \"Ids\": [] },\n",
-                "    { \"Target\": \"Parameter\", \"Name\": \"LipSync\", \"Ids\": [] }\n",
+                // Newtonsoft's `Formatting.Indented` expands every object and
+                // array and writes no trailing newline, and the managed
+                // extractor writes this document through it. The differential
+                // compares these bytes, so the layout is not a house style.
+                "    {\n",
+                "      \"Target\": \"Parameter\",\n",
+                "      \"Name\": \"EyeBlink\",\n",
+                "      \"Ids\": []\n",
+                "    },\n",
+                "    {\n",
+                "      \"Target\": \"Parameter\",\n",
+                "      \"Name\": \"LipSync\",\n",
+                "      \"Ids\": []\n",
+                "    }\n",
                 "  ]\n",
-                "}\n"
+                "}"
             )
         );
         assert!(

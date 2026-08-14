@@ -106,8 +106,8 @@ static object? Live2DPackages(AssetsManager manager)
             // size and hash, since two encoders will not agree byte for byte
             // and the decoded-pixel rows already cover texture content.
             documents[relative] = relative.EndsWith(".json", StringComparison.Ordinal)
-                ? JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(path))
-                : Bytes(File.ReadAllBytes(path));
+                ? new { Value = JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(path)), Text = Bytes(File.ReadAllBytes(path)) }
+                : (object)Bytes(File.ReadAllBytes(path));
         }
         return documents;
     }
@@ -342,6 +342,9 @@ static object MonoBehaviourPayload(MonoBehaviour behaviour)
             Physics = (JsonElement?)null,
             Motion = (JsonElement?)null,
             Expression = (JsonElement?)null,
+            PhysicsText = (string?)null,
+            MotionText = (string?)null,
+            ExpressionText = (string?)null,
         };
     }
 
@@ -398,6 +401,11 @@ static object MonoBehaviourPayload(MonoBehaviour behaviour)
         Expression = expressionJson == null
             ? (JsonElement?)null
             : JsonSerializer.Deserialize<JsonElement>(expressionJson),
+        // The document text, not only what it parses to. The layout and the
+        // number spellings are part of what these files are.
+        PhysicsText = physics == null ? null : Bytes(Encoding.UTF8.GetBytes(physics)),
+        MotionText = motion == null ? null : Bytes(Encoding.UTF8.GetBytes(motion)),
+        ExpressionText = expressionJson == null ? null : Bytes(Encoding.UTF8.GetBytes(expressionJson)),
     };
 }
 

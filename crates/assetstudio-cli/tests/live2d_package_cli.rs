@@ -75,10 +75,23 @@ fn writes_exact_static_package_moc_manifest_and_unity_order_png() {
             "    \"Expressions\": []\n",
             "  },\n",
             "  \"Groups\": [\n",
-            "    { \"Target\": \"Parameter\", \"Name\": \"EyeBlink\", \"Ids\": [] },\n",
-            "    { \"Target\": \"Parameter\", \"Name\": \"LipSync\", \"Ids\": [] }\n",
+            // Every object and array is expanded and the file ends without a
+            // trailing newline, because that is what Newtonsoft's
+            // `Formatting.Indented` produces and the managed extractor writes
+            // every one of these documents through it. The differential
+            // compares these bytes now, not only what they parse to.
+            "    {\n",
+            "      \"Target\": \"Parameter\",\n",
+            "      \"Name\": \"EyeBlink\",\n",
+            "      \"Ids\": []\n",
+            "    },\n",
+            "    {\n",
+            "      \"Target\": \"Parameter\",\n",
+            "      \"Name\": \"LipSync\",\n",
+            "      \"Ids\": []\n",
+            "    }\n",
             "  ]\n",
-            "}\n"
+            "}"
         )
     );
     let png = fs::read(package.join("textures/face.png")).unwrap();

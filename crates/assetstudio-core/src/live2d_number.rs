@@ -7,6 +7,17 @@
 //! that can check any model and one that can only check values short enough to
 //! print the same way by accident.
 //!
+//! That comparison is real now rather than aspirational: the differential
+//! compares each Cubism document's bytes against the one the managed extractor
+//! wrote, not only against what it parses to. Getting there took fixing the
+//! layout as well as the numbers -- see [`crate::live2d_package`] -- because a
+//! value comparison had been hiding the fact that the two disagreed about
+//! every object and array in every document.
+//!
+//! Neither format here is .NET's default `ToString()`, which is
+//! [`crate::managed_number`]; these are the two the Cubism extractor asks for
+//! specifically.
+//!
 //! Both formatters take `f32` because Unity serializes these fields as floats
 //! and both formats depend on the value's shortest *decimal* form, which
 //! changes when the value is widened: `0.8f` widened to `f64` prints as
