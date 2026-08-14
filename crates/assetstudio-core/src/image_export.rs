@@ -84,6 +84,24 @@ pub enum ImageRowOrder {
     Display,
 }
 
+/// Flips `image` in place between [`ImageRowOrder::UnityDecoded`] and
+/// [`ImageRowOrder::Display`].
+///
+/// `Texture2D` decoders emit rows bottom-up. [`write_rgba_image`] handles that
+/// through its `row_order` argument, but a caller that hands raw RGBA straight
+/// to a consumer has to apply the flip itself or the pixels arrive vertically
+/// mirrored.
+pub fn flip_rgba_rows(image: &mut RgbaImage) -> Result<()> {
+    let dimensions = validate_image(image)?;
+    let stride = dimensions.stride_usize;
+    for row in 0..dimensions.height_usize / 2 {
+        let opposite = dimensions.height_usize - row - 1;
+        let (top, bottom) = image.pixels.split_at_mut(opposite * stride);
+        top[row * stride..row * stride + stride].swap_with_slice(&mut bottom[..stride]);
+    }
+    Ok(())
+}
+
 /// Writes one RGBA8 image while enforcing the complete encoded-output budget.
 ///
 /// PNG scanlines are compressed directly into bounded IDAT chunks, so encoding
@@ -591,10 +609,36 @@ mod tests {
     use zune_jpeg::JpegDecoder;
 
     use super::{
-        ImageFormat, ImageRowOrder, PNG_SIGNATURE, png_crc32, write_rgba_image,
+        ImageFormat, ImageRowOrder, PNG_SIGNATURE, flip_rgba_rows, png_crc32, write_rgba_image,
         write_rgba_image_with_quality,
     };
     use crate::texture::RgbaImage;
+
+    #[test]
+    fn flipping_rows_is_an_involution_and_rejects_mismatched_buffers() {
+        let mut image = two_by_two();
+        let decoded = image.pixels.clone();
+        flip_rgba_rows(&mut image).unwrap();
+        assert_eq!(
+            image.pixels,
+            vec![0, 0, 255, 3, 255, 255, 255, 4, 255, 0, 0, 1, 0, 255, 0, 2]
+        );
+        flip_rgba_rows(&mut image).unwrap();
+        assert_eq!(image.pixels, decoded);
+
+        // An odd row count leaves the middle row where it is.
+        let mut odd = RgbaImage {
+            width: 1,
+            height: 3,
+            pixels: vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+        };
+        flip_rgba_rows(&mut odd).unwrap();
+        assert_eq!(odd.pixels, vec![3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1]);
+
+        let mut truncated = two_by_two();
+        truncated.pixels.pop();
+        assert!(flip_rgba_rows(&mut truncated).is_err());
+    }
 
     fn two_by_two() -> RgbaImage {
         RgbaImage {

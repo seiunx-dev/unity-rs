@@ -2490,7 +2490,7 @@ impl PyAssetStudio {
                 .decode_texture_mip(mip_level, limits)
                 .map_err(core_error)
         })?;
-        flip_rgba_rows(&mut image.pixels, image.width, image.height)?;
+        flip_rgba_rows(&mut image)?;
         Ok(PyRgbaImage {
             width: image.width,
             height: image.height,
@@ -2521,7 +2521,7 @@ impl PyAssetStudio {
         images
             .into_iter()
             .map(|mut image| {
-                flip_rgba_rows(&mut image.pixels, image.width, image.height)?;
+                flip_rgba_rows(&mut image)?;
                 Ok(PyRgbaImage {
                     width: image.width,
                     height: image.height,
@@ -4052,36 +4052,8 @@ const fn cubism_expression_blend_name(blend: CubismExpressionBlend) -> &'static 
     }
 }
 
-fn flip_rgba_rows(pixels: &mut [u8], width: u32, height: u32) -> PyResult<()> {
-    let row_bytes = usize::try_from(width)
-        .ok()
-        .and_then(|width| width.checked_mul(4))
-        .ok_or_else(|| PyValueError::new_err("RGBA row length overflowed"))?;
-    let expected = row_bytes
-        .checked_mul(
-            usize::try_from(height)
-                .map_err(|_| PyValueError::new_err("RGBA height does not fit this platform"))?,
-        )
-        .ok_or_else(|| PyValueError::new_err("RGBA image length overflowed"))?;
-    if pixels.len() != expected {
-        return Err(PyValueError::new_err(format!(
-            "RGBA image has {} bytes; expected {expected}",
-            pixels.len()
-        )));
-    }
-    for row_number in 0..height / 2 {
-        let opposite_number = height - row_number - 1;
-        let row = usize::try_from(row_number)
-            .map_err(|_| PyValueError::new_err("RGBA row does not fit this platform"))?;
-        let opposite = usize::try_from(opposite_number)
-            .map_err(|_| PyValueError::new_err("RGBA row does not fit this platform"))?;
-        let first = row * row_bytes;
-        let second = opposite * row_bytes;
-        for offset in 0..row_bytes {
-            pixels.swap(first + offset, second + offset);
-        }
-    }
-    Ok(())
+fn flip_rgba_rows(image: &mut assetstudio_core::texture::RgbaImage) -> PyResult<()> {
+    assetstudio_core::image_export::flip_rgba_rows(image).map_err(core_error)
 }
 
 #[pymodule]
