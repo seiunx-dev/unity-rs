@@ -119,6 +119,13 @@ export declare class AssetStudio {
    */
   readStaticFbx(maximumBytes?: number | undefined | null): Buffer
   /**
+   * The same static scene in FBX 7.4's binary encoding.
+   *
+   * Some importers accept only the binary form, and it is smaller and faster
+   * to parse. The scene is identical to `readStaticFbx`.
+   */
+  readStaticFbxBinary(maximumBytes?: number | undefined | null): Buffer
+  /**
    * Exports every supported object into `outputRoot`.
    *
    * The Core exporter writes atomically and never overwrites unless asked,
@@ -153,6 +160,8 @@ export declare class AssetStudio {
    * caller wants for a rigged model.
    */
   readFbx(maximumBytes?: number | undefined | null): Buffer
+  /** The same animated scene in FBX 7.4's binary encoding. */
+  readFbxBinary(maximumBytes?: number | undefined | null): Buffer
   /**
    * Materializes every Live2D package: the MOC, the model3 manifest, the
    * mip-zero texture PNGs, and the expression, motion, physics, pose and

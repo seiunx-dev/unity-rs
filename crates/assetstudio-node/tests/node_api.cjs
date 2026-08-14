@@ -513,6 +513,17 @@ console.log('node api: multi-buffer, resource range and scene ok')
     { name: 'text.assets', data: syntheticTextAsset() },
   ])
   assert.throws(() => fbxStudio.readStaticFbx())
+
+  // The binary encoding had no binding at all until the writer was wired up.
+  // This suite has no model fixture, so the bytes are checked by the Python
+  // and CLI tests; what is checked here is that the methods exist and behave
+  // like their text counterparts. Asserting they are functions first
+  // distinguishes "not bound" from "bound and raised", which assert.throws
+  // alone would not.
+  assert.strictEqual(typeof fbxStudio.readStaticFbxBinary, 'function')
+  assert.strictEqual(typeof fbxStudio.readFbxBinary, 'function')
+  assert.throws(() => fbxStudio.readStaticFbxBinary())
+  assert.throws(() => fbxStudio.readFbxBinary())
 }
 
 console.log('node api: export, extract and fbx ok')

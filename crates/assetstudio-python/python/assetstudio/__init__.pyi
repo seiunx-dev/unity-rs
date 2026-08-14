@@ -722,6 +722,17 @@ class AssetStudio:
         maximum_bytes: int = 536_870_912,
         acl_decoder: Optional[AclDecoder] = None,
     ) -> bytes: ...
+    def read_static_fbx_binary(
+        self,
+        *,
+        maximum_bytes: int = 536_870_912,
+    ) -> bytes: ...
+    def read_fbx_binary(
+        self,
+        *,
+        maximum_bytes: int = 536_870_912,
+        acl_decoder: Optional[AclDecoder] = None,
+    ) -> bytes: ...
     def split_object_fbx_candidates(self) -> list[FbxCandidate]: ...
     def animator_fbx_candidates(self) -> list[FbxCandidate]: ...
     def read_game_object_fbx(
