@@ -542,3 +542,135 @@ pub(crate) fn cubism_moc_object_with_script(
     data[20..28].copy_from_slice(&script_path_id.to_le_bytes());
     data
 }
+
+/// A `GameObject` naming a node and listing its components.
+pub(crate) fn game_object(name: &str, components: &[i64]) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_i32(&mut data, i32::try_from(components.len()).unwrap());
+    for path_id in components {
+        push_i32(&mut data, 0);
+        data.extend_from_slice(&path_id.to_le_bytes());
+    }
+    push_i32(&mut data, 0); // m_Layer
+    push_string(&mut data, name);
+    data
+}
+
+/// A `Transform` linking a node to its parent and children.
+pub(crate) fn transform(game_object: i64, children: &[i64], father: i64) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_pptr_to(&mut data, game_object);
+    // Rotation, position, scale: identity.
+    for value in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    push_i32(&mut data, i32::try_from(children.len()).unwrap());
+    for path_id in children {
+        push_pptr_to(&mut data, *path_id);
+    }
+    push_pptr_to(&mut data, father);
+    data
+}
+
+fn push_pptr_to(data: &mut Vec<u8>, path_id: i64) {
+    push_i32(data, 0);
+    data.extend_from_slice(&path_id.to_le_bytes());
+}
+
+/// The prefix every `MonoBehaviour` shares: owner, enabled flag, script, name.
+fn behaviour_prefix(game_object: i64, script: i64, name: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_pptr_to(&mut data, game_object);
+    data.push(1);
+    align(&mut data);
+    push_pptr_to(&mut data, script);
+    push_string(&mut data, name);
+    data
+}
+
+/// The tree for a behaviour whose only field is one object pointer.
+pub(crate) fn pointer_behaviour_tree(target: &str, field: &str) -> Vec<Value> {
+    let mut tree = TreeBuilder::new();
+    tree.push("MonoBehaviour", "Base", -1, 0, 0);
+    pptr(&mut tree, "m_GameObject", "GameObject", 1);
+    tree.byte("m_Enabled", 1);
+    pptr(&mut tree, "m_Script", "MonoScript", 1);
+    tree.string("m_Name", 1);
+    pptr(&mut tree, field, target, 1);
+    tree.finish()
+}
+
+/// A behaviour whose only field is one object pointer, such as the
+/// `CubismModel` that names its MOC.
+pub(crate) fn pointer_behaviour(game_object: i64, script: i64, name: &str, target: i64) -> Vec<u8> {
+    let mut data = behaviour_prefix(game_object, script, name);
+    push_pptr_to(&mut data, target);
+    data
+}
+
+/// The tree for a `CubismPosePart`.
+///
+/// Field names come from the managed extractor, which reads `GroupIndex` and
+/// `Link` out of the parsed behaviour.
+pub(crate) fn pose_part_tree() -> Vec<Value> {
+    let mut tree = TreeBuilder::new();
+    tree.push("MonoBehaviour", "Base", -1, 0, 0);
+    pptr(&mut tree, "m_GameObject", "GameObject", 1);
+    tree.byte("m_Enabled", 1);
+    pptr(&mut tree, "m_Script", "MonoScript", 1);
+    tree.string("m_Name", 1);
+    tree.int("GroupIndex", 1);
+    tree.string_vector("Link", 1);
+    tree.finish()
+}
+
+/// A `CubismPosePart` behaviour.
+pub(crate) fn pose_part(
+    game_object: i64,
+    script: i64,
+    group_index: i32,
+    links: &[&str],
+) -> Vec<u8> {
+    let mut data = behaviour_prefix(game_object, script, "");
+    push_i32(&mut data, group_index);
+    push_i32(&mut data, i32::try_from(links.len()).unwrap());
+    for link in links {
+        push_string(&mut data, link);
+    }
+    data
+}
+
+/// The tree for a display-info behaviour, which carries a name and an optional
+/// override.
+pub(crate) fn display_info_tree() -> Vec<Value> {
+    let mut tree = TreeBuilder::new();
+    tree.push("MonoBehaviour", "Base", -1, 0, 0);
+    pptr(&mut tree, "m_GameObject", "GameObject", 1);
+    tree.byte("m_Enabled", 1);
+    pptr(&mut tree, "m_Script", "MonoScript", 1);
+    tree.string("m_Name", 1);
+    tree.string("Name", 1);
+    tree.string("DisplayName", 1);
+    tree.finish()
+}
+
+/// A display-info behaviour.
+pub(crate) fn display_info(
+    game_object: i64,
+    script: i64,
+    name: &str,
+    display_name: &str,
+) -> Vec<u8> {
+    let mut data = behaviour_prefix(game_object, script, "");
+    push_string(&mut data, name);
+    push_string(&mut data, display_name);
+    data
+}
+
+/// The MOC behaviour, owned by a game object and naming its script.
+pub(crate) fn cubism_moc_behaviour(game_object: i64, script: i64, sdk_version: u8) -> Vec<u8> {
+    let mut data = cubism_moc_object_with_script("moc", sdk_version, script);
+    data[0..4].copy_from_slice(&0_i32.to_le_bytes());
+    data[4..12].copy_from_slice(&game_object.to_le_bytes());
+    data
+}

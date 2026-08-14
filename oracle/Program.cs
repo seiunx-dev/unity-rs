@@ -40,12 +40,84 @@ try
             Data = StreamBytes(entry.Value),
         })
         .ToArray();
-    Console.Write(JsonSerializer.Serialize(new { Files = files, Resources = resources }));
+    Console.Write(JsonSerializer.Serialize(new
+    {
+        Files = files,
+        Resources = resources,
+        Live2D = Live2DPackages(manager),
+    }));
     return 0;
 }
 finally
 {
     manager.Clear();
+}
+
+// Runs the real managed Live2D extractor over whatever model the file holds
+// and reports the documents it wrote.
+//
+// This drives CubismLive2DExtractor.ExtractCubismModel rather than
+// reimplementing its grouping here: an oracle that restated the conversion
+// would only compare this repository against its own reading of it, which is
+// the weak pattern the sprite rows were already corrected for. The extractor
+// classifies behaviours by their MonoScript class name, so a file without a
+// CubismMoc-scripted behaviour simply produces nothing.
+static object? Live2DPackages(AssetsManager manager)
+{
+    var objects = manager.AssetsFileList.SelectMany(file => file.Objects).ToList();
+    var mocMono = objects.OfType<MonoBehaviour>().FirstOrDefault(behaviour =>
+        behaviour.m_Script.TryGet(out var script) && script.m_ClassName == "CubismMoc");
+    var modelMono = objects.OfType<MonoBehaviour>().FirstOrDefault(behaviour =>
+        behaviour.m_Script.TryGet(out var script) && script.m_ClassName == "CubismModel");
+    // The CLI only reaches the extractor for a group its model discovery
+    // paired with a CubismModel component. Running it for a lone MOC would
+    // extract a model that AssetStudio itself would never offer, and the
+    // difference would be this harness rather than either implementation.
+    if (mocMono == null || modelMono == null)
+    {
+        return null;
+    }
+
+    // The CLI populates this from its own model discovery, which builds a
+    // CubismModel around the game object that owns the CubismModel behaviour.
+    // Without it the extractor names the model after its output directory,
+    // which is a temporary path here and would make every file name differ for
+    // a reason that has nothing to do with either implementation.
+    var mocDict = new Dictionary<MonoBehaviour, CubismModel>();
+    if (modelMono.m_GameObject.TryGet(out var modelGameObject))
+    {
+        mocDict[mocMono] = new CubismModel(modelGameObject) { CubismModelMono = modelMono };
+    }
+    CubismLive2DExtractor.Live2DExtractor.MocDict = mocDict;
+    var destination = Path.Combine(
+        Path.GetTempPath(),
+        $"assetstudio-oracle-live2d-{Environment.ProcessId}-{Guid.NewGuid():N}");
+    try
+    {
+        var extractor = new CubismLive2DExtractor.Live2DExtractor(
+            new KeyValuePair<MonoBehaviour, List<AssetStudio.Object>>(mocMono, objects));
+        extractor.ExtractCubismModel(destination, CubismLive2DExtractor.Live2DMotionMode.MonoBehaviour);
+
+        var documents = new SortedDictionary<string, object>(StringComparer.Ordinal);
+        foreach (var path in Directory.EnumerateFiles(destination, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(destination, path).Replace('\\', '/');
+            // JSON documents compare as values; anything else compares by
+            // size and hash, since two encoders will not agree byte for byte
+            // and the decoded-pixel rows already cover texture content.
+            documents[relative] = relative.EndsWith(".json", StringComparison.Ordinal)
+                ? JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(path))
+                : Bytes(File.ReadAllBytes(path));
+        }
+        return documents;
+    }
+    finally
+    {
+        if (Directory.Exists(destination))
+        {
+            Directory.Delete(destination, recursive: true);
+        }
+    }
 }
 
 static object OracleObject(AssetStudio.Object value)
