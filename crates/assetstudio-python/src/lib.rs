@@ -2829,7 +2829,7 @@ impl PyAssetStudio {
                 py,
                 PyCubismExpressionParameter {
                     id: parameter.id,
-                    value: parameter.value,
+                    value: f64::from(parameter.value),
                     blend: cubism_expression_blend_name(parameter.blend).to_owned(),
                 },
             )?);
@@ -2838,8 +2838,8 @@ impl PyAssetStudio {
             path_id: expression.path_id,
             source_name: expression.source_name,
             expression_type: expression.expression_type,
-            fade_in_time: expression.fade_in_time,
-            fade_out_time: expression.fade_out_time,
+            fade_in_time: f64::from(expression.fade_in_time),
+            fade_out_time: f64::from(expression.fade_out_time),
             parameters,
             json,
         })

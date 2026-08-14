@@ -10,6 +10,7 @@ use assetstudio_core::live2d_motion::{
     CubismFadeMotionReadLimits, CubismMotionTargetNames, project_cubism_fade_motion,
 };
 use assetstudio_core::live2d_physics::{CubismPhysicsReadLimits, project_cubism_physics};
+use assetstudio_core::live2d_schema::{CubismExpressionReadLimits, project_cubism_expression};
 use assetstudio_core::material::{MaterialReadLimits, read_material};
 use assetstudio_core::mesh::{MeshReadLimits, read_mesh_with_collection};
 use assetstudio_core::project_settings::{
@@ -652,6 +653,15 @@ fn mono_behaviour_manifest(
         _ => String::new(),
     };
 
+    let expression =
+        match project_cubism_expression(0, &value, CubismExpressionReadLimits::default()) {
+            Ok(expression) => {
+                let mut document = Vec::new();
+                expression.write_exp3_json(&mut document, 1024 * 1024)?;
+                Some(serde_json::from_slice::<Value>(&document)?)
+            }
+            Err(_) => None,
+        };
     let motion = match project_cubism_fade_motion(0, &value, CubismFadeMotionReadLimits::default())
     {
         Ok(fade) => {
@@ -679,7 +689,7 @@ fn mono_behaviour_manifest(
         // managed side reports the same absence by leaving the field null.
         Err(_) => None,
     };
-    Ok(json!({ "Name": name, "Physics": physics, "Motion": motion }))
+    Ok(json!({ "Name": name, "Physics": physics, "Motion": motion, "Expression": expression }))
 }
 
 fn bytes_manifest(input: &[u8]) -> Value {
