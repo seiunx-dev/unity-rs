@@ -7,6 +7,11 @@
 //! payload hashes, Material property bits, Mesh vertex/normal/UV/index bits,
 //! settings fields, and `TypeTree` dumps.
 //!
+//! It also runs the same comparison across every serialized format version from
+//! 13 through 22, and through the containers a game ships: `UnityFS` v6 with
+//! inline and tail blocks-info, `UnityFS` v7 with its mandatory alignment,
+//! legacy `UnityRaw` v6, and a gzip stream.
+//!
 //! Run with:
 //! `cargo test -p assetstudio-core --test dotnet_oracle -- --ignored`
 
@@ -124,8 +129,27 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
         assert_eq!(managed, rust, "fixture {}", fixture.path.display());
     }
 
+    assert_version_matrix(&executable);
     assert_container_fixtures(&executable);
     assert_truncated_fixture(&executable);
+}
+
+/// Compares one file per serialized format version the gate can build.
+fn assert_version_matrix(executable: &Path) {
+    for version in 13..22 {
+        let name = format!("oracle-format-v{version}.assets");
+        let fixture =
+            TemporaryFixture::new(&name, &synthetic_versioned_text_asset(version)).unwrap();
+        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+        assert_eq!(managed, rust, "format version {version}");
+        assert!(
+            managed["Files"][0]["Objects"]
+                .as_array()
+                .is_some_and(|objects| objects.len() == 1),
+            "format version {version} produced no object: {managed}"
+        );
+    }
 }
 
 /// Runs the same comparison through the container stack.
@@ -459,6 +483,73 @@ fn synthetic_plain_v22(version: &str, objects: &[(i32, i64, Vec<u8>)]) -> Vec<u8
     }
     metadata.push(0);
     finish_v22(&metadata, &data)
+}
+
+/// Builds a little-endian `TextAsset` file at one serialized format version.
+///
+/// The gate compared only versions 13 and 22, so every other version gate --
+/// aligned 64-bit path IDs at 14, the per-object stripped byte at 15 and 16,
+/// the type record's stripped flag at 16, the script type index moving into the
+/// type record at 17, and reference types at 20 -- rested on the Rust writer's
+/// own assumptions. Type trees are disabled, which the format allows from 13
+/// on, so these stay minimal; versions below 13 would have to carry a real tree
+/// and are still uncovered.
+fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
+    assert!(
+        (13..22).contains(&version),
+        "tree-less fixtures cover formats 13 through 21"
+    );
+    let object = text_asset();
+    let mut metadata = Vec::new();
+    metadata.extend_from_slice(b"2019.4.40f1\0");
+    push_i32(&mut metadata, 13);
+    metadata.push(0);
+
+    push_i32(&mut metadata, 1);
+    push_i32(&mut metadata, 49);
+    if version >= 16 {
+        metadata.push(0);
+    }
+    if version >= 17 {
+        metadata.extend_from_slice(&(-1_i16).to_le_bytes());
+    }
+    metadata.extend_from_slice(&[0x5a; 16]);
+
+    if (7..14).contains(&version) {
+        push_i32(&mut metadata, 0);
+    }
+    push_i32(&mut metadata, 1);
+    if version < 14 {
+        push_i32(&mut metadata, 0x1020_3040);
+    } else {
+        align(&mut metadata, 4);
+        metadata.extend_from_slice(&0x0102_0304_0506_0708_i64.to_le_bytes());
+    }
+    push_u32(&mut metadata, 0);
+    push_u32(&mut metadata, u32::try_from(object.len()).unwrap());
+    push_i32(&mut metadata, if version < 16 { 49 } else { 0 });
+    if version < 16 {
+        metadata.extend_from_slice(&49_u16.to_le_bytes());
+    }
+    if version < 11 {
+        metadata.extend_from_slice(&0_u16.to_le_bytes());
+    }
+    if (11..17).contains(&version) {
+        metadata.extend_from_slice(&(-1_i16).to_le_bytes());
+    }
+    if matches!(version, 15 | 16) {
+        metadata.push(0);
+    }
+
+    if version >= 11 {
+        push_i32(&mut metadata, 0);
+    }
+    push_i32(&mut metadata, 0);
+    if version >= 20 {
+        push_i32(&mut metadata, 0);
+    }
+    metadata.push(0);
+    finish_legacy_header(version, &metadata, &object, 0)
 }
 
 fn synthetic_v13_big_endian() -> Vec<u8> {
@@ -1312,12 +1403,17 @@ fn finish_v22(metadata: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 fn finish_v13(metadata: &[u8], data: &[u8], endianness: u8) -> Vec<u8> {
+    finish_legacy_header(13, metadata, data, endianness)
+}
+
+/// Wraps metadata in the 20-byte header every format below 22 uses.
+fn finish_legacy_header(version: u32, metadata: &[u8], data: &[u8], endianness: u8) -> Vec<u8> {
     let data_offset = (20 + metadata.len()).next_multiple_of(16);
     let file_size = data_offset + data.len();
     let mut output = vec![0; 20];
     output[0..4].copy_from_slice(&u32::try_from(metadata.len()).unwrap().to_be_bytes());
     output[4..8].copy_from_slice(&u32::try_from(file_size).unwrap().to_be_bytes());
-    output[8..12].copy_from_slice(&13_u32.to_be_bytes());
+    output[8..12].copy_from_slice(&version.to_be_bytes());
     output[12..16].copy_from_slice(&u32::try_from(data_offset).unwrap().to_be_bytes());
     output[16] = endianness;
     output.extend_from_slice(metadata);
