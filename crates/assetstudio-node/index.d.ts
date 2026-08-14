@@ -40,6 +40,28 @@ export declare class AssetStudio {
   readTextureArrayAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<Array<RgbaImage>>
   readSprite(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): RgbaImage
   readSpriteAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<RgbaImage>
+  /** Reads an `AudioClip`'s stored payload without transcoding it. */
+  readAudio(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AudioClip
+  /** Reads the identity of a `MonoScript`. */
+  readMonoScript(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): MonoScript
+  /**
+   * Reads a `Material`'s shader reference and the names of its properties.
+   *
+   * Property values are deliberately not flattened here: they are typed
+   * per sheet and a caller that needs them is better served by the Rust or
+   * Python API than by a lossy JavaScript projection.
+   */
+  readMaterial(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Material
+}
+
+/** One `AudioClip`'s stored payload and the extension its container implies. */
+export interface AudioClip {
+  name: string
+  /** The extension the stored bytes carry, `.fsb` or `.wav` for example. */
+  extension: string
+  /** True when the payload is already a playable RIFF/WAVE stream. */
+  isDirectWav: boolean
+  data: Buffer
 }
 
 export interface FileInfo {
@@ -47,6 +69,28 @@ export interface FileInfo {
   path: string
   unityVersion: string
   objectCount: number
+}
+
+/** A `Material`'s shader reference and its named property sheets. */
+export interface Material {
+  name: string
+  shaderFileId: number
+  shaderPathId: bigint
+  textureProperties: Array<string>
+  floatProperties: Array<string>
+  colorProperties: Array<string>
+}
+
+/**
+ * The identity fields of a `MonoScript`, which name the type a
+ * `MonoBehaviour` deserializes as.
+ */
+export interface MonoScript {
+  name: string
+  className: string
+  namespace: string
+  assemblyName: string
+  executionOrder?: number
 }
 
 export interface ObjectInfo {

@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
+use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
+use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
+use assetstudio_core::simple_assets::SimpleAssetReadLimits;
 use assetstudio_core::source::Region;
 use assetstudio_core::sprite::SpriteReadLimits;
 use assetstudio_core::studio::{Studio, StudioObject};
@@ -53,6 +56,39 @@ pub struct RgbaImage {
     /// output. `Texture2D` decoders work bottom-up, so these rows have already
     /// been flipped.
     pub pixels: Buffer,
+}
+
+/// One `AudioClip`'s stored payload and the extension its container implies.
+#[napi(object)]
+pub struct AudioClip {
+    pub name: String,
+    /// The extension the stored bytes carry, `.fsb` or `.wav` for example.
+    pub extension: String,
+    /// True when the payload is already a playable RIFF/WAVE stream.
+    pub is_direct_wav: bool,
+    pub data: Buffer,
+}
+
+/// The identity fields of a `MonoScript`, which name the type a
+/// `MonoBehaviour` deserializes as.
+#[napi(object)]
+pub struct MonoScript {
+    pub name: String,
+    pub class_name: String,
+    pub namespace: String,
+    pub assembly_name: String,
+    pub execution_order: Option<i32>,
+}
+
+/// A `Material`'s shader reference and its named property sheets.
+#[napi(object)]
+pub struct Material {
+    pub name: String,
+    pub shader_file_id: i32,
+    pub shader_path_id: BigInt,
+    pub texture_properties: Vec<String>,
+    pub float_properties: Vec<String>,
+    pub color_properties: Vec<String>,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -479,6 +515,86 @@ impl AssetStudio {
             maximum: byte_limit(maximum_bytes)?,
         }))
     }
+
+    /// Reads an `AudioClip`'s stored payload without transcoding it.
+    #[napi]
+    pub fn read_audio(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AudioClip> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let audio = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_audio_clip(SimpleAssetReadLimits {
+                maximum_payload_bytes: maximum,
+                ..SimpleAssetReadLimits::default()
+            })
+            .map_err(core_error)?;
+        let data = audio.payload.read_to_vec(maximum).map_err(core_error)?;
+        Ok(AudioClip {
+            name: audio.name,
+            extension: audio.raw_extension,
+            is_direct_wav: audio.direct_wav.is_some(),
+            data: data.into(),
+        })
+    }
+
+    /// Reads the identity of a `MonoScript`.
+    #[napi]
+    pub fn read_mono_script(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<MonoScript> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let script = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_mono_script(MonoBehaviourReadLimits {
+                maximum_string_bytes: usize::try_from(maximum).unwrap_or(usize::MAX),
+                ..MonoBehaviourReadLimits::default()
+            })
+            .map_err(core_error)?;
+        Ok(MonoScript {
+            name: script.name,
+            class_name: script.class_name,
+            namespace: script.namespace,
+            assembly_name: script.assembly_name,
+            execution_order: script.execution_order,
+        })
+    }
+
+    /// Reads a `Material`'s shader reference and the names of its properties.
+    ///
+    /// Property values are deliberately not flattened here: they are typed
+    /// per sheet and a caller that needs them is better served by the Rust or
+    /// Python API than by a lossy JavaScript projection.
+    #[napi]
+    pub fn read_material(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<Material> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let material = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_material(MaterialReadLimits {
+                maximum_object_bytes: maximum,
+                ..MaterialReadLimits::default()
+            })
+            .map_err(core_error)?;
+        Ok(Material {
+            name: material.name,
+            shader_file_id: material.shader.file_id,
+            shader_path_id: BigInt::from(material.shader.path_id),
+            texture_properties: property_names(&material.saved_properties.texture_environments),
+            float_properties: property_names(&material.saved_properties.floats),
+            color_properties: property_names(&material.saved_properties.colors),
+        })
+    }
 }
 
 impl AssetStudio {
@@ -676,6 +792,16 @@ fn studio_object(studio: &Studio, file_index: usize, path_id: i64) -> Result<Stu
             "object path ID {path_id} was not found in file index {file_index}"
         ))
     })
+}
+
+/// The names of one material property sheet, in serialized order.
+fn property_names<T>(
+    properties: &[assetstudio_core::material::NamedMaterialProperty<T>],
+) -> Vec<String> {
+    properties
+        .iter()
+        .map(|property| property.name.clone())
+        .collect()
 }
 
 fn texture_limits(maximum: u64) -> TextureReadLimits {
