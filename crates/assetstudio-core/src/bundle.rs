@@ -647,11 +647,17 @@ fn has_unity_cn_flag(common: &BundleHeader, flags: ArchiveFlags) -> bool {
     if common.unity_revision.is_stripped() {
         return false;
     }
-    let version = common.unity_revision.components();
-    let uses_v1_flag = version.0 < 2020
-        || (version.0 == 2020 && version <= (2020, 3, 34))
-        || (version.0 == 2021 && version <= (2021, 3, 2))
-        || (version.0 == 2022 && version <= (2022, 1, 1));
+    // The managed reader spells these as IsInRange(major, upper), which is
+    // `major >= lower && version < upper`: the upper bound is exclusive. Using
+    // an inclusive bound here misread the three boundary releases themselves,
+    // where 0x200 is an ordinary BlockInfoNeedPaddingAtStart rather than the
+    // UnityCN V1 marker, so a perfectly good bundle could be probed as
+    // encrypted. is_in_range already implements the half-open comparison.
+    let revision = &common.unity_revision;
+    let uses_v1_flag = revision.components().0 < 2020
+        || revision.is_in_range((2020, 0, 0), (2020, 3, 34))
+        || revision.is_in_range((2021, 0, 0), (2021, 3, 2))
+        || revision.is_in_range((2022, 0, 0), (2022, 1, 1));
     let mask = if uses_v1_flag {
         UNITY_CN_V1_FLAG
     } else {
@@ -1017,9 +1023,10 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        BLOCK_INFO_NEEDS_PADDING_AT_START, BLOCKS_AND_DIRECTORY_INFO_COMBINED, BLOCKS_INFO_AT_END,
-        BundleHeader, BundleOpenOptions, BundleParseLimits, CompressionType, OodleDecoder,
-        UNITY_CN_HEADER_BYTES, UnityFsBundle, parse_blocks_info,
+        ArchiveFlags, BLOCK_INFO_NEEDS_PADDING_AT_START, BLOCKS_AND_DIRECTORY_INFO_COMBINED,
+        BLOCKS_INFO_AT_END, BundleHeader, BundleOpenOptions, BundleParseLimits, CompressionType,
+        OodleDecoder, UNITY_CN_HEADER_BYTES, UNITY_CN_V1_FLAG, UNITY_CN_V2_V3_FLAGS, UnityFsBundle,
+        has_unity_cn_flag, parse_blocks_info,
     };
 
     const PAYLOAD: &[u8] = b"native-rust-payload";
@@ -1174,6 +1181,43 @@ mod tests {
 
         assert_eq!(bundle.data_offset % 16, 0);
         assert_eq!(bundle.read_entry(0).unwrap(), PAYLOAD);
+    }
+
+    #[test]
+    fn unity_cn_flag_ranges_use_the_managed_half_open_bounds() {
+        // AssetStudio spells these as IsInRange(major, upper), which is
+        // `major >= lower && version < upper`. At exactly the upper bounds the
+        // newer flag vocabulary already applies, so 0x200 there is an ordinary
+        // BlockInfoNeedPaddingAtStart and must not be read as the UnityCN V1
+        // marker -- an inclusive bound made those three releases probe a good
+        // bundle as encrypted.
+        let header = |revision: &str| BundleHeader {
+            signature: "UnityFS".to_owned(),
+            version: 7,
+            unity_version: "5.x.x".to_owned(),
+            unity_revision: revision.parse().unwrap(),
+        };
+        for (revision, expects_v1) in [
+            ("2019.4.40f1", true),
+            ("2020.3.33f1", true),
+            ("2020.3.34f1", false),
+            ("2021.3.1f1", true),
+            ("2021.3.2f1", false),
+            ("2022.1.0f1", true),
+            ("2022.1.1f1", false),
+            ("2023.1.0f1", false),
+        ] {
+            assert_eq!(
+                has_unity_cn_flag(&header(revision), ArchiveFlags(UNITY_CN_V1_FLAG)),
+                expects_v1,
+                "{revision} against the V1 flag"
+            );
+            assert_eq!(
+                has_unity_cn_flag(&header(revision), ArchiveFlags(UNITY_CN_V2_V3_FLAGS)),
+                !expects_v1,
+                "{revision} against the V2/V3 flags"
+            );
+        }
     }
 
     #[test]

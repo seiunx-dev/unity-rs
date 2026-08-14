@@ -34,13 +34,14 @@ const SERIALIZED_FILE_ENTRY: u32 = 4;
 
 /// How a bundle's block data or blocks-info table is stored.
 ///
-/// Only Zstd is offered alongside `None`. `lz4_flex` is built here with
-/// decode-only features and `lzma-rust2` exposes no bulk encoder, so those
-/// would mean taking a dependency purely for fixtures; Zstd already ships an
-/// encoder that the bundle tests use.
+/// LZ4 and LZ4HC share one block format, so the same safe block encoder can
+/// exercise both of Unity's compression codes. `lzma-rust2` exposes no bulk
+/// encoder, so LZMA remains outside this synthetic fixture builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
+    Lz4,
+    Lz4Hc,
     Zstd,
 }
 
@@ -48,6 +49,8 @@ impl Compression {
     const fn code(self) -> u32 {
         match self {
             Self::None => 0,
+            Self::Lz4 => 2,
+            Self::Lz4Hc => 3,
             Self::Zstd => 5,
         }
     }
@@ -55,6 +58,7 @@ impl Compression {
     fn apply(self, bytes: &[u8]) -> Vec<u8> {
         match self {
             Self::None => bytes.to_vec(),
+            Self::Lz4 | Self::Lz4Hc => lz4_flex::block::compress(bytes),
             Self::Zstd => zstd::bulk::compress(bytes, 3).expect("zstd fixture compression"),
         }
     }

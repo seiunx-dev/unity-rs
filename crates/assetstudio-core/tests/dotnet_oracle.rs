@@ -15,8 +15,8 @@
 //! It also runs the same comparison across every serialized format version from
 //! 13 through 22, and through the containers a game ships: `UnityFS` v6 with
 //! inline and tail blocks-info, `UnityFS` v7 with its mandatory alignment,
-//! Zstd-compressed block data and blocks-info tables, legacy `UnityRaw` v6, and
-//! a gzip stream.
+//! LZ4/LZ4HC/Zstd-compressed block data and blocks-info tables, legacy
+//! `UnityRaw` v6, and a gzip stream.
 //!
 //! Run with:
 //! `cargo test -p assetstudio-core --test dotnet_oracle -- --ignored`
@@ -36,6 +36,8 @@ mod oracle_manifest;
 
 use containers::{BlocksInfo, BundleEntry, BundleLayout, Compression};
 use oracle_manifest::rust_manifest;
+
+type ContainerCase = (&'static str, Vec<u8>, &'static [&'static str]);
 
 #[test]
 #[ignore = "requires the .NET 10 SDK and a Team-Haruki/AssetStudio checkout"]
@@ -168,11 +170,6 @@ fn assert_version_matrix(executable: &Path) {
 /// Rust writer's own assumptions.
 fn assert_container_fixtures(executable: &Path) {
     const REVISION: &str = "2022.3.62f1";
-    // The managed reader calls Zstd "non-standard" and then decodes it anyway.
-    // Listing the exact wording keeps the harness strict about every other
-    // diagnostic while documenting this one.
-    const ZSTD_BLOCK_WARNING: &str = "Non-standard block compression type: 5";
-    const ZSTD_INFO_WARNING: &str = "Non-standard blockInfo compression type: 5";
     // Resident objects only: a bundled fixture has nowhere to put a sibling
     // `.resS`. Two entries so the directory table itself is compared, not just
     // the single-entry degenerate case.
@@ -189,7 +186,7 @@ fn assert_container_fixtures(executable: &Path) {
             bytes: material_file.as_slice(),
         },
     ];
-    let cases: [(&str, Vec<u8>, &[&str]); 8] = [
+    let uncompressed: [ContainerCase; 3] = [
         (
             "oracle-bundle-v6-inline.unity3d",
             containers::unity_fs(&BundleLayout::v6(REVISION), &entries),
@@ -218,6 +215,89 @@ fn assert_container_fixtures(executable: &Path) {
             ),
             &[],
         ),
+    ];
+    let tail: [ContainerCase; 2] = [
+        (
+            "oracle-bundle-raw-v6.unity3d",
+            containers::unity_raw_v6(REVISION, &entries),
+            &[],
+        ),
+        ("oracle-gzip.assets.gz", containers::gzip(&inner), &[]),
+    ];
+    let cases = uncompressed
+        .into_iter()
+        .chain(compressed_bundle_cases(&entries))
+        .chain(tail);
+    for (name, bytes, allowed) in cases {
+        let fixture = TemporaryFixture::new(name, &bytes).unwrap();
+        let managed = managed_manifest_allowing(executable, fixture.input_path(), allowed).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+        assert_eq!(managed, rust, "container fixture {name}");
+        assert!(
+            managed["Files"]
+                .as_array()
+                .is_some_and(|files| !files.is_empty()),
+            "container fixture {name} produced no serialized files: {managed}"
+        );
+    }
+}
+
+fn compressed_bundle_cases(entries: &[BundleEntry<'_>]) -> [ContainerCase; 7] {
+    const REVISION: &str = "2022.3.62f1";
+    // The managed reader calls Zstd "non-standard" and then decodes it anyway.
+    // Listing the exact wording keeps the harness strict about every other
+    // diagnostic while documenting this one.
+    const ZSTD_BLOCK_WARNING: &str = "Non-standard block compression type: 5";
+    const ZSTD_INFO_WARNING: &str = "Non-standard blockInfo compression type: 5";
+
+    [
+        (
+            "oracle-bundle-lz4-blocks.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    blocks: Compression::Lz4,
+                    ..BundleLayout::v6(REVISION)
+                },
+                entries,
+            ),
+            &[],
+        ),
+        (
+            "oracle-bundle-lz4-directory.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    directory: Compression::Lz4,
+                    ..BundleLayout::v6(REVISION)
+                },
+                entries,
+            ),
+            &[],
+        ),
+        (
+            "oracle-bundle-lz4hc-blocks.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    blocks: Compression::Lz4Hc,
+                    ..BundleLayout::v6(REVISION)
+                },
+                entries,
+            ),
+            &[],
+        ),
+        (
+            "oracle-bundle-lz4hc-both-v7.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    version: 7,
+                    info: BlocksInfo::AtEnd,
+                    blocks: Compression::Lz4Hc,
+                    directory: Compression::Lz4Hc,
+                    ..BundleLayout::v6(REVISION)
+                },
+                entries,
+            ),
+            &[],
+        ),
         // Compressed blocks and a compressed directory: the decompression path
         // and the block mapping that depends on compressed-versus-uncompressed
         // sizes differing.
@@ -228,7 +308,7 @@ fn assert_container_fixtures(executable: &Path) {
                     blocks: Compression::Zstd,
                     ..BundleLayout::v6(REVISION)
                 },
-                &entries,
+                entries,
             ),
             &[ZSTD_BLOCK_WARNING],
         ),
@@ -239,7 +319,7 @@ fn assert_container_fixtures(executable: &Path) {
                     directory: Compression::Zstd,
                     ..BundleLayout::v6(REVISION)
                 },
-                &entries,
+                entries,
             ),
             &[ZSTD_INFO_WARNING],
         ),
@@ -253,29 +333,11 @@ fn assert_container_fixtures(executable: &Path) {
                     directory: Compression::Zstd,
                     ..BundleLayout::v6(REVISION)
                 },
-                &entries,
+                entries,
             ),
             &[ZSTD_BLOCK_WARNING, ZSTD_INFO_WARNING],
         ),
-        (
-            "oracle-bundle-raw-v6.unity3d",
-            containers::unity_raw_v6(REVISION, &entries),
-            &[],
-        ),
-        ("oracle-gzip.assets.gz", containers::gzip(&inner), &[]),
-    ];
-    for (name, bytes, allowed) in &cases {
-        let fixture = TemporaryFixture::new(name, bytes).unwrap();
-        let managed = managed_manifest_allowing(executable, fixture.input_path(), allowed).unwrap();
-        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
-        assert_eq!(managed, rust, "container fixture {name}");
-        assert!(
-            managed["Files"]
-                .as_array()
-                .is_some_and(|files| !files.is_empty()),
-            "container fixture {name} produced no serialized files: {managed}"
-        );
-    }
+    ]
 }
 
 fn assert_truncated_fixture(executable: &Path) {
