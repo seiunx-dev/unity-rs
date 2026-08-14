@@ -78,7 +78,7 @@
 - `cargo fmt --all -- --check`；
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`；
 - `cargo test --workspace --all-targets --locked --no-fail-fast`；
-- Core 478 项普通测试通过，10 项依赖可选 vgmstream oracle 的测试在本机额外执行并全部通过（其中 1 项钉住的是已记录的上游 Opus 偏离，不是一致性）；
+- Core 479 项普通测试通过，10 项依赖可选 vgmstream oracle 的测试在本机额外执行并全部通过（其中 1 项钉住的是已记录的上游 Opus 偏离，不是一致性）；
 - C#→Rust 托管差分 oracle 通过；
 - TypeTree dump 浮点文本对照 .NET 10 实测生成的 849 个取值（边界值 + 位模式扫描）逐字节一致，期望值以 fixture 形式入库；
 - `cargo doc --workspace --no-deps` 在 `-D warnings` 下通过；
@@ -139,7 +139,8 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - **Switch GOB 反交织已纳入托管差分（2026-08-14）**：3 个 fixture（RGBA32 两种 block height，加一个 BC7）端到端对照，全部一致。GOB 布局只取决于 texel 大小和 platform blob 里的 block height 指数，这三个就把两者都覆盖了。DXT5 和 ASTC 不放进来，理由和块格式矩阵一样：前者是已记录的 s3tc 偏离，后者随机字节会命中保留编码，都与交织无关。顺带确认了一件事：`texture2ddecoder` 的 ASTC 解码器在畸形输入上会 panic（减法下溢），但 Core 早已用 catch_unwind 包住外部解码器，所以对外仍然是报错而不是崩溃——不可信输入不崩溃这条不变量成立。
    - **Crunch 已纳入托管差分（2026-08-14）**：6 个真实 CRN 载荷（classic DXT1/DXT5 走 2017.2，UnityCrunch DXT1/DXT5/ETC1/ETC2A 走 2022.3）端到端对照，全部一致。单元测试此前只比解码器本身对着 C++ oracle 的哈希；这一条走的是调用方真正的路径：Texture2D 解析、头部嗅探、转码、mip0 解码，连选哪个 Crunch 方言的版本门也一并比了。fixture builder 现在按 revision 生成 Texture2D 布局（2017.3 的 fallback 块、2018.2 的 streaming 对、2019.3 的 mip limit、2020 的 stripped mip 与 64 位流偏移、2022.2 的 mip-limit group），因此老版本纹理布局本身也进了差分。
    - **块压缩纹理解码差分已建立（2026-08-14），并因此修掉一个真实缺陷**：oracle 之前只比原始 payload 字节（那是直接从盘上读的），所有块解码器都只有本项目自己的往返测试背书。现在比解码后的像素，覆盖 BC4/BC5/BC7、ETC_RGB4、ETC2_RGB/RGBA1/RGBA8、EAC_R/RG 及其 signed 变体共 11 种格式。首轮就查出 `texture2ddecoder` 0.1.2 的 EAC 入口把 48 位索引流按小端整数读，而格式是最高位在前——同一个 crate 自己的 ETC2 alpha 解码器读的是大端并且与托管解码器一致，等于 crate 跟自己不一致。受影响的是 EAC_R/EAC_R_SIGNED/EAC_RG/EAC_RG_SIGNED，即移动端常见的法线图和 mask 图，像素会整块错位。已在 `texture.rs` 内实现 EAC 解码取代 crate 的入口：只改字节序，算术仍按格式的 11 位空间做（multiplier 为 0 时代入的 1 是 11 位步长，不是 8 位；照 8 位算会让那一块的调制范围放大 8 倍——这一点也是差分查出来的）。
-   - **BC6H 与 ASTC 暂未纳入差分**：随机字节会命中编码器永远不会产出的保留编码，两边对这类输入的处理本就不同（ASTC 托管侧给 error color，本项目直接报错）。要判定需要真实编码器产出的 fixture。
+   - **ASTC 已全部纳入托管差分（2026-08-15），并因此查出一个上游缺陷**：之所以一直排除在外，是因为差分里其他格式喂的都是伪随机字节，而 ASTC 不能这么喂——随机数据会命中编码器永远不产出的保留编码，两边对这类输入的处理本就按设计不同（托管给 error color，本项目直接报错），比出来的分歧说明不了任何解码器的问题。现在用 ARM 官方 `astcenc`（经 `astc-encoder-py`）生成真实载荷，六种 block footprint × RGB/RGBA/HDR 共 18 个格式全部端到端对照，每个 fixture 都是 2×2 个块，连块间摆放也覆盖到。12 个 LDR 格式逐字节一致；6 个 HDR 格式不一致，根因是 `texture2ddecoder` 0.1.2 把参考实现 `select_color_hdr` 里的 `roundf(f * 255)` 移植成了 `floor(f * 255)`，HDR 通道凡是落在 .5 以上的都低一格——本 fixture 里 8% 到 14% 的字节受影响，差值恒为 1 且方向一致。在本地副本里改回 `round` 之后，6 个 HDR 格式的哈希与托管完全一致，这也是 `-managed.rgba` 基准的来历。真要修得改本项目对上游的用法：为了一个词 vendor 进 1800 行 ASTC 解码器，代价与收益（HDR ASTC 上最多 1/255）不成比例，因此先记录不动，**这个取舍需要你拍板**。已有两个测试把两头钉住：`texture.rs` 里逐字节验证偏差形态（不是只钉哈希，任何别的形状或幅度都会失败），差分里则每次跑都拿活的托管解码器复核这些基准文件，并在两边开始一致时失败——那正是把 HDR 挪进精确集合的信号。
+   - **BC6H 暂未纳入差分**：同样需要真实编码器产出的 fixture，目前手头没有 BC6H 编码器（`astcenc` 只管 ASTC）。
    - **DXT5 与 DXT1 同属已记录的 s3tc 偏离**：托管的颜色调色板复刻 NV4x 硬件，本项目跟规范；DXT5 的 alpha 半边（BC4）能对上，颜色半边对不上，正好印证根因。
    - **DXT1 punch-through alpha 已裁决（2026-08-14）：跟 s3tc 规范**。`q0 <= q1` 模式下 index 3 解为透明黑 `(0,0,0,0)`，与独立解码器（Pillow）一致；AssetStudio 原生 `bcn.cpp` 给不透明黑 `(0,0,0,255)`，复刻的是 NV4x 时代硬件行为。这是对 oracle 的有意偏离——镂空贴图的遮罩区应当透明而非黑块——已在 `texture.rs` 注释、测试和兼容矩阵中记录。UnityPy 无法作为第三方仲裁：它与本项目共用同一个 `texture2ddecoder` 上游。（同批复核确认 DXT3/DXT5 调色板不是缺陷：Rust 符合 s3tc 规范，原生解码器复刻的是 NV4x 时代硬件行为，且 C# 侧根本没有 DXT3 解码器。）
    - multistream MPEG/Opus 和少数平台音频 codec 仍保留原始数据；

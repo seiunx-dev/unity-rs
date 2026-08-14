@@ -35,7 +35,7 @@ mod containers;
 mod oracle_manifest;
 
 use containers::{BlocksInfo, BundleEntry, BundleLayout, Compression};
-use oracle_manifest::rust_manifest;
+use oracle_manifest::{fnv1a64, rust_manifest};
 
 type ContainerCase = (&'static str, Vec<u8>, &'static [&'static str]);
 
@@ -54,6 +54,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_version_matrix(&executable);
     assert_compressed_texture_formats(&executable);
     assert_crunched_textures(&executable);
+    assert_astc_textures(&executable);
     assert_switch_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
@@ -337,6 +338,108 @@ fn assert_switch_textures(executable: &Path) {
 /// mip-zero decode -- against the managed reader doing the same, so the version
 /// gate that chooses between the two Crunch dialects is compared too rather
 /// than assumed.
+/// Compares ASTC decoding against the managed decoder on real encoder output.
+///
+/// ASTC sat outside this comparison because the other formats are fed
+/// pseudorandom bytes and ASTC cannot be: random data hits reserved block
+/// encodings that no encoder produces, and the two implementations diverge on
+/// those by design. Payloads from ARM's `astcenc` remove that objection; see
+/// `tests/fixtures/astc/README.md`.
+fn assert_astc_textures(executable: &Path) {
+    // (block size, RGB format, RGBA format, HDR format)
+    const FOOTPRINTS: &[(i32, i32, i32, i32)] = &[
+        (4, 48, 54, 66),
+        (5, 49, 55, 67),
+        (6, 50, 56, 68),
+        (8, 51, 57, 69),
+        (10, 52, 58, 70),
+        (12, 53, 59, 71),
+    ];
+    // HDR ASTC needs a revision that has the formats; they arrived in 2019.1.
+    const REVISION: &str = "2022.3.62f1";
+
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
+    let mut disagreed = Vec::new();
+    let mut compared = 0_usize;
+    for (block, rgb, rgba, hdr) in FOOTPRINTS {
+        for (variant, format) in [("rgb", rgb), ("rgba", rgba), ("hdr", hdr)] {
+            let name = format!("astc-{variant}-{block}x{block}");
+            let payload = fs::read(directory.join(format!("{name}.bin")))
+                .unwrap_or_else(|error| panic!("cannot read {name}.bin: {error}"));
+            // The fixtures are two blocks each way, so the surface is twice the
+            // footprint and the comparison covers block placement too.
+            let size = block * 2;
+            let object = texture2d_inline(
+                &format!("oracle-{name}"),
+                size,
+                size,
+                *format,
+                1,
+                REVISION,
+                &[],
+                &payload,
+            );
+            let file = synthetic_single_v22(28, 28, REVISION, &object);
+            let fixture = TemporaryFixture::new(&format!("oracle-{name}.assets"), &file)
+                .expect("the ASTC fixture is writable");
+            let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+            let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+            let managed_decoded = &managed["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+            let rust_decoded = &rust["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+            assert!(
+                !managed_decoded.is_null(),
+                "ASTC format {name} decoded to nothing, so the comparison would \
+                 prove nothing: {managed}"
+            );
+
+            if variant == "hdr" {
+                // HDR is the one case that does not match: the decoder this
+                // crate uses truncates where the managed one rounds. That is
+                // characterised byte for byte in `texture.rs`, against blobs of
+                // managed output committed beside the fixtures; what this does
+                // is re-earn the right to call those blobs managed output, by
+                // checking them against the live managed decoder rather than
+                // trusting a hash recorded once.
+                let blob = fs::read(directory.join(format!("{name}-managed.rgba")))
+                    .unwrap_or_else(|error| panic!("cannot read {name}-managed.rgba: {error}"));
+                assert_eq!(
+                    managed_decoded["Fnv64"].as_str().unwrap(),
+                    format!("{:016x}", fnv1a64(&blob)),
+                    "the committed {name} blob is no longer what the managed decoder produces"
+                );
+                assert_ne!(
+                    managed_decoded, rust_decoded,
+                    "{name} now matches the managed decoder; the truncation was fixed \
+                     upstream, so move the HDR formats into the exact set above and \
+                     drop hdr_astc_differs_from_the_managed_decoder_only_by_truncation"
+                );
+                compared += 1;
+                continue;
+            }
+
+            if managed_decoded != rust_decoded {
+                disagreed.push(format!(
+                    "{name} ({format}): managed {managed_decoded} vs Rust {rust_decoded}"
+                ));
+                continue;
+            }
+            assert_eq!(managed, rust, "ASTC format {name} ({format})");
+            compared += 1;
+        }
+    }
+    assert!(
+        disagreed.is_empty(),
+        "decoded pixels disagree for {} ASTC format(s):\n{}",
+        disagreed.len(),
+        disagreed.join("\n")
+    );
+    assert_eq!(
+        compared,
+        FOOTPRINTS.len() * 3,
+        "every ASTC format is compared"
+    );
+}
+
 fn assert_crunched_textures(executable: &Path) {
     // Real CRN payloads; see tests/fixtures/crunch/README.md for provenance.
     // A classic payload needs a pre-2017.3 revision and a UnityCrunch one needs
