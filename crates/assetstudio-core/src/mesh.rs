@@ -2072,18 +2072,147 @@ fn reserve_vec<T>(capacity: usize, field: &str) -> Result<Vec<T>> {
     Ok(values)
 }
 
+/// A float rendered the way the managed exporter renders it.
+///
+/// The managed writer formats each value with `string.Format` under the
+/// invariant culture, which is .NET's general format: the shortest digits that
+/// round-trip, laid out as a plain decimal when the value's exponent falls in
+/// `[-4, 8]` and in scientific notation otherwise. Rust's `Display` never
+/// switches to scientific notation, so a normal component of `4.3e-8` -- an
+/// ordinary amount of floating-point noise in real mesh data, not an
+/// artificial edge case -- came out as `0.000000043` where the managed file
+/// has `4.3E-08`. Both describe the same geometry, so nothing an importer
+/// reads changes, but the documents stop being comparable byte for byte, and
+/// that comparison is what the differential is for.
 pub(crate) struct ObjFloat(pub(crate) f32);
+
+/// Room for any `f32` in exponential form: sign, ten mantissa characters,
+/// `e`, sign and two exponent digits.
+struct DecimalBuffer {
+    bytes: [u8; 32],
+    length: usize,
+}
+
+impl DecimalBuffer {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 32],
+            length: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> fmt::Result {
+        *self.bytes.get_mut(self.length).ok_or(fmt::Error)? = byte;
+        self.length += 1;
+        Ok(())
+    }
+
+    fn as_str(&self) -> &str {
+        // Filled only through `write_str` and `push`, and `push` is only ever
+        // handed ASCII digits.
+        std::str::from_utf8(&self.bytes[..self.length]).unwrap_or_default()
+    }
+}
+
+impl fmt::Write for DecimalBuffer {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.length.checked_add(text.len()).ok_or(fmt::Error)?;
+        self.bytes
+            .get_mut(self.length..end)
+            .ok_or(fmt::Error)?
+            .copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
 
 impl fmt::Display for ObjFloat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_nan() {
-            formatter.write_str("0")
-        } else if self.0 == f32::INFINITY {
-            formatter.write_str("Infinity")
-        } else if self.0 == f32::NEG_INFINITY {
-            formatter.write_str("-Infinity")
+        use fmt::Write as _;
+
+        let value = self.0;
+        if value.is_nan() {
+            // The managed writer substitutes NaN as it writes the line, so the
+            // token never reaches the document.
+            return formatter.write_str("0");
+        }
+        if value.is_infinite() {
+            return formatter.write_str(if value < 0.0 { "-Infinity" } else { "Infinity" });
+        }
+        if value.is_sign_negative() {
+            formatter.write_str("-")?;
+        }
+        let magnitude = value.abs();
+        if magnitude == 0.0 {
+            return formatter.write_str("0");
+        }
+
+        // The shortest form gives the digit count. Re-rendering at exactly that
+        // many digits gives .NET's rounding: both break ties at the last digit,
+        // but Rust's shortest form breaks them away from zero and its
+        // fixed-precision form breaks them to even, which is what .NET does.
+        // Without the second pass, values like -1298351.25 print as
+        // `-1298351.3` here and `-1298351.2` there.
+        let mut shortest = DecimalBuffer::new();
+        write!(shortest, "{magnitude:e}")?;
+        let significant = shortest
+            .as_str()
+            .split_once('e')
+            .ok_or(fmt::Error)?
+            .0
+            .bytes()
+            .filter(u8::is_ascii_digit)
+            .count();
+        let mut rendered = DecimalBuffer::new();
+        write!(rendered, "{:.*e}", significant.saturating_sub(1), magnitude)?;
+
+        let (mantissa, exponent) = rendered.as_str().split_once('e').ok_or(fmt::Error)?;
+        let exponent: i32 = exponent.parse().map_err(|_| fmt::Error)?;
+        let mut digits = DecimalBuffer::new();
+        for byte in mantissa.bytes().filter(u8::is_ascii_digit) {
+            digits.push(byte)?;
+        }
+        // Rounding up to the next power of ten leaves trailing zeros behind,
+        // and they carry no value once the exponent is written separately.
+        let digits = digits.as_str().trim_end_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+
+        if !(-4..9).contains(&exponent) {
+            formatter.write_str(digits.get(..1).ok_or(fmt::Error)?)?;
+            if let Some(rest) = digits.get(1..)
+                && !rest.is_empty()
+            {
+                formatter.write_str(".")?;
+                formatter.write_str(rest)?;
+            }
+            formatter.write_str("E")?;
+            formatter.write_str(if exponent < 0 { "-" } else { "+" })?;
+            let magnitude = exponent.unsigned_abs();
+            if magnitude < 10 {
+                formatter.write_str("0")?;
+            }
+            write!(formatter, "{magnitude}")
+        } else if exponent >= 0 {
+            let whole = usize::try_from(exponent).map_err(|_| fmt::Error)? + 1;
+            if let Some(fraction) = digits.get(whole..)
+                && !fraction.is_empty()
+            {
+                formatter.write_str(digits.get(..whole).ok_or(fmt::Error)?)?;
+                formatter.write_str(".")?;
+                formatter.write_str(fraction)
+            } else {
+                formatter.write_str(digits)?;
+                for _ in 0..(whole - digits.len()) {
+                    formatter.write_str("0")?;
+                }
+                Ok(())
+            }
         } else {
-            self.0.fmt(formatter)
+            formatter.write_str("0.")?;
+            for _ in 0..(-exponent - 1) {
+                formatter.write_str("0")?;
+            }
+            formatter.write_str(digits)
         }
     }
 }
@@ -2144,6 +2273,54 @@ mod tests {
         MESH_CLASS_ID, Mesh, MeshReadLimits, MeshSubMesh, STREAM_ALIGNMENT, read_mesh,
         read_mesh_with_collection, triangulate, write_mesh_obj, write_mesh_object_obj,
     };
+
+    #[test]
+    fn obj_floats_render_the_way_the_managed_exporter_renders_them() {
+        use super::ObjFloat;
+
+        // Probed from .NET 10:
+        //   string.Format(CultureInfo.InvariantCulture, "{0}", value)
+        // which is what the managed OBJ writer calls for every coordinate.
+        // Values are given as bit patterns so nothing is rounded to a
+        // neighbour on the way into the test.
+        const CASES: &[(u32, &str)] = &[
+            (0, "0"),                          // zero
+            (2_147_483_648, "-0"),             // negative zero, which `-x` produces
+            (1_056_964_608, "0.5"),            // a half
+            (3_214_934_016, "-1.25"),          // a negative
+            (1_120_403_456, "100"),            // an integral value
+            (1_036_831_949, "0.1"),            // a tenth
+            (1_051_372_203, "0.33333334"),     // a third
+            (953_267_991, "0.0001"),           // the smallest fixed-point magnitude
+            (953_267_990, "9.999999E-05"),     // just below it, which turns scientific
+            (925_353_388, "1E-05"),            // a round value past the threshold
+            (1_315_859_238, "999999900"),      // the largest fixed-point magnitude
+            (1_315_859_240, "1E+09"),          // just above it, which turns scientific
+            (1_318_263_473, "1.234E+09"),      // scientific with a fraction
+            (3_382_607_226, "-1298351.2"),     // a tie, rounded to even
+            (1_184_677_024, "20062.312"),      // another tie
+            (1, "1E-45"),                      // the smallest subnormal
+            (8_388_607, "1.1754942E-38"),      // the largest subnormal
+            (8_388_608, "1.1754944E-38"),      // the smallest normal
+            (4_286_578_687, "-3.4028235E+38"), // the most negative finite value
+            (2_139_095_039, "3.4028235E+38"),  // the largest finite value
+            (1_266_679_808, "16777216"),       // the largest exact integer
+            (1_290_500_515, "123456790"),      // nine significant digits
+            (2_139_095_040, "Infinity"),
+            (4_286_578_688, "-Infinity"),
+        ];
+        for (bits, expected) in CASES {
+            assert_eq!(
+                ObjFloat(f32::from_bits(*bits)).to_string(),
+                *expected,
+                "bits {bits}"
+            );
+        }
+        // The managed writer substitutes NaN as it writes each line, so the
+        // token never reaches the document.
+        assert_eq!(ObjFloat(f32::NAN).to_string(), "0");
+        assert_eq!(ObjFloat(-f32::NAN).to_string(), "0");
+    }
 
     #[test]
     fn parses_resident_uncompressed_v22_mesh_and_writes_exact_obj_contract() {
