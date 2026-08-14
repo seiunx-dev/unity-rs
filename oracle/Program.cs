@@ -637,6 +637,7 @@ static object MeshPayload(Mesh mesh)
     mesh.ProcessData();
     return new
     {
+        Obj = MeshObj(mesh),
         Name = mesh.m_Name,
         VertexCount = mesh.m_VertexCount,
         Vertices = FloatValues(mesh.m_Vertices),
@@ -647,6 +648,43 @@ static object MeshPayload(Mesh mesh)
         Uv0 = mesh.m_UV0 is null or { Length: 0 } ? null : FloatValues(mesh.m_UV0),
         Indices = UInt32Values(mesh.m_Indices),
     };
+}
+
+// Drives the managed OBJ writer rather than restating it here, for the reason
+// the Live2D rows drive the managed extractor: an oracle that reimplements the
+// thing it checks proves only that the reimplementation agrees with itself.
+// The geometry rows below already compare what the writer is given; this
+// compares what it produces, which is where the negated axis, the reversed
+// winding, the one-based indices and the invariant number format live.
+//
+// The method is private, so this reaches it the same way the resource-table
+// row reaches a private field. The writer is constructed exactly as
+// ReadMeshPayloadInto constructs it, because the newline it is given is part
+// of the document.
+static object MeshObj(Mesh mesh)
+{
+    var method = typeof(AssetStudioCore.AssetStudioSession).GetMethod(
+        "WriteMeshObj",
+        BindingFlags.Static | BindingFlags.NonPublic
+    ) ?? throw new MissingMethodException("AssetStudioSession", "WriteMeshObj");
+
+    using var buffer = new MemoryStream();
+    using (var writer = new StreamWriter(buffer, new UTF8Encoding(false), 8192, leaveOpen: true)
+    {
+        NewLine = "\r\n",
+    })
+    {
+        try
+        {
+            method.Invoke(null, new object[] { mesh, writer });
+        }
+        catch (TargetInvocationException error) when (error.InnerException is not null)
+        {
+            throw error.InnerException;
+        }
+        writer.Flush();
+    }
+    return Bytes(buffer.ToArray());
 }
 
 static object FloatValues(IEnumerable<float> values)

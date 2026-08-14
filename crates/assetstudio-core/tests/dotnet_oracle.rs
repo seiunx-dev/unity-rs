@@ -10,7 +10,12 @@
 //! `VideoClip` resource ranges plus resident Material, Mesh, and Sprite objects. It
 //! compares stable order, path IDs, classes, names, raw object hashes, parsed
 //! payload hashes, Material property bits, Mesh vertex/normal/UV/index bits,
-//! settings fields, and `TypeTree` dumps.
+//! the exported OBJ document itself, settings fields, and `TypeTree` dumps.
+//!
+//! The OBJ row exists because the geometry rows do not cover the writer. They
+//! compare what it is handed; the negated axis, the reversed winding, the
+//! one-based indices and .NET's number format live in what it produces, and
+//! all four survive a comparison of the geometry alone.
 //!
 //! It also runs the same comparison across every serialized format version from
 //! 5 through 22, and through the containers a game ships: `UnityFS` v6 with
@@ -2901,11 +2906,38 @@ fn push_tuanjie_shared_cluster(output: &mut Vec<u8>, revision: u8) {
     push_i32(output, 0);
 }
 
+/// Geometry chosen so the exported document exercises the number format.
+///
+/// The managed writer renders every coordinate with .NET's general format,
+/// which switches to scientific notation outside `[1e-4, 1e9)`. Ordinary
+/// fixture values -- 1.5, 2, 3 -- all sit inside that band and print the same
+/// way under any shortest-round-trip formatter, so a mesh built from them
+/// compares equal even when the formatting is wrong. These values straddle
+/// both thresholds, sit exactly on them, include a value that ties at the last
+/// digit, and reach the subnormal range. The X components are the ones the
+/// writer negates, so the tie and the negative zero land there.
 fn mesh_vertex_data() -> Vec<u8> {
     let vertices = [
-        ([1.5_f32, 0.0, 0.0], [1.0_f32, 0.0, 0.0], [0.0_f32, 0.0]),
-        ([0.0, 2.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0]),
-        ([0.0, 0.0, 3.0], [0.0, 0.0, 1.0], [0.0, 1.0]),
+        (
+            // 1298351.25 exactly, which ties between ...2 and ...3 at the last
+            // digit. Written as bits because the literal spelling of a tie is
+            // by definition longer than it needs to be to round-trip.
+            [f32::from_bits(1_235_123_578), 4.3e-8, 999_999_900.0],
+            [1.0_f32, 0.0, 0.0],
+            [0.0_f32, 1e-5],
+        ),
+        (
+            // 1e-4 is the smallest magnitude still written in full.
+            [0.0, 1e9, 1e-4],
+            [0.0, 2.5e-7, 1.0],
+            [1.0, 0.0],
+        ),
+        (
+            // Just below it, which turns scientific.
+            [0.0, 9.999_999e-5, 3.0],
+            [f32::from_bits(1), 0.0, 1.0],
+            [16_777_216.0, 1.175_494_4e-38],
+        ),
     ];
     let mut vertex_data = Vec::new();
     for (position, _, _) in vertices {

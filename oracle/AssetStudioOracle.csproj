@@ -21,11 +21,14 @@
     <!-- ShaderConverter, the managed implementation the shader rows compare
          against, lives here rather than in the core reader project. -->
     <AssetStudioUtilityProject>$(AssetStudioRepo)/AssetStudioUtility/AssetStudioUtility.csproj</AssetStudioUtilityProject>
+    <!-- The managed OBJ writer lives here. The mesh rows compare the exported
+         document, not only the geometry it was written from. -->
+    <AssetStudioCoreProject>$(AssetStudioRepo)/AssetStudioCore/AssetStudioCore.csproj</AssetStudioCoreProject>
   </PropertyGroup>
 
   <Target Name="RequireAssetStudioCheckout" BeforeTargets="PrepareForBuild;CollectPackageReferences">
     <Error
-      Condition="!Exists('$(AssetStudioProject)') Or !Exists('$(AssetStudioUtilityProject)')"
+      Condition="!Exists('$(AssetStudioProject)') Or !Exists('$(AssetStudioUtilityProject)') Or !Exists('$(AssetStudioCoreProject)')"
       Text="The managed oracle needs a Team-Haruki/AssetStudio checkout. Looked for '$(AssetStudioProject)'. Clone it beside this repository, or pass -p:AssetStudioRepo=&lt;path&gt;." />
   </Target>
 
@@ -35,6 +38,9 @@
       SetTargetFramework="TargetFramework=net10.0" />
     <ProjectReference
       Include="$(AssetStudioUtilityProject)"
+      SetTargetFramework="TargetFramework=net10.0" />
+    <ProjectReference
+      Include="$(AssetStudioCoreProject)"
       SetTargetFramework="TargetFramework=net10.0" />
   </ItemGroup>
 
