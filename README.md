@@ -218,10 +218,15 @@ accumulate across the file; a companion `.mtl` under the same stem carries the
 material colours and `map_Kd`/`map_Bump`/`map_Ks` lines pointing at the sibling
 textures. Its face references name only the channels the mesh actually has,
 unlike the single-mesh `.obj` the `export` command writes, which reproduces the
-managed writer's unconditional `v/vt/vn` exactly. Two departures there are
-deliberate and documented on `write_mesh_obj`: line endings are CRLF
-throughout, where the managed writer's `g` lines follow the platform and its
-other lines do not; and `NaN` is replaced per numeric value rather than by a
+managed writer's unconditional `v/vt/vn` exactly. The managed repository holds
+three writers for this format and they disagree with each other; this matches
+the headless one -- the path behind the managed library's own object payloads,
+and so the one being replaced -- byte for byte, which the differential checks
+by comparing the exported documents rather than only the geometry behind them.
+Against the other two, the exporters behind the GUI and the CLI, two
+differences remain, both documented on `write_mesh_obj`: line endings are CRLF
+throughout, where those writers' `g` lines follow the platform and their other
+lines do not; and `NaN` is replaced per numeric value rather than by a
 document-wide text substitution that also rewrites a mesh named `NaN`.
 
 `--binary` writes FBX 7.4's binary encoding instead of its text one, with the
