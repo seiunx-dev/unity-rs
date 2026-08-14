@@ -125,6 +125,12 @@ export declare class AssetStudio {
    * to parse. The scene is identical to `readStaticFbx`.
    */
   readStaticFbxBinary(maximumBytes?: number | undefined | null): Buffer
+  /** Reads a `Font`'s resident payload. */
+  readFont(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): BinaryAsset
+  /** Reads the resident Ogg payload from a legacy `MovieTexture`. */
+  readMovieTexture(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): BinaryAsset
+  /** Reads a `VideoClip`'s resident or external payload. */
+  readVideoClip(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): BinaryAsset
   /**
    * Exports every supported object into `outputRoot`.
    *
@@ -305,6 +311,21 @@ export interface Avatar {
    */
   pathCount: number
   hasHumanDescription: boolean
+}
+
+/**
+ * A resident binary asset: a `Font`, a legacy `MovieTexture`, or a `VideoClip`.
+ *
+ * All three are a name and a blob whose format the file declares, so one shape
+ * covers them rather than three that differ only in what they are called.
+ */
+export interface BinaryAsset {
+  name: string
+  /** What the payload is, as the reader classified it. */
+  kind: string
+  /** The extension the stored bytes carry, `.ttf` or `.ogg` for example. */
+  extension: string
+  data: Buffer
 }
 
 /** The scene lists a `BuildSettings` object records. */
