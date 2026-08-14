@@ -142,15 +142,21 @@ def groups(interpreter: str) -> list[Group]:
         Group(
             "linux",
             [
-                Step(
-                    "workspace tests on Linux",
-                    [
-                        "docker", "run", "--rm", "--platform", "linux/amd64",
-                        "-v", f"{ROOT}:/src", "-w", "/src",
-                        "-e", "CARGO_TARGET_DIR=/tmp/target",
-                        LINUX_IMAGE,
-                        "sh", "-c", LINUX_TESTS,
-                    ],
+                # Both architectures CI builds for. Each gets its own target
+                # directory so the two do not fight over one cache.
+                *(
+                    Step(
+                        f"workspace tests on Linux {architecture}",
+                        [
+                            "docker", "run", "--rm",
+                            "--platform", f"linux/{architecture}",
+                            "-v", f"{ROOT}:/src", "-w", "/src",
+                            "-e", f"CARGO_TARGET_DIR=/tmp/target-{architecture}",
+                            LINUX_IMAGE,
+                            "sh", "-c", LINUX_TESTS,
+                        ],
+                    )
+                    for architecture in ("amd64", "arm64")
                 ),
                 Step(
                     "Python wheel on Linux",

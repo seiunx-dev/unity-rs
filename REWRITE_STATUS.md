@@ -209,7 +209,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 **需要外部输入，我这边无法推进：**
 
-1. 让 CI 重新跑起来（GitHub Actions 计费）。本机已把 CI 的每一步复跑过一遍且全绿，唯独 Linux/Windows 复现不了——而这正是上次 Python 侧坏了很久没人发现的原因。为降低这条的代价，新增 `tools/local_ci.py`：一条命令跑完 CI 的全部 16 步（格式、Clippy、rustdoc、打包、workspace 测试、托管差分、音频差分、Node 构建/测试/打包、Python wheel 构建/安装/两套测试、UnityPy 差分），缺哪个工具就把那一组记为跳过而不是失败。这不能替代 CI——CI 是在三个平台上跑这套矩阵——但它让拿得到 Linux/Windows 的人能自己产出同样的证据，而不必先从 workflow 文件里把步骤拼出来。另外补了一个 `cross` 组：本机交叉编译到 `x86_64-unknown-linux-gnu`（含全部测试目标）已验证通过，Windows 侧用 `zig cc` 也验证了 core/CLI/Python 三个 crate 能编过（Node addon 要链 libnode.dll，交叉环境下不适用）。这只覆盖「能不能编译」——路径假设、漏掉的 `cfg`、只在某个平台成立的 `Send` 之类——行为层面则由新增的 `linux` 组覆盖：用 CI 钉住的同一个 Rust 1.88 镜像，在容器里跑 core+CLI 的完整测试（482 项 core、6 项畸形输入扫描、全部 CLI 套件）以及 Python wheel 的构建与两套测试，本机已实跑通过——这是 LZMA 那次提交之后第一次拿到 Linux 上的真实运行结果，而 Python 那两套正是之前坏了很久没人发现的。Node addon 也在容器里跑通了（镜像没有 Node，因此按 CI 用的版本拉官方构建），10 组 API 测试全过，跑完会把产出的 Linux `.node` 删掉以免污染宿主构建。Windows 目前仍只有编译层面的验证。顺带记一笔：workspace 唯一的 C 依赖是 `zstd`（`zstd-sys` 会编 C 源码），交叉编译因此需要目标平台的 C 工具链；`docs/upstream-defects.md` 里原先把「纯 Rust」当成本 crate 已有的性质来论证，那是不准确的，已改成「再加一个原生依赖的代价」；
+1. 让 CI 重新跑起来（GitHub Actions 计费）。本机已把 CI 的每一步复跑过一遍且全绿，唯独 Linux/Windows 复现不了——而这正是上次 Python 侧坏了很久没人发现的原因。为降低这条的代价，新增 `tools/local_ci.py`：一条命令跑完 CI 的全部 16 步（格式、Clippy、rustdoc、打包、workspace 测试、托管差分、音频差分、Node 构建/测试/打包、Python wheel 构建/安装/两套测试、UnityPy 差分），缺哪个工具就把那一组记为跳过而不是失败。这不能替代 CI——CI 是在三个平台上跑这套矩阵——但它让拿得到 Linux/Windows 的人能自己产出同样的证据，而不必先从 workflow 文件里把步骤拼出来。另外补了一个 `cross` 组：本机交叉编译到 `x86_64-unknown-linux-gnu`（含全部测试目标）已验证通过，Windows 侧用 `zig cc` 也验证了 core/CLI/Python 三个 crate 能编过（Node addon 要链 libnode.dll，交叉环境下不适用）。这只覆盖「能不能编译」——路径假设、漏掉的 `cfg`、只在某个平台成立的 `Send` 之类——行为层面则由新增的 `linux` 组覆盖：用 CI 钉住的同一个 Rust 1.88 镜像，在容器里跑 core+CLI 的完整测试（482 项 core、6 项畸形输入扫描、全部 CLI 套件）以及 Python wheel 的构建与两套测试，x86-64 与 arm64 两个架构都已实跑通过（CI 的 wheel 矩阵正是这两个）——这是 LZMA 那次提交之后第一次拿到 Linux 上的真实运行结果，而 Python 那两套正是之前坏了很久没人发现的。Node addon 也在容器里跑通了（镜像没有 Node，因此按 CI 用的版本拉官方构建），10 组 API 测试全过，跑完会把产出的 Linux `.node` 删掉以免污染宿主构建。Windows 目前仍只有编译层面的验证。顺带记一笔：workspace 唯一的 C 依赖是 `zstd`（`zstd-sys` 会编 C 源码），交叉编译因此需要目标平台的 C 工具链；`docs/upstream-defects.md` 里原先把「纯 Rust」当成本 crate 已有的性质来论证，那是不准确的，已改成「再加一个原生依赖的代价」；
 2. 扩充真实 corpus，按实际命中率排序缺口（需要真实游戏文件）。为降低这条的门槛，corpus 用例的 `expected` 快照改成可选：不给快照时依然会把每个对象都读一遍、出错即失败，并报出读到了多少文件/对象/可解析载荷，只是没法断言取值对不对。这样「有游戏文件」就够跑，不再同时要求 .NET SDK 与 AssetStudio checkout 来生成快照。另加了一条防自欺断言：没有快照的用例必须至少解析出一个对象——reader 认不出来的输入会被当成资源文件、解析出零个对象，否则那种用例会安静地通过；
 3. 获取样本并实现 Unity 6000.2 MeshLOD/虚拟几何、Tuanjie 虚拟几何 cluster、UnityArchive，而不是猜测布局；
 4. 是否把 `ruopus` 与 `texture2ddecoder` 的缺陷提到上游（补丁已备好，见 `docs/upstream-defects.md`）。
@@ -242,7 +242,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 | 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷 |
 | 代表性真实 corpus 稳定通过 | **未满足**；没有真实游戏语料 |
 | 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
-| 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux x86-64 上 core+CLI 测试、Python wheel 构建与两套测试、Node addon 构建与测试均已在容器里实跑通过；Windows 与 Linux 的编译也验证过。缺的是 Windows 上的真实运行，以及 CI 自己的发布产物流程（打包、上传、多架构矩阵）|
+| 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux 的 x86-64 与 arm64 两个架构上，core+CLI 测试、Python wheel 构建与两套测试、Node addon 构建与测试均已在容器里实跑通过；Windows 侧验证了编译。缺的是 Windows 上的真实运行——本机查过 wine（未安装）、Windows 容器（macOS 上不支持）与 Parallels（只有一个无效的 Debian 虚拟机），都不具备条件，装 wine 属于往你机器上装东西，没有自作主张——以及 CI 自己的发布产物流程 |
 | 导出/解包有界、拒绝穿越与符号链接、原子发布 | 满足 |
 | C# 仅作历史参考或可选 oracle | 满足 |
 
