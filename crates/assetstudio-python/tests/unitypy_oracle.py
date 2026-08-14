@@ -21,6 +21,8 @@ Run with the wheel and UnityPy installed in the same interpreter:
 
 from __future__ import annotations
 
+import json
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -60,6 +62,47 @@ def portable_file_name(path: str) -> str:
     return tail
 
 
+def narrow_floats(value: Any) -> Any:
+    """Rounds every float to the nearest `f32`, in both documents.
+
+    UnityPy hands back Python floats, which are doubles, so a serialized
+    `float` arrives widened: `0.8f` becomes `0.800000011920929` where this
+    project keeps the source width and prints `0.8`. Narrowing both sides makes
+    them comparable.
+
+    The cost is that a genuine `double` field is narrowed too, so a difference
+    below `f32` precision in one would not show here. The fixture carries a
+    double that is not exactly representable as a float, and
+    `assert_double_precision` checks that one directly, so the gap is covered
+    rather than ignored.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    if isinstance(value, dict):
+        return {key: narrow_floats(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [narrow_floats(item) for item in value]
+    return value
+
+
+def read_tree(reader: Any) -> Any:
+    """The object's TypeTree values, or None when there is no embedded tree.
+
+    UnityPy falls back to its bundled database when a file carries no tree,
+    which would compare this project against that database rather than against
+    a second parse of the same bytes. Only files with their own tree are
+    compared.
+    """
+    if getattr(getattr(reader, "serialized_type", None), "nodes", None) is None:
+        return None
+    try:
+        return narrow_floats(reader.read_typetree())
+    except Exception:
+        return None
+
+
 def unitypy_manifest(path: Path) -> dict[str, Any]:
     environment = UnityPy.load(str(path))
     files = []
@@ -78,6 +121,7 @@ def unitypy_manifest(path: Path) -> dict[str, Any]:
                     "ByteSize": object_reader.byte_size,
                     "Name": peek_name(object_reader),
                     "Raw": bytes_manifest(bytes(raw)),
+                    "Tree": read_tree(object_reader),
                 }
             )
         files.append(
@@ -122,6 +166,7 @@ def wheel_manifest(path: Path) -> dict[str, Any]:
                     "ByteSize": obj.byte_size,
                     "Name": obj.name or "",
                     "Raw": bytes_manifest(bytes(raw)),
+                    "Tree": wheel_tree(studio, obj),
                 }
             )
         files.append(
@@ -132,6 +177,35 @@ def wheel_manifest(path: Path) -> dict[str, Any]:
             }
         )
     return {"Files": files}
+
+
+def wheel_tree(studio: Any, obj: Any) -> Any:
+    """The same values from this project, or None when there is no tree."""
+    try:
+        document = studio.read_type_tree_json(obj.file_index, obj.path_id)
+    except Exception:
+        return None
+    return narrow_floats(json.loads(document))
+
+
+def assert_double_precision(path: Path) -> None:
+    """Checks the one field `narrow_floats` would have hidden a loss in.
+
+    Read straight from the file rather than from the compared manifest, whose
+    floats have deliberately been narrowed. The fixture stores -0.1 in a
+    `double`, which no float holds exactly, so a reader that widened from a
+    float would produce -0.10000000149011612 -- and this asserts it does not.
+    """
+    studio = AssetStudio(path)
+    for obj in studio.objects():
+        try:
+            document = json.loads(
+                studio.read_type_tree_json(obj.file_index, obj.path_id)
+            )
+        except Exception:
+            continue
+        if isinstance(document, dict) and "Double" in document:
+            assert document["Double"] == -0.1, document["Double"]
 
 
 def cases() -> list[tuple[str, bytes]]:
@@ -157,6 +231,7 @@ def cases() -> list[tuple[str, bytes]]:
         ("shader-unity6.assets", fixtures.synthetic_unity6_shader()),
         ("sprite.assets", fixtures.synthetic_tight_sprite()),
         ("legacy-pcm.assets", fixtures.synthetic_legacy_pcm()),
+        ("type-tree.assets", fixtures.synthetic_type_tree_object()),
     ]
 
 
@@ -174,7 +249,7 @@ def drop_undetermined_names(expected: dict[str, Any], actual: dict[str, Any]) ->
     return skipped
 
 
-def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int]:
+def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, int]:
     if len(data) < UNITYPY_MINIMUM_SNIFF_BYTES:
         return (
             [
@@ -183,27 +258,40 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int]:
                 "read as a resource file rather than parsed"
             ],
             0,
+            0,
         )
     path = directory / name
     path.write_bytes(data)
 
     expected = unitypy_manifest(path)
     actual = wheel_manifest(path)
+    assert_double_precision(path)
+    # A tree row that is None on both sides compares equal while proving
+    # nothing, so the run reports how many were really compared and main()
+    # requires at least one.
+    compared_trees = sum(
+        1
+        for file in expected["Files"]
+        for entry in file["Objects"]
+        if entry.get("Tree") is not None
+    )
     skipped = drop_undetermined_names(expected, actual)
     if expected == actual:
-        return ([], skipped)
-    return ([f"{name}:\n  UnityPy: {expected}\n  wheel:   {actual}"], skipped)
+        return ([], skipped, compared_trees)
+    return ([f"{name}:\n  UnityPy: {expected}\n  wheel:   {actual}"], skipped, compared_trees)
 
 
 def main() -> None:
     failures: list[str] = []
     checked = 0
     skipped_names = 0
+    compared_trees = 0
     with tempfile.TemporaryDirectory(prefix="assetstudio-unitypy-oracle-") as directory:
         for name, data in cases():
-            case_failures, case_skipped = compare(name, data, Path(directory))
+            case_failures, case_skipped, case_trees = compare(name, data, Path(directory))
             failures.extend(case_failures)
             skipped_names += case_skipped
+            compared_trees += case_trees
             checked += 1
 
     if failures:
@@ -212,7 +300,17 @@ def main() -> None:
             print(failure)
             print()
         raise SystemExit(1)
-    summary = f"UnityPy differential: {checked} fixtures agree"
+    # Without a tree-bearing fixture every Tree row is None on both sides and
+    # compares equal while checking nothing.
+    if compared_trees == 0:
+        raise SystemExit(
+            "UnityPy differential: no TypeTree was compared, so the tree rows "
+            "proved nothing; a fixture with an embedded tree is required"
+        )
+    summary = (
+        f"UnityPy differential: {checked} fixtures agree"
+        f" ({compared_trees} TypeTree object(s) compared)"
+    )
     if skipped_names:
         summary += (
             f" ({skipped_names} name comparison(s) skipped: UnityPy's TypeTree"
