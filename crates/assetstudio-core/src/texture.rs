@@ -3893,6 +3893,8 @@ mod tests {
 
     /// The same truncation, in the BC6H decoder.
     ///
+    /// Written up with a patch in `docs/upstream-defects.md`.
+    ///
     /// `texture2ddecoder` 0.1.2 has two ports of the reference `f32_to_u8`. The
     /// ASTC one drops `roundf` for `floor`; this one drops it for a cast, which
     /// truncates. Both come out a step low wherever the value lands at or above
@@ -3950,6 +3952,8 @@ mod tests {
     }
 
     /// Pins the one way HDR ASTC decoding differs from the managed decoder.
+    ///
+    /// Written up with a patch in `docs/upstream-defects.md`.
     ///
     /// `texture2ddecoder` 0.1.2 ports the reference `select_color_hdr` with
     /// `floor(f * 255)` where the C++ it came from has `roundf(f * 255)`. The
