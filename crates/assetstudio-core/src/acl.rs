@@ -697,41 +697,145 @@ mod tests {
             valid
         );
 
-        for output in [
-            AclDecodedClip {
-                times: vec![0.0],
-                binding_indices: vec![2, 3],
-                values: vec![1.0, 2.0],
-                following_curve_offset: 4,
-            },
-            AclDecodedClip {
-                times: vec![0.0, -1.0],
-                binding_indices: vec![2, 3],
-                values: vec![1.0, 2.0, 3.0, 4.0],
-                following_curve_offset: 4,
-            },
-            AclDecodedClip {
-                times: vec![0.0, 1.0],
-                binding_indices: vec![3, 2],
-                values: vec![1.0, 2.0, 3.0, 4.0],
-                following_curve_offset: 4,
-            },
-            AclDecodedClip {
-                times: vec![0.0, 1.0],
-                binding_indices: vec![2, 3],
-                values: vec![1.0, f32::NAN, 3.0, 4.0],
-                following_curve_offset: 4,
-            },
-            AclDecodedClip {
-                times: vec![0.0, 1.0],
-                binding_indices: vec![2, 3],
-                values: vec![1.0, 2.0, 3.0],
-                following_curve_offset: 4,
-            },
-        ] {
+        assert_rejected_shapes(&clip);
+        assert_rejected_limits(&clip, &valid);
+    }
+
+    /// Each hostile output paired with the guard it must trip.
+    ///
+    /// Asserting only `is_err()` would let a case that fails for an unrelated
+    /// reason stand in for a branch nothing exercises, which is how four of
+    /// these went uncovered: a non-finite time, an offset that does not follow
+    /// the last binding, a curve count disagreeing with the declared one, and
+    /// each of the three resource ceilings.
+    fn assert_rejected_shapes(clip: &AclClip) {
+        let cases: &[(&str, AclDecodedClip)] = &[
+            (
+                "returned 1 times",
+                AclDecodedClip {
+                    times: vec![0.0],
+                    binding_indices: vec![2, 3],
+                    values: vec![1.0, 2.0],
+                    following_curve_offset: 4,
+                },
+            ),
+            (
+                "monotonically non-decreasing",
+                AclDecodedClip {
+                    times: vec![0.0, -1.0],
+                    binding_indices: vec![2, 3],
+                    values: vec![1.0, 2.0, 3.0, 4.0],
+                    following_curve_offset: 4,
+                },
+            ),
+            (
+                "monotonically non-decreasing",
+                AclDecodedClip {
+                    times: vec![0.0, f32::INFINITY],
+                    binding_indices: vec![2, 3],
+                    values: vec![1.0, 2.0, 3.0, 4.0],
+                    following_curve_offset: 4,
+                },
+            ),
+            (
+                "strictly increasing",
+                AclDecodedClip {
+                    times: vec![0.0, 1.0],
+                    binding_indices: vec![3, 2],
+                    values: vec![1.0, 2.0, 3.0, 4.0],
+                    following_curve_offset: 4,
+                },
+            ),
+            (
+                "non-finite curve value",
+                AclDecodedClip {
+                    times: vec![0.0, 1.0],
+                    binding_indices: vec![2, 3],
+                    values: vec![1.0, f32::NAN, 3.0, 4.0],
+                    following_curve_offset: 4,
+                },
+            ),
+            (
+                "3 values",
+                AclDecodedClip {
+                    times: vec![0.0, 1.0],
+                    binding_indices: vec![2, 3],
+                    values: vec![1.0, 2.0, 3.0],
+                    following_curve_offset: 4,
+                },
+            ),
+            (
+                "does not follow every decoded binding index",
+                AclDecodedClip {
+                    times: vec![0.0, 1.0],
+                    binding_indices: vec![2, 3],
+                    values: vec![1.0, 2.0, 3.0, 4.0],
+                    following_curve_offset: 3,
+                },
+            ),
+            (
+                "for 2 declared curves",
+                AclDecodedClip {
+                    times: vec![0.0, 1.0],
+                    binding_indices: vec![2, 3, 4],
+                    values: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    following_curve_offset: 5,
+                },
+            ),
+        ];
+        for (reason, output) in cases {
+            let error = clip
+                .decode_with(
+                    &FakeDecoder {
+                        output: output.clone(),
+                    },
+                    AclDecodeLimits::default(),
+                )
+                .unwrap_err();
             assert!(
-                clip.decode_with(&FakeDecoder { output }, AclDecodeLimits::default())
-                    .is_err()
+                error.to_string().contains(reason),
+                "expected {reason:?}, got {error}"
+            );
+        }
+    }
+
+    /// The three resource ceilings, each tripped on its own so one cannot mask
+    /// another.
+    fn assert_rejected_limits(clip: &AclClip, valid: &AclDecodedClip) {
+        for (reason, limits) in [
+            (
+                "exceeds limit 1",
+                AclDecodeLimits {
+                    maximum_frames: 1,
+                    ..AclDecodeLimits::default()
+                },
+            ),
+            (
+                "exceeding limit 1",
+                AclDecodeLimits {
+                    maximum_curves: 1,
+                    ..AclDecodeLimits::default()
+                },
+            ),
+            (
+                "requires 4 values",
+                AclDecodeLimits {
+                    maximum_values: 3,
+                    ..AclDecodeLimits::default()
+                },
+            ),
+        ] {
+            let error = clip
+                .decode_with(
+                    &FakeDecoder {
+                        output: valid.clone(),
+                    },
+                    limits,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(reason),
+                "expected {reason:?}, got {error}"
             );
         }
     }
