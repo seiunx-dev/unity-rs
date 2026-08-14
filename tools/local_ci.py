@@ -11,6 +11,12 @@ It is not a replacement for CI. CI runs this matrix on Linux, Windows and
 macOS; this runs it wherever you are. The value is that a contributor on a
 platform the maintainer cannot reach can produce the same evidence.
 
+The `cross` group is the exception, and a partial one: it compiles the
+workspace and its tests for another target without running them. That catches
+what fails to build elsewhere -- a path assumption, a missing `cfg`, a type
+that is only `Send` on one platform -- but says nothing about behaviour. It
+needs a cross C toolchain because zstd builds from C sources.
+
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
 UnityPy are all optional. Anything that runs and fails is a failure.
@@ -109,6 +115,26 @@ def groups(interpreter: str) -> list[Group]:
             ],
             requires="vgmstream-cli",
             reason="the audio differential decodes with vgmstream-cli",
+        ),
+        Group(
+            "cross",
+            [
+                Step(
+                    "compile for Linux x86-64",
+                    [
+                        "cargo", "check", "--workspace", "--all-targets",
+                        "--locked", "--target", "x86_64-unknown-linux-gnu",
+                    ],
+                    env={
+                        "CC_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-gcc",
+                        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": (
+                            "x86_64-unknown-linux-gnu-gcc"
+                        ),
+                    },
+                )
+            ],
+            requires="x86_64-unknown-linux-gnu-gcc",
+            reason="cross-compiling needs a Linux C toolchain for zstd's C sources",
         ),
         Group(
             "node",
