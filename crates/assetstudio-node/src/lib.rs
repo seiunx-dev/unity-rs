@@ -9,7 +9,10 @@ use assetstudio_core::avatar::AvatarReadLimits;
 use assetstudio_core::export::ExportOptions;
 use assetstudio_core::extraction::ExtractionOptions;
 use assetstudio_core::image_export::ImageFormat;
+use assetstudio_core::live2d_motion::{CubismFadeMotionReadLimits, CubismMotionTargetNames};
 use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMaterializeLimits};
+use assetstudio_core::live2d_physics::CubismPhysicsReadLimits;
+use assetstudio_core::live2d_schema::CubismExpressionReadLimits;
 use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
@@ -85,6 +88,20 @@ pub struct AudioClip {
     /// True when the payload is already a playable RIFF/WAVE stream.
     pub is_direct_wav: bool,
     pub data: Buffer,
+}
+
+/// One Cubism document produced from a single behaviour.
+///
+/// The bytes are the document itself; the counts alongside are what a caller
+/// would otherwise have to parse the JSON to learn.
+#[napi(object)]
+pub struct CubismDocument {
+    pub name: String,
+    /// The document's own JSON text.
+    pub json: Buffer,
+    /// Sub-rigs for physics, parameters for an expression, curves for a
+    /// motion. Zero for a document that has no such notion.
+    pub entry_count: u32,
 }
 
 /// One `GameObject` branch that can be exported as its own FBX.
@@ -1126,6 +1143,91 @@ impl AssetStudio {
             .read_static_fbx_binary(byte_limit(maximum_bytes)?)
             .map(Into::into)
             .map_err(core_error)
+    }
+
+    /// Reads a `CubismPhysicsController` and writes its physics3.json.
+    ///
+    /// `motionFps` is the fallback the converter uses when the rig carries no
+    /// frame rate of its own, matching the managed extractor's argument.
+    #[napi]
+    pub fn read_cubism_physics(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        motion_fps: Option<f64>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<CubismDocument> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let rig = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_cubism_physics(CubismPhysicsReadLimits::default())
+            .map_err(core_error)?;
+        let mut json = Vec::new();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "physics3.json's fps field is a float"
+        )]
+        let fallback = motion_fps.unwrap_or(30.0) as f32;
+        rig.write_physics3_json(fallback, &mut json, maximum)
+            .map_err(core_error)?;
+        Ok(CubismDocument {
+            name: String::new(),
+            json: json.into(),
+            entry_count: u32::try_from(rig.sub_rigs.len()).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Reads a `CubismExpressionData` and writes its exp3.json.
+    #[napi]
+    pub fn read_cubism_expression(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<CubismDocument> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let expression = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_cubism_expression(CubismExpressionReadLimits::default())
+            .map_err(core_error)?;
+        let mut json = Vec::new();
+        expression
+            .write_exp3_json(&mut json, maximum)
+            .map_err(core_error)?;
+        Ok(CubismDocument {
+            name: expression.source_name.clone(),
+            json: json.into(),
+            entry_count: u32::try_from(expression.parameters.len()).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Reads a `CubismFadeMotionData` and writes its motion3.json.
+    #[napi]
+    pub fn read_cubism_fade_motion(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<CubismDocument> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let motion = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_cubism_fade_motion(CubismFadeMotionReadLimits::default())
+            .map_err(core_error)?;
+        let mut json = Vec::new();
+        motion
+            .write_motion3_json(
+                &CubismMotionTargetNames::default(),
+                false,
+                &mut json,
+                maximum,
+            )
+            .map_err(core_error)?;
+        Ok(CubismDocument {
+            name: motion.source_name.clone(),
+            json: json.into(),
+            entry_count: u32::try_from(motion.curves.len()).unwrap_or(u32::MAX),
+        })
     }
 
     /// Enumerates the `GameObject` branches a split-objects export would write.
