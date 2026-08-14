@@ -52,6 +52,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
 
     assert_version_matrix(&executable);
     assert_compressed_texture_formats(&executable);
+    assert_crunched_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
     assert_truncated_fixture(&executable);
@@ -224,6 +225,71 @@ fn assert_converted_shader(fixture: &TemporaryFixture, manifest: &Value) {
     );
 }
 
+/// Compares decoded pixels for classic Crunch and `UnityCrunch` payloads.
+///
+/// The unit tests already check these against hashes taken from the bundled
+/// C++ decoder, but only the decoder in isolation. This runs the whole path the
+/// way a caller reaches it -- `Texture2D` parse, header sniff, transcode,
+/// mip-zero decode -- against the managed reader doing the same, so the version
+/// gate that chooses between the two Crunch dialects is compared too rather
+/// than assumed.
+fn assert_crunched_textures(executable: &Path) {
+    // Real CRN payloads; see tests/fixtures/crunch/README.md for provenance.
+    // A classic payload needs a pre-2017.3 revision and a UnityCrunch one needs
+    // 2017.3 or newer, except for the ETC formats which are always UnityCrunch.
+    const CASES: &[(&str, &str, i32, &str)] = &[
+        ("classic-dxt1", "classic_dxt1.crn", 28, "2017.2.0f3"),
+        ("classic-dxt5", "classic_dxt5.crn", 29, "2017.2.0f3"),
+        ("unity-dxt1", "unity_dxt1.crn", 28, "2022.3.62f1"),
+        ("unity-dxt5", "unity_dxt5.crn", 29, "2022.3.62f1"),
+        ("unity-etc1", "unity_etc1.crn", 64, "2022.3.62f1"),
+        ("unity-etc2a", "unity_etc2a.crn", 65, "2022.3.62f1"),
+    ];
+    // 512x512 RGBA is a megabyte decoded, so the manifest cap has to clear it.
+    const MAXIMUM_BYTES: u64 = 8 * 1024 * 1024;
+
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crunch");
+    for (name, file_name, format, revision) in CASES {
+        let payload = fs::read(directory.join(file_name))
+            .unwrap_or_else(|error| panic!("cannot read {file_name}: {error}"));
+        let object = crunched_texture2d(&format!("oracle-{name}"), *format, revision, &payload);
+        let file = synthetic_single_v22(28, 28, revision, &object);
+        let fixture = TemporaryFixture::new(&format!("oracle-crunch-{name}.assets"), &file)
+            .expect("the Crunch fixture is writable");
+        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), MAXIMUM_BYTES).unwrap();
+        assert_eq!(managed, rust, "Crunch fixture {name}");
+        assert_eq!(
+            managed["Files"][0]["Objects"][0]["Payload"]["Decoded"]["Size"],
+            512 * 512 * 4,
+            "Crunch fixture {name} did not decode a full 512x512 surface: {managed}"
+        );
+    }
+}
+
+/// A 512x512 `Texture2D` whose payload is a CRN stream.
+///
+/// Ten mip levels, which is what a 512-pixel chain has and what these CRN
+/// streams carry; only level zero is decoded and compared.
+fn crunched_texture2d(name: &str, format: i32, revision: &str, payload: &[u8]) -> Vec<u8> {
+    texture2d_inline(name, 512, 512, format, 10, revision, payload)
+}
+
+/// The major and minor components of a Unity revision like `2017.2.0f3`.
+fn unity_minor_version(revision: &str) -> (u32, u32) {
+    let mut parts = revision.split('.');
+    let major = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let minor = parts
+        .next()
+        .unwrap_or("0")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    (major, minor)
+}
+
 /// Compares decoded pixels across the block-compressed texture formats.
 ///
 /// Only the stored payload was ever compared here, and that comes straight off
@@ -266,12 +332,21 @@ fn assert_compressed_texture_formats(executable: &Path) {
     // placement as well as the decode of one block.
     const SIZE: i32 = 8;
     const BLOCKS: usize = 4;
+    const REVISION: &str = "2022.3.62f1";
 
     let mut disagreed = Vec::new();
     for (index, (name, format, block_bytes)) in FORMATS.iter().enumerate() {
         let payload = block_payload(BLOCKS * block_bytes, 0x9E37_79B9_7F4A_7C15 ^ index as u64);
-        let object = texture2d_inline(&format!("oracle-{name}"), SIZE, SIZE, *format, &payload);
-        let file = synthetic_single_v22(28, 28, "2022.3.62f1", &object);
+        let object = texture2d_inline(
+            &format!("oracle-{name}"),
+            SIZE,
+            SIZE,
+            *format,
+            1,
+            REVISION,
+            &payload,
+        );
+        let file = synthetic_single_v22(28, 28, REVISION, &object);
         let fixture = TemporaryFixture::new(&format!("oracle-texture-{name}.assets"), &file)
             .expect("the texture fixture is writable");
         let managed = managed_manifest(executable, fixture.input_path()).unwrap();
@@ -1977,33 +2052,78 @@ fn push_empty_packed_int(output: &mut Vec<u8>) {
 /// Inline rather than streamed so one fixture file is self-contained, which
 /// lets the differential carry a texture per compressed format without a
 /// sibling `.resS` for each.
-fn texture2d_inline(name: &str, width: i32, height: i32, format: i32, data: &[u8]) -> Vec<u8> {
+fn texture2d_inline(
+    name: &str,
+    width: i32,
+    height: i32,
+    format: i32,
+    mip_count: i32,
+    revision: &str,
+    data: &[u8],
+) -> Vec<u8> {
     let mut output = Vec::new();
     push_string(&mut output, name);
-    push_i32(&mut output, 0);
-    output.extend_from_slice(&[0, 0]);
-    align(&mut output, 4);
+    // The fallback-format block arrives at 2017.3, and its alpha-channel byte
+    // at 2020.2. Before that the name is followed straight by the dimensions.
+    let version = unity_minor_version(revision);
+    if version >= (2017, 3) {
+        push_i32(&mut output, 0);
+        output.push(0);
+        if version >= (2020, 2) {
+            output.push(0);
+        }
+        align(&mut output, 4);
+    }
     push_i32(&mut output, width);
     push_i32(&mut output, height);
     output.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
-    push_i32(&mut output, 0);
+    // The stripped-mip count arrives in 2020.
+    if version.0 >= 2020 {
+        push_i32(&mut output, 0);
+    }
     push_i32(&mut output, format);
-    push_i32(&mut output, 1);
-    output.extend_from_slice(&[1, 0, 0]);
+    push_i32(&mut output, mip_count);
+
+    // Import settings. The readable flag is the only one every supported
+    // revision has; preprocessing arrives in 2020, the mip limit in 2019.3 and
+    // its group name in 2022.2, and the streaming-mipmap pair in 2018.2.
+    output.push(1);
+    if version.0 >= 2020 {
+        output.push(0);
+    }
+    if version >= (2019, 3) {
+        output.push(0);
+        if version >= (2022, 2) {
+            align(&mut output, 4);
+        }
+    }
+    if version >= (2022, 2) {
+        push_string(&mut output, "");
+    }
+    if version >= (2018, 2) {
+        output.push(0);
+    }
     align(&mut output, 4);
-    push_string(&mut output, "");
-    output.push(0);
-    align(&mut output, 4);
-    push_i32(&mut output, 0);
-    push_i32(&mut output, 1);
-    push_i32(&mut output, 2);
-    output.extend_from_slice(&[0; 24]);
-    push_i32(&mut output, 0);
-    push_i32(&mut output, 0);
-    push_i32(&mut output, 0);
+    if version >= (2018, 2) {
+        push_i32(&mut output, 0);
+    }
+
+    push_i32(&mut output, 1); // image count
+    push_i32(&mut output, 2); // dimension
+    output.extend_from_slice(&[0; 24]); // GL texture settings
+    push_i32(&mut output, 0); // lightmap format
+    push_i32(&mut output, 0); // colour space
+    if version >= (2020, 2) {
+        push_i32(&mut output, 0); // empty platform blob
+    }
     push_i32(&mut output, i32::try_from(data.len()).unwrap());
     output.extend_from_slice(data);
-    output.extend_from_slice(&0_i64.to_le_bytes());
+    // The stream offset widens to 64 bits in 2020.
+    if version.0 >= 2020 {
+        output.extend_from_slice(&0_i64.to_le_bytes());
+    } else {
+        output.extend_from_slice(&0_u32.to_le_bytes());
+    }
     output.extend_from_slice(&0_u32.to_le_bytes());
     push_string(&mut output, "");
     output
