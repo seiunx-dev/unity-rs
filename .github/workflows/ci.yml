@@ -64,7 +64,7 @@ jobs:
         uses: actions/checkout@v6
       - name: Install minimum Rust toolchain
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
           rustup override set 1.88.0
       - name: Build Rust workspace
         run: cargo build --workspace --locked
@@ -91,7 +91,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install Node.js 24
         uses: actions/setup-node@v6
         with:
@@ -139,7 +139,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install wheel-build Python
         id: build-python
         uses: actions/setup-python@v6
@@ -217,7 +217,7 @@ jobs:
           ref: 5829998bc4c3bdcddc66dd7e77fb4ec557d4321b
           path: managed-oracle-source
       - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install .NET 10 oracle SDK
         uses: actions/setup-dotnet@v5
         with:
@@ -251,7 +251,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Build release CLI
         run: cargo +1.88.0 build --release --locked -p assetstudio-cli
       - name: Upload native CLI
