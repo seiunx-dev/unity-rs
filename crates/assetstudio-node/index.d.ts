@@ -137,6 +137,48 @@ export declare class AssetStudio {
    * files land and stays inside whatever budget it set.
    */
   readLive2DPackages(maximumBytes?: number | undefined | null): Array<Live2DPackageFiles>
+  /**
+   * Writes the collection as ASCII FBX with its animations and returns the
+   * material textures it references.
+   *
+   * The FBX names each texture by file name, so the returned files have to
+   * be written beside it for those references to resolve. They come back
+   * rather than being written because this call has no directory of its own
+   * and where they land is the caller's decision.
+   */
+  readFbxWithTextures(maximumBytes?: number | undefined | null): TexturedFbx
+  /**
+   * Inspects an `AnimationClip`'s ACL blob without decompressing it.
+   *
+   * Core ships no ACL decoder, so this is what a caller needs to decide
+   * whether its own decoder can handle the blob before asking for it.
+   */
+  readAclTracks(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AclTracks
+}
+
+/**
+ * The header of one ACL compressed-track blob.
+ *
+ * Enough to decide whether a caller's decoder can handle it, without
+ * decompressing anything.
+ *
+ * The state flags stay separate booleans rather than the packed bits Core
+ * keeps them in: this is a JavaScript-facing shape, and a bitfield would only
+ * move the unpacking to the other side.
+ */
+export interface AclTracks {
+  declaredSize: number
+  storedHash: number
+  version: number
+  trackType: string
+  trackCount: number
+  samplesPerTrack: number
+  sampleRate: number
+  decompressedValueCount: bigint
+  hasMetadata: boolean
+  isWrapOptimized: boolean
+  hasDatabase: boolean
+  hasStrippedKeyframes: boolean
 }
 
 /**
@@ -352,4 +394,17 @@ export interface SceneNode {
   hasMeshRenderer: boolean
   hasSkinnedMeshRenderer: boolean
   hasAnimator: boolean
+}
+
+/** An FBX plus the texture files it references by name. */
+export interface TexturedFbx {
+  fbx: Buffer
+  /** Each must be written beside the FBX for its reference to resolve. */
+  textures: Array<Live2DFile>
+  /**
+   * Texture references this reader could not resolve or decode, with the
+   * reason. Reported rather than raised so one bad texture does not cost the
+   * model.
+   */
+  skipped: Array<string>
 }
