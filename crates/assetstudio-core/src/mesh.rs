@@ -2029,7 +2029,7 @@ fn reserve_vec<T>(capacity: usize, field: &str) -> Result<Vec<T>> {
     Ok(values)
 }
 
-struct ObjFloat(f32);
+pub(crate) struct ObjFloat(pub(crate) f32);
 
 impl fmt::Display for ObjFloat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2045,15 +2045,15 @@ impl fmt::Display for ObjFloat {
     }
 }
 
-struct BoundedWriter<'a, W> {
+pub(crate) struct BoundedWriter<'a, W> {
     inner: &'a mut W,
     maximum: u64,
-    written: u64,
-    limit_exceeded: bool,
+    pub(crate) written: u64,
+    pub(crate) limit_exceeded: bool,
 }
 
 impl<'a, W> BoundedWriter<'a, W> {
-    const fn new(inner: &'a mut W, maximum: u64) -> Self {
+    pub(crate) const fn new(inner: &'a mut W, maximum: u64) -> Self {
         Self {
             inner,
             maximum,
