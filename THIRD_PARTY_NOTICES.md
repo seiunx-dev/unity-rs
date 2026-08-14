@@ -27,6 +27,14 @@ resolved crate sources.
 
 ## Codec-specific provenance
 
+- **Vendored copy.** `crates/assetstudio-core/src/vendor/texture2ddecoder/`
+  carries that crate's ASTC and BC6H decoders, their helper modules, the MIT
+  licence text and the upstream copyright notice. Two expressions are changed
+  and marked `VENDOR FIX` in place; one unused `paste`-generated block is
+  dropped and marked `VENDOR DELTA`. Everything else is the published source,
+  so the copy diffs cleanly against it. The reason, the patch and the
+  conditions for deleting the copy are in `docs/upstream-defects.md`. Every
+  other format still comes from the crate itself.
 - `texture2ddecoder 0.1.2` is a pure-Rust, `no_std` decoder distributed under
   MIT OR Apache-2.0. Its upstream notice attributes ATC and BCn code to
   AssetStudio's MIT native decoder, ASTC/ETC/PVRTC code to MIT sources, FP16

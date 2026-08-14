@@ -2356,7 +2356,7 @@ fn decode_external_compressed_pixels(
 
     let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match format {
         TextureFormat::BC6H => {
-            texture2ddecoder::decode_bc6_unsigned(input, width, height, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_bc6_unsigned(input, width, height, &mut decoded)
         }
         TextureFormat::BC7 => texture2ddecoder::decode_bc7(input, width, height, &mut decoded),
         TextureFormat::PVRTC_RGB2 | TextureFormat::PVRTC_RGBA2 => {
@@ -2394,32 +2394,32 @@ fn decode_external_compressed_pixels(
         TextureFormat::ASTC_RGB_4X4
         | TextureFormat::ASTC_RGBA_4X4
         | TextureFormat::ASTC_HDR_4X4 => {
-            texture2ddecoder::decode_astc(input, width, height, 4, 4, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 4, 4, &mut decoded)
         }
         TextureFormat::ASTC_RGB_5X5
         | TextureFormat::ASTC_RGBA_5X5
         | TextureFormat::ASTC_HDR_5X5 => {
-            texture2ddecoder::decode_astc(input, width, height, 5, 5, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 5, 5, &mut decoded)
         }
         TextureFormat::ASTC_RGB_6X6
         | TextureFormat::ASTC_RGBA_6X6
         | TextureFormat::ASTC_HDR_6X6 => {
-            texture2ddecoder::decode_astc(input, width, height, 6, 6, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 6, 6, &mut decoded)
         }
         TextureFormat::ASTC_RGB_8X8
         | TextureFormat::ASTC_RGBA_8X8
         | TextureFormat::ASTC_HDR_8X8 => {
-            texture2ddecoder::decode_astc(input, width, height, 8, 8, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 8, 8, &mut decoded)
         }
         TextureFormat::ASTC_RGB_10X10
         | TextureFormat::ASTC_RGBA_10X10
         | TextureFormat::ASTC_HDR_10X10 => {
-            texture2ddecoder::decode_astc(input, width, height, 10, 10, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 10, 10, &mut decoded)
         }
         TextureFormat::ASTC_RGB_12X12
         | TextureFormat::ASTC_RGBA_12X12
         | TextureFormat::ASTC_HDR_12X12 => {
-            texture2ddecoder::decode_astc(input, width, height, 12, 12, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 12, 12, &mut decoded)
         }
         _ => Err("unsupported external texture decoder format"),
     }))
@@ -3891,29 +3891,17 @@ mod tests {
         }
     }
 
-    /// The same truncation, in the BC6H decoder.
+    /// BC6H decodes exactly as the managed decoder does.
     ///
-    /// Written up with a patch in `docs/upstream-defects.md`.
+    /// It did not until the decoder was vendored: `texture2ddecoder` 0.1.2
+    /// truncates where the reference `f32_to_u8` rounds, so every HDR channel
+    /// at or above a half came out a step low. This asserted that divergence
+    /// byte for byte; now it asserts there is none.
     ///
-    /// `texture2ddecoder` 0.1.2 has two ports of the reference `f32_to_u8`. The
-    /// ASTC one drops `roundf` for `floor`; this one drops it for a cast, which
-    /// truncates. Both come out a step low wherever the value lands at or above
-    /// a half, and BC6H is HDR-only, so every one of its pixels goes through it.
-    ///
-    /// The blob beside the payload is what the managed decoder produces:
-    /// restoring `roundf` in a local copy of the crate reproduces its hash
-    /// exactly, which is also what confirms the synthetic payload is a valid
-    /// block rather than something the two decoders merely disagree about.
-    ///
-    /// Fixing it here means vendoring the crate to change one call. It is
-    /// recorded instead, and this fails if the divergence ever grows past a
-    /// one-step truncation -- or disappears, which is the cue to compare BC6H
-    /// exactly.
+    /// The blob is the managed decoder's own output, re-checked against the
+    /// live managed decoder by the differential on every run.
     #[test]
-    fn bc6h_differs_from_the_managed_decoder_only_by_truncation() {
-        // Every byte of this fixture that differs, differs by exactly one.
-        const EXPECTED_DIFFERENCES: usize = 11;
-
+    fn bc6h_decodes_exactly_like_the_managed_decoder() {
         let directory =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bc6h");
         let payload = std::fs::read(directory.join("one-subset.bin")).unwrap();
@@ -3927,70 +3915,35 @@ mod tests {
             .decode_mip_rgba8(0, TextureReadLimits::default())
             .unwrap()
             .pixels;
-
-        assert_eq!(actual.len(), expected.len(), "BC6H surface size");
-        let differences: Vec<i32> = actual
-            .iter()
-            .zip(&expected)
-            .map(|(mine, managed)| i32::from(*managed) - i32::from(*mine))
-            .filter(|difference| *difference != 0)
-            .collect();
-        assert!(
-            differences.iter().all(|difference| *difference == 1),
-            "BC6H diverges by more than a one-step truncation: {:?}",
-            differences
-                .iter()
-                .filter(|difference| **difference != 1)
-                .take(8)
-                .collect::<Vec<_>>()
-        );
         assert_eq!(
-            differences.len(),
-            EXPECTED_DIFFERENCES,
-            "BC6H truncation count moved"
+            actual, expected,
+            "BC6H no longer matches the managed decoder"
         );
     }
 
-    /// Pins the one way HDR ASTC decoding differs from the managed decoder.
+    /// Every HDR ASTC footprint decodes exactly as the managed decoder does.
     ///
-    /// Written up with a patch in `docs/upstream-defects.md`.
-    ///
-    /// `texture2ddecoder` 0.1.2 ports the reference `select_color_hdr` with
-    /// `floor(f * 255)` where the C++ it came from has `roundf(f * 255)`. The
-    /// LDR path is unaffected and matches exactly -- all twelve LDR formats are
-    /// compared end to end in the managed differential -- but every HDR channel
-    /// that lands on a fractional value at or above one half comes out a step
-    /// low. It is a truncation bias, never an overshoot, and never more than
-    /// one.
-    ///
-    /// Correcting that single word in a local copy of the crate makes all six
-    /// HDR formats hash-identical to the managed decoder, which is where the
-    /// `-managed.rgba` blobs come from; the differential re-checks that claim
-    /// against the live managed decoder on every run rather than trusting it.
-    ///
-    /// Fixing it here for real means vendoring the crate's 1,800-line ASTC
-    /// decoder to change one word, so the divergence is recorded instead. This
-    /// test fails if it ever grows past a one-step truncation, and fails if it
-    /// disappears -- at which point the HDR formats belong in the exact set.
+    /// The two of these tests used to record a divergence rather than assert
+    /// agreement: `texture2ddecoder` 0.1.2 carries two ports of the reference
+    /// `f32_to_u8` and both dropped its rounding. Vendoring the two decoders
+    /// with that one expression restored made all seven formats exact.
     #[test]
-    fn hdr_astc_differs_from_the_managed_decoder_only_by_truncation() {
-        // (block size, format, bytes that differ out of the whole surface)
-        const CASES: &[(usize, TextureFormat, usize)] = &[
-            (4, TextureFormat::ASTC_HDR_4X4, 30),
-            (5, TextureFormat::ASTC_HDR_5X5, 33),
-            (6, TextureFormat::ASTC_HDR_6X6, 43),
-            (8, TextureFormat::ASTC_HDR_8X8, 150),
-            (10, TextureFormat::ASTC_HDR_10X10, 226),
-            (12, TextureFormat::ASTC_HDR_12X12, 176),
+    fn hdr_astc_decodes_exactly_like_the_managed_decoder() {
+        const CASES: &[(usize, TextureFormat)] = &[
+            (4, TextureFormat::ASTC_HDR_4X4),
+            (5, TextureFormat::ASTC_HDR_5X5),
+            (6, TextureFormat::ASTC_HDR_6X6),
+            (8, TextureFormat::ASTC_HDR_8X8),
+            (10, TextureFormat::ASTC_HDR_10X10),
+            (12, TextureFormat::ASTC_HDR_12X12),
         ];
 
         let directory =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
-        for (block, format, expected_differences) in CASES {
+        for (block, format) in CASES {
             let name = format!("astc-hdr-{block}x{block}");
             let payload = std::fs::read(directory.join(format!("{name}.bin"))).unwrap();
             let expected = std::fs::read(directory.join(format!("{name}-managed.rgba"))).unwrap();
-            // The fixtures are two blocks each way.
             let size = i32::try_from(block * 2).unwrap();
 
             let object = texture_object(size, size, *format, 1, &payload, None);
@@ -4002,27 +3955,9 @@ mod tests {
                 .decode_mip_rgba8(0, TextureReadLimits::default())
                 .unwrap()
                 .pixels;
-
-            assert_eq!(actual.len(), expected.len(), "{name} surface size");
-            let differences: Vec<i32> = actual
-                .iter()
-                .zip(&expected)
-                .map(|(mine, managed)| i32::from(*managed) - i32::from(*mine))
-                .filter(|difference| *difference != 0)
-                .collect();
-            assert!(
-                differences.iter().all(|difference| *difference == 1),
-                "{name} diverges by more than a one-step truncation: {:?}",
-                differences
-                    .iter()
-                    .filter(|difference| **difference != 1)
-                    .take(8)
-                    .collect::<Vec<_>>()
-            );
             assert_eq!(
-                differences.len(),
-                *expected_differences,
-                "{name} truncation count moved"
+                actual, expected,
+                "{name} no longer matches the managed decoder"
             );
         }
     }

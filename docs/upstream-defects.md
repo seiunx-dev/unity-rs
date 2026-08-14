@@ -1,12 +1,10 @@
 # Upstream defects
 
-Two dependencies produce output this project can show is wrong, and neither can
-be fixed from here without taking over the code. Both are recorded with the
-measurement that found them, a reproduction, and the change that fixes them, so
-that filing either one upstream is a copy rather than a re-investigation.
-
-The tests that pin these divergences name the file they would need to be
-deleted from if the fix lands upstream, so nothing here goes stale silently.
+Two dependencies produce output this project can show is wrong. Neither can be
+corrected from outside the dependency, so one is fixed by vendoring the code
+that carries it and the other is recorded and left alone. Both are written up
+with the measurement that found them, a reproduction, and the change that fixes
+them, so filing either upstream is a copy rather than a re-investigation.
 
 ---
 
@@ -87,20 +85,30 @@ survive the clamp, and avoids `f32::round`, which the crate cannot use in
 Decode any HDR payload with both this crate and the reference C++ decoder and
 compare. In this repository:
 
-* `cargo test -p assetstudio-core --lib bc6h_differs_from_the_managed_decoder_only_by_truncation`
-* `cargo test -p assetstudio-core --lib hdr_astc_differs_from_the_managed_decoder_only_by_truncation`
+* `cargo test -p assetstudio-core --lib bc6h_decodes_exactly_like_the_managed_decoder`
+* `cargo test -p assetstudio-core --lib hdr_astc_decodes_exactly_like_the_managed_decoder`
 
 Both compare against blobs of reference output committed beside the fixtures
-(`tests/fixtures/bc6h/`, `tests/fixtures/astc/`), and both assert that every
-difference is exactly one and in the same direction. Applying the diff above to
-a local copy of the crate makes the output hash-identical to the reference for
-all seven formats, which is also how the synthetic BC6H blocks were confirmed
-valid: two independent decoders agreeing on all 256 bytes once the conversion
-matches is not something a malformed block produces.
+(`tests/fixtures/bc6h/`, `tests/fixtures/astc/`). Before the fix they asserted
+that every difference was exactly one and in the same direction; they now assert
+there is none. Applying the diff above to an unmodified copy of the crate makes
+its output hash-identical to the reference for all seven formats, which is also
+how the synthetic BC6H blocks were confirmed valid: two independent decoders
+agreeing on all 256 bytes once the conversion matches is not something a
+malformed block produces.
 
 ### Status
 
 Present on `master` as of 2026-08-15; 0.1.2 is the latest release. Not filed.
+
+**Fixed here by vendoring.** `crates/assetstudio-core/src/vendor/texture2ddecoder/`
+carries the ASTC and BC6H decoders with the two expressions above corrected
+and nothing else changed, so the copy diffs cleanly against the published
+source. Every other format still comes from the crate. All eighteen ASTC
+formats and BC6H now compare exactly against the managed decoder, so the
+copy is held to the same standard as the rest of the texture path rather
+than trusted because it was copied. Drop the directory and restore the two
+call sites in `texture.rs` when upstream releases the fix.
 
 ---
 
@@ -152,13 +160,19 @@ libopus bindings, which would end this crate's pure-Rust property.
 
 ---
 
-## Why neither is fixed here
+## Why one is fixed here and the other is not
 
-Both fixes are one expression. Applying either one in this repository means
-vendoring the dependency — roughly 2,600 lines for the two texture decoders and
-their helpers — which moves permanent maintenance of third-party code into this
-project to correct, in the texture case, an error of at most 1/255 per channel.
+Both fixes are one expression, and neither can be applied from outside the
+dependency: the conversion is the decoder's last step, and nothing downstream
+can recover what it discarded.
 
-That trade is a dependency-posture decision rather than a technical one, so it
-is recorded here instead of taken. The tests hold the current behaviour in
-place and will fail if either divergence changes shape or disappears.
+The texture defect is fixed by vendoring the two decoders that carry it. That
+was worth roughly 3,000 lines because it makes seven texture formats byte-exact
+against the managed implementation, and because the managed differential proves
+the copy correct rather than the copy being taken on trust.
+
+The Opus defect is not, because the equivalent step would be vendoring or
+replacing an Opus decoder, and the alternatives are libopus bindings, which
+would end this crate's pure-Rust property for a codec whose CELT path is already
+correct. Its tests hold the current behaviour in place and will fail if the
+divergence changes shape or disappears.

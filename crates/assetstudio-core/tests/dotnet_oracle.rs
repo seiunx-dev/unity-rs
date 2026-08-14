@@ -709,10 +709,9 @@ fn assert_bc6h_textures(executable: &Path) {
         "BC6H did not decode a full surface: {managed}"
     );
 
-    // BC6H does not match, for the same reason HDR ASTC does not: the decoder
-    // this crate uses truncates where the managed one rounds. The shape of that
-    // difference is checked byte for byte in `texture.rs` against the blob this
-    // re-earns here, rather than being remembered from a hash recorded once.
+    // The committed blob is what `texture.rs` compares against byte for byte,
+    // so this re-earns the right to call it managed output rather than trusting
+    // a hash recorded once.
     let blob = fs::read(directory.join("one-subset-managed.rgba"))
         .expect("the committed managed BC6H output is readable");
     assert_eq!(
@@ -720,13 +719,7 @@ fn assert_bc6h_textures(executable: &Path) {
         format!("{:016x}", fnv1a64(&blob)),
         "the committed BC6H blob is no longer what the managed decoder produces"
     );
-    let rust_decoded = &rust["Files"][0]["Objects"][0]["Payload"]["Decoded"];
-    assert_ne!(
-        managed_decoded, rust_decoded,
-        "BC6H now matches the managed decoder; the truncation was fixed upstream, \
-         so compare it exactly and drop \
-         bc6h_differs_from_the_managed_decoder_only_by_truncation"
-    );
+    assert_eq!(managed, rust, "BC6H decoding");
 }
 
 /// Compares ASTC decoding against the managed decoder on real encoder output.
@@ -784,13 +777,10 @@ fn assert_astc_textures(executable: &Path) {
             );
 
             if variant == "hdr" {
-                // HDR is the one case that does not match: the decoder this
-                // crate uses truncates where the managed one rounds. That is
-                // characterised byte for byte in `texture.rs`, against blobs of
-                // managed output committed beside the fixtures; what this does
-                // is re-earn the right to call those blobs managed output, by
-                // checking them against the live managed decoder rather than
-                // trusting a hash recorded once.
+                // The committed blob is what `texture.rs` compares against, so
+                // this re-earns the right to call it managed output rather than
+                // trusting a hash recorded once. The comparison below is exact
+                // for HDR as it is for LDR.
                 let blob = fs::read(directory.join(format!("{name}-managed.rgba")))
                     .unwrap_or_else(|error| panic!("cannot read {name}-managed.rgba: {error}"));
                 assert_eq!(
@@ -798,14 +788,6 @@ fn assert_astc_textures(executable: &Path) {
                     format!("{:016x}", fnv1a64(&blob)),
                     "the committed {name} blob is no longer what the managed decoder produces"
                 );
-                assert_ne!(
-                    managed_decoded, rust_decoded,
-                    "{name} now matches the managed decoder; the truncation was fixed \
-                     upstream, so move the HDR formats into the exact set above and \
-                     drop hdr_astc_differs_from_the_managed_decoder_only_by_truncation"
-                );
-                compared += 1;
-                continue;
             }
 
             if managed_decoded != rust_decoded {
