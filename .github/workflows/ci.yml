@@ -1,0 +1,262 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MATURIN_VERSION: "1.13.3"
+
+jobs:
+  quality:
+    name: Format and lint (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install minimum Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup override set 1.88.0
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build warning-free Rust API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+      - name: Verify publishable Rust core crate
+        run: cargo package --locked -p assetstudio-core
+      - name: Upload Rust core crate
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assetstudio-core-crate
+          path: target/package/assetstudio-core-*.crate
+          if-no-files-found: error
+
+  test:
+    name: Test on ${{ matrix.os }} (Rust 1.88)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install minimum Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup override set 1.88.0
+      - name: Build Rust workspace
+        run: cargo build --workspace --locked
+      - name: Run workspace tests
+        # The PyO3 cdylib is exercised by the installed-wheel job below. On
+        # macOS, forcing a cdylib test harness with --all-targets bypasses the
+        # extension module loader and cannot resolve Python's framework rpath.
+        run: cargo test --workspace --locked
+
+  node:
+    name: Node-API binding (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    defaults:
+      run:
+        working-directory: crates/assetstudio-node
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: crates/assetstudio-node/package-lock.json
+      - name: Install locked Node build tooling
+        run: npm ci
+      - name: Build the native Node-API addon and TypeScript declarations
+        run: npm run build:debug
+      - name: Run installed-addon API tests
+        run: npm test
+      - name: Verify package contents
+        run: npm pack --dry-run
+
+  python:
+    name: Python abi3 wheel (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x64
+            build_python: "3.9"
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+            build_python: "3.9"
+          - os: windows-latest
+            artifact: windows-x64
+            build_python: "3.9"
+          - os: windows-11-arm
+            artifact: windows-arm64
+            build_python: "3.14"
+          - os: macos-15-intel
+            artifact: macos-x64
+            build_python: "3.9"
+          - os: macos-latest
+            artifact: macos-arm64
+            build_python: "3.9"
+    defaults:
+      run:
+        working-directory: crates/assetstudio-python
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install wheel-build Python
+        id: build-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.build_python }}
+      - name: Install wheel builder
+        run: python -m pip install "maturin==${{ env.MATURIN_VERSION }}"
+      - name: Build release wheel from the locked workspace
+        run: maturin build --release --locked --compatibility pypi --interpreter "${{ steps.build-python.outputs.python-path }}" --out dist
+      - name: Build and compile-check the Python source distribution
+        if: matrix.artifact == 'linux-x64'
+        # Maturin prunes the workspace inside an sdist to Core + Python. Cargo
+        # must therefore remove the CLI/Node-only entries copied from the root
+        # lock file before it can compile that pruned workspace. The release
+        # wheel above remains the dependency-locked artifact we publish.
+        run: maturin build --release --sdist --compatibility pypi --interpreter "${{ steps.build-python.outputs.python-path }}" --out sdist-dist
+      - name: Verify Python source distribution contents
+        if: matrix.artifact == 'linux-x64'
+        run: python tests/sdist_contents.py sdist-dist
+      - name: Install the wheel rebuilt from the source distribution
+        if: matrix.artifact == 'linux-x64'
+        run: python -c "import glob, subprocess, sys; wheels = glob.glob('sdist-dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
+      - name: Test the wheel rebuilt from the source distribution
+        if: matrix.artifact == 'linux-x64'
+        run: |
+          python -I tests/installed_wheel.py
+          python -I tests/python_api.py
+      - name: Install wheel into the build interpreter
+        run: python -c "import glob, subprocess, sys; wheels = glob.glob('dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
+      - name: Test installed wheel on the build interpreter
+        run: |
+          python -I tests/installed_wheel.py
+          python -I tests/python_api.py
+      - name: Install Python 3.14 for abi3 forward-compatibility
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install the same abi3 wheel into Python 3.14
+        run: python -c "import glob, subprocess, sys; wheels = glob.glob('dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
+      - name: Test installed wheel on Python 3.14
+        run: |
+          python -I tests/installed_wheel.py
+          python -I tests/python_api.py
+      - name: Upload Python wheel
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assetstudio-python-${{ matrix.artifact }}
+          path: crates/assetstudio-python/dist/*.whl
+          if-no-files-found: error
+      - name: Upload Python source distribution
+        if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && matrix.artifact == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assetstudio-python-sdist
+          path: crates/assetstudio-python/sdist-dist/*.tar.gz
+          if-no-files-found: error
+
+  managed-oracle:
+    name: Managed-to-Rust differential oracle
+    runs-on: ubuntu-latest
+    env:
+      ASSETSTUDIO_REPO: ${{ github.workspace }}/managed-oracle-source
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      # The managed reader is the compatibility oracle only; nothing shipped
+      # from this repository depends on it. It is pinned to the revision the
+      # differential was last validated against, so a change over there shows
+      # up as a deliberate bump here rather than as a surprise failure.
+      - name: Check out the managed AssetStudio oracle
+        uses: actions/checkout@v6
+        with:
+          repository: Team-Haruki/AssetStudio
+          ref: 5829998bc4c3bdcddc66dd7e77fb4ec557d4321b
+          path: managed-oracle-source
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install .NET 10 oracle SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+      - name: Restore managed oracle offline-ready graph
+        run: dotnet restore oracle/AssetStudioOracle.csproj --ignore-failed-sources -p:NuGetAudit=false -p:AssetStudioRepo="$ASSETSTUDIO_REPO"
+      - name: Compare managed and Rust manifests
+        run: cargo +1.88.0 test -p assetstudio-core --test dotnet_oracle --locked -- --ignored --nocapture
+
+  package-cli:
+    name: Native CLI artifact on ${{ matrix.os }}
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs:
+      - quality
+      - test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x64
+            binary: target/release/assetstudio
+          - os: windows-latest
+            artifact: windows-x64
+            binary: target/release/assetstudio.exe
+          - os: macos-latest
+            artifact: macos
+            binary: target/release/assetstudio
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Build release CLI
+        run: cargo +1.88.0 build --release --locked -p assetstudio-cli
+      - name: Upload native CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: assetstudio-cli-${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error

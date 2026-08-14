@@ -9,9 +9,26 @@
     <RestoreIgnoreFailedSources>true</RestoreIgnoreFailedSources>
   </PropertyGroup>
 
+  <!--
+    The managed reader lives in a separate repository, Team-Haruki/AssetStudio.
+    It is the compatibility oracle only; nothing shipped from this repository
+    depends on it. Point AssetStudioRepo at a checkout, or leave it unset and
+    keep that repository as a sibling directory of this one.
+  -->
+  <PropertyGroup>
+    <AssetStudioRepo Condition="'$(AssetStudioRepo)' == ''">$(MSBuildThisFileDirectory)../../AssetStudio</AssetStudioRepo>
+    <AssetStudioProject>$(AssetStudioRepo)/AssetStudio/AssetStudio.csproj</AssetStudioProject>
+  </PropertyGroup>
+
+  <Target Name="RequireAssetStudioCheckout" BeforeTargets="PrepareForBuild;CollectPackageReferences">
+    <Error
+      Condition="!Exists('$(AssetStudioProject)')"
+      Text="The managed oracle needs a Team-Haruki/AssetStudio checkout. Looked for '$(AssetStudioProject)'. Clone it beside this repository, or pass -p:AssetStudioRepo=&lt;path&gt;." />
+  </Target>
+
   <ItemGroup>
     <ProjectReference
-      Include="../../AssetStudio/AssetStudio.csproj"
+      Include="$(AssetStudioProject)"
       SetTargetFramework="TargetFramework=net10.0" />
   </ItemGroup>
 

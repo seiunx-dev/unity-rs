@@ -1,16 +1,22 @@
-# AssetStudio native Rust rewrite
+# unity-rs
 
-This workspace is the native Rust replacement for AssetStudio's .NET parsing
-and export stack. Its primary public surfaces are the `assetstudio-core` Rust
-crate, the `assetstudio-rs` Python package, the native CLI, and the optional
-`assetstudio-rs-node` Node-API package. The older C ABI source is retained only
-as historical compatibility code outside this workspace; it is not built,
-tested, or released as part of the rewrite.
+Native Rust replacement for AssetStudio's .NET Unity asset parsing and export
+stack. The public surfaces are the `assetstudio-core` Rust crate, the
+`assetstudio-rs` Python package, the native `assetstudio` CLI, and the optional
+`assetstudio-rs-node` Node-API package. The archived C ABI source under
+`crates/assetstudio-ffi` is excluded from the Cargo workspace; it is not built,
+tested, or released.
 
-The C# implementation remains the compatibility oracle until differential tests
-show that the Rust engine matches it. Keeping both implementations during the
-migration lets useful, verified slices land without replacing working export
-paths prematurely.
+Nothing here depends on .NET at runtime. The managed implementation, in the
+separate [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)
+repository, is kept as a compatibility oracle: the differential gate builds it
+and compares complete manifests, so a Rust reader is only called compatible
+once it matches. Point `ASSETSTUDIO_REPO` at a checkout of that repository, or
+keep it as a sibling directory of this one.
+
+```shell
+cargo test -p assetstudio-core --test dotnet_oracle -- --ignored
+```
 
 The migration target is the parsing/export core, reusable Rust API, Python
 package, native CLI, and an optional direct Node.js binding. The WinForms GUI
@@ -69,7 +75,6 @@ criteria, and prioritized gap list live in
 ## Build and test
 
 ```shell
-cd rust
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 # Optional private real-game corpus; see corpus/README.md.
@@ -258,7 +263,7 @@ again on CPython 3.14. Tagged and manually dispatched builds also publish the
 verified source distribution, native CLI binaries, and the Rust Core crate as
 workflow artifacts.
 
-The managed-oracle CI job builds the checked-in C# parser and compares it with
+The managed-oracle CI job checks out the pinned managed parser and compares it with
 Rust over v13 big-endian/32-bit-PathID and v22
 little-endian/64-bit-PathID fixtures. The manifest locks object order, signed
 and non-monotonic PathIDs, class IDs, names, byte sizes, raw object hashes,

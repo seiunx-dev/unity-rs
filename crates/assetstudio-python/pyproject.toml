@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/aelurum/AssetStudio"
+Repository = "https://github.com/Team-Haruki/unity-rs"
 
 [tool.maturin]
 features = ["extension-module"]

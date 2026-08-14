@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/aelurum/AssetStudio"
+repository = "https://github.com/Team-Haruki/unity-rs"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
