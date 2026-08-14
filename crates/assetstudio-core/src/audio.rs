@@ -4977,6 +4977,103 @@ mod tests {
         fsb5(1, 11, 0, &[(1152, 1, 44_100, None)], &data)
     }
 
+    /// The Opus differential's non-silent payload.
+    ///
+    /// Already in FSB5's own framing -- each packet preceded by its
+    /// little-endian length -- because that is exactly what the container
+    /// stores. See `tests/fixtures/audio/README.md` for how it was produced.
+    const OPUS_TONE: &[u8] = include_bytes!("../tests/fixtures/audio/opus-tone-packets.bin");
+    /// Six packets at 960 samples each, less the encoder delay FSB5 hides.
+    const OPUS_TONE_FRAMES: u64 = 6 * 960 - 312;
+
+    /// Records how far this crate's Opus output sits from libopus on real
+    /// audio.
+    ///
+    /// This is not a rounding tolerance and should not be read as one. Opus
+    /// conformance is defined by a similarity metric rather than bit equality,
+    /// so some divergence is expected, but the numbers here are larger than
+    /// that explains and have not been root-caused:
+    ///
+    /// * `ffmpeg` and `vgmstream`, both libopus-based, agree with each other to
+    ///   within one unit on this fixture.
+    /// * This crate's output sits about two samples earlier and, once aligned,
+    ///   differs by up to 135 in the first frame and 20 to 46 afterwards,
+    ///   against a peak near 4140.
+    ///
+    /// The bound below is the measured behaviour, pinned so a regression past
+    /// it fails. Closing the gap means finding why the first frame differs
+    /// most, which points at decoder state or pre-skip handling rather than
+    /// the codec proper.
+    ///
+    /// The silent fixtures alongside this one hid all of it: two decoders agree
+    /// on zeroes no matter what they do with the bits.
+    #[test]
+    #[ignore = "requires the optional vgmstream-cli decoder oracle"]
+    fn fsb5_opus_tone_divergence_from_libopus_is_bounded() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const ALIGNMENT: usize = 2;
+        const WORST_DELTA: i32 = 135;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fsb_bytes = fsb5_opus_tone();
+        let region = Region::from_bytes(fsb_bytes.clone());
+        let kind = detect_direct_wav(&region, Some(16)).unwrap().unwrap();
+        let mut actual = Vec::new();
+        write_direct_wav(&region, kind, 1024 * 1024, &mut actual).unwrap();
+
+        let input = std::env::temp_dir().join(format!(
+            "assetstudio-fsb5-opus-tone-{}-{unique}.fsb",
+            std::process::id()
+        ));
+        let output = input.with_extension("wav");
+        std::fs::write(&input, fsb_bytes).unwrap();
+        let status = Command::new("vgmstream-cli")
+            .arg("-o")
+            .arg(&output)
+            .arg(&input)
+            .status()
+            .expect("vgmstream-cli must be installed to run this ignored oracle test");
+        assert!(status.success());
+        let expected = std::fs::read(&output).unwrap();
+
+        let rust = wave_data(&actual);
+        let oracle = wave_data(&expected);
+        assert_eq!(rust.len(), oracle.len(), "sample count");
+        let rust: Vec<i32> = rust
+            .chunks_exact(2)
+            .map(|pair| i32::from(i16::from_le_bytes(pair.try_into().unwrap())))
+            .collect();
+        let oracle: Vec<i32> = oracle
+            .chunks_exact(2)
+            .map(|pair| i32::from(i16::from_le_bytes(pair.try_into().unwrap())))
+            .collect();
+        // The oracle is not silent, or none of the above would mean anything.
+        assert!(oracle.iter().any(|value| value.abs() > 1000));
+
+        let mut worst = 0_i32;
+        for index in ALIGNMENT..oracle.len() {
+            worst = worst.max((rust[index - ALIGNMENT] - oracle[index]).abs());
+        }
+        assert!(
+            worst <= WORST_DELTA,
+            "Opus divergence grew to {worst}, past the recorded {WORST_DELTA}"
+        );
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_file(output).unwrap();
+    }
+
+    fn fsb5_opus_tone() -> Vec<u8> {
+        let mut data = OPUS_TONE.to_vec();
+        // The zero length that ends the packet run.
+        data.extend_from_slice(&0_u16.to_le_bytes());
+        fsb5(1, 17, 0, &[(OPUS_TONE_FRAMES, 1, 48_000, None)], &data)
+    }
+
     fn fsb5_opus(channels: u16, packet_count: usize) -> Vec<u8> {
         const MONO: [[u8; 64]; 2] = [
             [
