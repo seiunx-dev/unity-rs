@@ -17,7 +17,7 @@ use assetstudio_core::live2d_package::{
 use assetstudio_core::live2d_physics::{CubismPhysicsReadLimits, project_cubism_physics};
 use assetstudio_core::live2d_schema::{CubismExpressionReadLimits, project_cubism_expression};
 use assetstudio_core::material::{MaterialReadLimits, read_material};
-use assetstudio_core::mesh::{MeshReadLimits, read_mesh_with_collection};
+use assetstudio_core::mesh::{MeshReadLimits, read_mesh_with_collection, write_mesh_obj};
 use assetstudio_core::project_settings::{
     ProjectSettingsReadLimits, read_build_settings, read_player_settings,
 };
@@ -606,7 +606,25 @@ fn mesh_manifest(
         .sub_meshes
         .iter()
         .flat_map(|sub_mesh| sub_mesh.indices.iter().copied());
+    // The rows below compare what the writer is given. This compares what it
+    // produces: the negated axis, the reversed winding, the one-based indices
+    // and the invariant number format are all in the document and none of them
+    // are in the geometry.
+    let mut obj = Vec::new();
+    if !mesh.vertices.is_empty() {
+        // The managed writer returns before writing anything when a mesh has no
+        // vertices, so an empty document is what the comparison expects there.
+        // Real files carry such meshes, and this gate also runs over real
+        // files.
+        //
+        // The budget is the object ceiling scaled up because the text form is
+        // far larger than the binary object it comes from -- three coordinates
+        // of twelve bytes become up to a hundred and forty characters -- and
+        // the managed writer this is compared against has no limit at all.
+        write_mesh_obj(&mesh, &mut obj, maximum_bytes.saturating_mul(64))?;
+    }
     Ok(json!({
+        "Obj": bytes_manifest(&obj),
         "Name": mesh.name,
         "VertexCount": mesh.vertices.len(),
         "Vertices": f32_values_manifest(mesh.vertices.iter().flatten().copied())?,
