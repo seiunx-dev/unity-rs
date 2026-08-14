@@ -100,6 +100,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - **已补齐**：serialized format v13-v22 全部版本门；UnityFS v6 内联 blocks-info、UnityFS v6 尾部 blocks-info、UnityFS v7 强制 16 字节对齐、LZ4/LZ4HC/Zstd 压缩块与压缩 blocks-info（含同时压缩 + 尾部布局）、legacy UnityRaw v6、gzip 流。容器差分首轮即发现两处命名分歧（bundle 条目标签、gzip/brotli 把可移植名变成字面量 `"gzip"`，后者会让压缩序列化文件永远无法被外部引用按名匹配），均已修复。
    - **仍缺**：v5-v12（需要真实 TypeTree，tree-less fixture 做不到）；LZMA 块（`lzma-rust2` 无 bulk encoder，补它要为 fixture 单独引入编码依赖）；UnityWebData、ZIP、split 组；压缩纹理、Crunch、Switch、tight-mesh sprite；Cubism 模型；AnimationClip 关键帧值；Shader 只覆盖了 5.2 直连脚本，5.3-5.4 与 5.5+ 序列化程序未对照（`oracle/Program.cs` 目前遇到 subprogram blob 会直接抛错，要先解除这个 guard）。
    - oracle harness 接受任意输入路径，上述补强全部不需要专有样本。
+   - **第二 oracle 已就位**：`crates/assetstudio-python/tests/unitypy_oracle.py` 用 UnityPy（独立实现，不需要 .NET）对照对象顺序、PathID、classID、字节大小、名称和原始载荷哈希，14 个 fixture 首轮全对。刻意不比较解码后的像素与网格——UnityPy 走的是本项目已链接的同一个 `texture2ddecoder`，网格/shader 又是 AssetStudio 的转写，比了不构成独立证据。UnityPy 解析不出名字时（它的名称查找依赖自带的 TypeTree 数据库，不覆盖所有 class/版本）记为跳过并报数，而不是当成"双方都认为是空串"。
 
 2. **真实游戏语料覆盖不足**
    - 当前合成 fixture 和差分 oracle 已覆盖大量版本门与格式分支，但不能替代跨游戏、跨平台、跨 Unity 版本的真实 corpus。
