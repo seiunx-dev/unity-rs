@@ -78,7 +78,7 @@
 - `cargo fmt --all -- --check`；
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`；
 - `cargo test --workspace --all-targets --locked --no-fail-fast`；
-- Core 478 项普通测试通过，9 项依赖可选 vgmstream oracle 的测试在本机额外执行并全部通过（其中 1 项钉住的是已记录的 Opus 偏离，不是一致性）；
+- Core 478 项普通测试通过，10 项依赖可选 vgmstream oracle 的测试在本机额外执行并全部通过（其中 1 项钉住的是已记录的上游 Opus 偏离，不是一致性）；
 - C#→Rust 托管差分 oracle 通过；
 - TypeTree dump 浮点文本对照 .NET 10 实测生成的 849 个取值（边界值 + 位模式扫描）逐字节一致，期望值以 fixture 形式入库；
 - `cargo doc --workspace --no-deps` 在 `-D warnings` 下通过；
@@ -145,7 +145,17 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - multistream MPEG/Opus 和少数平台音频 codec 仍保留原始数据；
    - 8 个音频差分此前虽然写好却从未跑过（全部 `#[ignore]`，CI 也没有对应 job），现已加 `audio-oracle` job：按固定 release 拉 `vgmstream-cli` 再跑 `--ignored`，8 条首次执行即全部通过；
    - **MPEG/Opus 的全零 fixture 已换成真实音频（2026-08-15）**：此前两边比的都是静音，解码器无论怎么处理比特两边都会一致地得到零，等于只验证了分帧。现在各自嵌入一段真实编码的正弦——MPEG 是 6 帧 MP3，Opus 是 libopus 编的 6 个包（FSB5 的 MPEG 帧按 4 字节对齐、Opus 包带 u16 长度前缀并以零长度收尾，这两条框架细节也因此第一次被真实数据验证）。MPEG 换成有内容之后仍然对得上，容差 1（实测得来，不是猜的）。
-   - **Opus 解码存在未定位的实现偏离（2026-08-15，换成有内容 fixture 后暴露）**：`ffmpeg` 与 `vgmstream` 两个独立的 libopus 实现在这段样本上彼此差 1 以内，本项目的输出比它们早约 2 个采样，对齐之后首帧最大差 135、之后每帧 20 到 46，而峰值约 4140。Opus 的一致性本来就是按相似度而非逐位定义的，但首帧差得最多、之后收敛这个形态更像解码器状态或 pre-skip 处理的问题，不是编解码本身的容许误差。目前在 `fsb5_opus_tone_divergence_from_libopus_is_bounded` 里把实测值钉住（**这不是容差，是记录**），超过就失败；根因未定位，属于已知缺陷。全零 fixture 把这一切都盖住了；
+   - **Opus 偏离已定位到上游 `ruopus` 0.1.2 的 SILK 路径（2026-08-15）**：换成有内容 fixture 后先暴露出偏离，再把它从本项目的 FSB5 代码里摘出来复现——直接把同一批包喂给解码器、按流自己声明的 pre-skip 裁掉前导，不经过本项目任何一行代码，偏离照旧；而 `ffmpeg` 与 `vgmstream` 两个 libopus 实现彼此差 1 以内。分模式实测（峰值都在 4200 附近）：
+
+     | 包模式 | 偏移 | 最大差 |
+     |---|---|---|
+     | CELT-only | 0 | 1 |
+     | SILK/hybrid | -2 | 103 |
+     | SILK 宽带 | -2 | 135 |
+     | SILK 窄带 | -4 | 115 |
+
+     CELT 路径是准确的，偏差只出在 SILK；偏移量还随 SILK 的内部采样率变化（窄带 8 kHz 偏 4 个、宽带 16 kHz 偏 2 个，折算下来是同一个固定的内部采样分数），这正是重采样器延迟补偿差一点点的形态。因此现在拆成两个差分：`fsb5_opus_celt_tone_matches_vgmstream` 要求 CELT 对齐精确、幅度差不超过 1（实测值）；`fsb5_opus_silk_tone_divergence_from_libopus_is_bounded` 把 SILK fixture 的实测值 276 钉住（**这不是容差，是对已知缺陷的记录**），超过就失败。要真正修好需要上游改动或换解码器，而换解码器目前只有 libopus FFI 一条路，跟纯 Rust 的取向冲突，先记录不动。全零 fixture 把这一切都盖住了；
+   - **音频 fixture 的生成过程已补上（2026-08-15）**：`tools/generate_audio_fixtures.py` 用记录在案的 ffmpeg/lame 命令重新生成三个编码 fixture，两次运行字节一致，连此前只写了文字描述的 MP3 也逐字节复现出来——原来的 Opus fixture 只有“从一次 ffmpeg 编码里提取”这句话，没有命令，等于是不可复现的二进制块，而这正是我一直在别处挑的毛病；
    - 新增 codec 必须先有真实样本和独立 oracle，不能只凭推测实现。
 
 3. **MonoBehaviour schema 来源**
@@ -177,7 +187,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 1. 把托管差分 oracle 从裸 `.assets` 扩到容器、版本门和已实现的资产解码路径（P0 第 1 项，全部不需要专有样本，且能防止同类缺陷再生）；
 2. 扩充真实 corpus 和 C#→Rust 差分快照，按实际命中率排序缺口；
-3. 定位 Opus 解码相对 libopus 的偏离（P0 第 2 项，全零 fixture 换掉之后暴露出来的已知缺陷）；
+3. 视上游进展处理 `ruopus` SILK 偏离（已定位，非本项目代码，CELT 路径已有精确差分把守）；
 4. 扩展可选 binary FBX 输出（贴图输出已完成）；
 5. 把 MOC3 标识表接入 Live2D 参数组，并补散件发现回退；
 6. 获取样本并实现 Unity 6000.2 MeshLOD/虚拟几何，而不是猜测布局；
