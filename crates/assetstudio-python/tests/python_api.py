@@ -3002,7 +3002,14 @@ def main() -> None:
         # has no decimal point. This read 60.0 until the managed differential
         # established the format.
         assert b'"Fps": 60' in physics.json
-        assert b'"Destination": { "Target": "Parameter", "Id": "ParamHair" }' in physics.json
+        # Newtonsoft's `Formatting.Indented` expands every object, and the
+        # managed extractor writes this document through it, so a destination
+        # spans four lines rather than one. This read the compact form until
+        # the differential started comparing these documents byte for byte.
+        assert (
+            b'"Destination": {\n            "Target": "Parameter",\n'
+            b'            "Id": "ParamHair"\n          }'
+        ) in physics.json
 
         motion_path = Path(directory) / "motion.assets"
         motion_path.write_bytes(synthetic_cubism_fade_motion())

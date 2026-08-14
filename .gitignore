@@ -3,6 +3,7 @@
 
 # Python extension module and locally built distributions
 crates/assetstudio-python/python/assetstudio/_native.*
+crates/assetstudio-python/.ci-venv/
 crates/assetstudio-python/dist/
 crates/assetstudio-python/sdist-dist/
 __pycache__/
