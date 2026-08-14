@@ -3,6 +3,7 @@ use std::io::{self, Write};
 
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::loader::AssetCollection;
+use crate::packed_bits::{PackedFloatVector, PackedIntVector};
 use crate::serialized::{ObjectInfo, SerializedFile};
 use crate::source::{Region, RegionCursor};
 use crate::{Error, Result};
@@ -160,6 +161,195 @@ pub fn read_mesh_with_collection(
     limits: MeshReadLimits,
 ) -> Result<Mesh> {
     read_mesh_inner(Some(collection), file, object_index, limits)
+}
+
+/// The packed geometry Unity writes when a mesh is compressed.
+///
+/// Each vector is a quantized bit stream; nothing is reconstructed until
+/// [`CompressedMesh::decode`] runs, so the budgets that bound the packed bytes
+/// are charged while reading and the unpacked sizes are checked separately.
+#[derive(Debug, Clone, Default)]
+struct CompressedMesh {
+    vertices: PackedFloatVector,
+    uv: PackedFloatVector,
+    normals: PackedFloatVector,
+    tangents: PackedFloatVector,
+    weights: PackedIntVector,
+    normal_signs: PackedIntVector,
+    tangent_signs: PackedIntVector,
+    float_colors: PackedFloatVector,
+    bone_indices: PackedIntVector,
+    triangles: PackedIntVector,
+    uv_info: u32,
+}
+
+impl CompressedMesh {
+    fn has_items(&self) -> bool {
+        !self.vertices.is_empty()
+            || !self.uv.is_empty()
+            || !self.normals.is_empty()
+            || !self.tangents.is_empty()
+            || !self.weights.is_empty()
+            || !self.normal_signs.is_empty()
+            || !self.tangent_signs.is_empty()
+            || !self.float_colors.is_empty()
+            || !self.bone_indices.is_empty()
+            || !self.triangles.is_empty()
+    }
+
+    /// Reconstructs the attributes the `Mesh` type carries.
+    ///
+    /// Tangents and colours are decoded by the managed reader too, but this
+    /// type has nowhere to put them, so their vectors are left packed rather
+    /// than decoded and dropped.
+    fn decode(&self, limits: MeshReadLimits) -> Result<DecodedVertexData> {
+        let flat = self.vertices.unpack(3, 0, None)?;
+        let vertex_count = flat.len() / 3;
+        if vertex_count == 0 {
+            return Err(Error::invalid_data("compressed Mesh has no vertices"));
+        }
+        if vertex_count > limits.maximum_vertices {
+            return Err(Error::invalid_data(format!(
+                "compressed Mesh has {vertex_count} vertices, exceeding limit {}",
+                limits.maximum_vertices
+            )));
+        }
+        let mut vertices = reserve_vec(vertex_count, "compressed Mesh vertices")?;
+        for chunk in flat.chunks_exact(3) {
+            vertices.push([chunk[0], chunk[1], chunk[2]]);
+        }
+
+        Ok(DecodedVertexData {
+            vertices,
+            normals: self.decode_normals()?,
+            uv0: self.decode_uv0(vertex_count)?,
+            skin: self.decode_skin(vertex_count)?,
+        })
+    }
+
+    /// Rebuilds normals from their octahedral pair plus a sign bit.
+    fn decode_normals(&self) -> Result<Option<Vec<[f32; 3]>>> {
+        if self.normals.is_empty() {
+            return Ok(None);
+        }
+        let pairs = self.normals.unpack(2, 0, None)?;
+        let signs = self.normal_signs.unpack()?;
+        let count = pairs.len() / 2;
+        if signs.len() < count {
+            return Err(Error::invalid_data(
+                "compressed Mesh has fewer normal signs than normals",
+            ));
+        }
+        let mut normals = reserve_vec(count, "compressed Mesh normals")?;
+        for (index, pair) in pairs.chunks_exact(2).enumerate() {
+            let mut normal = restore_octahedral(pair[0], pair[1]);
+            if signs[index] == 0 {
+                normal[2] = -normal[2];
+            }
+            normals.push(normal);
+        }
+        Ok(Some(normals))
+    }
+
+    /// Rebuilds UV0, honouring the packed channel descriptor when present.
+    fn decode_uv0(&self, vertex_count: usize) -> Result<Option<Vec<[f32; 2]>>> {
+        const BITS_PER_CHANNEL: u32 = 4;
+        const DIMENSION_MASK: u32 = 3;
+        const CHANNEL_EXISTS: u32 = 4;
+
+        if self.uv.is_empty() {
+            return Ok(None);
+        }
+        let dimension = if self.uv_info == 0 {
+            2
+        } else {
+            let descriptor = self.uv_info & ((1 << BITS_PER_CHANNEL) - 1);
+            if descriptor & CHANNEL_EXISTS == 0 {
+                return Ok(None);
+            }
+            usize::try_from(1 + (descriptor & DIMENSION_MASK))
+                .map_err(|_| Error::invalid_data("compressed Mesh UV dimension is out of range"))?
+        };
+        let values = self.uv.unpack(dimension, 0, Some(vertex_count))?;
+        let mut uv0 = reserve_vec(vertex_count, "compressed Mesh UV0")?;
+        for chunk in values.chunks_exact(dimension) {
+            uv0.push([chunk[0], chunk.get(1).copied().unwrap_or(0.0)]);
+        }
+        Ok(Some(uv0))
+    }
+
+    /// Rebuilds four-influence skin weights from the 31-quantized run.
+    ///
+    /// A vertex ends either when its weights reach the full 31 or after three
+    /// influences, in which case the fourth takes the remainder.
+    fn decode_skin(&self, vertex_count: usize) -> Result<Option<Vec<MeshBoneWeight>>> {
+        if self.weights.is_empty() {
+            return Ok(None);
+        }
+        let weights = self.weights.unpack()?;
+        let bones = self.bone_indices.unpack()?;
+        let mut skin: Vec<MeshBoneWeight> = reserve_vec(vertex_count, "compressed Mesh skin")?;
+        let mut current = MeshBoneWeight::default();
+        let mut influence = 0_usize;
+        let mut total = 0_u32;
+        let mut bone_cursor = 0_usize;
+        let take_bone = |cursor: &mut usize| -> Result<u32> {
+            let value = bones
+                .get(*cursor)
+                .copied()
+                .ok_or_else(|| Error::invalid_data("compressed Mesh ran out of bone indices"))?;
+            *cursor += 1;
+            Ok(value)
+        };
+
+        for weight in weights {
+            current.weights[influence] = f32::from(
+                u16::try_from(weight)
+                    .map_err(|_| Error::invalid_data("compressed Mesh weight is out of range"))?,
+            ) / 31.0;
+            current.bone_indices[influence] = take_bone(&mut bone_cursor)?;
+            influence += 1;
+            total += weight;
+
+            if total >= 31 {
+                skin.push(current);
+                current = MeshBoneWeight::default();
+                influence = 0;
+                total = 0;
+            } else if influence == 3 {
+                current.weights[3] = f32::from(
+                    u16::try_from(31 - total)
+                        .map_err(|_| Error::invalid_data("compressed Mesh weight underflowed"))?,
+                ) / 31.0;
+                current.bone_indices[3] = take_bone(&mut bone_cursor)?;
+                skin.push(current);
+                current = MeshBoneWeight::default();
+                influence = 0;
+                total = 0;
+            }
+            if skin.len() > vertex_count {
+                return Err(Error::invalid_data(
+                    "compressed Mesh produced more skin records than vertices",
+                ));
+            }
+        }
+        Ok(Some(skin))
+    }
+}
+
+/// Restores the third component of an octahedrally packed unit vector.
+fn restore_octahedral(x: f32, y: f32) -> [f32; 3] {
+    let squared = 1.0 - x * x - y * y;
+    if squared >= 0.0 {
+        return [x, y, squared.sqrt()];
+    }
+    // Off the unit sphere: fall back to normalizing the pair, as the managed
+    // reader does, rather than producing a NaN.
+    let length = x.hypot(y);
+    if length == 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+    [x / length, y / length, 0.0]
 }
 
 /// Expands a submesh's index run into a triangle list.
@@ -325,12 +515,6 @@ fn read_mesh_inner(
     } else {
         reader.align(4)?;
     }
-    if mesh_compression != 0 {
-        return Err(Error::unsupported(format!(
-            "compressed Mesh data (compression mode {mesh_compression})"
-        )));
-    }
-
     let index_width = match reader.reader.read_i32()? {
         0 => 2_usize,
         1 => 4_usize,
@@ -371,7 +555,7 @@ fn read_mesh_inner(
         None
     };
     let mut vertex_data = reader.read_vertex_data(version)?;
-    let has_compressed_geometry = reader.read_compressed_mesh()?;
+    let compressed = reader.read_compressed_mesh()?;
     reader.skip(24, "Mesh local AABB")?;
     reader.skip(4, "Mesh usage flags")?;
     if version >= (2022, 1, 0) {
@@ -445,13 +629,28 @@ fn read_mesh_inner(
         ));
     }
 
-    if has_compressed_geometry {
-        return Err(Error::unsupported(
-            "packed/compressed Mesh geometry vectors",
-        ));
+    if mesh_compression != 0 && !compressed.has_items() {
+        return Err(Error::invalid_data(format!(
+            "Mesh declares compression mode {mesh_compression} but carries no packed geometry"
+        )));
     }
 
-    let decoded = vertex_data.decode(reader.reader.endian(), limits, version)?;
+    let (decoded, index_buffer) = if compressed.has_items() {
+        let indices = compressed.triangles.unpack()?;
+        if indices.len() > limits.maximum_indices {
+            return Err(Error::invalid_data(format!(
+                "compressed Mesh has {} indices, exceeding limit {}",
+                indices.len(),
+                limits.maximum_indices
+            )));
+        }
+        (compressed.decode(limits)?, indices)
+    } else {
+        (
+            vertex_data.decode(reader.reader.endian(), limits, version)?,
+            index_buffer,
+        )
+    };
     let vertex_count = decoded.vertices.len();
     if let Some(shapes) = &blend_shapes {
         validate_blend_shapes(shapes, vertex_count)?;
@@ -1372,20 +1571,31 @@ impl MeshObjectReader {
         })
     }
 
-    fn read_compressed_mesh(&mut self) -> Result<bool> {
-        let mut has_items = false;
-        for field in ["vertices", "UVs", "normals", "tangents"] {
-            has_items |= self.read_packed_float(field)? != 0;
-        }
-        for field in ["weights", "normal signs", "tangent signs"] {
-            has_items |= self.read_packed_int(field)? != 0;
-        }
-        has_items |= self.read_packed_float("float colors")? != 0;
-        for field in ["bone indices", "triangles"] {
-            has_items |= self.read_packed_int(field)? != 0;
-        }
-        self.skip(4, "Mesh compressed UV info")?;
-        Ok(has_items)
+    fn read_compressed_mesh(&mut self) -> Result<CompressedMesh> {
+        let vertices = self.read_packed_float("vertices")?;
+        let uv = self.read_packed_float("UVs")?;
+        let normals = self.read_packed_float("normals")?;
+        let tangents = self.read_packed_float("tangents")?;
+        let weights = self.read_packed_int("weights")?;
+        let normal_signs = self.read_packed_int("normal signs")?;
+        let tangent_signs = self.read_packed_int("tangent signs")?;
+        let float_colors = self.read_packed_float("float colors")?;
+        let bone_indices = self.read_packed_int("bone indices")?;
+        let triangles = self.read_packed_int("triangles")?;
+        let uv_info = self.reader.read_u32()?;
+        Ok(CompressedMesh {
+            vertices,
+            uv,
+            normals,
+            tangents,
+            weights,
+            normal_signs,
+            tangent_signs,
+            float_colors,
+            bone_indices,
+            triangles,
+            uv_info,
+        })
     }
 
     fn skip_tuanjie_shared_cluster(&mut self, revision: u8) -> Result<()> {
@@ -1417,28 +1627,45 @@ impl MeshObjectReader {
         self.skip_counted_auxiliary_bytes("Tuanjie Mesh streamable cluster page")
     }
 
-    fn read_packed_float(&mut self, field: &str) -> Result<u32> {
+    fn read_packed_float(&mut self, field: &str) -> Result<PackedFloatVector> {
         let item_count = self.reader.read_u32()?;
-        self.skip(8, &format!("Mesh compressed {field} range"))?;
+        let range = self.reader.read_f32()?;
+        let start = self.reader.read_f32()?;
         let byte_length = self.read_length(&format!("Mesh compressed {field}"))?;
-        self.skip_compressed(byte_length, field)?;
+        let data = self.read_compressed(byte_length, field)?;
         self.align(4)?;
-        self.skip(1, &format!("Mesh compressed {field} bit size"))?;
+        let bit_size = self.reader.read_u8()?;
         self.align(4)?;
-        Ok(item_count)
+        Ok(PackedFloatVector {
+            item_count,
+            range,
+            start,
+            data,
+            bit_size,
+        })
     }
 
-    fn read_packed_int(&mut self, field: &str) -> Result<u32> {
+    fn read_packed_int(&mut self, field: &str) -> Result<PackedIntVector> {
         let item_count = self.reader.read_u32()?;
         let byte_length = self.read_length(&format!("Mesh compressed {field}"))?;
-        self.skip_compressed(byte_length, field)?;
+        let data = self.read_compressed(byte_length, field)?;
         self.align(4)?;
-        self.skip(1, &format!("Mesh compressed {field} bit size"))?;
+        let bit_size = self.reader.read_u8()?;
         self.align(4)?;
-        Ok(item_count)
+        Ok(PackedIntVector {
+            item_count,
+            data,
+            bit_size,
+        })
     }
 
-    fn skip_compressed(&mut self, byte_length: usize, field: &str) -> Result<()> {
+    /// Reads one packed payload, charging it against the compressed-data budget.
+    fn read_compressed(&mut self, byte_length: usize, field: &str) -> Result<Vec<u8>> {
+        self.charge_compressed(byte_length, field)?;
+        self.reader.read_bytes(byte_length)
+    }
+
+    fn charge_compressed(&mut self, byte_length: usize, field: &str) -> Result<()> {
         let length = u64::try_from(byte_length)
             .map_err(|_| Error::invalid_data("Mesh compressed length does not fit in u64"))?;
         self.compressed_bytes_read = self
@@ -1451,7 +1678,7 @@ impl MeshObjectReader {
                 self.limits.maximum_compressed_data_bytes
             )));
         }
-        self.skip(length, &format!("Mesh compressed {field}"))
+        Ok(())
     }
 
     fn skip_counted_auxiliary_records(&mut self, record_size: u64, field: &str) -> Result<()> {
@@ -2271,6 +2498,34 @@ mod tests {
     }
 
     #[test]
+    fn decodes_compressed_mesh_geometry_instead_of_refusing_it() {
+        // Packed geometry used to fail the whole mesh read. The fixture packs a
+        // three-vertex triangle whose 8-bit values decode to themselves.
+        let object = resident_mesh_fixture(MeshFixtureOptions {
+            compressed: true,
+            ..MeshFixtureOptions::default()
+        });
+        let mesh = read_mesh(&parse_v22_mesh(&object), 0, MeshReadLimits::default()).unwrap();
+
+        assert_eq!(mesh.vertices.len(), 3);
+        assert!((mesh.vertices[0][0] - 1.0).abs() < 1e-4);
+        assert!((mesh.vertices[1][1] - 2.0).abs() < 1e-4);
+        assert!((mesh.vertices[2][2] - 3.0).abs() < 1e-4);
+
+        // The octahedral pair (1, 0) restores a zero third component, and the
+        // sign bit leaves it positive.
+        let normals = mesh.normals.as_ref().expect("compressed normals");
+        assert_eq!(normals.len(), 3);
+        for normal in normals {
+            let length =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            assert!((length - 1.0).abs() < 1e-3, "normal {normal:?} is not unit");
+        }
+
+        assert_eq!(mesh.sub_meshes[0].indices, [0, 1, 2]);
+    }
+
+    #[test]
     fn expands_strip_and_quad_topology_into_triangles() {
         // A three-index submesh as a strip is one triangle with the source
         // winding; the same run as a quad is not a whole quad, so nothing is
@@ -2354,18 +2609,12 @@ mod tests {
                 "base vertex",
             ),
             (
+                // The flag claims compression but no packed vector carries data.
                 MeshFixtureOptions {
                     mesh_compression: 1,
                     ..MeshFixtureOptions::default()
                 },
-                "compressed Mesh",
-            ),
-            (
-                MeshFixtureOptions {
-                    packed_vertex_items: 3,
-                    ..MeshFixtureOptions::default()
-                },
-                "packed/compressed Mesh",
+                "carries no packed geometry",
             ),
             (
                 MeshFixtureOptions {
@@ -2531,6 +2780,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy)]
+    #[allow(clippy::struct_excessive_bools)]
     struct MeshFixtureOptions {
         index_width: usize,
         topology: i32,
@@ -2541,6 +2791,7 @@ mod tests {
         stream_offset: u64,
         stream_size: u32,
         packed_vertex_items: u32,
+        compressed: bool,
         skin_records: usize,
         skinning: bool,
         blend_shapes: bool,
@@ -2561,6 +2812,7 @@ mod tests {
                 stream_offset: 0,
                 stream_size: 0,
                 packed_vertex_items: 0,
+                compressed: false,
                 skin_records: 0,
                 skinning: false,
                 blend_shapes: false,
@@ -2609,7 +2861,11 @@ mod tests {
             push_i32(&mut object, 0);
         }
 
-        object.push(options.mesh_compression);
+        object.push(if options.compressed {
+            1
+        } else {
+            options.mesh_compression
+        });
         object.extend_from_slice(&[1, 0, 0]);
         if let Some(tuanjie) = options.tuanjie {
             if tuanjie.revision == 3 {
@@ -2701,18 +2957,42 @@ mod tests {
         object.extend_from_slice(&vertex_data);
         align(&mut object, 4);
 
-        push_packed_float(&mut object, options.packed_vertex_items);
-        for _ in 0..3 {
+        if options.compressed {
+            // A three-vertex triangle. Range 255 with an 8-bit width makes each
+            // packed value decode to itself, so the expected geometry is plain.
+            push_packed_float_data(&mut object, 9, 255.0, 0.0, &[1, 0, 0, 0, 2, 0, 0, 0, 3], 8);
+            push_empty_packed_float(&mut object); // UVs
+            // Normals as octahedral pairs plus their sign bits.
+            push_packed_float_data(
+                &mut object,
+                6,
+                2.0,
+                -1.0,
+                &[255, 128, 255, 128, 255, 128],
+                8,
+            );
+            push_empty_packed_float(&mut object); // tangents
+            push_empty_packed_int(&mut object); // weights
+            push_packed_int_data(&mut object, &[1, 1, 1], 1); // normal signs
+            push_empty_packed_int(&mut object); // tangent signs
+            push_empty_packed_float(&mut object); // float colours
+            push_empty_packed_int(&mut object); // bone indices
+            push_packed_int_data(&mut object, &[0, 1, 2], 8); // triangles
+            push_u32(&mut object, 0); // UV info
+        } else {
+            push_packed_float(&mut object, options.packed_vertex_items);
+            for _ in 0..3 {
+                push_empty_packed_float(&mut object);
+            }
+            for _ in 0..3 {
+                push_empty_packed_int(&mut object);
+            }
             push_empty_packed_float(&mut object);
+            for _ in 0..2 {
+                push_empty_packed_int(&mut object);
+            }
+            push_u32(&mut object, 0);
         }
-        for _ in 0..3 {
-            push_empty_packed_int(&mut object);
-        }
-        push_empty_packed_float(&mut object);
-        for _ in 0..2 {
-            push_empty_packed_int(&mut object);
-        }
-        push_u32(&mut object, 0);
 
         object.extend_from_slice(&[0_u8; 24]);
         push_i32(&mut object, 0);
@@ -2895,13 +3175,57 @@ mod tests {
     }
 
     fn push_packed_float(output: &mut Vec<u8>, item_count: u32) {
+        push_packed_float_data(output, item_count, 0.0, 0.0, &[], 0);
+    }
+
+    /// Writes a `PackedFloatVector` carrying `values` at `bit_size` bits each.
+    fn push_packed_float_data(
+        output: &mut Vec<u8>,
+        item_count: u32,
+        range: f32,
+        start: f32,
+        values: &[u32],
+        bit_size: u8,
+    ) {
         push_u32(output, item_count);
-        output.extend_from_slice(&0_f32.to_le_bytes());
-        output.extend_from_slice(&0_f32.to_le_bytes());
-        push_i32(output, 0);
+        output.extend_from_slice(&range.to_le_bytes());
+        output.extend_from_slice(&start.to_le_bytes());
+        let data = pack_bits(values, bit_size);
+        push_i32(output, i32::try_from(data.len()).unwrap());
+        output.extend_from_slice(&data);
         align(output, 4);
-        output.push(0);
+        output.push(bit_size);
         align(output, 4);
+    }
+
+    /// Writes a `PackedIntVector` carrying `values` at `bit_size` bits each.
+    fn push_packed_int_data(output: &mut Vec<u8>, values: &[u32], bit_size: u8) {
+        push_u32(output, u32::try_from(values.len()).unwrap());
+        let data = pack_bits(values, bit_size);
+        push_i32(output, i32::try_from(data.len()).unwrap());
+        output.extend_from_slice(&data);
+        align(output, 4);
+        output.push(bit_size);
+        align(output, 4);
+    }
+
+    fn pack_bits(values: &[u32], bit_size: u8) -> Vec<u8> {
+        if bit_size == 0 {
+            return Vec::new();
+        }
+        let mut bits = Vec::new();
+        for value in values {
+            for bit in 0..bit_size {
+                bits.push((value >> bit) & 1 == 1);
+            }
+        }
+        let mut bytes = vec![0_u8; bits.len().div_ceil(8)];
+        for (position, set) in bits.iter().enumerate() {
+            if *set {
+                bytes[position / 8] |= 1 << (position % 8);
+            }
+        }
+        bytes
     }
 
     fn push_empty_packed_int(output: &mut Vec<u8>) {
