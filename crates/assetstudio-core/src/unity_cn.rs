@@ -52,7 +52,7 @@ impl std::fmt::Debug for UnityCnKey {
 }
 
 /// The encryption header that follows the archive flags.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct UnityCnHeader {
     data: [u8; 16],
     key: [u8; 16],
@@ -91,12 +91,34 @@ impl UnityCnHeader {
 }
 
 /// Substitution tables derived from the header and a caller-supplied key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ArchiveDecryptor {
     /// 16 nibbles indexed by a ciphertext nibble.
     index: [u8; 16],
     /// 16 nibbles read as a transposed 4x4 matrix, indexed by the counter.
     substitute: [u8; 16],
+}
+
+/// Prints nothing about the header's key material.
+///
+/// The stored key is ciphertext rather than the caller's key, but it is half
+/// of what derives the substitution tables, and a derived `Debug` is exactly
+/// how such a value reaches a log by accident.
+impl std::fmt::Debug for UnityCnHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UnityCnHeader(<redacted>)")
+    }
+}
+
+/// Prints nothing about the derived tables.
+///
+/// These are not the key; for an attacker they are better than the key, since
+/// they decrypt this bundle without it. Redacting `UnityCnKey` alone would
+/// leave the capability printable one struct away.
+impl std::fmt::Debug for ArchiveDecryptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArchiveDecryptor(<redacted>)")
+    }
 }
 
 impl ArchiveDecryptor {
@@ -635,9 +657,30 @@ mod tests {
         }
     }
 
+    /// No type on the decryption path prints key material.
+    ///
+    /// The key itself is the obvious one. The header carries the encrypted key
+    /// blob, and the decryptor carries the tables derived from both -- which
+    /// are better than the key for an attacker, since they decrypt this bundle
+    /// without it. Both of those derived `Debug` until this test was widened,
+    /// so redacting only the key left the capability printable one struct away.
     #[test]
-    fn the_key_never_appears_in_debug_output() {
-        let key = UnityCnKey::new([0xab; 16]);
+    fn no_key_material_appears_in_debug_output() {
+        let bytes = [0xab_u8; 16];
+        let key = UnityCnKey::new(bytes);
         assert_eq!(format!("{key:?}"), "UnityCnKey(<redacted>)");
+
+        let header_bytes = header_for(&bytes, [0x1b; 16]);
+        let header = UnityCnHeader::parse(&header_bytes).unwrap();
+        assert_eq!(format!("{header:?}"), "UnityCnHeader(<redacted>)");
+
+        let decryptor = ArchiveDecryptor::new(&header, UnityCnKey::new(bytes)).unwrap();
+        assert_eq!(format!("{decryptor:?}"), "ArchiveDecryptor(<redacted>)");
+
+        // Nested in another value, which is how such a thing actually reaches a
+        // log: a container's derived `Debug` calls each field's.
+        let nested = format!("{:?}", (key, header, decryptor));
+        assert!(!nested.contains("ab"), "{nested}");
+        assert!(!nested.contains("171"), "{nested}");
     }
 }
