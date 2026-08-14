@@ -20,7 +20,14 @@ const DEFAULT_MAXIMUM_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 struct CorpusCase {
     name: String,
     input: PathBuf,
-    expected: PathBuf,
+    /// The managed snapshot to compare against, when there is one.
+    ///
+    /// Optional because generating it needs the .NET SDK and an `AssetStudio`
+    /// checkout, and requiring all three -- game files, a toolchain and a
+    /// snapshot -- kept this gate unused. A case without one still reads every
+    /// object and still fails on an error; it just cannot say the values are
+    /// right, only that nothing broke.
+    expected: Option<PathBuf>,
     maximum_object_bytes: u64,
     enabled: bool,
 }
@@ -29,8 +36,12 @@ struct CorpusCase {
 fn example_corpus_manifest_is_valid() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/manifest.example.json");
     let cases = read_cases(&path).unwrap();
-    assert_eq!(cases.len(), 1);
-    assert!(!cases[0].enabled);
+    assert_eq!(cases.len(), 2);
+    assert!(cases.iter().all(|case| !case.enabled));
+    // One case of each shape, so the example shows that the snapshot is
+    // optional rather than leaving it to the prose.
+    assert!(cases[0].expected.is_some());
+    assert!(cases[1].expected.is_none());
 }
 
 #[test]
@@ -40,14 +51,49 @@ fn private_real_corpus_matches_managed_snapshots() {
         .map(PathBuf::from)
         .expect("ASSETSTUDIO_CORPUS_MANIFEST is not set");
     let cases = read_cases(&path).unwrap();
-    let mut executed = 0_usize;
+    let mut compared = 0_usize;
+    let mut read_only = Vec::new();
     for case in cases.iter().filter(|case| case.enabled) {
-        let expected: Value = serde_json::from_slice(&fs::read(&case.expected).unwrap()).unwrap();
-        let actual = rust_manifest(&case.input, case.maximum_object_bytes).unwrap();
-        assert_eq!(actual, expected, "private corpus case {:?}", case.name);
-        executed += 1;
+        // Reading is the same work either way, and an error here fails the case
+        // whether or not a snapshot exists.
+        let actual =
+            rust_manifest(&case.input, case.maximum_object_bytes).unwrap_or_else(|error| {
+                panic!("corpus case {:?} could not be read: {error}", case.name)
+            });
+        if let Some(expected) = &case.expected {
+            let expected: Value = serde_json::from_slice(&fs::read(expected).unwrap()).unwrap();
+            assert_eq!(actual, expected, "private corpus case {:?}", case.name);
+            compared += 1;
+        } else {
+            // Without a snapshot there is nothing to compare values against,
+            // so the case has to at least prove it read something: an input
+            // the reader does not recognise parses as a resource file with no
+            // objects and would otherwise pass while checking nothing.
+            let (files, objects, _) = counts(&actual);
+            assert!(
+                files > 0 && objects > 0,
+                "corpus case {:?} produced {files} file(s) and {objects} object(s); \
+                 a case without a snapshot must at least parse to something",
+                case.name
+            );
+            read_only.push((case.name.clone(), summarize(&actual)));
+        }
     }
-    assert!(executed > 0, "private corpus manifest has no enabled cases");
+    assert!(
+        compared + read_only.len() > 0,
+        "private corpus manifest has no enabled cases"
+    );
+    for (name, summary) in &read_only {
+        // Printed rather than asserted: without a snapshot there is nothing to
+        // assert the values against, and saying so is more useful than a
+        // silent pass that looks like a comparison.
+        println!("corpus case {name:?}: read only, no snapshot -- {summary}");
+    }
+    println!(
+        "corpus: {compared} case(s) compared against managed snapshots, \
+         {} read without one",
+        read_only.len()
+    );
 }
 
 fn read_cases(path: &Path) -> Result<Vec<CorpusCase>, Box<dyn std::error::Error>> {
@@ -71,7 +117,15 @@ fn read_cases(path: &Path) -> Result<Vec<CorpusCase>, Box<dyn std::error::Error>
             .ok_or_else(|| format!("corpus case {index} must be an object"))?;
         let name = required_string(entry, "name", index)?;
         let input = resolve_path(base, &required_string(entry, "input", index)?);
-        let expected = resolve_path(base, &required_string(entry, "expected", index)?);
+        let expected = entry
+            .get("expected")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(|value| resolve_path(base, value))
+                    .ok_or_else(|| format!("corpus case {index} expected is not a string"))
+            })
+            .transpose()?;
         let maximum_object_bytes = entry
             .get("maximum_object_bytes")
             .map(|value| {
@@ -130,4 +184,27 @@ fn resolve_path(base: &Path, value: &str) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+/// Files, objects, and objects with a parsed payload.
+fn counts(manifest: &Value) -> (usize, usize, usize) {
+    let Some(files) = manifest["Files"].as_array() else {
+        return (0, 0, 0);
+    };
+    let objects: Vec<&Value> = files
+        .iter()
+        .flat_map(|file| file["Objects"].as_array().map_or(&[][..], Vec::as_slice))
+        .collect();
+    let parsed = objects
+        .iter()
+        .filter(|object| !object["Payload"].is_null())
+        .count();
+    (files.len(), objects.len(), parsed)
+}
+
+/// What a manifest contains, so a read-only case reports something checkable
+/// rather than just "no error".
+fn summarize(manifest: &Value) -> String {
+    let (files, objects, parsed) = counts(manifest);
+    format!("{files} file(s), {objects} object(s), {parsed} with a parsed payload")
 }

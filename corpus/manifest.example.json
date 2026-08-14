@@ -7,6 +7,12 @@
       "expected": "private/snapshots/game.json",
       "maximum_object_bytes": 536870912,
       "enabled": false
+    },
+    {
+      "name": "read-only-case-needs-no-managed-snapshot",
+      "input": "private/another_game_Data",
+      "maximum_object_bytes": 536870912,
+      "enabled": false
     }
   ]
 }
