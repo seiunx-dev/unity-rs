@@ -11,6 +11,12 @@ same mistake and the sample comparison would still line up.
 refuses files whose fields disagree. Asking it for the channel count, sample
 rate, width and frame count is a genuine second opinion on the container.
 
+It is not a complete one. `wave` reads the three fields it needs and ignores
+the byte rate and block alignment entirely, and both of those are redundant --
+derived from the other three -- which is precisely why a wrong one survives
+every reader that recomputes what it needs. The chunk walk here checks them,
+along with the chunk sizes against the file's own length.
+
     python3 tools/validate_wav_output.py            # export through the CLI
     python3 tools/validate_wav_output.py sound.wav  # check an existing file
 """
@@ -107,7 +113,73 @@ def check(path: Path, channels: int, rate: int, bits: int, frames: int) -> list[
             f"wave read {len(data)} bytes of samples; "
             f"{frames * channels * bits // 8} are implied by the header"
         )
-    return [f"{channels}ch {rate}Hz {bits}-bit, {frames} frame(s)"]
+    return [f"{channels}ch {rate}Hz {bits}-bit, {frames} frame(s)", *derived(path)]
+
+
+def derived(path: Path) -> list[str]:
+    """Checks the fields `wave` computes nothing from and reports nowhere.
+
+    The byte rate and block alignment are redundant -- both follow from the
+    channel count, sample rate and sample width -- which is exactly why a wrong
+    one survives. Python's reader takes the three it needs and ignores these
+    two, so a file with a nonsense byte rate reads back perfectly above and
+    still trips players that seek by it. The chunk sizes are redundant in the
+    same way against the file's own length.
+    """
+    data = path.read_bytes()
+    if len(data) < 44:
+        raise Invalid(f"the file is {len(data)} bytes, shorter than a WAV header")
+    riff, chunk_size, wave_tag = struct.unpack_from("<4sI4s", data, 0)
+    if riff != b"RIFF" or wave_tag != b"WAVE":
+        raise Invalid("the file is not RIFF/WAVE")
+    if chunk_size != len(data) - 8:
+        raise Invalid(f"RIFF size is {chunk_size}; the file implies {len(data) - 8}")
+
+    at = 12
+    seen = []
+    while at + 8 <= len(data):
+        identifier, size = struct.unpack_from("<4sI", data, at)
+        seen.append(identifier.decode("ascii", "replace"))
+        body = data[at + 8 : at + 8 + size]
+        if len(body) != size:
+            raise Invalid(
+                f"chunk {seen[-1]} declares {size} bytes but only {len(body)} remain"
+            )
+        if identifier == b"fmt ":
+            if size < 16:
+                raise Invalid(f"the fmt chunk is {size} bytes, shorter than PCM's 16")
+            (
+                audio_format,
+                channels,
+                rate,
+                byte_rate,
+                block_align,
+                bits,
+            ) = struct.unpack_from("<HHIIHH", body, 0)
+            if audio_format != 1:
+                raise Invalid(f"fmt declares format {audio_format}, not PCM")
+            expected_block = channels * bits // 8
+            if block_align != expected_block:
+                raise Invalid(
+                    f"block alignment is {block_align}; "
+                    f"{channels} channels at {bits} bits imply {expected_block}"
+                )
+            expected_rate = rate * expected_block
+            if byte_rate != expected_rate:
+                raise Invalid(
+                    f"byte rate is {byte_rate}; "
+                    f"{rate}Hz at {expected_block} bytes per frame imply {expected_rate}"
+                )
+        elif identifier == b"data" and at + 8 + size != len(data):
+            raise Invalid(
+                f"the data chunk ends at {at + 8 + size} of {len(data)} bytes"
+            )
+        at += 8 + size + (size % 2)
+
+    for required in ("fmt ", "data"):
+        if required not in seen:
+            raise Invalid(f"the file has no {required} chunk")
+    return [f"chunks {'/'.join(seen)}, byte rate and block alignment consistent"]
 
 
 def export_and_validate() -> int:
