@@ -1504,6 +1504,8 @@ impl Matrix4 {
         Ok(matrix)
     }
 
+    /// Loads a serialized Unity `Matrix4x4f`, which stores its elements in row
+    /// order (`e00, e01, e02, e03, e10, ...`), and mirrors it about X.
     fn mirrored_bind_pose(values: [f32; 16]) -> Result<Self> {
         let mut matrix = Self([0.0; 16]);
         let signs = [-1.0, 1.0, 1.0, 1.0];
@@ -1512,7 +1514,7 @@ impl Matrix4 {
                 matrix.set(
                     row,
                     column,
-                    f64::from(values[row + column * 4]) * signs[row] * signs[column],
+                    f64::from(values[4 * row + column]) * signs[row] * signs[column],
                 );
             }
         }
@@ -2179,14 +2181,17 @@ fn write_morph(morph: &MorphPlan<'_>, output: &mut impl Write) -> io::Result<()>
     Ok(())
 }
 
+/// Writes an FBX `*16` matrix array.
+///
+/// FBX flattens a matrix in column order, so element `(row, column)` lands at
+/// `4 * column + row` and the translation occupies slots 12, 13 and 14. That is
+/// exactly [`Matrix4`]'s own storage order.
 fn write_matrix(name: &str, matrix: Matrix4, output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "        {name}: *16 {{")?;
     output.write_all(b"            a: ")?;
     let mut first = true;
-    for row in 0..4 {
-        for column in 0..4 {
-            write_array_value(output, &mut first, FbxDouble(matrix.get(row, column)))?;
-        }
+    for value in matrix.0 {
+        write_array_value(output, &mut first, FbxDouble(value))?;
     }
     output.write_all(b"\n        }\n")
 }
@@ -2818,8 +2823,30 @@ mod tests {
         assert!(text.contains("Weights: *2 {\n            a: 1,0.25"));
         assert!(text.contains("Indexes: *2 {\n            a: 1,2"));
         assert!(text.contains("Weights: *2 {\n            a: 0.75,1"));
-        assert!(text.contains("a: 1,0,0,-12,0,1,0,0,0,0,1,0,0,0,0,1"));
-        assert!(text.contains("a: 1,0,0,-11,0,1,0,0,0,0,1,0,0,0,0,1"));
+        // FBX flattens in column order, so the translation occupies slots 12,
+        // 13 and 14 and the projective row lands at 3, 7, 11 and 15. Assert the
+        // structure rather than a golden string: emitting the transpose still
+        // produces a plausible-looking array, but not an affine one.
+        let transforms = matrix_arrays(text, "Transform");
+        let links = matrix_arrays(text, "TransformLink");
+        assert_eq!(transforms.len(), 2);
+        assert_eq!(links.len(), 2);
+        for matrix in transforms.iter().chain(links.iter()) {
+            for slot in [3, 7, 11] {
+                assert!(
+                    matrix[slot].abs() < 1e-9,
+                    "slot {slot} of an affine matrix must be zero, got {}",
+                    matrix[slot]
+                );
+            }
+            assert!((matrix[15] - 1.0).abs() < 1e-9);
+        }
+        // The mesh node sits at world X -12 after mirroring, and the second
+        // cluster's bind pose moves its link matrix to -11.
+        assert!((transforms[0][12] + 12.0).abs() < 1e-9);
+        assert!((transforms[1][12] + 12.0).abs() < 1e-9);
+        assert!((links[0][12] + 12.0).abs() < 1e-9);
+        assert!((links[1][12] + 11.0).abs() < 1e-9);
         assert!(text.contains("C: \"OO\",4000000000,2000000000"));
         assert!(text.contains("C: \"OO\",5000000000,4000000000"));
         assert!(text.contains("C: \"OO\",1000000002,5000000000"));
@@ -3033,6 +3060,25 @@ mod tests {
         });
     }
 
+    /// Reads back every `*16` array emitted under `name`, in document order.
+    fn matrix_arrays(text: &str, name: &str) -> Vec<[f64; 16]> {
+        let header = format!("{name}: *16 {{\n            a: ");
+        text.match_indices(&header)
+            .map(|(start, _)| {
+                let body = &text[start + header.len()..];
+                let line = body.split('\n').next().expect("matrix array line");
+                let mut matrix = [0.0_f64; 16];
+                let mut count = 0_usize;
+                for (slot, value) in line.split(',').enumerate() {
+                    matrix[slot] = value.parse().expect("matrix array value");
+                    count += 1;
+                }
+                assert_eq!(count, 16);
+                matrix
+            })
+            .collect()
+    }
+
     fn skinned_model_fixture() -> ModelIr {
         let root = key(1);
         let mesh_node = key(2);
@@ -3052,7 +3098,10 @@ mod tests {
             model_node(bone1, Some(bone0), Vec::new(), key(14), [0.0, 1.0, 0.0]),
         ];
         let mut second_bind_pose = identity_matrix();
-        second_bind_pose[12] = 1.0;
+        // Unity serializes Matrix4x4f in row order, so element 3 is e03: the
+        // bind pose's X translation. Element 12 would be e30, which is always
+        // zero for an affine transform.
+        second_bind_pose[3] = 1.0;
         let mesh = Mesh {
             path_id: mesh_key.path_id,
             name: "skin".to_owned(),
