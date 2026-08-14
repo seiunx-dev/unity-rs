@@ -98,7 +98,8 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 1. **托管差分 oracle 覆盖面仍不足（系统性根因）**
    - 这不是理论风险：2026-08-14 修掉的 FBX blend shape 增量、FBX 矩阵约定、Node 纹理行序、bundle 版本覆盖四个缺陷，全部被手写的测试期望值锁死，正是因为它们从未与 C# 对照过。
    - **已补齐**：serialized format v13-v22 全部版本门；UnityFS v6 内联 blocks-info、UnityFS v6 尾部 blocks-info、UnityFS v7 强制 16 字节对齐、LZ4/LZ4HC/Zstd 压缩块与压缩 blocks-info（含同时压缩 + 尾部布局）、legacy UnityRaw v6、gzip 流。容器差分首轮即发现两处命名分歧（bundle 条目标签、gzip/brotli 把可移植名变成字面量 `"gzip"`，后者会让压缩序列化文件永远无法被外部引用按名匹配），均已修复。
-   - **仍缺**：v5-v12（需要真实 TypeTree，tree-less fixture 做不到）；LZMA 块（`lzma-rust2` 无 bulk encoder，补它要为 fixture 单独引入编码依赖）；UnityWebData、ZIP、split 组；压缩纹理、Crunch、Switch、tight-mesh sprite；Cubism 模型；AnimationClip 关键帧值；Shader 只覆盖了 5.2 直连脚本，5.3-5.4 与 5.5+ 序列化程序未对照（`oracle/Program.cs` 目前遇到 subprogram blob 会直接抛错，要先解除这个 guard）。
+   - **v5-v12 已补齐（2026-08-14）**：这些格式必然带 TypeTree，13 之后那个可以关掉树的 flag 还不存在，所以 tree-less fixture 做不到；自己编一棵树等于让两个 reader 去比对 Unity 从没写过的形状。改用 `tools/generate_typetree_fixtures.py` 从 UnityPy 自带的 `lzma.tpk` 里取真实的 TextAsset 树，产出 JSON 入库（TPK 本身不 vendor，脚本也不进 CI，只在开发时跑一次；派生链在脚本头部写明）。差分矩阵现在覆盖 5-21，首轮全对：9 以下头部在文件尾、7 起才有 Unity 版本串、8 起才有 target platform、11 起 destroyed 字段换成 script type index、树在 10 和 12 从递归编码换成 blob——这些门此前全靠 Rust writer 自己的假设。
+   - **仍缺**：LZMA 块（`lzma-rust2` 无 bulk encoder，补它要为 fixture 单独引入编码依赖）；UnityWebData、ZIP、split 组；压缩纹理、Crunch、Switch、tight-mesh sprite；Cubism 模型；AnimationClip 关键帧值；Shader 只覆盖了 5.2 直连脚本，5.3-5.4 与 5.5+ 序列化程序未对照（`oracle/Program.cs` 目前遇到 subprogram blob 会直接抛错，要先解除这个 guard）。
    - oracle harness 接受任意输入路径，上述补强全部不需要专有样本。
    - **第二 oracle 已就位**：`crates/assetstudio-python/tests/unitypy_oracle.py` 用 UnityPy（独立实现，不需要 .NET）对照对象顺序、PathID、classID、字节大小、名称和原始载荷哈希，14 个 fixture 首轮全对。刻意不比较解码后的像素与网格——UnityPy 走的是本项目已链接的同一个 `texture2ddecoder`，网格/shader 又是 AssetStudio 的转写，比了不构成独立证据。UnityPy 解析不出名字时（它的名称查找依赖自带的 TypeTree 数据库，不覆盖所有 class/版本）记为跳过并报数，而不是当成"双方都认为是空串"。
 

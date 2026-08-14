@@ -142,12 +142,23 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_truncated_fixture(&executable);
 }
 
-/// Compares one file per serialized format version the gate can build.
+/// Compares one file per serialized format version, 5 through 21.
+///
+/// Formats 5 through 12 always carry a `TypeTree`, so they need real trees rather
+/// than the tree-less shortcut 13 and later allow; those come from the
+/// committed TPK-derived fixture. Both halves cover the same claim: every
+/// version gate this reader implements is compared against the managed reader
+/// rather than against the Rust writer's own assumptions.
 fn assert_version_matrix(executable: &Path) {
-    for version in 13..22 {
+    let trees = text_asset_type_trees();
+    for version in 5..22 {
         let name = format!("oracle-format-v{version}.assets");
-        let fixture =
-            TemporaryFixture::new(&name, &synthetic_versioned_text_asset(version)).unwrap();
+        let bytes = if version < 13 {
+            tree_bearing_text_asset(version, &trees)
+        } else {
+            synthetic_versioned_text_asset(version)
+        };
+        let fixture = TemporaryFixture::new(&name, &bytes).unwrap();
         let managed = managed_manifest(executable, fixture.input_path()).unwrap();
         let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
         assert_eq!(managed, rust, "format version {version}");
@@ -156,6 +167,12 @@ fn assert_version_matrix(executable: &Path) {
                 .as_array()
                 .is_some_and(|objects| objects.len() == 1),
             "format version {version} produced no object: {managed}"
+        );
+        // The name only resolves if the reader walked the tree correctly, so an
+        // agreed empty string would hide a tree both readers mis-parse.
+        assert_eq!(
+            managed["Files"][0]["Objects"][0]["Name"], "oracle.txt",
+            "format version {version} did not resolve the TextAsset name"
         );
     }
 }
@@ -652,15 +669,179 @@ fn synthetic_plain_v22(version: &str, objects: &[(i32, i64, Vec<u8>)]) -> Vec<u8
     finish_v22(&metadata, &data)
 }
 
-/// Builds a little-endian `TextAsset` file at one serialized format version.
+/// The real `TextAsset` type trees the pre-13 fixtures embed.
+///
+/// Serialized formats below 13 always carry a tree; the flag that turns it off
+/// arrives at 13. A fixture for those formats therefore has to embed one, and
+/// inventing a shape would make the differential compare two readers against
+/// something Unity never wrote. These come from
+/// `tools/generate_typetree_fixtures.py`, which extracts them from `UnityPy`'s
+/// bundled TPK; see that script for the derivation chain.
+fn text_asset_type_trees() -> Value {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typetree/text_asset.json");
+    let bytes =
+        fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    serde_json::from_slice(&bytes).expect("the type tree fixture is valid JSON")
+}
+
+/// Builds a little-endian `TextAsset` file at a format that carries a tree.
+///
+/// Formats 5 through 12 differ from each other in more than the tree: the
+/// header moves to the end of the file below 9, the Unity version string only
+/// appears from 7, the target platform from 8, the per-object destroyed field
+/// disappears at 11 while the script type index appears, and the tree itself
+/// switches from the recursive encoding to the blob at 10 and again from 12.
+/// Every one of those gates was previously unexercised by the differential.
+fn tree_bearing_text_asset(version: u32, trees: &Value) -> Vec<u8> {
+    assert!(
+        (5..13).contains(&version),
+        "tree-bearing fixtures cover formats 5 through 12"
+    );
+    let tree = &trees["trees"][version.to_string()];
+    let nodes = tree["nodes"].as_array().expect("the tree has nodes");
+    let object = text_asset();
+
+    let mut metadata = Vec::new();
+    if version >= 7 {
+        let unity_version = tree["unity_version"].as_str().expect("a Unity version");
+        metadata.extend_from_slice(unity_version.as_bytes());
+        metadata.push(0);
+    }
+    if version >= 8 {
+        // 13 is the standalone Windows player, the same target the tree-less
+        // fixtures declare.
+        push_i32(&mut metadata, 13);
+    }
+
+    // One type record: the class ID, then the tree, with no stripped flag,
+    // script type index or hashes before format 13.
+    push_i32(&mut metadata, 1);
+    push_i32(&mut metadata, 49);
+    if version >= 12 || version == 10 {
+        push_blob_type_tree(&mut metadata, nodes);
+    } else {
+        push_recursive_type_tree(&mut metadata, nodes);
+    }
+
+    if (7..14).contains(&version) {
+        push_i32(&mut metadata, 0); // big ID disabled
+    }
+
+    push_i32(&mut metadata, 1);
+    push_i32(&mut metadata, 0x1020_3040);
+    push_u32(&mut metadata, 0);
+    push_u32(&mut metadata, u32::try_from(object.len()).unwrap());
+    push_i32(&mut metadata, 49); // type ID, matched to the record by class ID
+    metadata.extend_from_slice(&49_u16.to_le_bytes());
+    if version < 11 {
+        metadata.extend_from_slice(&0_u16.to_le_bytes()); // not destroyed
+    } else {
+        metadata.extend_from_slice(&(-1_i16).to_le_bytes()); // no script type
+    }
+
+    if version >= 11 {
+        push_i32(&mut metadata, 0); // script types
+    }
+    push_i32(&mut metadata, 0); // externals
+    metadata.push(0); // user information
+
+    finish_tree_bearing_header(version, &metadata, &object)
+}
+
+/// Reads one integer field of a type-tree node from the committed fixture.
+fn node_field(node: &Value, field: &str) -> i32 {
+    let value = node[field]
+        .as_i64()
+        .unwrap_or_else(|| panic!("type tree node field {field} is not an integer: {node}"));
+    i32::try_from(value)
+        .unwrap_or_else(|_| panic!("type tree node field {field} does not fit in i32: {value}"))
+}
+
+/// Writes the pre-blob tree encoding: one variable-length record per node.
+fn push_recursive_type_tree(output: &mut Vec<u8>, nodes: &[Value]) {
+    for node in nodes {
+        output.extend_from_slice(node["type"].as_str().unwrap().as_bytes());
+        output.push(0);
+        output.extend_from_slice(node["name"].as_str().unwrap().as_bytes());
+        output.push(0);
+        push_i32(output, node_field(node, "byte_size"));
+        push_i32(output, node_field(node, "index"));
+        push_i32(output, node_field(node, "is_array"));
+        push_i32(output, node_field(node, "version"));
+        push_i32(output, node_field(node, "meta_flags"));
+        push_i32(output, node_field(node, "children"));
+    }
+}
+
+/// Writes the flat tree encoding: fixed 24-byte records plus a string buffer.
+///
+/// Names are written into the buffer rather than taken from the common-string
+/// table, so the fixture exercises the offset path instead of the shortcut.
+fn push_blob_type_tree(output: &mut Vec<u8>, nodes: &[Value]) {
+    let mut buffer = Vec::new();
+    let mut offsets: Vec<(u32, u32)> = Vec::new();
+    let intern = |value: &str, buffer: &mut Vec<u8>| -> u32 {
+        let offset = u32::try_from(buffer.len()).unwrap();
+        buffer.extend_from_slice(value.as_bytes());
+        buffer.push(0);
+        offset
+    };
+    for node in nodes {
+        let type_offset = intern(node["type"].as_str().unwrap(), &mut buffer);
+        let name_offset = intern(node["name"].as_str().unwrap(), &mut buffer);
+        offsets.push((type_offset, name_offset));
+    }
+
+    push_i32(output, i32::try_from(nodes.len()).unwrap());
+    push_i32(output, i32::try_from(buffer.len()).unwrap());
+    for (node, (type_offset, name_offset)) in nodes.iter().zip(&offsets) {
+        let node_version = u16::try_from(node_field(node, "version")).unwrap();
+        output.extend_from_slice(&node_version.to_le_bytes());
+        output.push(u8::try_from(node_field(node, "level")).unwrap());
+        output.push(u8::try_from(node_field(node, "is_array")).unwrap());
+        push_u32(output, *type_offset);
+        push_u32(output, *name_offset);
+        push_i32(output, node_field(node, "byte_size"));
+        push_i32(output, node_field(node, "index"));
+        push_i32(output, node_field(node, "meta_flags"));
+    }
+    output.extend_from_slice(&buffer);
+}
+
+/// Assembles the file around the metadata.
+///
+/// From format 9 the header leads the file and carries the endianness byte.
+/// Before that the header is 16 bytes, and a reader seeks to
+/// `file_size - metadata_size` to find the endianness byte followed by the
+/// metadata, so the metadata sits at the end and the object data comes first.
+fn finish_tree_bearing_header(version: u32, metadata: &[u8], data: &[u8]) -> Vec<u8> {
+    if version >= 9 {
+        return finish_legacy_header(version, metadata, data, 0);
+    }
+    let metadata_size = 1 + metadata.len();
+    let data_offset = 16;
+    let file_size = data_offset + data.len() + metadata_size;
+    let mut output = vec![0_u8; 16];
+    output[0..4].copy_from_slice(&u32::try_from(metadata_size).unwrap().to_be_bytes());
+    output[4..8].copy_from_slice(&u32::try_from(file_size).unwrap().to_be_bytes());
+    output[8..12].copy_from_slice(&version.to_be_bytes());
+    output[12..16].copy_from_slice(&u32::try_from(data_offset).unwrap().to_be_bytes());
+    output.extend_from_slice(data);
+    output.push(0); // little-endian
+    output.extend_from_slice(metadata);
+    output
+}
+
+/// Builds a little-endian `TextAsset` file at one tree-less format version.
 ///
 /// The gate compared only versions 13 and 22, so every other version gate --
 /// aligned 64-bit path IDs at 14, the per-object stripped byte at 15 and 16,
 /// the type record's stripped flag at 16, the script type index moving into the
 /// type record at 17, and reference types at 20 -- rested on the Rust writer's
 /// own assumptions. Type trees are disabled, which the format allows from 13
-/// on, so these stay minimal; versions below 13 would have to carry a real tree
-/// and are still uncovered.
+/// on, so these stay minimal. [`tree_bearing_text_asset`] covers 5 through 12,
+/// where a tree is mandatory.
 fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
     assert!(
         (13..22).contains(&version),
