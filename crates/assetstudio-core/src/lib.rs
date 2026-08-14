@@ -64,6 +64,8 @@ pub mod type_tree;
 pub mod type_tree_dump;
 pub mod unity_cn;
 pub mod unity_version;
+/// Vendored third-party decoders; see the module documentation for why.
+mod vendor;
 pub mod web_file;
 
 pub use error::{Error, Result};
