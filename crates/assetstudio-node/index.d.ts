@@ -12,6 +12,19 @@ export declare class AssetStudio {
    */
   static openWithVersion(path: string, unityVersion: string): AssetStudio
   /**
+   * Writes the animated FBX, decoding ACL tracks through a caller-supplied
+   * decoder.
+   *
+   * Core ships no ACL decoder. Without one a clip whose samples are ACL
+   * compressed contributes nothing to the FBX; with one its tracks are
+   * validated on the way back in -- shape, ordering and budgets are Core's
+   * checks, not the caller's promises.
+   *
+   * Asynchronous for the same reason as the Oodle entry point: the callback
+   * runs on the event loop while a worker waits for it.
+   */
+  readFbxWithAclDecoder(decoder: AclCallback, maximumBytes?: number | undefined | null): Promise<Buffer>
+  /**
    * Opens a path whose bundles are Oodle-compressed, using a
    * caller-supplied decoder.
    *
@@ -176,6 +189,34 @@ export declare class AssetStudio {
    * nothing in them is executed.
    */
   readMonoBehaviourJsonWithSchemas(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): Buffer
+}
+
+/**
+ * Frame-major scalar curves an injected ACL decoder returns.
+ *
+ * `bindingIndices[column]` is the absolute Unity binding scalar index for
+ * `values[frame * bindingIndices.length + column]`, and the indices must be
+ * strictly increasing.
+ */
+export interface AclDecodedClip {
+  times: Array<number>
+  bindingIndices: Array<number>
+  values: Array<number>
+  /** Binding offset for the ordinary streamed curves that follow. */
+  followingCurveOffset: number
+}
+
+/** What an injected ACL decoder is asked to decode. */
+export interface AclDecodeRequest {
+  frameCount: number
+  boneCount: number
+  sampleRate: number
+  declaredCurveCount?: number
+  useFastSampleMode?: boolean
+  /** The validated compressed-track bytes. */
+  compressedTracks: Buffer
+  /** Tuanjie's decoder map, empty when the clip carries none. */
+  decoderMap: Array<number>
 }
 
 /**
