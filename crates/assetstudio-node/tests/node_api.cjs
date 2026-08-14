@@ -88,6 +88,38 @@ const TEXTURE_PIXELS = Buffer.from([
   255, 0, 0, 1, 0, 255, 0, 2, 0, 0, 255, 3, 255, 255, 255, 4,
 ])
 
+// A Font whose payload is an OpenType blob, so the reader's extension guess has
+// something to key on.
+function syntheticFont() {
+  const payload = Buffer.concat([
+    alignedString('node-font'),
+    Buffer.alloc(4), // line spacing
+    Buffer.alloc(12), // default material PPtr
+    Buffer.alloc(4), // font size
+    Buffer.alloc(12), // texture PPtr
+    Buffer.alloc(20),
+    i32(0), // character rects
+    i32(0), // kerning
+    Buffer.alloc(4), // pixel scale
+    i32(8),
+    Buffer.from('OTTOfont'),
+  ])
+  return finishV22Asset(128, payload)
+}
+
+// A legacy MovieTexture, whose payload is an Ogg stream.
+function syntheticMovieTexture() {
+  const payload = Buffer.concat([
+    alignedString('node-movie'),
+    Buffer.alloc(8), // five colour-space bytes, aligned to four
+    Buffer.from([1, 0, 0, 0]), // loop flag, aligned
+    Buffer.alloc(12), // audio clip PPtr
+    i32(4),
+    Buffer.from('OggS'),
+  ])
+  return finishV22Asset(152, payload, '2018.4.36f1')
+}
+
 function syntheticTexture2d() {
   let payload = Buffer.alloc(0)
   const push = (...parts) => {
@@ -405,6 +437,29 @@ testAsyncWorkers().catch((error) => {
   } finally {
     fs.rmSync(scriptDirectory, { recursive: true, force: true })
   }
+}
+
+// Font, MovieTexture and VideoClip had no Node binding at all: a caller could
+// only reach them through `export`. Checked against what the payload declares
+// rather than against bytes this project produced.
+{
+  const fontStudio = addon.AssetStudio.fromBuffers([
+    { name: 'font.assets', data: syntheticFont() },
+  ])
+  const font = fontStudio.readFont(0, 7n)
+  assert.strictEqual(font.name, 'node-font')
+  assert.strictEqual(font.extension, '.otf')
+  assert.ok(font.data.subarray(0, 4).equals(Buffer.from('OTTO')))
+
+  const movieStudio = addon.AssetStudio.fromBuffers([
+    { name: 'movie.assets', data: syntheticMovieTexture() },
+  ])
+  const movie = movieStudio.readMovieTexture(0, 7n)
+  assert.strictEqual(movie.name, 'node-movie')
+  assert.ok(movie.data.equals(Buffer.from('OggS')))
+
+  // Reading one kind as another must fail rather than return something.
+  assert.throws(() => fontStudio.readMovieTexture(0, 7n))
 }
 
 console.log('node api: additional readers ok')

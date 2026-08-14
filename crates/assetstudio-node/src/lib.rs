@@ -19,7 +19,7 @@ use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
 use assetstudio_core::scene_textures::SceneTextureLimits;
 use assetstudio_core::serialized::{TypeTree, TypeTreeNode};
-use assetstudio_core::simple_assets::SimpleAssetReadLimits;
+use assetstudio_core::simple_assets::{SimpleAssetReadLimits, SimpleBinaryAsset};
 use assetstudio_core::source::Region;
 use assetstudio_core::sprite::SpriteReadLimits;
 use assetstudio_core::studio::{Studio, StudioObject};
@@ -82,6 +82,20 @@ pub struct AudioClip {
     pub extension: String,
     /// True when the payload is already a playable RIFF/WAVE stream.
     pub is_direct_wav: bool,
+    pub data: Buffer,
+}
+
+/// A resident binary asset: a `Font`, a legacy `MovieTexture`, or a `VideoClip`.
+///
+/// All three are a name and a blob whose format the file declares, so one shape
+/// covers them rather than three that differ only in what they are called.
+#[napi(object)]
+pub struct BinaryAsset {
+    pub name: String,
+    /// What the payload is, as the reader classified it.
+    pub kind: String,
+    /// The extension the stored bytes carry, `.ttf` or `.ogg` for example.
+    pub extension: String,
     pub data: Buffer,
 }
 
@@ -1101,6 +1115,45 @@ impl AssetStudio {
             .map_err(core_error)
     }
 
+    /// Reads a `Font`'s resident payload.
+    #[napi]
+    pub fn read_font(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<BinaryAsset> {
+        self.binary_asset(file_index, path_id, maximum_bytes, |object, limits| {
+            object.read_font(limits)
+        })
+    }
+
+    /// Reads the resident Ogg payload from a legacy `MovieTexture`.
+    #[napi]
+    pub fn read_movie_texture(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<BinaryAsset> {
+        self.binary_asset(file_index, path_id, maximum_bytes, |object, limits| {
+            object.read_movie_texture(limits)
+        })
+    }
+
+    /// Reads a `VideoClip`'s resident or external payload.
+    #[napi]
+    pub fn read_video_clip(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<BinaryAsset> {
+        self.binary_asset(file_index, path_id, maximum_bytes, |object, limits| {
+            object.read_video_clip(limits)
+        })
+    }
+
     /// Exports every supported object into `outputRoot`.
     ///
     /// The Core exporter writes atomically and never overwrites unless asked,
@@ -1457,6 +1510,37 @@ impl AssetStudio {
 }
 
 impl AssetStudio {
+    /// Shared body for the three binary-asset readers, which differ only in
+    /// which Core method they call.
+    fn binary_asset(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+        read: impl FnOnce(
+            &StudioObject<'_>,
+            SimpleAssetReadLimits,
+        ) -> assetstudio_core::Result<SimpleBinaryAsset>,
+    ) -> Result<BinaryAsset> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let object = self.object(file_index, bigint_i64(path_id, "pathId")?)?;
+        let asset = read(
+            &object,
+            SimpleAssetReadLimits {
+                maximum_payload_bytes: maximum,
+                ..SimpleAssetReadLimits::default()
+            },
+        )
+        .map_err(core_error)?;
+        let data = asset.payload.read_to_vec(maximum).map_err(core_error)?;
+        Ok(BinaryAsset {
+            name: asset.name,
+            kind: asset.payload_kind.to_owned(),
+            extension: asset.suggested_extension,
+            data: data.into(),
+        })
+    }
+
     fn object(&self, file_index: u32, path_id: i64) -> Result<StudioObject<'_>> {
         let file_index = usize::try_from(file_index).expect("u32 fits usize");
         studio_object(&self.studio, file_index, path_id)
