@@ -121,6 +121,22 @@ export declare class AssetStudio {
    * an explicit output budget.
    */
   live2DPackages(): Array<Live2DPackageInfo>
+  /**
+   * Writes the collection as ASCII FBX 7.4 including its animation tracks.
+   *
+   * The static variant omits animation deliberately; this is the one a
+   * caller wants for a rigged model.
+   */
+  readFbx(maximumBytes?: number | undefined | null): Buffer
+  /**
+   * Materializes every Live2D package: the MOC, the model3 manifest, the
+   * mip-zero texture PNGs, and the expression, motion, physics, pose and
+   * display-info JSON where their verified fields are present.
+   *
+   * Returned in memory rather than written, so the caller decides where the
+   * files land and stays inside whatever budget it set.
+   */
+  readLive2DPackages(maximumBytes?: number | undefined | null): Array<Live2DPackageFiles>
 }
 
 /**
@@ -225,6 +241,20 @@ export interface FileInfo {
   path: string
   unityVersion: string
   objectCount: number
+}
+
+/** One file belonging to a materialized Live2D package. */
+export interface Live2DFile {
+  /** Path relative to the package directory. */
+  fileName: string
+  data: Buffer
+}
+
+/** One materialized Live2D model: every file it needs, in memory. */
+export interface Live2DPackageFiles {
+  name: string
+  directoryName: string
+  files: Array<Live2DFile>
 }
 
 /** One Live2D model discovered in the collection. */

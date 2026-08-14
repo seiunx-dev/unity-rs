@@ -7,7 +7,7 @@ use assetstudio_core::animator_controller::AnimatorControllerReadLimits;
 use assetstudio_core::avatar::AvatarReadLimits;
 use assetstudio_core::export::ExportOptions;
 use assetstudio_core::extraction::ExtractionOptions;
-use assetstudio_core::live2d_package::Live2dPackageLimits;
+use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMaterializeLimits};
 use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
@@ -238,6 +238,22 @@ pub struct Live2dPackageInfo {
     pub has_physics: bool,
     pub has_pose: bool,
     pub has_display_info: bool,
+}
+
+/// One file belonging to a materialized Live2D package.
+#[napi(object)]
+pub struct Live2dFile {
+    /// Path relative to the package directory.
+    pub file_name: String,
+    pub data: Buffer,
+}
+
+/// One materialized Live2D model: every file it needs, in memory.
+#[napi(object)]
+pub struct Live2dPackageFiles {
+    pub name: String,
+    pub directory_name: String,
+    pub files: Vec<Live2dFile>,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -1095,6 +1111,78 @@ impl AssetStudio {
                 has_display_info: package.display_info.is_some(),
             })
             .collect())
+    }
+
+    /// Writes the collection as ASCII FBX 7.4 including its animation tracks.
+    ///
+    /// The static variant omits animation deliberately; this is the one a
+    /// caller wants for a rigged model.
+    #[napi]
+    pub fn read_fbx(&self, maximum_bytes: Option<i64>) -> Result<Buffer> {
+        self.studio
+            .read_fbx(byte_limit(maximum_bytes)?)
+            .map(Into::into)
+            .map_err(core_error)
+    }
+
+    /// Materializes every Live2D package: the MOC, the model3 manifest, the
+    /// mip-zero texture PNGs, and the expression, motion, physics, pose and
+    /// display-info JSON where their verified fields are present.
+    ///
+    /// Returned in memory rather than written, so the caller decides where the
+    /// files land and stays inside whatever budget it set.
+    #[napi]
+    pub fn read_live2d_packages(
+        &self,
+        maximum_bytes: Option<i64>,
+    ) -> Result<Vec<Live2dPackageFiles>> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let set = self
+            .studio
+            .read_live2d_packages(
+                Live2dPackageLimits::default(),
+                Live2dPackageMaterializeLimits {
+                    maximum_total_bytes: maximum,
+                    ..Live2dPackageMaterializeLimits::default()
+                },
+            )
+            .map_err(core_error)?;
+        let mut packages = Vec::with_capacity(set.packages.len());
+        for package in set.packages {
+            let mut files = Vec::new();
+            files.push(Live2dFile {
+                file_name: package.moc_file_name,
+                data: package.moc.into(),
+            });
+            files.push(Live2dFile {
+                file_name: package.manifest_file_name,
+                data: package.manifest.into(),
+            });
+            for texture in package.textures {
+                files.push(Live2dFile {
+                    file_name: texture.file_name,
+                    data: texture.png.into(),
+                });
+            }
+            for expression in package.expressions {
+                files.push(Live2dFile {
+                    file_name: expression.file_name,
+                    data: expression.json.into(),
+                });
+            }
+            for motion in package.motions {
+                files.push(Live2dFile {
+                    file_name: motion.file_name,
+                    data: motion.json.into(),
+                });
+            }
+            packages.push(Live2dPackageFiles {
+                name: package.name,
+                directory_name: package.directory_name,
+                files,
+            });
+        }
+        Ok(packages)
     }
 }
 

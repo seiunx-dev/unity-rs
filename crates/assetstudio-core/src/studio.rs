@@ -330,6 +330,50 @@ impl Studio {
         write_model_ir_fbx_ascii_with_animations(&model, &animations, output, maximum_output_bytes)
     }
 
+    /// Builds the model with its animations and its material textures, streams
+    /// the FBX, and returns the texture set alongside the byte count.
+    ///
+    /// The FBX references each texture by file name, so a caller has to write
+    /// the returned set beside the model for those references to resolve. That
+    /// is why the set comes back rather than being written here: this method
+    /// owns one output stream and has no directory to write siblings into.
+    pub fn write_fbx_with_textures(
+        &self,
+        output: &mut impl Write,
+        maximum_output_bytes: u64,
+        format: crate::image_export::ImageFormat,
+        texture_limits: crate::scene_textures::SceneTextureLimits,
+    ) -> Result<(u64, crate::scene_textures::SceneTextureSet)> {
+        let hierarchy = self.scene_hierarchy(SceneHierarchyLimits::default())?;
+        let model = build_model_ir(&self.collection, &hierarchy, ModelIrLimits::default())?;
+        let graph = build_animation_graph(
+            &self.collection,
+            &hierarchy,
+            AnimationGraphLimits::default(),
+        )?;
+        let animations = build_model_animations_with_acl_decoder(
+            &self.collection,
+            &model,
+            &graph,
+            ModelAnimationLimits::default(),
+            None,
+        )?;
+        let textures = crate::scene_textures::SceneTextureSet::from_model(
+            &self.collection,
+            &model,
+            format,
+            texture_limits,
+        )?;
+        let written = crate::fbx_ascii::write_model_ir_fbx_ascii_with_textures(
+            &model,
+            &animations,
+            &textures,
+            output,
+            maximum_output_bytes,
+        )?;
+        Ok((written, textures))
+    }
+
     /// Materializes bounded ASCII FBX 7.4 with supported animation tracks.
     pub fn read_fbx(&self, maximum_output_bytes: u64) -> Result<Vec<u8>> {
         self.read_fbx_with_acl_decoder(maximum_output_bytes, None)
