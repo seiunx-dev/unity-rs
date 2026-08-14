@@ -4421,11 +4421,7 @@ mod tests {
             // disagreement is one, on about seven percent of samples. Silence
             // still has to match exactly, where any difference at all would be
             // a real defect rather than rounding.
-            let tolerance = if channels.starts_with("silence") {
-                0
-            } else {
-                1
-            };
+            let tolerance = i32::from(!channels.starts_with("silence"));
             for (index, (rust, oracle)) in
                 rust.chunks_exact(2).zip(oracle.chunks_exact(2)).enumerate()
             {
