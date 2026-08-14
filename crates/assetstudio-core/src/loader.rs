@@ -324,9 +324,8 @@ impl AssetCollection {
                     let file = SerializedFile::open_with_options(
                         input.region,
                         SerializedOpenOptions {
-                            unity_version_override: unity_version_override
-                                .cloned()
-                                .or(input.unity_version_hint),
+                            unity_version_override: unity_version_override.cloned(),
+                            bundle_version_hint: input.unity_version_hint,
                             ..SerializedOpenOptions::default()
                         },
                     )?;
@@ -1968,6 +1967,37 @@ mod tests {
             AssetCollection::load_with_limits("legacy.unity3d", Region::from_bytes(raw), limits,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_bundle_revision_does_not_replace_a_declared_serialized_file_version() {
+        // The managed reader applies the bundle revision only below format 7.
+        // These files are v22 and say what they are, so the enclosing bundle's
+        // 3.5.0f5 must not reach the version gates that drive every later
+        // layout decision.
+        let declared = empty_v22_serialized_file_with_version("2019.4.40f1");
+        let raw = legacy_raw_bundle(&[("CAB-declared", declared.as_slice())]);
+
+        let loaded =
+            AssetCollection::load("declared.unity3d", Region::from_bytes(raw.clone())).unwrap();
+        assert_eq!(loaded.serialized_files.len(), 1);
+        assert_eq!(
+            loaded.serialized_files[0].file.unity_version.full_version,
+            "2019.4.40f1"
+        );
+
+        // A caller-supplied version still outranks the file's own.
+        let explicit = UnityVersion::new(6000, 2, 0);
+        let overridden = AssetCollection::load_with_options(
+            "declared.unity3d",
+            Region::from_bytes(raw),
+            AssetLoadOptions {
+                unity_version_override: Some(explicit.clone()),
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(overridden.serialized_files[0].file.unity_version, explicit);
     }
 
     #[test]
