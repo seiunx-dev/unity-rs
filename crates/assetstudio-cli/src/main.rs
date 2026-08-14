@@ -2211,8 +2211,23 @@ impl Drop for Live2dPublicationLock {
     }
 }
 
+/// Flushes a directory entry so a create or rename inside it survives a crash.
+///
+/// This is a POSIX technique and it has no supported Windows equivalent.
+/// `File::open` on a directory there fails outright with `ERROR_ACCESS_DENIED`
+/// because a directory handle needs `FILE_FLAG_BACKUP_SEMANTICS`, and even with
+/// that flag `FlushFileBuffers` wants write access a directory handle cannot
+/// carry. Attempting it made every `Live2D` package publish fail on Windows, so
+/// the sync is skipped there; the publish itself stays atomic either way,
+/// because it is still a single rename of a fully written directory.
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 

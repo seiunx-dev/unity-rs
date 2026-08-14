@@ -1972,6 +1972,17 @@ mod tests {
         assert_eq!(selected[0].legacy_base, Some(key(2)));
     }
 
+    /// Tolerance for Euler angle comparisons, in degrees.
+    ///
+    /// These angles come out of f32 `atan2` and `to_degrees`, and libm
+    /// implementations are only required to be close to the correctly rounded
+    /// result, not identical to each other. For the 45-degree case the correctly
+    /// rounded f32 answer is already -45.0000076, so a 1e-5 bound left under two
+    /// ulps of headroom: it passed on ARM macOS and failed on x86-64 Linux purely
+    /// on an `atan2` ulp. A thousandth of a degree is orders of magnitude below any
+    /// geometric significance and survives an implementation difference.
+    const EULER_DEGREES_TOLERANCE: f32 = 1e-3;
+
     #[test]
     fn converts_legacy_transform_curves_and_resolves_suffix_paths() {
         let model = model_fixture();
@@ -2020,7 +2031,7 @@ mod tests {
             [2.0_f32, 3.0, 4.0].map(f32::to_bits)
         );
         assert_eq!(tracks[0].rotations.len(), 2);
-        assert!((tracks[0].rotations[0].value[2] + 45.0).abs() < 0.000_01);
+        assert!((tracks[0].rotations[0].value[2] + 45.0).abs() < EULER_DEGREES_TOLERANCE);
         assert_eq!(
             tracks[0].rotations[1].value.map(f32::to_bits),
             [10.0_f32, -20.0, -30.0].map(f32::to_bits)

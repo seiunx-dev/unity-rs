@@ -2691,26 +2691,37 @@ mod tests {
         write_geometry, write_model_ir_fbx_ascii, write_model_ir_fbx_ascii_with_animations,
     };
 
+    /// Tolerance for Euler angle comparisons, in degrees.
+    ///
+    /// These angles come out of f32 `atan2` and `to_degrees`, and libm
+    /// implementations are only required to be close to the correctly rounded
+    /// result, not identical to each other. For the 45-degree case the correctly
+    /// rounded f32 answer is already -45.0000076, so a 1e-5 bound left under two
+    /// ulps of headroom: it passed on ARM macOS and failed on x86-64 Linux purely
+    /// on an `atan2` ulp. A thousandth of a degree is orders of magnitude below any
+    /// geometric significance and survives an implementation difference.
+    const EULER_DEGREES_TOLERANCE: f32 = 1e-3;
+
     #[test]
     fn quaternion_conversion_matches_the_fbx_sdk_oracle() {
         let euler = quaternion_to_euler_degrees([0.2, -0.3, 0.1, 0.927_361_85]).unwrap();
-        assert!((euler[0] - 22.791_931).abs() < 0.000_01);
-        assert!((euler[1] + 36.613_724).abs() < 0.000_01);
-        assert!((euler[2] - 4.678_685_7).abs() < 0.000_01);
+        assert!((euler[0] - 22.791_931).abs() < EULER_DEGREES_TOLERANCE);
+        assert!((euler[1] + 36.613_724).abs() < EULER_DEGREES_TOLERANCE);
+        assert!((euler[2] - 4.678_685_7).abs() < EULER_DEGREES_TOLERANCE);
 
         let positive_lock =
             quaternion_to_euler_degrees([-0.270_598_05, 0.653_281_5, 0.270_598_05, 0.653_281_5])
                 .unwrap();
-        assert!((positive_lock[0] + 45.0).abs() < 0.000_01);
-        assert!((positive_lock[1] - 90.0).abs() < 0.000_01);
-        assert!(positive_lock[2].abs() < 0.000_01);
+        assert!((positive_lock[0] + 45.0).abs() < EULER_DEGREES_TOLERANCE);
+        assert!((positive_lock[1] - 90.0).abs() < EULER_DEGREES_TOLERANCE);
+        assert!(positive_lock[2].abs() < EULER_DEGREES_TOLERANCE);
 
         let negative_lock =
             quaternion_to_euler_degrees([-0.270_598_05, -0.653_281_5, -0.270_598_05, 0.653_281_5])
                 .unwrap();
-        assert!((negative_lock[0] + 45.0).abs() < 0.000_01);
-        assert!((negative_lock[1] + 90.0).abs() < 0.000_01);
-        assert!(negative_lock[2].abs() < 0.000_01);
+        assert!((negative_lock[0] + 45.0).abs() < EULER_DEGREES_TOLERANCE);
+        assert!((negative_lock[1] + 90.0).abs() < EULER_DEGREES_TOLERANCE);
+        assert!(negative_lock[2].abs() < EULER_DEGREES_TOLERANCE);
     }
 
     #[test]
@@ -2800,7 +2811,7 @@ mod tests {
             converted.translation.map(f32::to_bits),
             [-2.0_f32, 3.0, 4.0].map(f32::to_bits)
         );
-        assert!((converted.rotation[2] + 45.0).abs() < 0.000_01);
+        assert!((converted.rotation[2] + 45.0).abs() < EULER_DEGREES_TOLERANCE);
         assert_eq!(
             converted.scale.map(f32::to_bits),
             [2.0_f32, 3.0, 4.0].map(f32::to_bits)
