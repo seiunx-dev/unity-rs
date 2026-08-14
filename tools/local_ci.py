@@ -11,11 +11,14 @@ It is not a replacement for CI. CI runs this matrix on Linux, Windows and
 macOS; this runs it wherever you are. The value is that a contributor on a
 platform the maintainer cannot reach can produce the same evidence.
 
-The `cross` group is the exception, and a partial one: it compiles the
-workspace and its tests for another target without running them. That catches
-what fails to build elsewhere -- a path assumption, a missing `cfg`, a type
-that is only `Send` on one platform -- but says nothing about behaviour. It
-needs a cross C toolchain because zstd builds from C sources.
+Two groups reach past this machine. `cross` compiles the workspace and its
+tests for another target without running them, which catches what fails to
+build elsewhere -- a path assumption, a missing `cfg`, a type that is only
+`Send` on one platform -- but says nothing about behaviour; it needs a cross C
+toolchain because zstd builds from C sources. `linux` goes further and runs the
+suite and the Python wheel inside a container on the toolchain CI pins, which
+is behaviour rather than compilation. Neither covers Windows or macOS at once,
+so CI still has work to do.
 
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
@@ -137,6 +140,33 @@ def groups(interpreter: str) -> list[Group]:
             reason="cross-compiling needs a Linux C toolchain for zstd's C sources",
         ),
         Group(
+            "linux",
+            [
+                Step(
+                    "workspace tests on Linux",
+                    [
+                        "docker", "run", "--rm", "--platform", "linux/amd64",
+                        "-v", f"{ROOT}:/src", "-w", "/src",
+                        "-e", "CARGO_TARGET_DIR=/tmp/target",
+                        LINUX_IMAGE,
+                        "sh", "-c", LINUX_TESTS,
+                    ],
+                ),
+                Step(
+                    "Python wheel on Linux",
+                    [
+                        "docker", "run", "--rm", "--platform", "linux/amd64",
+                        "-v", f"{ROOT}:/src", "-w", "/src/crates/assetstudio-python",
+                        "-e", "CARGO_TARGET_DIR=/tmp/target",
+                        LINUX_IMAGE,
+                        "sh", "-c", LINUX_WHEEL,
+                    ],
+                ),
+            ],
+            requires="docker",
+            reason="running the suite on Linux needs a container runtime",
+        ),
+        Group(
             "node",
             [
                 Step("install", ["npm", "ci"], cwd=NODE),
@@ -179,6 +209,28 @@ def groups(interpreter: str) -> list[Group]:
         ),
     ]
 
+
+# The toolchain CI pins, so a failure here is a failure there.
+LINUX_IMAGE = "rust:1.88-slim-bookworm"
+
+# zstd builds from C sources, so the image needs a compiler.
+LINUX_SETUP = "apt-get update -qq >/dev/null && apt-get install -y -qq gcc >/dev/null"
+
+# The Node addon is excluded: it links libnode, which this image does not carry.
+LINUX_TESTS = (
+    f"{LINUX_SETUP} && cargo test -p assetstudio-core -p assetstudio-cli --locked"
+)
+
+LINUX_WHEEL = (
+    f"{LINUX_SETUP} && apt-get install -y -qq python3 python3-venv >/dev/null"
+    " && python3 -m venv /tmp/venv"
+    " && /tmp/venv/bin/pip install --quiet maturin"
+    " && /tmp/venv/bin/maturin build --release --locked"
+    " --interpreter /tmp/venv/bin/python --out /tmp/dist"
+    " && /tmp/venv/bin/pip install --quiet --force-reinstall --no-deps /tmp/dist/*.whl"
+    " && /tmp/venv/bin/python -I tests/installed_wheel.py"
+    " && /tmp/venv/bin/python -I tests/python_api.py"
+)
 
 INSTALL_WHEEL = (
     "import glob, subprocess, sys; "
