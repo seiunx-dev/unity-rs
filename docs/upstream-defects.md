@@ -159,7 +159,8 @@ that is correct; both need `vgmstream-cli` and run under `--ignored`.
 ### Status
 
 Not filed. No workaround short of a different decoder, and the alternatives are
-libopus bindings, which would end this crate's pure-Rust property.
+libopus bindings, which would add a second native dependency to a crate whose
+audio decoding is otherwise pure Rust.
 
 ---
 
@@ -179,9 +180,10 @@ because the managed differential proves the copy correct rather than the copy
 being taken on trust.
 
 The Opus defect is not, for two reasons. The equivalent step would be vendoring
-or replacing an Opus decoder, and the alternatives are libopus bindings, which
-would end this crate's pure-Rust property for a codec whose CELT path is already
-correct. And there is no one-line fix to apply: finding it means working through
+or replacing an Opus decoder, and the alternatives are libopus bindings: a
+second native dependency, for a codec whose CELT path is already correct. (The
+first is `zstd`, whose C sources this workspace already builds, so the point is
+the cost of adding another rather than a pure-Rust property to protect.) And there is no one-line fix to apply: finding it means working through
 `ruopus`'s SILK resampler, which is upstream's work to do with the measurements
 above rather than a patch waiting to be written. Its tests hold the current behaviour in place and will fail if the
 divergence changes shape or disappears.
