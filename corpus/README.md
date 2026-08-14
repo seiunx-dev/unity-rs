@@ -8,7 +8,17 @@ belong in the repository.
 1. Copy `manifest.example.json` to a private location.
 2. Point each enabled case at an asset file, bundle, web container, split-file
    directory, or game data directory.
-3. Generate the expected snapshot with the checked managed oracle:
+3. Optionally generate the expected snapshot with the checked managed oracle.
+
+   A case may omit `expected`, in which case the gate reads every object and
+   fails on an error but has nothing to compare values against; it reports what
+   it read and requires the case to parse to at least one object, so an input
+   the reader does not recognise -- which parses as a resource file with no
+   objects -- fails rather than passing quietly. That mode needs only the game
+   files. Comparing values needs the snapshot below, and the snapshot needs the
+   .NET SDK and an AssetStudio checkout.
+
+   To generate one:
 
    ```shell
    dotnet build oracle/AssetStudioOracle.csproj \
@@ -17,7 +27,8 @@ belong in the repository.
      /path/to/game_Data > /private/corpus/snapshots/game.json
    ```
 
-4. Run the same input through Rust and compare the complete manifest:
+4. Run the input through Rust, comparing against the snapshot where a case has
+   one:
 
    ```shell
    ASSETSTUDIO_CORPUS_MANIFEST=/private/corpus/manifest.json \
