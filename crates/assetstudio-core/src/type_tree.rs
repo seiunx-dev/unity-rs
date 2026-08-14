@@ -40,13 +40,39 @@ pub enum TypeValue {
     Signed(i64),
     Unsigned(u64),
     Character(u16),
+    /// A serialized `float`, kept at its source width.
+    ///
+    /// Widening to `f64` on decode would be lossless numerically but not
+    /// textually: the shortest round-trip form of the widened value is the
+    /// double expansion, so `0.1f` would serialize as `0.10000000149011612`.
+    Float32(f32),
+    /// A serialized `double`.
     Float(f64),
     Boolean(bool),
     String(String),
-    TypelessData { offset: u64, size: u64 },
+    TypelessData {
+        offset: u64,
+        size: u64,
+    },
     Array(Vec<Self>),
     Object(Vec<TypeField>),
     Map(Vec<TypeMapEntry>),
+}
+
+impl TypeValue {
+    /// Returns the numeric value of either floating-point variant.
+    ///
+    /// Consumers that only need the number, such as the Cubism schema readers,
+    /// should use this rather than matching one variant and silently rejecting
+    /// the other.
+    #[must_use]
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float32(value) => Some(f64::from(*value)),
+            Self::Float(value) => Some(*value),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,10 +229,7 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
             ),
             ValueKind::Signed64 => (TypeValue::Signed(self.reader.read_i64()?), index + 1),
             ValueKind::Unsigned64 => (TypeValue::Unsigned(self.reader.read_u64()?), index + 1),
-            ValueKind::Float32 => (
-                TypeValue::Float(f64::from(self.reader.read_f32()?)),
-                index + 1,
-            ),
+            ValueKind::Float32 => (TypeValue::Float32(self.reader.read_f32()?), index + 1),
             ValueKind::Float64 => (TypeValue::Float(self.reader.read_f64()?), index + 1),
             ValueKind::Boolean => (TypeValue::Boolean(self.reader.read_bool()?), index + 1),
             ValueKind::String => {

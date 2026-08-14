@@ -579,6 +579,7 @@ fn required_string<'a>(value: &'a TypeValue, names: &[&str], description: &str) 
 
 fn required_number(value: &TypeValue, names: &[&str], description: &str) -> Result<f64> {
     let value = match required_field(value, names, description)? {
+        TypeValue::Float32(value) => f64::from(*value),
         TypeValue::Float(value) => *value,
         TypeValue::Signed(value) => value.to_string().parse::<f64>().map_err(|error| {
             Error::invalid_data(format!(
