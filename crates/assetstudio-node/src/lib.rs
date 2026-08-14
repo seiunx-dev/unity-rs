@@ -26,7 +26,8 @@ use assetstudio_core::studio::{Studio, StudioObject};
 use assetstudio_core::texture::TextureReadLimits;
 use assetstudio_core::texture_array::TextureArrayReadLimits;
 use assetstudio_core::unity_version::UnityVersion;
-use napi::bindgen_prelude::{AsyncTask, BigInt, Buffer};
+use napi::bindgen_prelude::{AsyncTask, BigInt, Buffer, FnArgs};
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Error, Result, Status, Task};
 use napi_derive::napi;
 
@@ -363,6 +364,24 @@ impl AssetStudio {
             studio: Arc::new(studio),
         })
         .map_err(core_error)
+    }
+
+    /// Opens a path whose bundles are Oodle-compressed, using a
+    /// caller-supplied decoder.
+    ///
+    /// Asynchronous by necessity, not for convenience: the decoder runs on the
+    /// JavaScript event loop while a worker waits for it, so calling this
+    /// synchronously would block the loop that has to run the callback.
+    ///
+    /// The callback receives the compressed bytes and the exact expected output
+    /// length, and must return precisely that many bytes.
+    #[must_use]
+    #[napi(ts_return_type = "Promise<AssetStudio>")]
+    pub fn open_with_oodle(path: String, decoder: OodleCallback) -> AsyncTask<OpenWithOodleTask> {
+        AsyncTask::new(OpenWithOodleTask {
+            path,
+            decoder: Arc::new(JsOodleDecoder { callback: decoder }),
+        })
     }
 
     /// Opens a path on a libuv worker so container discovery does not block
@@ -1385,6 +1404,89 @@ impl AssetStudio {
             maximum: byte_limit(maximum_bytes)?,
             kind,
         }))
+    }
+}
+
+/// The JavaScript decoder callback: compressed bytes and the exact expected
+/// output length in, exactly that many bytes out.
+type OodleCallback =
+    ThreadsafeFunction<FnArgs<(Buffer, u32)>, Buffer, FnArgs<(Buffer, u32)>, Status, false>;
+
+/// Bridges a JavaScript Oodle decoder into Core's synchronous decompression.
+///
+/// Core never ships an Oodle decoder: the format is licensed, so a caller has
+/// to supply one. Core asks for bytes in and bytes out, which means the
+/// JavaScript function has to be called from whichever thread is decompressing
+/// and its result waited for.
+///
+/// That is only safe off the main thread. The worker blocks on a channel while
+/// the JavaScript callback runs on the event loop; doing the same from the main
+/// thread would block the very loop that has to run the callback and deadlock.
+/// This is why the only way to reach it is the asynchronous factory.
+struct JsOodleDecoder {
+    callback: OodleCallback,
+}
+
+impl assetstudio_core::bundle::OodleDecoder for JsOodleDecoder {
+    fn decompress(&self, input: &[u8], output: &mut [u8]) -> assetstudio_core::Result<usize> {
+        let expected = u32::try_from(output.len()).map_err(|_| {
+            assetstudio_core::Error::invalid_data("Oodle output length does not fit u32")
+        })?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.callback.call_with_return_value(
+            (Buffer::from(input.to_vec()), expected).into(),
+            ThreadsafeFunctionCallMode::Blocking,
+            move |result: Result<Buffer>, _env| {
+                let _ = sender.send(result.map(|buffer| buffer.to_vec()));
+                Ok(())
+            },
+        );
+        let decoded = receiver
+            .recv()
+            .map_err(|_| {
+                assetstudio_core::Error::invalid_data("the Oodle decoder callback never answered")
+            })?
+            .map_err(|error| {
+                assetstudio_core::Error::invalid_data(format!("the Oodle decoder failed: {error}"))
+            })?;
+        if decoded.len() != output.len() {
+            return Err(assetstudio_core::Error::invalid_data(format!(
+                "the Oodle decoder returned {} bytes, expected {}",
+                decoded.len(),
+                output.len()
+            )));
+        }
+        output.copy_from_slice(&decoded);
+        Ok(decoded.len())
+    }
+}
+
+pub struct OpenWithOodleTask {
+    path: String,
+    decoder: Arc<JsOodleDecoder>,
+}
+
+impl Task for OpenWithOodleTask {
+    type Output = Studio;
+    type JsValue = AssetStudio;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        Studio::open_with_options(
+            &self.path,
+            AssetLoadOptions {
+                oodle_decoder: Some(
+                    Arc::clone(&self.decoder) as Arc<dyn assetstudio_core::bundle::OodleDecoder>
+                ),
+                ..AssetLoadOptions::default()
+            },
+        )
+        .map_err(core_error)
+    }
+
+    fn resolve(&mut self, _env: Env, studio: Self::Output) -> Result<Self::JsValue> {
+        Ok(AssetStudio {
+            studio: Arc::new(studio),
+        })
     }
 }
 

@@ -158,6 +158,69 @@ function syntheticStrippedPlayerSettings() {
   return finishV22Asset(129, built.subarray(Number(built.readBigInt64BE(32))), '0.0.0')
 }
 
+function u32be(value) {
+  const buffer = Buffer.alloc(4)
+  buffer.writeUInt32BE(value)
+  return buffer
+}
+
+function i64be(value) {
+  const buffer = Buffer.alloc(8)
+  buffer.writeBigInt64BE(BigInt(value))
+  return buffer
+}
+
+function cstring(value) {
+  return Buffer.concat([Buffer.from(value, 'ascii'), Buffer.from([0])])
+}
+
+// A UnityFS v6 bundle whose single data block is marked Oodle-compressed.
+//
+// The stored bytes are the payload verbatim: Core cannot decompress Oodle
+// itself, so what the block actually contains is whatever the injected decoder
+// says it does. Marking it compression 6 is what forces that decoder to be
+// called, which is the point of the fixture.
+function syntheticOodleBundle(entryName, payload) {
+  const COMBINED = 0x40
+  const SERIALIZED_FILE_ENTRY = 4
+  const OODLE = 6
+
+  const entryTable = Buffer.concat([
+    i64be(0),
+    i64be(payload.length),
+    u32be(SERIALIZED_FILE_ENTRY),
+    cstring(entryName),
+  ])
+  const blocksInfo = Buffer.concat([
+    Buffer.alloc(16), // hash
+    u32be(1), // one block
+    u32be(payload.length), // uncompressed size
+    u32be(payload.length), // stored size
+    Buffer.from([0, OODLE]), // block flags, big-endian u16
+    u32be(1), // one directory entry
+    entryTable,
+  ])
+
+  const header = Buffer.concat([
+    cstring('UnityFS'),
+    u32be(6),
+    cstring('5.x.x'),
+    cstring('2019.4.40f1'),
+  ])
+  const sizeOffset = header.length
+  const rest = Buffer.concat([
+    i64be(0), // total size, patched below
+    u32be(blocksInfo.length), // stored blocks-info size
+    u32be(blocksInfo.length), // uncompressed blocks-info size
+    u32be(COMBINED), // uncompressed blocks-info, combined directory
+    blocksInfo,
+    payload,
+  ])
+  const bundle = Buffer.concat([header, rest])
+  bundle.writeBigInt64BE(BigInt(bundle.length), sizeOffset)
+  return bundle
+}
+
 function syntheticTypeTreeIntAsset() {
   const payload = i32(42)
   const strings = Buffer.from('int\0value\0', 'ascii')
@@ -525,3 +588,44 @@ console.log('node api: textured fbx and acl inspection ok')
 }
 
 console.log('node api: monobehaviour schemas ok')
+
+// Oodle decoder injection. Core ships no Oodle decoder, so a bundle marked
+// with it is unreadable until the caller supplies one.
+async function testOodleInjection() {
+  const oodleDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'assetstudio-node-oodle-'))
+  try {
+    const inner = syntheticTextAsset()
+    const bundlePath = path.join(oodleDirectory, 'oodle.unity3d')
+    fs.writeFileSync(bundlePath, syntheticOodleBundle('CAB-oodle', inner))
+
+    // Without a decoder the bundle is refused rather than silently skipped.
+    assert.throws(() => new addon.AssetStudio(bundlePath))
+
+    // With one, it loads. This fixture's block is stored verbatim, so the
+    // decoder is the identity -- what matters is that it is called at all and
+    // that its bytes are what Core goes on to parse.
+    let calls = 0
+    const studio = await addon.AssetStudio.openWithOodle(bundlePath, (input, expected) => {
+      calls += 1
+      assert.equal(input.length, expected)
+      return input
+    })
+    assert.equal(calls, 1)
+    assert.equal(studio.fileCount, 1)
+    assert.deepEqual(studio.readText(0, 7n), Buffer.from('hello node'))
+
+    // A decoder returning the wrong length is an error, not a short read.
+    await assert.rejects(
+      addon.AssetStudio.openWithOodle(bundlePath, (input) => input.subarray(0, 4)),
+      /expected/i,
+    )
+  } finally {
+    fs.rmSync(oodleDirectory, { recursive: true, force: true })
+  }
+  console.log('node api: oodle injection ok')
+}
+
+testOodleInjection().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
