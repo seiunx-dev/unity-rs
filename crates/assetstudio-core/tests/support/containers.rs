@@ -180,6 +180,60 @@ fn bundle(signature: &str, layout: &BundleLayout<'_>, entries: &[BundleEntry<'_>
     output
 }
 
+/// Builds a `UnityWebData1.0` archive, the WebGL player's asset container.
+///
+/// The header is a null-terminated signature, the byte length of the header
+/// itself, then one record per entry: data offset, data length, path length and
+/// the path. Entry payloads follow at the offsets the records name.
+#[must_use]
+pub fn unity_web_data(signature: &str, entries: &[BundleEntry<'_>]) -> Vec<u8> {
+    let mut header_length = signature.len() + 1 + 4;
+    for entry in entries {
+        header_length += 12 + entry.path.len();
+    }
+
+    let mut output = Vec::new();
+    output.extend_from_slice(signature.as_bytes());
+    output.push(0);
+    output.extend_from_slice(&u32::try_from(header_length).unwrap().to_le_bytes());
+    let mut offset = header_length;
+    for entry in entries {
+        output.extend_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
+        output.extend_from_slice(&u32::try_from(entry.bytes.len()).unwrap().to_le_bytes());
+        output.extend_from_slice(&u32::try_from(entry.path.len()).unwrap().to_le_bytes());
+        output.extend_from_slice(entry.path.as_bytes());
+        offset += entry.bytes.len();
+    }
+    assert_eq!(
+        output.len(),
+        header_length,
+        "the header length must be exact"
+    );
+    for entry in entries {
+        output.extend_from_slice(entry.bytes);
+    }
+    output
+}
+
+/// Builds a stored (uncompressed) ZIP archive holding `entries`.
+///
+/// Stored rather than deflated so the fixture stays byte-predictable; the
+/// container dispatch and directory walk are what this exercises, not the
+/// inflate path, which the block compressions already cover.
+#[must_use]
+pub fn zip_archive(entries: &[BundleEntry<'_>]) -> Vec<u8> {
+    use std::io::Cursor;
+    use zip::write::SimpleFileOptions;
+
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for entry in entries {
+        writer.start_file(entry.path, options).unwrap();
+        writer.write_all(entry.bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
 /// Wraps `bytes` in a gzip stream, which the loader unwraps before dispatch.
 #[must_use]
 pub fn gzip(bytes: &[u8]) -> Vec<u8> {
