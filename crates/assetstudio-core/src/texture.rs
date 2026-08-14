@@ -3891,6 +3891,80 @@ mod tests {
         }
     }
 
+    /// Pins the one way HDR ASTC decoding differs from the managed decoder.
+    ///
+    /// `texture2ddecoder` 0.1.2 ports the reference `select_color_hdr` with
+    /// `floor(f * 255)` where the C++ it came from has `roundf(f * 255)`. The
+    /// LDR path is unaffected and matches exactly -- all twelve LDR formats are
+    /// compared end to end in the managed differential -- but every HDR channel
+    /// that lands on a fractional value at or above one half comes out a step
+    /// low. It is a truncation bias, never an overshoot, and never more than
+    /// one.
+    ///
+    /// Correcting that single word in a local copy of the crate makes all six
+    /// HDR formats hash-identical to the managed decoder, which is where the
+    /// `-managed.rgba` blobs come from; the differential re-checks that claim
+    /// against the live managed decoder on every run rather than trusting it.
+    ///
+    /// Fixing it here for real means vendoring the crate's 1,800-line ASTC
+    /// decoder to change one word, so the divergence is recorded instead. This
+    /// test fails if it ever grows past a one-step truncation, and fails if it
+    /// disappears -- at which point the HDR formats belong in the exact set.
+    #[test]
+    fn hdr_astc_differs_from_the_managed_decoder_only_by_truncation() {
+        // (block size, format, bytes that differ out of the whole surface)
+        const CASES: &[(usize, TextureFormat, usize)] = &[
+            (4, TextureFormat::ASTC_HDR_4X4, 30),
+            (5, TextureFormat::ASTC_HDR_5X5, 33),
+            (6, TextureFormat::ASTC_HDR_6X6, 43),
+            (8, TextureFormat::ASTC_HDR_8X8, 150),
+            (10, TextureFormat::ASTC_HDR_10X10, 226),
+            (12, TextureFormat::ASTC_HDR_12X12, 176),
+        ];
+
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
+        for (block, format, expected_differences) in CASES {
+            let name = format!("astc-hdr-{block}x{block}");
+            let payload = std::fs::read(directory.join(format!("{name}.bin"))).unwrap();
+            let expected = std::fs::read(directory.join(format!("{name}-managed.rgba"))).unwrap();
+            // The fixtures are two blocks each way.
+            let size = i32::try_from(block * 2).unwrap();
+
+            let object = texture_object(size, size, *format, 1, &payload, None);
+            let file = parse_asset(&object);
+            let collection = collection_with(file.clone(), "unused", b"");
+            let texture =
+                read_texture2d(&collection, &file, 0, TextureReadLimits::default()).unwrap();
+            let actual = texture
+                .decode_mip_rgba8(0, TextureReadLimits::default())
+                .unwrap()
+                .pixels;
+
+            assert_eq!(actual.len(), expected.len(), "{name} surface size");
+            let differences: Vec<i32> = actual
+                .iter()
+                .zip(&expected)
+                .map(|(mine, managed)| i32::from(*managed) - i32::from(*mine))
+                .filter(|difference| *difference != 0)
+                .collect();
+            assert!(
+                differences.iter().all(|difference| *difference == 1),
+                "{name} diverges by more than a one-step truncation: {:?}",
+                differences
+                    .iter()
+                    .filter(|difference| **difference != 1)
+                    .take(8)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                differences.len(),
+                *expected_differences,
+                "{name} truncation count moved"
+            );
+        }
+    }
+
     #[test]
     fn decodes_pvrtc_2bpp_and_4bpp_like_the_native_cpp_oracle() {
         // Deterministic compressed words were decoded with
