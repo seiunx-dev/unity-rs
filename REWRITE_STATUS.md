@@ -143,7 +143,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - **DXT5 与 DXT1 同属已记录的 s3tc 偏离**：托管的颜色调色板复刻 NV4x 硬件，本项目跟规范；DXT5 的 alpha 半边（BC4）能对上，颜色半边对不上，正好印证根因。
    - **DXT1 punch-through alpha 已裁决（2026-08-14）：跟 s3tc 规范**。`q0 <= q1` 模式下 index 3 解为透明黑 `(0,0,0,0)`，与独立解码器（Pillow）一致；AssetStudio 原生 `bcn.cpp` 给不透明黑 `(0,0,0,255)`，复刻的是 NV4x 时代硬件行为。这是对 oracle 的有意偏离——镂空贴图的遮罩区应当透明而非黑块——已在 `texture.rs` 注释、测试和兼容矩阵中记录。UnityPy 无法作为第三方仲裁：它与本项目共用同一个 `texture2ddecoder` 上游。（同批复核确认 DXT3/DXT5 调色板不是缺陷：Rust 符合 s3tc 规范，原生解码器复刻的是 NV4x 时代硬件行为，且 C# 侧根本没有 DXT3 解码器。）
    - multistream MPEG/Opus 和少数平台音频 codec 仍保留原始数据；
-   - Opus/MPEG 的 vgmstream 差分目前使用全零 fixture，验证的是分帧而非采样内容；且 8 个音频差分全部 `#[ignore]`，CI 未执行；
+   - Opus/MPEG 的 vgmstream 差分目前使用全零 fixture，验证的是分帧而非采样内容；8 个音频差分此前虽然写好却从未跑过（全部 `#[ignore]`，CI 也没有对应 job），现已加 `audio-oracle` job：按固定 release 拉 `vgmstream-cli` 再跑 `--ignored`，8 条首次执行即全部通过；
    - 新增 codec 必须先有真实样本和独立 oracle，不能只凭推测实现。
 
 3. **MonoBehaviour schema 来源**
