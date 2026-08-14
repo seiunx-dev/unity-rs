@@ -218,7 +218,11 @@ accumulate across the file; a companion `.mtl` under the same stem carries the
 material colours and `map_Kd`/`map_Bump`/`map_Ks` lines pointing at the sibling
 textures. Its face references name only the channels the mesh actually has,
 unlike the single-mesh `.obj` the `export` command writes, which reproduces the
-managed writer's unconditional `v/vt/vn` exactly.
+managed writer's unconditional `v/vt/vn` exactly. Two departures there are
+deliberate and documented on `write_mesh_obj`: line endings are CRLF
+throughout, where the managed writer's `g` lines follow the platform and its
+other lines do not; and `NaN` is replaced per numeric value rather than by a
+document-wide text substitution that also rewrites a mesh named `NaN`.
 
 `--binary` writes FBX 7.4's binary encoding instead of its text one, with the
 same scene content; some importers accept only that form, and it is smaller and

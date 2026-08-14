@@ -784,6 +784,20 @@ pub fn write_mesh_object_obj_with_collection<W: Write>(
 /// Writes AssetStudio-compatible OBJ text: X is mirrored for positions and
 /// normals, triangle winding is reversed, every line ends in CRLF, number
 /// formatting is locale-independent, and `NaN` components are written as `0`.
+///
+/// Two deliberate departures from the managed writer, both of which make the
+/// output depend on less:
+///
+/// * Line endings are CRLF throughout. The managed writer emits its `g` lines
+///   with `StringBuilder.AppendLine`, which uses the platform's newline, while
+///   every other line carries an explicit CRLF -- so its output has mixed line
+///   endings when it runs on Linux or macOS and uniform ones on Windows. This
+///   matches the Windows form everywhere rather than making a mesh's bytes
+///   depend on which machine exported it.
+/// * `NaN` is replaced per value rather than per document. The managed writer
+///   finishes with `sb.Replace("NaN", "0")` over the whole text, which also
+///   rewrites a mesh whose *name* contains `NaN`. Here only numeric components
+///   are substituted, so the name survives.
 pub fn write_mesh_obj<W: Write>(
     mesh: &Mesh,
     output: &mut W,
