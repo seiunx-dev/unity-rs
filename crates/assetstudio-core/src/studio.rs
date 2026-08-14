@@ -330,6 +330,93 @@ impl Studio {
         write_model_ir_fbx_ascii_with_animations(&model, &animations, output, maximum_output_bytes)
     }
 
+    /// Streams the same static scene in FBX 7.4's binary encoding.
+    ///
+    /// The scene is identical to [`Self::write_static_fbx`]; only the encoding
+    /// differs. Binary is smaller and parses faster, and some importers accept
+    /// only it.
+    pub fn write_static_fbx_binary(
+        &self,
+        output: &mut impl Write,
+        maximum_output_bytes: u64,
+    ) -> Result<u64> {
+        let hierarchy = self.scene_hierarchy(SceneHierarchyLimits::default())?;
+        let model = build_model_ir(&self.collection, &hierarchy, ModelIrLimits::default())?;
+        crate::fbx_binary_scene::write_model_ir_fbx_binary(&model, output, maximum_output_bytes)
+    }
+
+    /// Materializes bounded static binary FBX 7.4 bytes.
+    pub fn read_static_fbx_binary(&self, maximum_output_bytes: u64) -> Result<Vec<u8>> {
+        let maximum = usize::try_from(maximum_output_bytes).map_err(|_| {
+            crate::Error::invalid_data("FBX output limit does not fit this platform")
+        })?;
+        let mut output = LimitedBuffer::new(maximum, "binary FBX");
+        let write_result = self.write_static_fbx_binary(&mut output, maximum_output_bytes);
+        output.finish(write_result)?;
+        Ok(output.bytes)
+    }
+
+    /// Streams binary FBX 7.4 with the animation tracks [`Self::write_fbx`]
+    /// emits.
+    pub fn write_fbx_binary(
+        &self,
+        output: &mut impl Write,
+        maximum_output_bytes: u64,
+    ) -> Result<u64> {
+        self.write_fbx_binary_with_acl_decoder(output, maximum_output_bytes, None)
+    }
+
+    /// Builds and writes binary FBX, optionally using an injected ACL decoder.
+    pub fn write_fbx_binary_with_acl_decoder(
+        &self,
+        output: &mut impl Write,
+        maximum_output_bytes: u64,
+        acl_decoder: Option<&dyn AclDecoder>,
+    ) -> Result<u64> {
+        let hierarchy = self.scene_hierarchy(SceneHierarchyLimits::default())?;
+        let model = build_model_ir(&self.collection, &hierarchy, ModelIrLimits::default())?;
+        let graph = build_animation_graph(
+            &self.collection,
+            &hierarchy,
+            AnimationGraphLimits::default(),
+        )?;
+        let animations = build_model_animations_with_acl_decoder(
+            &self.collection,
+            &model,
+            &graph,
+            ModelAnimationLimits::default(),
+            acl_decoder,
+        )?;
+        crate::fbx_binary_scene::write_model_ir_fbx_binary_full(
+            &model,
+            Some(&animations),
+            None,
+            output,
+            maximum_output_bytes,
+        )
+    }
+
+    /// Materializes bounded binary FBX 7.4 with supported animation tracks.
+    pub fn read_fbx_binary(&self, maximum_output_bytes: u64) -> Result<Vec<u8>> {
+        self.read_fbx_binary_with_acl_decoder(maximum_output_bytes, None)
+    }
+
+    /// Materializes binary FBX, optionally using an injected ACL decoder.
+    pub fn read_fbx_binary_with_acl_decoder(
+        &self,
+        maximum_output_bytes: u64,
+        acl_decoder: Option<&dyn AclDecoder>,
+    ) -> Result<Vec<u8>> {
+        let maximum = usize::try_from(maximum_output_bytes).map_err(|_| {
+            crate::Error::invalid_data("FBX output limit does not fit this platform")
+        })?;
+        let mut output = LimitedBuffer::new(maximum, "binary FBX");
+        let write_result =
+            self.write_fbx_binary_with_acl_decoder(&mut output, maximum_output_bytes, acl_decoder);
+        output.finish(write_result)?;
+        Ok(output.bytes)
+    }
+
     /// Builds the model with its animations and its material textures, streams
     /// the FBX, and returns the texture set alongside the byte count.
     ///

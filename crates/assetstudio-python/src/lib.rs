@@ -1863,6 +1863,48 @@ impl PyAssetStudio {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// The same static scene in FBX 7.4's binary encoding.
+    ///
+    /// Some importers accept only the binary form, and it is smaller and faster
+    /// to parse; the scene itself is identical to `read_static_fbx`.
+    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    fn read_static_fbx_binary<'py>(
+        &self,
+        py: Python<'py>,
+        maximum_bytes: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py
+            .detach(|| self.studio.read_static_fbx_binary(maximum_bytes))
+            .map_err(core_error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// The same animated scene in FBX 7.4's binary encoding.
+    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT, acl_decoder=None))]
+    fn read_fbx_binary<'py>(
+        &self,
+        py: Python<'py>,
+        maximum_bytes: u64,
+        acl_decoder: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if acl_decoder
+            .as_ref()
+            .is_some_and(|decoder| !decoder.bind(py).is_callable())
+        {
+            return Err(PyTypeError::new_err("acl_decoder must be callable"));
+        }
+        let bytes = py.detach(|| {
+            let decoder = acl_decoder.map(|callback| PythonAclDecoder { callback });
+            self.studio
+                .read_fbx_binary_with_acl_decoder(
+                    maximum_bytes,
+                    decoder.as_ref().map(|value| value as &dyn AclDecoder),
+                )
+                .map_err(core_error)
+        })?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Builds ASCII FBX 7.4 with supported bound animations and an optional
     /// caller-supplied Tuanjie ACL decoder.
     #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT, acl_decoder=None))]

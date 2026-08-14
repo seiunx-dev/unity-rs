@@ -1089,6 +1089,18 @@ impl AssetStudio {
             .map_err(core_error)
     }
 
+    /// The same static scene in FBX 7.4's binary encoding.
+    ///
+    /// Some importers accept only the binary form, and it is smaller and faster
+    /// to parse. The scene is identical to `readStaticFbx`.
+    #[napi]
+    pub fn read_static_fbx_binary(&self, maximum_bytes: Option<i64>) -> Result<Buffer> {
+        self.studio
+            .read_static_fbx_binary(byte_limit(maximum_bytes)?)
+            .map(Into::into)
+            .map_err(core_error)
+    }
+
     /// Exports every supported object into `outputRoot`.
     ///
     /// The Core exporter writes atomically and never overwrites unless asked,
@@ -1258,6 +1270,15 @@ impl AssetStudio {
     pub fn read_fbx(&self, maximum_bytes: Option<i64>) -> Result<Buffer> {
         self.studio
             .read_fbx(byte_limit(maximum_bytes)?)
+            .map(Into::into)
+            .map_err(core_error)
+    }
+
+    /// The same animated scene in FBX 7.4's binary encoding.
+    #[napi]
+    pub fn read_fbx_binary(&self, maximum_bytes: Option<i64>) -> Result<Buffer> {
+        self.studio
+            .read_fbx_binary(byte_limit(maximum_bytes)?)
             .map(Into::into)
             .map_err(core_error)
     }

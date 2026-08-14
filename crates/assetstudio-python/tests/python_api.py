@@ -2640,6 +2640,16 @@ def main() -> None:
         model_path = Path(directory) / "model.assets"
         model_path.write_bytes(synthetic_static_model())
         fbx = AssetStudio(model_path).read_static_fbx(maximum_bytes=128 * 1024)
+        # The same scene in the other encoding, which had no binding at all
+        # until the writer was wired up. Checked against the format's own magic
+        # and version word rather than against bytes this project produced.
+        binary_fbx = AssetStudio(model_path).read_static_fbx_binary(
+            maximum_bytes=128 * 1024
+        )
+        assert binary_fbx.startswith(b"Kaydara FBX Binary  \0"), binary_fbx[:32]
+        assert struct.unpack_from("<I", binary_fbx, 23)[0] == 7400
+        assert b"Geometry" in binary_fbx
+        assert binary_fbx != fbx
         model_studio = AssetStudio(model_path)
         split_candidates = model_studio.split_object_fbx_candidates()
         assert len(split_candidates) == 1
@@ -2666,6 +2676,11 @@ def main() -> None:
         assert b'P: "Lcl Scaling", "Lcl Scaling", "", "A",2,3,4' in fbx
         assert b"a: 2,1,-1" in fbx
         animated_fbx = AssetStudio(model_path).read_fbx(maximum_bytes=128 * 1024)
+        animated_binary = AssetStudio(model_path).read_fbx_binary(
+            maximum_bytes=128 * 1024
+        )
+        assert animated_binary.startswith(b"Kaydara FBX Binary  \0")
+        assert struct.unpack_from("<I", animated_binary, 23)[0] == 7400
         assert animated_fbx.startswith(b"; FBX 7.4.0 project file\n")
         assert b'ObjectType: "AnimationStack" { Count: 0 }' in animated_fbx
         assert b"Geometry::python triangle" in animated_fbx
