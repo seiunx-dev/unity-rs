@@ -506,8 +506,71 @@ fn check_range(data: &Region, offset: u64, length: u64, field: &str) -> Result<(
     Ok(())
 }
 
+/// MOC3 byte builders shared by the tests of modules that consume a MOC.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn synthetic_moc3(big_endian: bool, sdk_version: u8) -> Vec<u8> {
+        const COUNT_TABLE: usize = 280;
+        const CANVAS_INFO: usize = 320;
+        const PART_IDS: usize = 384;
+        const PARAMETER_IDS: usize = 512;
+        let mut model = vec![0_u8; 576];
+        model[..4].copy_from_slice(b"MOC3");
+        model[4] = sdk_version;
+        model[5] = u8::from(big_endian);
+        write_u32(
+            &mut model,
+            64,
+            u32::try_from(COUNT_TABLE).unwrap(),
+            big_endian,
+        );
+        write_u32(
+            &mut model,
+            68,
+            u32::try_from(CANVAS_INFO).unwrap(),
+            big_endian,
+        );
+        write_u32(&mut model, 76, u32::try_from(PART_IDS).unwrap(), big_endian);
+        write_u32(
+            &mut model,
+            264,
+            u32::try_from(PARAMETER_IDS).unwrap(),
+            big_endian,
+        );
+        write_u32(&mut model, COUNT_TABLE, 2, big_endian);
+        write_u32(&mut model, COUNT_TABLE + 20, 1, big_endian);
+        write_f32(&mut model, CANVAS_INFO, 100.0, big_endian);
+        write_f32(&mut model, CANVAS_INFO + 4, 1.5, big_endian);
+        write_f32(&mut model, CANVAS_INFO + 8, -2.0, big_endian);
+        write_f32(&mut model, CANVAS_INFO + 12, 800.0, big_endian);
+        write_f32(&mut model, CANVAS_INFO + 16, 600.0, big_endian);
+        write_identifier(&mut model, PART_IDS, "PartHead");
+        write_identifier(&mut model, PART_IDS + 64, "PartArm");
+        write_identifier(&mut model, PARAMETER_IDS, "ParamAngleX");
+        model
+    }
+
+    pub(crate) fn write_u32(output: &mut [u8], offset: usize, value: u32, big_endian: bool) {
+        let bytes = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        output[offset..offset + 4].copy_from_slice(&bytes);
+    }
+
+    pub(crate) fn write_f32(output: &mut [u8], offset: usize, value: f32, big_endian: bool) {
+        write_u32(output, offset, value.to_bits(), big_endian);
+    }
+
+    pub(crate) fn write_identifier(output: &mut [u8], offset: usize, value: &str) {
+        output[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{synthetic_moc3, write_u32};
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::monobehaviour::MONO_BEHAVIOUR_CLASS_ID;
     use crate::serialized::SerializedFile;
@@ -708,64 +771,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    fn synthetic_moc3(big_endian: bool, sdk_version: u8) -> Vec<u8> {
-        const COUNT_TABLE: usize = 280;
-        const CANVAS_INFO: usize = 320;
-        const PART_IDS: usize = 384;
-        const PARAMETER_IDS: usize = 512;
-        let mut model = vec![0_u8; 576];
-        model[..4].copy_from_slice(b"MOC3");
-        model[4] = sdk_version;
-        model[5] = u8::from(big_endian);
-        write_u32(
-            &mut model,
-            64,
-            u32::try_from(COUNT_TABLE).unwrap(),
-            big_endian,
-        );
-        write_u32(
-            &mut model,
-            68,
-            u32::try_from(CANVAS_INFO).unwrap(),
-            big_endian,
-        );
-        write_u32(&mut model, 76, u32::try_from(PART_IDS).unwrap(), big_endian);
-        write_u32(
-            &mut model,
-            264,
-            u32::try_from(PARAMETER_IDS).unwrap(),
-            big_endian,
-        );
-        write_u32(&mut model, COUNT_TABLE, 2, big_endian);
-        write_u32(&mut model, COUNT_TABLE + 20, 1, big_endian);
-        write_f32(&mut model, CANVAS_INFO, 100.0, big_endian);
-        write_f32(&mut model, CANVAS_INFO + 4, 1.5, big_endian);
-        write_f32(&mut model, CANVAS_INFO + 8, -2.0, big_endian);
-        write_f32(&mut model, CANVAS_INFO + 12, 800.0, big_endian);
-        write_f32(&mut model, CANVAS_INFO + 16, 600.0, big_endian);
-        write_identifier(&mut model, PART_IDS, "PartHead");
-        write_identifier(&mut model, PART_IDS + 64, "PartArm");
-        write_identifier(&mut model, PARAMETER_IDS, "ParamAngleX");
-        model
-    }
-
-    fn write_u32(output: &mut [u8], offset: usize, value: u32, big_endian: bool) {
-        let bytes = if big_endian {
-            value.to_be_bytes()
-        } else {
-            value.to_le_bytes()
-        };
-        output[offset..offset + 4].copy_from_slice(&bytes);
-    }
-
-    fn write_f32(output: &mut [u8], offset: usize, value: f32, big_endian: bool) {
-        write_u32(output, offset, value.to_bits(), big_endian);
-    }
-
-    fn write_identifier(output: &mut [u8], offset: usize, value: &str) {
-        output[offset..offset + value.len()].copy_from_slice(value.as_bytes());
     }
 
     fn cubism_object(name: &str, model: &[u8], no_target: bool) -> Vec<u8> {

@@ -45,6 +45,9 @@ fn scene_prints_stable_multi_game_object_tree_without_side_effects() {
     let result = cli(root.path(), ["scene".into(), input.as_os_str().into()]);
     assert_success(&result);
     let stdout = String::from_utf8(result.stdout).unwrap();
+    // The CLI escapes quoted fields, so a Windows path's separators arrive
+    // doubled. Compare against the same escaping rather than the raw path.
+    let escaped_input = escape_text(&input.display().to_string());
     let expected_tail = format!(
         concat!(
             "  serialized files: 1\n",
@@ -58,9 +61,7 @@ fn scene_prints_stable_multi_game_object_tree_without_side_effects() {
             "        transform component=f0:20 parent=f0:10 position=(4,5,6) rotation=(0,0,0,1) scale=(1,1,1)\n",
             "    root f0:3 source=\"{}\" name=\"Loose\"\n",
         ),
-        input.display(),
-        input.display(),
-        input.display()
+        escaped_input, escaped_input, escaped_input
     );
     assert!(stdout.starts_with(&format!("scene {}\n", input.display())));
     assert!(stdout.ends_with(&expected_tail), "stdout:\n{stdout}");
@@ -264,4 +265,9 @@ fn align_with_base(out: &mut Vec<u8>, base: usize, alignment: usize) {
     while !(base + out.len()).is_multiple_of(alignment) {
         out.push(0);
     }
+}
+
+/// Mirrors the CLI's quoted-field escaping.
+fn escape_text(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
