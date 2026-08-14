@@ -581,6 +581,23 @@ console.log('node api: multi-buffer, resource range and scene ok')
   assert.throws(() => fbxStudio.readFbxBinary())
 }
 
+// Per-GameObject FBX planning, which had no Node binding: a caller could
+// export the whole collection but not one branch of it.
+//
+// This suite has no model fixture, so the bytes are covered by the CLI and
+// Python tests. What is checked here is that a collection with no models
+// yields an empty plan rather than an error -- which is the answer, not a
+// failure -- and that selecting an object that does not exist is an error
+// rather than an empty file.
+{
+  const planStudio = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  assert.deepStrictEqual(planStudio.splitObjectFbxCandidates(), [])
+  assert.deepStrictEqual(planStudio.animatorFbxCandidates(), [])
+  assert.throws(() => planStudio.readGameObjectFbx(0, 999n))
+}
+
 console.log('node api: export, extract and fbx ok')
 
 // Live2D discovery on a collection that has none, which is a fact rather than

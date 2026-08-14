@@ -218,7 +218,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 5. 纯 Rust Tuanjie ACL 2.x 解码。crates.io 上没有现成实现，属于从零写；而且没有可对照的样本，写出来无法验证，因此在拿到样本之前不宜动手；
 6. 补齐高命中率的平台纹理/音频长尾（新 codec 必须先有真实样本和独立 oracle）；
-7. 继续提升 Node 专用 API 覆盖。2026-08-15 补了三个此前完全没有绑定的读取器：`readFont`/`readMovieTexture`/`readVideoClip`——Node 调用方原先只能通过 `export` 间接拿到这三类资产。对着 Python 的公开面逐个核过一遍，剩下的差距主要是按 GameObject 粒度的 FBX 规划（`splitObjectFbxCandidates`/`animatorFbxCandidates`/`readGameObjectFbx`）与几个 Cubism 单文档读取器；后者 Node 已能通过 `readLive2DPackages` 拿到整包里的同名文档，因此优先级低于前者。
+7. 继续提升 Node 专用 API 覆盖。2026-08-15 补了三个此前完全没有绑定的读取器：`readFont`/`readMovieTexture`/`readVideoClip`——Node 调用方原先只能通过 `export` 间接拿到这三类资产。对着 Python 的公开面逐个核过一遍，按 GameObject 粒度的 FBX 规划（`splitObjectFbxCandidates`/`animatorFbxCandidates`/`readGameObjectFbx`）也一并补上——此前 Node 只能整集合导一个 FBX，没法只导其中一支。剩下的差距是几个 Cubism 单文档读取器，而 Node 已能通过 `readLive2DPackages` 拿到整包里的同名文档，属于便利性而非缺口。
 
 ## 完成判定
 

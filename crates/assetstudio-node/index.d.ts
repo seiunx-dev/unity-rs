@@ -125,6 +125,18 @@ export declare class AssetStudio {
    * to parse. The scene is identical to `readStaticFbx`.
    */
   readStaticFbxBinary(maximumBytes?: number | undefined | null): Buffer
+  /**
+   * Enumerates the `GameObject` branches a split-objects export would write.
+   *
+   * The whole-collection FBX calls put every model in one file; these name
+   * the branches so a caller can write one file each, which is what the
+   * CLI's `split-objects` does.
+   */
+  splitObjectFbxCandidates(): Array<FbxCandidate>
+  /** Enumerates the branches an Animator owns. */
+  animatorFbxCandidates(): Array<FbxCandidate>
+  /** Writes one selected `GameObject` branch as FBX. */
+  readGameObjectFbx(fileIndex: number, pathId: bigint, includeAnimations?: boolean | undefined | null, maximumBytes?: number | undefined | null): Buffer
   /** Reads a `Font`'s resident payload. */
   readFont(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): BinaryAsset
   /** Reads the resident Ogg payload from a legacy `MovieTexture`. */
@@ -369,6 +381,16 @@ export interface ExtractionReport {
   skippedExistingCount: number
   failureCount: number
   outputBytes: bigint
+}
+
+/** One `GameObject` branch that can be exported as its own FBX. */
+export interface FbxCandidate {
+  fileIndex: number
+  pathId: bigint
+  /** The Animator that owns this branch, when one does. */
+  animatorFileIndex?: number
+  animatorPathId?: bigint
+  name: string
 }
 
 export interface FileInfo {

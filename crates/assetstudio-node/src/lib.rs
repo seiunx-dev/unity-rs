@@ -13,10 +13,12 @@ use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMateria
 use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
+use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
 use assetstudio_core::mono_schema::{MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry};
 use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
+use assetstudio_core::scene_hierarchy::SceneObjectKey;
 use assetstudio_core::scene_textures::SceneTextureLimits;
 use assetstudio_core::serialized::{TypeTree, TypeTreeNode};
 use assetstudio_core::simple_assets::{SimpleAssetReadLimits, SimpleBinaryAsset};
@@ -83,6 +85,17 @@ pub struct AudioClip {
     /// True when the payload is already a playable RIFF/WAVE stream.
     pub is_direct_wav: bool,
     pub data: Buffer,
+}
+
+/// One `GameObject` branch that can be exported as its own FBX.
+#[napi(object)]
+pub struct FbxCandidate {
+    pub file_index: u32,
+    pub path_id: BigInt,
+    /// The Animator that owns this branch, when one does.
+    pub animator_file_index: Option<u32>,
+    pub animator_path_id: Option<BigInt>,
+    pub name: String,
 }
 
 /// A resident binary asset: a `Font`, a legacy `MovieTexture`, or a `VideoClip`.
@@ -1111,6 +1124,54 @@ impl AssetStudio {
     pub fn read_static_fbx_binary(&self, maximum_bytes: Option<i64>) -> Result<Buffer> {
         self.studio
             .read_static_fbx_binary(byte_limit(maximum_bytes)?)
+            .map(Into::into)
+            .map_err(core_error)
+    }
+
+    /// Enumerates the `GameObject` branches a split-objects export would write.
+    ///
+    /// The whole-collection FBX calls put every model in one file; these name
+    /// the branches so a caller can write one file each, which is what the
+    /// CLI's `split-objects` does.
+    #[napi]
+    pub fn split_object_fbx_candidates(&self) -> Result<Vec<FbxCandidate>> {
+        let candidates = self
+            .studio
+            .split_object_fbx_candidates(ModelExportPlanLimits::default())
+            .map_err(core_error)?;
+        Ok(candidates.into_iter().map(into_candidate).collect())
+    }
+
+    /// Enumerates the branches an Animator owns.
+    #[napi]
+    pub fn animator_fbx_candidates(&self) -> Result<Vec<FbxCandidate>> {
+        let candidates = self
+            .studio
+            .animator_fbx_candidates(ModelExportPlanLimits::default())
+            .map_err(core_error)?;
+        Ok(candidates.into_iter().map(into_candidate).collect())
+    }
+
+    /// Writes one selected `GameObject` branch as FBX.
+    #[napi]
+    pub fn read_game_object_fbx(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        include_animations: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<Buffer> {
+        let key = SceneObjectKey {
+            file_index: usize::try_from(file_index).expect("u32 fits usize"),
+            path_id: bigint_i64(path_id, "pathId")?,
+        };
+        self.studio
+            .read_game_object_fbx_with_acl_decoder(
+                key,
+                include_animations.unwrap_or(true),
+                byte_limit(maximum_bytes)?,
+                None,
+            )
             .map(Into::into)
             .map_err(core_error)
     }
@@ -2147,6 +2208,21 @@ fn copy_string(value: &str, field: &str) -> Result<String> {
 
 fn invalid_arg(message: impl Into<String>) -> Error {
     Error::new(Status::InvalidArg, message.into())
+}
+
+/// Converts a Core export candidate into the shape JavaScript receives.
+fn into_candidate(candidate: ModelExportCandidate) -> FbxCandidate {
+    FbxCandidate {
+        file_index: u32::try_from(candidate.game_object.file_index).expect("a file index fits u32"),
+        path_id: BigInt::from(candidate.game_object.path_id),
+        animator_file_index: candidate
+            .animator
+            .map(|animator| u32::try_from(animator.file_index).expect("a file index fits u32")),
+        animator_path_id: candidate
+            .animator
+            .map(|animator| BigInt::from(animator.path_id)),
+        name: candidate.name,
+    }
 }
 
 fn core_error(error: assetstudio_core::Error) -> Error {
