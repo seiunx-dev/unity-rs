@@ -636,6 +636,7 @@ class AssetStudio:
         maximum_directory_entries: int = 2_000_000,
         oodle_decoder: Optional[OodleDecoder] = None,
         skip_unreadable_inputs: bool = False,
+        unity_cn_key: Union[bytes, str, None] = None,
     ) -> AssetStudio: ...
     @staticmethod
     def from_bytes(
@@ -656,6 +657,7 @@ class AssetStudio:
         maximum_total_bytes: int = 4_294_967_296,
         oodle_decoder: Optional[OodleDecoder] = None,
         skip_unreadable_inputs: bool = False,
+        unity_cn_key: Union[bytes, str, None] = None,
     ) -> AssetStudio: ...
     @property
     def file_count(self) -> int: ...
@@ -1007,4 +1009,5 @@ def extract(
     overwrite: bool = False,
     limits: Optional[ExtractionLimits] = None,
     oodle_decoder: Optional[OodleDecoder] = None,
+    unity_cn_key: Union[bytes, str, None] = None,
 ) -> ExtractionReport: ...

@@ -39,7 +39,7 @@ criteria, and prioritized gap list live in
 | Common UnityWeb/UnityRaw/UnityArchive/UnityFS signature and header dispatch | Implemented |
 | UnityWebData/TuanjieWebData directory and payload access | Implemented |
 | UnityFS v6/v7 block directory, inline/tail metadata, and padding | Implemented |
-| UnityCN-encrypted UnityFS detection | Implemented; encrypted payloads are explicitly rejected until a decryptor is available |
+| UnityCN-encrypted UnityFS detection and decryption | Implemented. Detection is flag-driven rather than a speculative parse, so an encrypted blocks-info table is named as such instead of surfacing as invalid compressed data. Decryption needs a caller-supplied 16-byte key on `BundleOpenOptions`/`AssetLoadOptions`, or `unity_cn_key=` from Python; without one these bundles are still refused, and no key material ships here. The AES-128 used for key verification and table derivation is implemented in this crate and checked against the FIPS-197 vectors |
 | UnityFS None, LZ4/LZ4HC, LZMA, and Zstd blocks-info/data decoding | Implemented |
 | gzip, Brotli, and safe Stored/Deflate ZIP traversal | Implemented |
 | TypeTree decoding to ordered values and bounded JSON | Implemented |

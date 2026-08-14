@@ -21,6 +21,7 @@ use crate::serialized::{
     RESOURCE_MANAGER_CLASS_ID, SerializedFile, SerializedOpenOptions,
 };
 use crate::source::Region;
+use crate::unity_cn::UnityCnKey;
 use crate::unity_version::UnityVersion;
 use crate::web_file::{WebFile, WebParseLimits};
 use crate::{Error, Result};
@@ -100,6 +101,7 @@ struct RootLoadSettings<'a> {
     limits: &'a AssetLoadLimits,
     unity_version_override: Option<&'a UnityVersion>,
     oodle_decoder: Option<&'a Arc<dyn OodleDecoder>>,
+    unity_cn_key: Option<UnityCnKey>,
     failure_policy: LoadFailurePolicy,
 }
 
@@ -108,6 +110,8 @@ pub struct AssetLoadOptions {
     pub limits: AssetLoadLimits,
     pub unity_version_override: Option<UnityVersion>,
     pub oodle_decoder: Option<Arc<dyn OodleDecoder>>,
+    /// Key for UnityCN-encrypted bundles. Without one they stay refused.
+    pub unity_cn_key: Option<UnityCnKey>,
     pub failure_policy: LoadFailurePolicy,
 }
 
@@ -121,6 +125,7 @@ impl fmt::Debug for AssetLoadOptions {
                 "oodle_decoder",
                 &self.oodle_decoder.as_ref().map(|_| "<configured>"),
             )
+            .field("unity_cn_key", &self.unity_cn_key)
             .field("failure_policy", &self.failure_policy)
             .finish()
     }
@@ -216,6 +221,7 @@ impl AssetCollection {
             limits,
             unity_version_override,
             oodle_decoder,
+            unity_cn_key,
             failure_policy,
         } = options;
         let mut collection = Self::default();
@@ -227,6 +233,7 @@ impl AssetCollection {
                 limits: &limits,
                 unity_version_override: unity_version_override.as_ref(),
                 oodle_decoder: oodle_decoder.as_ref(),
+                unity_cn_key,
                 failure_policy,
             },
             &mut budget,
@@ -246,12 +253,14 @@ impl AssetCollection {
             limits,
             unity_version_override,
             oodle_decoder,
+            unity_cn_key,
             failure_policy,
         } = options;
         let settings = RootLoadSettings {
             limits: &limits,
             unity_version_override: unity_version_override.as_ref(),
             oodle_decoder: oodle_decoder.as_ref(),
+            unity_cn_key,
             failure_policy,
         };
         let mut collection = Self::default();
@@ -299,6 +308,7 @@ impl AssetCollection {
             limits,
             unity_version_override,
             oodle_decoder,
+            unity_cn_key,
             failure_policy,
         } = options;
         let path = path.as_ref();
@@ -320,6 +330,7 @@ impl AssetCollection {
             limits: &limits,
             unity_version_override: unity_version_override.as_ref(),
             oodle_decoder: oodle_decoder.as_ref(),
+            unity_cn_key,
             failure_policy,
         };
         let mut collection = Self::default();
@@ -335,11 +346,16 @@ impl AssetCollection {
         &mut self,
         path: String,
         region: Region,
-        limits: &AssetLoadLimits,
-        unity_version_override: Option<&UnityVersion>,
-        oodle_decoder: Option<&Arc<dyn OodleDecoder>>,
+        settings: &RootLoadSettings<'_>,
         budget: &mut AssetLoadBudget,
     ) -> Result<()> {
+        let RootLoadSettings {
+            limits,
+            unity_version_override,
+            oodle_decoder,
+            unity_cn_key,
+            ..
+        } = *settings;
         let mut pending = VecDeque::from([PendingInput {
             path,
             region,
@@ -409,6 +425,7 @@ impl AssetCollection {
                             BundleOpenOptions {
                                 limits: bundle_limits,
                                 oodle_decoder: oodle_decoder.cloned(),
+                                unity_cn_key,
                             },
                         )?;
                         let unity_version_hint =
@@ -572,14 +589,7 @@ impl AssetCollection {
         // root started so a skipped one leaves nothing behind.
         let serialized_files = self.serialized_files.len();
         let resources = self.resources.len();
-        let result = self.load_root(
-            label.clone(),
-            region,
-            settings.limits,
-            settings.unity_version_override,
-            settings.oodle_decoder,
-            budget,
-        );
+        let result = self.load_root(label.clone(), region, settings, budget);
         if let Err(error) = result {
             if settings.failure_policy == LoadFailurePolicy::Abort {
                 return Err(error);

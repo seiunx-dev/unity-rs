@@ -56,6 +56,7 @@ pub mod texture;
 pub mod texture_array;
 pub mod type_tree;
 pub mod type_tree_dump;
+pub mod unity_cn;
 pub mod unity_version;
 pub mod web_file;
 
