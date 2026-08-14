@@ -69,6 +69,65 @@ fn fbx_exports_a_real_static_model_with_the_ascii_contract() {
 }
 
 #[test]
+fn obj_exports_the_model_with_a_companion_material_library() {
+    let root = TestDirectory::new("obj-success");
+    let input = root.path().join("model.assets");
+    let destination = root.path().join("nested").join("model.obj");
+    let fixture = synthetic_model([0.0, 0.0, 0.0, 1.0]);
+    fs::write(&input, &fixture).unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "obj".into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+    assert_success(&result);
+
+    let text = fs::read_to_string(&destination).unwrap();
+    assert!(text.starts_with("mtllib model.mtl\r\n"), "{text}");
+    // The node sits at Unity X=2, and OBJ mirrors X.
+    assert!(text.contains("v -2 3 4\r\n"), "{text}");
+    assert!(text.contains("usemtl "), "{text}");
+    assert!(text.contains("f "), "{text}");
+
+    // The library lands beside the OBJ under the same stem.
+    let library = destination.parent().unwrap().join("model.mtl");
+    let mtl = fs::read_to_string(&library).unwrap();
+    assert!(mtl.contains("newmtl "), "{mtl}");
+    assert!(mtl.contains("illum 2\r\n"), "{mtl}");
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("Wavefront OBJ"));
+    assert!(stdout.contains("material library"));
+    assert_eq!(fs::read(&input).unwrap(), fixture);
+    assert_no_fbx_temporary_files(destination.parent().unwrap());
+}
+
+#[test]
+fn obj_never_clobbers_an_existing_destination() {
+    let root = TestDirectory::new("obj-clobber");
+    let input = root.path().join("model.assets");
+    let destination = root.path().join("model.obj");
+    fs::write(&input, synthetic_model([0.0, 0.0, 0.0, 1.0])).unwrap();
+    fs::write(&destination, b"keep me").unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "obj".into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+    assert!(!result.status.success());
+    assert_eq!(fs::read(&destination).unwrap(), b"keep me");
+    assert_no_fbx_temporary_files(root.path());
+}
+
+#[test]
 fn fbx_budget_invalid_input_and_general_rotation_are_handled_atomically() {
     let root = TestDirectory::new("failures");
     let input = root.path().join("model.assets");

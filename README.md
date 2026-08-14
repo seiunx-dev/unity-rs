@@ -86,6 +86,7 @@ cargo run -p assetstudio-cli -- info <file-or-directory>
 cargo run -p assetstudio-cli -- list <file-or-directory>
 cargo run -p assetstudio-cli -- scene <file-or-directory>
 cargo run -p assetstudio-cli -- fbx <file-or-directory> <output.fbx>
+cargo run -p assetstudio-cli -- obj <file-or-directory> <output.obj>
 cargo run -p assetstudio-cli -- split-objects <file-or-directory> <output-directory>
 cargo run -p assetstudio-cli -- animator <file-or-directory> <output-directory>
 cargo run -p assetstudio-cli -- live2d <file-or-directory> <output-directory>
@@ -198,6 +199,14 @@ Unity X, converts mirrored
 quaternions to Euler degrees, reverses triangle winding, writes through an
 atomic no-clobber temporary file, and accepts
 `--maximum-output-bytes <N>` with a 16 MiB default and 512 MiB hard ceiling.
+The `obj` command writes the same model as Wavefront OBJ. Because OBJ has no
+hierarchy, node transforms are baked into world space and vertex indices
+accumulate across the file; a companion `.mtl` under the same stem carries the
+material colours and `map_Kd`/`map_Bump`/`map_Ks` lines pointing at the sibling
+textures. Its face references name only the channels the mesh actually has,
+unlike the single-mesh `.obj` the `export` command writes, which reproduces the
+managed writer's unconditional `v/vt/vn` exactly.
+
 Binary FBX is an explicit unsupported case. Material textures are resolved
 through their `PPtr`s, decoded once per texture object, and written beside the
 FBX as `Texture`/`Video` pairs connected to `DiffuseColor`, `NormalMap`,

@@ -39,6 +39,7 @@ pub mod model_export;
 pub mod model_ir;
 pub mod mono_schema;
 pub mod monobehaviour;
+pub mod obj_scene;
 pub mod object_name;
 pub mod packed_bits;
 pub mod project_settings;

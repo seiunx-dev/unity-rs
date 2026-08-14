@@ -1115,7 +1115,7 @@ fn lookup_bone_hash_node(index: &[BoneHashNode], hash: u32) -> Option<usize> {
         .and_then(|position| index.get(position).map(|entry| entry.node_index))
 }
 
-fn build_global_matrices(model: &ModelIr) -> Result<Vec<Option<Matrix4>>> {
+pub(crate) fn build_global_matrices(model: &ModelIr) -> Result<Vec<Option<Matrix4>>> {
     let mut matrices = reserve_vec(model.nodes.len(), "FBX global matrices")?;
     matrices.resize(model.nodes.len(), None);
     let mut states = reserve_vec(model.nodes.len(), "FBX matrix traversal state")?;
@@ -1581,8 +1581,8 @@ fn rounded_f64_to_i64(value: f64) -> Result<i64> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Matrix4([f64; 16]);
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Matrix4([f64; 16]);
 
 impl Matrix4 {
     fn from_unity_transform(transform: ModelLocalTransform) -> Result<Self> {
@@ -1743,6 +1743,34 @@ impl Matrix4 {
 
     const fn get(self, row: usize, column: usize) -> f64 {
         self.0[row + column * 4]
+    }
+
+    /// Transforms a position, applying translation.
+    pub(crate) fn transform_point(self, point: [f32; 3]) -> [f32; 3] {
+        self.apply(point, 1.0)
+    }
+
+    /// Transforms a direction, ignoring translation.
+    ///
+    /// A normal transformed this way is only correct for a uniform scale. Unity
+    /// models routinely carry non-uniform scales, but the managed OBJ path does
+    /// not transform normals at all, so this stays the simpler rule rather than
+    /// silently introducing an inverse-transpose the rest of the pipeline does
+    /// not use.
+    pub(crate) fn transform_direction(self, direction: [f32; 3]) -> [f32; 3] {
+        self.apply(direction, 0.0)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn apply(self, vector: [f32; 3], w: f64) -> [f32; 3] {
+        let mut result = [0.0_f32; 3];
+        for (row, value) in result.iter_mut().enumerate() {
+            *value = (self.get(row, 0) * f64::from(vector[0])
+                + self.get(row, 1) * f64::from(vector[1])
+                + self.get(row, 2) * f64::from(vector[2])
+                + self.get(row, 3) * w) as f32;
+        }
+        result
     }
 
     fn set(&mut self, row: usize, column: usize, value: f64) {

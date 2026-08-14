@@ -33,6 +33,7 @@ use assetstudio_core::model_export::{
 };
 use assetstudio_core::model_ir::{ModelIrLimits, build_model_ir, build_model_ir_for_game_object};
 use assetstudio_core::monobehaviour::MONO_BEHAVIOUR_CLASS_ID;
+use assetstudio_core::obj_scene::{write_model_ir_mtl, write_model_ir_obj};
 use assetstudio_core::scene_hierarchy::{
     SceneHierarchy, SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey, build_scene_hierarchy,
 };
@@ -148,6 +149,7 @@ fn run_with_arguments(arguments: &[OsString], output: &mut impl Write) -> CliRes
         CliCommand::List(path) => report_collection(&path, true, &load, output),
         CliCommand::Scene(path) => report_scene(&path, &load, output),
         CliCommand::Fbx(command) => export_fbx(&command, &load, output),
+        CliCommand::Obj(command) => export_obj(&command, &load, output),
         CliCommand::FbxBatch(command) => export_fbx_batch(&command, &load, output),
         CliCommand::Live2d(command) => {
             export_live2d(&command.input, &command.output, &load, output)
@@ -221,6 +223,7 @@ enum CliCommand {
     List(PathBuf),
     Scene(PathBuf),
     Fbx(FbxCommand),
+    Obj(ObjCommand),
     FbxBatch(FbxBatchCommand),
     Live2d(Live2dCommand),
     Live2dPackage(Live2dCommand),
@@ -250,7 +253,10 @@ fn parse_cli_arguments(arguments: &[OsString]) -> CliResult<CliCommand> {
         Some("info") => parse_read_command("info", &arguments[1..], CliCommand::Info),
         Some("list") => parse_read_command("list", &arguments[1..], CliCommand::List),
         Some("scene") => parse_read_command("scene", &arguments[1..], CliCommand::Scene),
-        Some("fbx") => parse_fbx_arguments(&arguments[1..])
+        Some("obj") => parse_model_arguments(&arguments[1..], "obj")
+            .map(CliCommand::Obj)
+            .map_err(|error| CliError::Usage(error.to_string())),
+        Some("fbx") => parse_model_arguments(&arguments[1..], "fbx")
             .map(CliCommand::Fbx)
             .map_err(|error| CliError::Usage(error.to_string())),
         Some("split-objects") => parse_fbx_batch_arguments("split-objects", &arguments[1..])
@@ -467,6 +473,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          Usage:\n  assetstudio inspect <file-or-directory>\n  assetstudio info <file-or-directory>\n  \
          assetstudio list <file-or-directory>\n  assetstudio scene <file-or-directory>\n  \
          assetstudio fbx <file-or-directory> <output.fbx> [options]\n  \
+         assetstudio obj <file-or-directory> <output.obj> [options]\n  \
          assetstudio split-objects <file-or-directory> <output-directory> [options]\n  \
          assetstudio animator <file-or-directory> <output-directory> [options]\n  \
          assetstudio <file-or-directory>\n  \
@@ -493,6 +500,11 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          --no-textures                 Write the model without its textures\n  \
          --texture-format <FORMAT>     jpg|jpeg|png|bmp|tga|webp|raw-rgba; the default is png\n  \
          Existing files are never overwritten.\n\n\
+         OBJ export:\n  Writes the whole model as Wavefront OBJ with node transforms baked into\n  \
+         world space, a companion .mtl under the same stem, and the same sibling textures.\n  \
+         Face references name only the channels the mesh has, unlike the single-mesh\n  \
+         .obj the export command writes, which mirrors the managed writer exactly.\n  \
+         It takes the same options as fbx.\n\n\
          Batch FBX options:\n  --maximum-output-bytes <N>  Per-file limit\n  \
          --no-animations               Omit selected animation clips\n  \
          --no-textures                 Write the models without their textures\n  \
@@ -541,6 +553,9 @@ struct FbxCommand {
     texture_format: ImageFormat,
 }
 
+/// `obj` takes the same options as `fbx`; only the writer differs.
+type ObjCommand = FbxCommand;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FbxBatchMode {
     SplitObjects,
@@ -586,7 +601,7 @@ fn parse_live2d_arguments(arguments: &[OsString]) -> Result<Live2dCommand> {
     parse_live2d_write_arguments("live2d", arguments)
 }
 
-fn parse_fbx_arguments(arguments: &[OsString]) -> Result<FbxCommand> {
+fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<FbxCommand> {
     let mut positional = Vec::new();
     let mut maximum_output_bytes = DEFAULT_FBX_OUTPUT_BYTES;
     let mut saw_maximum = false;
@@ -634,7 +649,7 @@ fn parse_fbx_arguments(arguments: &[OsString]) -> Result<FbxCommand> {
                 .is_some_and(|value| value.starts_with('-'))
         {
             return Err(Error::invalid_data(format!(
-                "unknown fbx option: {}",
+                "unknown {command_name} option: {}",
                 argument.to_string_lossy()
             )));
         } else {
@@ -643,16 +658,18 @@ fn parse_fbx_arguments(arguments: &[OsString]) -> Result<FbxCommand> {
         index += 1;
     }
     if positional.len() != 2 {
-        return Err(Error::invalid_data(
-            "fbx requires an input path and an output .fbx path",
-        ));
+        return Err(Error::invalid_data(format!(
+            "{command_name} requires an input path and an output .{command_name} path"
+        )));
     }
     if positional[1]
         .extension()
         .and_then(|value| value.to_str())
-        .is_none_or(|value| !value.eq_ignore_ascii_case("fbx"))
+        .is_none_or(|value| !value.eq_ignore_ascii_case(command_name))
     {
-        return Err(Error::invalid_data("fbx output path must end in .fbx"));
+        return Err(Error::invalid_data(format!(
+            "{command_name} output path must end in .{command_name}"
+        )));
     }
     Ok(FbxCommand {
         input: positional.remove(0),
@@ -1046,6 +1063,79 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
     )?;
     report_model_textures(command.textures, &textures, written_textures.len(), output)?;
     skipped_input_result("FBX export", &collection)
+}
+
+fn export_obj(command: &ObjCommand, load: &LoadOptions, output: &mut impl Write) -> CliResult<()> {
+    let collection = load_asset_collection(&command.input, load, output)?;
+    let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
+    let model = build_model_ir(&collection, &hierarchy, ModelIrLimits::default())?;
+    let parent = prepare_fbx_output_parent(&command.output)?;
+    let textures = if command.textures {
+        SceneTextureSet::from_model(
+            &collection,
+            &model,
+            command.texture_format,
+            SceneTextureLimits::default(),
+        )?
+    } else {
+        SceneTextureSet::default()
+    };
+    // The MTL sits beside the OBJ under the same stem, which is what `mtllib`
+    // resolves against.
+    let mtl_name = obj_material_library_name(&command.output)?;
+    let mtl_path = parent.join(&mtl_name);
+
+    let mut temporary = FbxTemporaryFile::create(&parent)?;
+    let written = write_model_ir_obj(
+        &model,
+        Some(mtl_name.as_str()),
+        temporary.file_mut(),
+        command.maximum_output_bytes,
+    )?;
+    temporary.file_mut().flush()?;
+    temporary.file_mut().sync_all()?;
+    temporary.close()?;
+    temporary.persist_no_clobber(&command.output)?;
+
+    let mut temporary = FbxTemporaryFile::create(&parent)?;
+    let mtl_written = write_model_ir_mtl(
+        &model,
+        &textures,
+        temporary.file_mut(),
+        command.maximum_output_bytes,
+    )?;
+    temporary.file_mut().flush()?;
+    temporary.file_mut().sync_all()?;
+    temporary.close()?;
+    temporary.persist_no_clobber(&mtl_path)?;
+
+    let written_textures = textures.write_to_directory(&parent)?;
+    writeln!(
+        output,
+        "exported Wavefront OBJ ({written} bytes) -> {}",
+        command.output.display()
+    )?;
+    writeln!(
+        output,
+        "  wrote the material library ({mtl_written} bytes) -> {}",
+        mtl_path.display()
+    )?;
+    report_model_textures(command.textures, &textures, written_textures.len(), output)?;
+    skipped_input_result("OBJ export", &collection)
+}
+
+/// The `mtllib` name for an OBJ destination: its file stem plus `.mtl`.
+fn obj_material_library_name(destination: &Path) -> Result<String> {
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "OBJ output path has no usable file name: {}",
+                destination.display()
+            ))
+        })?;
+    Ok(format!("{stem}.mtl"))
 }
 
 /// Reports what happened to the model's textures.
@@ -3064,9 +3154,10 @@ mod tests {
     use super::{
         AudioExportFormat, CliCommand, ExportMode, FilenameFormat, ImageFormat, Live2dExportState,
         MAX_LIVE2D_OUTPUT_MODELS, MAX_LIVE2D_TOTAL_OUTPUT_BYTES, SceneObjectKey,
-        charge_live2d_model, parse_cli_arguments, parse_export_arguments, parse_extract_arguments,
-        parse_live2d_arguments, parse_live2d_package_arguments, sanitize_live2d_base_name,
-        write_object_reference, write_scene_key,
+        charge_live2d_model, obj_material_library_name, parse_cli_arguments,
+        parse_export_arguments, parse_extract_arguments, parse_live2d_arguments,
+        parse_live2d_package_arguments, sanitize_live2d_base_name, write_object_reference,
+        write_scene_key,
     };
     use assetstudio_core::serialized::ObjectReference;
     use std::ffi::OsString;
@@ -3074,6 +3165,57 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn model_commands_default_to_writing_png_textures() {
+        for (command, extension) in [("fbx", "out.fbx"), ("obj", "out.obj")] {
+            let parsed =
+                parse_cli_arguments(&arguments(&[command, "input.assets", extension])).unwrap();
+            let parsed = match parsed {
+                CliCommand::Fbx(parsed) | CliCommand::Obj(parsed) => parsed,
+                other => panic!("{command} parsed as {other:?}"),
+            };
+            assert_eq!(parsed.input, PathBuf::from("input.assets"));
+            assert_eq!(parsed.output, PathBuf::from(extension));
+            assert!(
+                parsed.textures,
+                "{command} should write textures by default"
+            );
+            assert_eq!(parsed.texture_format, ImageFormat::Png);
+        }
+    }
+
+    #[test]
+    fn model_commands_accept_the_texture_options_and_check_the_extension() {
+        let parsed = parse_cli_arguments(&arguments(&[
+            "obj",
+            "input.assets",
+            "out.obj",
+            "--no-textures",
+            "--texture-format",
+            "tga",
+        ]))
+        .unwrap();
+        let CliCommand::Obj(parsed) = parsed else {
+            panic!("expected an obj command");
+        };
+        assert!(!parsed.textures);
+        assert_eq!(parsed.texture_format, ImageFormat::Tga);
+
+        // The output extension has to match the command, or the two writers
+        // would silently produce a file named for the other format.
+        assert!(parse_cli_arguments(&arguments(&["obj", "input.assets", "out.fbx"])).is_err());
+        assert!(parse_cli_arguments(&arguments(&["fbx", "input.assets", "out.obj"])).is_err());
+    }
+
+    #[test]
+    fn the_material_library_takes_the_obj_stem() {
+        assert_eq!(
+            obj_material_library_name(&PathBuf::from("/models/body.obj")).unwrap(),
+            "body.mtl"
+        );
+        assert!(obj_material_library_name(&PathBuf::from("/")).is_err());
     }
 
     #[test]
