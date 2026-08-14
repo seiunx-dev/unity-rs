@@ -52,7 +52,37 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
 
     assert_version_matrix(&executable);
     assert_container_fixtures(&executable);
+    assert_split_group_fixture(&executable);
     assert_truncated_fixture(&executable);
+}
+
+/// Compares a serialized file delivered as a Unity split group.
+///
+/// Each reader gets its own copy of the directory. The managed reader merges a
+/// split group by writing the joined file back into the directory it found the
+/// parts in, so a shared fixture would leave the second reader looking at both
+/// the parts and the merged file and reporting the objects twice.
+fn assert_split_group_fixture(executable: &Path) {
+    // The mesh file is resident-only, so the split group needs no sibling .resS.
+    let bytes = synthetic_single_v22(43, 43, "2022.3.62f1", &mesh());
+    let managed_fixture = TemporaryFixture::with_split_parts("oracle-split.assets", &bytes, 3)
+        .expect("the managed split fixture is writable");
+    let rust_fixture = TemporaryFixture::with_split_parts("oracle-split.assets", &bytes, 3)
+        .expect("the Rust split fixture is writable");
+
+    let managed = managed_manifest(executable, managed_fixture.input_path()).unwrap();
+    let rust = rust_manifest(rust_fixture.input_path(), 1024 * 1024).unwrap();
+    assert_eq!(managed, rust, "split group fixture");
+    assert_eq!(
+        managed["Files"][0]["Path"], "oracle-split.assets",
+        "the merged file should carry the name without the split suffix: {managed}"
+    );
+    assert!(
+        managed["Files"][0]["Objects"]
+            .as_array()
+            .is_some_and(|objects| !objects.is_empty()),
+        "the split group produced no objects: {managed}"
+    );
 }
 
 /// One fixture per object-level reader the gate compares.
@@ -266,13 +296,26 @@ fn assert_container_fixtures(executable: &Path) {
             &[],
         ),
     ];
-    let tail: [ContainerCase; 2] = [
+    let tail: [ContainerCase; 5] = [
         (
             "oracle-bundle-raw-v6.unity3d",
             containers::unity_raw_v6(REVISION, &entries),
             &[],
         ),
         ("oracle-gzip.assets.gz", containers::gzip(&inner), &[]),
+        // The WebGL player's container, and the Tuanjie fork of it. Both were
+        // implemented against the format description alone.
+        (
+            "oracle-webdata.unityweb",
+            containers::unity_web_data("UnityWebData1.0", &entries),
+            &[],
+        ),
+        (
+            "oracle-webdata-tuanjie.unityweb",
+            containers::unity_web_data("TuanjieWebData1.0", &entries),
+            &[],
+        ),
+        ("oracle-archive.zip", containers::zip_archive(&entries), &[]),
     ];
     let cases = uncompressed
         .into_iter()
@@ -501,6 +544,7 @@ struct TemporaryFixture {
     directory: PathBuf,
     path: PathBuf,
     resource_path: Option<PathBuf>,
+    extra_paths: Vec<PathBuf>,
 }
 
 impl TemporaryFixture {
@@ -520,6 +564,7 @@ impl TemporaryFixture {
             directory,
             path,
             resource_path: None,
+            extra_paths: Vec::new(),
         })
     }
 
@@ -536,6 +581,24 @@ impl TemporaryFixture {
         Ok(fixture)
     }
 
+    /// Writes `bytes` as `name.split0`, `name.split1`, ... in `chunks` pieces.
+    ///
+    /// A Unity split group is a plain byte-wise cut, so a reader has to
+    /// concatenate the parts in index order before parsing. Splitting at an
+    /// arbitrary offset -- not on any structure boundary -- is the point: a
+    /// reader that parsed the parts individually would fail outright.
+    fn with_split_parts(name: &str, bytes: &[u8], chunks: usize) -> std::io::Result<Self> {
+        assert!(chunks > 1, "a split group needs at least two parts");
+        let part_length = bytes.len().div_ceil(chunks);
+        let mut fixture = Self::new(&format!("{name}.split0"), &bytes[..part_length])?;
+        for (index, part) in bytes[part_length..].chunks(part_length).enumerate() {
+            let path = fixture.directory.join(format!("{name}.split{}", index + 1));
+            fs::write(&path, part)?;
+            fixture.extra_paths.push(path);
+        }
+        Ok(fixture)
+    }
+
     fn input_path(&self) -> &Path {
         &self.directory
     }
@@ -543,11 +606,10 @@ impl TemporaryFixture {
 
 impl Drop for TemporaryFixture {
     fn drop(&mut self) {
-        if let Some(resource_path) = &self.resource_path {
-            let _ = fs::remove_file(resource_path);
-        }
-        let _ = fs::remove_file(&self.path);
-        let _ = fs::remove_dir(&self.directory);
+        // Whole-directory removal rather than per-file: the managed reader
+        // writes the merged file into a split fixture's directory itself, so
+        // the harness does not know every name it has to clean up.
+        let _ = fs::remove_dir_all(&self.directory);
     }
 }
 
