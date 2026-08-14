@@ -2,15 +2,19 @@
 
 use std::sync::Arc;
 
+use assetstudio_core::avatar::AvatarReadLimits;
+use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
+use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::simple_assets::SimpleAssetReadLimits;
 use assetstudio_core::source::Region;
 use assetstudio_core::sprite::SpriteReadLimits;
 use assetstudio_core::studio::{Studio, StudioObject};
 use assetstudio_core::texture::TextureReadLimits;
 use assetstudio_core::texture_array::TextureArrayReadLimits;
+use assetstudio_core::unity_version::UnityVersion;
 use napi::bindgen_prelude::{AsyncTask, BigInt, Buffer};
 use napi::{Env, Error, Result, Status, Task};
 use napi_derive::napi;
@@ -91,6 +95,34 @@ pub struct Material {
     pub color_properties: Vec<String>,
 }
 
+/// The scene lists a `BuildSettings` object records.
+#[napi(object)]
+pub struct BuildSettings {
+    /// Pre-5.x level paths, absent on newer layouts.
+    pub levels: Option<Vec<String>>,
+    /// 5.x and newer scene paths, absent on older layouts.
+    pub scenes: Option<Vec<String>>,
+}
+
+/// The identity fields of a `PlayerSettings` object.
+#[napi(object)]
+pub struct PlayerSettings {
+    pub company_name: String,
+    pub product_name: String,
+}
+
+/// An `Avatar`'s skeleton summary.
+#[napi(object)]
+pub struct Avatar {
+    pub name: String,
+    /// The size the object declares for its constant block.
+    pub declared_size: u32,
+    /// Bone path entries, retained in order so duplicate hashes keep Unity's
+    /// first-hit behaviour.
+    pub path_count: u32,
+    pub has_human_description: bool,
+}
+
 /// One opened collection. All format work is delegated to `assetstudio-core`.
 #[napi]
 pub struct AssetStudio {
@@ -106,6 +138,31 @@ impl AssetStudio {
                 studio: Arc::new(studio),
             })
             .map_err(core_error)
+    }
+
+    /// Opens a path, parsing against `unityVersion` instead of the version the
+    /// files declare.
+    ///
+    /// Needed for files whose own version was stripped at build time, where a
+    /// reader has nothing to key its layout decisions on.
+    // napi marshals a JavaScript string by value; a reference does not expand.
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi(factory)]
+    pub fn open_with_version(path: String, unity_version: String) -> Result<Self> {
+        let version: UnityVersion = unity_version
+            .parse()
+            .map_err(|_| invalid_arg(format!("unsupported Unity version: {unity_version}")))?;
+        Studio::open_with_options(
+            path,
+            AssetLoadOptions {
+                unity_version_override: Some(version),
+                ..AssetLoadOptions::default()
+            },
+        )
+        .map(|studio| Self {
+            studio: Arc::new(studio),
+        })
+        .map_err(core_error)
     }
 
     /// Opens a path on a libuv worker so container discovery does not block
@@ -595,6 +652,67 @@ impl AssetStudio {
             color_properties: property_names(&material.saved_properties.colors),
         })
     }
+
+    /// Reads the scene list a `BuildSettings` object records.
+    #[napi]
+    pub fn read_build_settings(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<BuildSettings> {
+        let settings = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_build_settings(settings_limits(byte_limit(maximum_bytes)?))
+            .map_err(core_error)?;
+        Ok(BuildSettings {
+            levels: settings.levels,
+            scenes: settings.scenes,
+        })
+    }
+
+    /// Reads the company and product names from a `PlayerSettings` object.
+    #[napi]
+    pub fn read_player_settings(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<PlayerSettings> {
+        let settings = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_player_settings(settings_limits(byte_limit(maximum_bytes)?))
+            .map_err(core_error)?;
+        Ok(PlayerSettings {
+            company_name: settings.company_name,
+            product_name: settings.product_name,
+        })
+    }
+
+    /// Reads an `Avatar`'s skeleton summary.
+    #[napi]
+    pub fn read_avatar(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<Avatar> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let avatar = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_avatar(AvatarReadLimits {
+                maximum_object_bytes: maximum,
+                ..AvatarReadLimits::default()
+            })
+            .map_err(core_error)?;
+        Ok(Avatar {
+            name: avatar.name,
+            declared_size: avatar.declared_avatar_size,
+            path_count: u32::try_from(avatar.paths.len())
+                .map_err(|_| invalid_arg("avatar path count does not fit u32"))?,
+            has_human_description: avatar.human_description.is_some(),
+        })
+    }
 }
 
 impl AssetStudio {
@@ -792,6 +910,14 @@ fn studio_object(studio: &Studio, file_index: usize, path_id: i64) -> Result<Stu
             "object path ID {path_id} was not found in file index {file_index}"
         ))
     })
+}
+
+/// Settings objects are small; one budget covers the payload and its strings.
+fn settings_limits(maximum: u64) -> ProjectSettingsReadLimits {
+    ProjectSettingsReadLimits {
+        maximum_object_bytes: maximum,
+        ..ProjectSettingsReadLimits::default()
+    }
 }
 
 /// The names of one material property sheet, in serialized order.

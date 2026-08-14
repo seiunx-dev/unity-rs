@@ -148,9 +148,9 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - 自动从 managed assembly/dummy DLL 生成 schema 仍是独立的离线可信工具工作，不会在解析进程中加载或执行 DLL。
 
 4. **Node 专用 reader 完整度**
-   - Node 公开面从 15 个同步方法加 9 个 Promise 方法扩到 18 + 9：新增 `readAudio`（原始载荷 + 容器隐含的扩展名 + 是否已是可直接播放的 RIFF/WAVE）、`readMonoScript`（class/namespace/assembly 三元组，MonoBehaviour 靠它定类型）、`readMaterial`（shader 引用 + 三张属性表的名字）。Material 的属性值刻意不摊平到 JS：它们按表分类型，需要值的调用方用 Rust 或 Python API 更合适，硬摊平只会丢信息。
+   - Node 公开面从 15 个同步方法加 9 个 Promise 方法扩到 21 + 9：新增 `readAudio`（原始载荷 + 容器隐含的扩展名 + 是否已是可直接播放的 RIFF/WAVE）、`readMonoScript`（class/namespace/assembly 三元组，MonoBehaviour 靠它定类型）、`readMaterial`（shader 引用 + 三张属性表的名字）、`readBuildSettings`、`readPlayerSettings`、`readAvatar`，以及工厂方法 `openWithVersion`（给构建时被剥掉版本号的文件用）。Material 的属性值刻意不摊平到 JS：它们按表分类型，需要值的调用方用 Rust 或 Python API 更合适，硬摊平只会丢信息。
    - Live2D 与 FBX 仍是完全缺失而非不完整；
-   - 除专用 reader 外还缺：export、extract、场景层级、MonoBehaviour schema、BuildSettings/PlayerSettings、AnimationClip/AnimatorController/Avatar、ACL 检视与注入、Oodle decoder 注入、Unity 版本覆盖、多文件内存加载、`read_resource_range`/按路径读资源；
+   - 除专用 reader 外还缺：export、extract、场景层级、MonoBehaviour schema、AnimationClip/AnimatorController、ACL 检视与注入、Oodle decoder 注入、Unity 版本覆盖、多文件内存加载、`read_resource_range`/按路径读资源；
    - Node 是可选交付面，因此优先级低于 Core 和 Python 的真实语料兼容。
 
 5. **Live2D 散件发现**

@@ -4,6 +4,14 @@
 export declare class AssetStudio {
   constructor(path: string)
   /**
+   * Opens a path, parsing against `unityVersion` instead of the version the
+   * files declare.
+   *
+   * Needed for files whose own version was stripped at build time, where a
+   * reader has nothing to key its layout decisions on.
+   */
+  static openWithVersion(path: string, unityVersion: string): AssetStudio
+  /**
    * Opens a path on a libuv worker so container discovery does not block
    * the JavaScript event loop.
    */
@@ -52,6 +60,12 @@ export declare class AssetStudio {
    * Python API than by a lossy JavaScript projection.
    */
   readMaterial(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Material
+  /** Reads the scene list a `BuildSettings` object records. */
+  readBuildSettings(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): BuildSettings
+  /** Reads the company and product names from a `PlayerSettings` object. */
+  readPlayerSettings(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): PlayerSettings
+  /** Reads an `Avatar`'s skeleton summary. */
+  readAvatar(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Avatar
 }
 
 /** One `AudioClip`'s stored payload and the extension its container implies. */
@@ -62,6 +76,27 @@ export interface AudioClip {
   /** True when the payload is already a playable RIFF/WAVE stream. */
   isDirectWav: boolean
   data: Buffer
+}
+
+/** An `Avatar`'s skeleton summary. */
+export interface Avatar {
+  name: string
+  /** The size the object declares for its constant block. */
+  declaredSize: number
+  /**
+   * Bone path entries, retained in order so duplicate hashes keep Unity's
+   * first-hit behaviour.
+   */
+  pathCount: number
+  hasHumanDescription: boolean
+}
+
+/** The scene lists a `BuildSettings` object records. */
+export interface BuildSettings {
+  /** Pre-5.x level paths, absent on newer layouts. */
+  levels?: Array<string>
+  /** 5.x and newer scene paths, absent on older layouts. */
+  scenes?: Array<string>
 }
 
 export interface FileInfo {
@@ -102,6 +137,12 @@ export interface ObjectInfo {
   byteSize: bigint
   name?: string
   container?: string
+}
+
+/** The identity fields of a `PlayerSettings` object. */
+export interface PlayerSettings {
+  companyName: string
+  productName: string
 }
 
 export interface ResourceInfo {
