@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
+use assetstudio_core::acl::AclCompressedTracksLimits;
 use assetstudio_core::animation_clip::AnimationClipReadLimits;
 use assetstudio_core::animator_controller::AnimatorControllerReadLimits;
 use assetstudio_core::avatar::AvatarReadLimits;
 use assetstudio_core::export::ExportOptions;
 use assetstudio_core::extraction::ExtractionOptions;
+use assetstudio_core::image_export::ImageFormat;
 use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMaterializeLimits};
 use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
@@ -14,6 +16,7 @@ use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
+use assetstudio_core::scene_textures::SceneTextureLimits;
 use assetstudio_core::simple_assets::SimpleAssetReadLimits;
 use assetstudio_core::source::Region;
 use assetstudio_core::sprite::SpriteReadLimits;
@@ -254,6 +257,43 @@ pub struct Live2dPackageFiles {
     pub name: String,
     pub directory_name: String,
     pub files: Vec<Live2dFile>,
+}
+
+/// An FBX plus the texture files it references by name.
+#[napi(object)]
+pub struct TexturedFbx {
+    pub fbx: Buffer,
+    /// Each must be written beside the FBX for its reference to resolve.
+    pub textures: Vec<Live2dFile>,
+    /// Texture references this reader could not resolve or decode, with the
+    /// reason. Reported rather than raised so one bad texture does not cost the
+    /// model.
+    pub skipped: Vec<String>,
+}
+
+/// The header of one ACL compressed-track blob.
+///
+/// Enough to decide whether a caller's decoder can handle it, without
+/// decompressing anything.
+///
+/// The state flags stay separate booleans rather than the packed bits Core
+/// keeps them in: this is a JavaScript-facing shape, and a bitfield would only
+/// move the unpacking to the other side.
+#[allow(clippy::struct_excessive_bools)]
+#[napi(object)]
+pub struct AclTracks {
+    pub declared_size: u32,
+    pub stored_hash: u32,
+    pub version: u16,
+    pub track_type: String,
+    pub track_count: u32,
+    pub samples_per_track: u32,
+    pub sample_rate: f64,
+    pub decompressed_value_count: BigInt,
+    pub has_metadata: bool,
+    pub is_wrap_optimized: bool,
+    pub has_database: bool,
+    pub has_stripped_keyframes: bool,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -1183,6 +1223,90 @@ impl AssetStudio {
             });
         }
         Ok(packages)
+    }
+
+    /// Writes the collection as ASCII FBX with its animations and returns the
+    /// material textures it references.
+    ///
+    /// The FBX names each texture by file name, so the returned files have to
+    /// be written beside it for those references to resolve. They come back
+    /// rather than being written because this call has no directory of its own
+    /// and where they land is the caller's decision.
+    #[napi]
+    pub fn read_fbx_with_textures(&self, maximum_bytes: Option<i64>) -> Result<TexturedFbx> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let mut fbx = Vec::new();
+        let (_, textures) = self
+            .studio
+            .write_fbx_with_textures(
+                &mut fbx,
+                maximum,
+                ImageFormat::Png,
+                SceneTextureLimits::default(),
+            )
+            .map_err(core_error)?;
+        Ok(TexturedFbx {
+            fbx: fbx.into(),
+            textures: textures
+                .textures
+                .iter()
+                .map(|texture| Live2dFile {
+                    file_name: texture.file_name.clone(),
+                    data: texture.encoded.clone().into(),
+                })
+                .collect(),
+            skipped: textures
+                .skipped
+                .iter()
+                .map(|skip| format!("{}: {}", skip.property, skip.reason))
+                .collect(),
+        })
+    }
+
+    /// Inspects an `AnimationClip`'s ACL blob without decompressing it.
+    ///
+    /// Core ships no ACL decoder, so this is what a caller needs to decide
+    /// whether its own decoder can handle the blob before asking for it.
+    #[napi]
+    pub fn read_acl_tracks(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AclTracks> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let clip = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_animation_clip(AnimationClipReadLimits {
+                maximum_object_bytes: maximum,
+                ..AnimationClipReadLimits::default()
+            })
+            .map_err(core_error)?;
+        let acl = clip
+            .muscle_clip
+            .as_ref()
+            .and_then(|muscle| muscle.clip.acl.as_ref())
+            .ok_or_else(|| invalid_arg("AnimationClip does not contain ACL tracks"))?;
+        let tracks = acl
+            .inspect_compressed_tracks(AclCompressedTracksLimits {
+                maximum_compressed_bytes: maximum,
+                ..AclCompressedTracksLimits::default()
+            })
+            .map_err(core_error)?;
+        Ok(AclTracks {
+            declared_size: tracks.declared_size,
+            stored_hash: tracks.stored_hash,
+            version: tracks.version,
+            track_type: tracks.track_type.name().to_owned(),
+            track_count: tracks.num_tracks,
+            samples_per_track: tracks.num_samples_per_track,
+            sample_rate: f64::from(tracks.sample_rate()),
+            decompressed_value_count: BigInt::from(tracks.decompressed_value_count),
+            has_metadata: tracks.has_metadata(),
+            is_wrap_optimized: tracks.is_wrap_optimized(),
+            has_database: tracks.has_database(),
+            has_stripped_keyframes: tracks.has_stripped_keyframes(),
+        })
     }
 }
 

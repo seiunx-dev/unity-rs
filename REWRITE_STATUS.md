@@ -148,10 +148,10 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - 自动从 managed assembly/dummy DLL 生成 schema 仍是独立的离线可信工具工作，不会在解析进程中加载或执行 DLL。
 
 4. **Node 专用 reader 完整度**
-   - Node 公开面从 15 个同步方法加 9 个 Promise 方法扩到 33 + 9：新增 `readAudio`、`readMonoScript`、`readMaterial`、`readBuildSettings`、`readPlayerSettings`、`readAvatar`、`readResourceRange`、`resourceIndexByPath`、`scene`、`readStaticFbx`、`readFbx`（含动画轨道）、`export`、静态方法 `extract`、`readAnimationClipInfo`、`readAnimatorController`、`live2DPackages`、`readLive2DPackages`（落盘内容返回内存，由调用方决定写哪），以及工厂方法 `openWithVersion` 与 `fromBuffers`。Material 属性值刻意只给名字不给值：它们按表分类型，硬摊平到 JS 只会丢信息。
+   - Node 公开面从 15 个同步方法加 9 个 Promise 方法扩到 35 + 9：读取面新增 `readAudio`、`readMonoScript`、`readMaterial`、`readBuildSettings`、`readPlayerSettings`、`readAvatar`、`readAnimationClipInfo`、`readAnimatorController`、`readAclTracks`（只读 ACL 头，够调用方判断自己的 decoder 能不能处理）、`readResourceRange`、`resourceIndexByPath`、`scene`；输出面新增 `readStaticFbx`、`readFbx`（含动画）、`readFbxWithTextures`（贴图随 FBX 一起返回，由调用方决定写哪）、`export`、静态 `extract`、`live2DPackages`、`readLive2DPackages`；加载面新增工厂方法 `openWithVersion` 与 `fromBuffers`。Material 属性值刻意只给名字不给值：它们按表分类型，硬摊平到 JS 只会丢信息。
    - Core 侧同时补上 `Studio::write_fbx_with_textures`：此前贴图输出只有 CLI 走得到，库调用方拿不到。它返回贴图集合而不是自己写盘——这个方法只持有一个输出流，没有目录可以写同级文件，由调用方决定落在哪里。
-   - Live2D 包发现与落盘均已接；FBX 静态几何与动画均已接，贴图在 Core 有 API、Node 未接；
-   - 除专用 reader 外还缺：MonoBehaviour 外部 schema、ACL 检视与注入、Oodle decoder 注入、Node 侧的贴图 FBX；
+   - Live2D 包发现与落盘、FBX 静态几何/动画/贴图均已接；
+   - 除专用 reader 外还缺：MonoBehaviour 外部 schema、ACL/Oodle decoder 注入（注入需要把 JS 回调跨线程送进解压路径，与只读检视不是一回事）；
    - Node 是可选交付面，因此优先级低于 Core 和 Python 的真实语料兼容。
 
 5. **Live2D 散件发现**

@@ -481,3 +481,17 @@ console.log('node api: animation and live2d discovery ok')
 }
 
 console.log('node api: animated fbx and live2d materialization ok')
+
+// Textured FBX and ACL inspection on inputs that have neither.
+{
+  const barren = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  assert.throws(() => barren.readFbxWithTextures())
+  // A TextAsset is not an AnimationClip, so asking for its ACL blob is
+  // refused rather than answered with zeroes.
+  const objects = barren.objectPage(0)
+  assert.throws(() => barren.readAclTracks(0, objects[0].pathId))
+}
+
+console.log('node api: textured fbx and acl inspection ok')
