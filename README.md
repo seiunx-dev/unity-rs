@@ -76,6 +76,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ASSETSTUDIO_CORPUS_MANIFEST=/private/corpus/manifest.json \
   cargo test -p assetstudio-core --test real_corpus --locked -- --ignored
 cargo run -p assetstudio-cli -- inspect <file-or-directory>
+cargo run -p assetstudio-cli -- list <input> --unity-version 2022.3.62f1
 cargo run -p assetstudio-cli -- info <file-or-directory>
 cargo run -p assetstudio-cli -- list <file-or-directory>
 cargo run -p assetstudio-cli -- scene <file-or-directory>
@@ -151,6 +152,15 @@ For stripped `MonoBehaviour` data, the Python package also accepts a complete
 schemas can be collected in `MonoBehaviourSchemas` and passed to Live2D
 package materialization. The assembly name is used only for matching; the
 runtime never loads or executes the DLL.
+
+Every command that opens a collection accepts `--unity-version <VERSION>`,
+which parses the input against that version instead of the one it declares. It
+is required for files whose version was stripped at build time, and it outranks
+both the declared version and any enclosing bundle revision, matching the
+managed reader's `CustomUnityVersion`. `list` reports the effective version
+whenever it differs from the declared one. Oodle-compressed bundles still need
+a caller-supplied decoder and are therefore reachable from the Rust and Python
+APIs but not from the CLI, which does not load external native libraries.
 
 The read-only `inspect`, `info`, `list`, and `scene` commands never create a
 default output directory. `scene` streams the bounded collection-wide
