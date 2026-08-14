@@ -53,6 +53,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_version_matrix(&executable);
     assert_compressed_texture_formats(&executable);
     assert_crunched_textures(&executable);
+    assert_switch_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
     assert_truncated_fixture(&executable);
@@ -225,6 +226,66 @@ fn assert_converted_shader(fixture: &TemporaryFixture, manifest: &Value) {
     );
 }
 
+/// Compares Switch GOB-deswizzled textures.
+///
+/// A Switch payload is stored in the console's block-linear layout, so the
+/// reader has to undo the GOB swizzle before decoding and then crop the padded
+/// surface back to the declared size. That reordering was only ever checked
+/// against this crate's own expectations. The platform blob carries the block
+/// height exponent the layout depends on.
+fn assert_switch_textures(executable: &Path) {
+    const SWITCH_TARGET_PLATFORM: i32 = 38;
+    const REVISION: &str = "2022.3.62f1";
+    // (name, format code, bytes per texel block, block height exponent)
+    // Uncompressed at two block heights plus a block-compressed format, which
+    // is what the deswizzle itself needs: the texel size and the block-height
+    // exponent are the only inputs to the GOB layout. DXT5 and ASTC are left
+    // out for the same reasons they are absent from the block-format matrix --
+    // the recorded s3tc divergence and reserved encodings random bytes reach --
+    // neither of which says anything about the swizzle.
+    const CASES: &[(&str, i32, usize, i32)] = &[
+        ("rgba32", 4, 4, 0),
+        ("rgba32-tall", 4, 4, 2),
+        ("bc7", 25, 16, 1),
+    ];
+    // 64x64 keeps the padded surface a whole number of GOBs at every block
+    // height these cases use, so nothing depends on the crop being lenient.
+    const SIZE: i32 = 64;
+
+    for (index, (name, format, texel_bytes, block_height_log2)) in CASES.iter().enumerate() {
+        let blocks = if *texel_bytes == 4 {
+            (SIZE * SIZE) as usize
+        } else {
+            ((SIZE / 4) * (SIZE / 4)) as usize
+        };
+        let payload = block_payload(blocks * texel_bytes, 0x5851_F42D_4C95_7F2D ^ index as u64);
+        let mut blob = vec![0_u8; 12];
+        blob[8..12].copy_from_slice(&block_height_log2.to_le_bytes());
+        let object = texture2d_inline(
+            &format!("oracle-switch-{name}"),
+            SIZE,
+            SIZE,
+            *format,
+            1,
+            REVISION,
+            &blob,
+            &payload,
+        );
+        let file =
+            synthetic_single_v22_on_platform(28, 28, REVISION, SWITCH_TARGET_PLATFORM, &object);
+        let fixture = TemporaryFixture::new(&format!("oracle-switch-{name}.assets"), &file)
+            .expect("the Switch fixture is writable");
+        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 8 * 1024 * 1024).unwrap();
+        assert_eq!(managed, rust, "Switch texture {name}");
+        assert_eq!(
+            managed["Files"][0]["Objects"][0]["Payload"]["Decoded"]["Size"],
+            i64::from(SIZE) * i64::from(SIZE) * 4,
+            "Switch texture {name} did not decode a full surface: {managed}"
+        );
+    }
+}
+
 /// Compares decoded pixels for classic Crunch and `UnityCrunch` payloads.
 ///
 /// The unit tests already check these against hashes taken from the bundled
@@ -272,7 +333,7 @@ fn assert_crunched_textures(executable: &Path) {
 /// Ten mip levels, which is what a 512-pixel chain has and what these CRN
 /// streams carry; only level zero is decoded and compared.
 fn crunched_texture2d(name: &str, format: i32, revision: &str, payload: &[u8]) -> Vec<u8> {
-    texture2d_inline(name, 512, 512, format, 10, revision, payload)
+    texture2d_inline(name, 512, 512, format, 10, revision, &[], payload)
 }
 
 /// The major and minor components of a Unity revision like `2017.2.0f3`.
@@ -344,6 +405,7 @@ fn assert_compressed_texture_formats(executable: &Path) {
             *format,
             1,
             REVISION,
+            &[],
             &payload,
         );
         let file = synthetic_single_v22(28, 28, REVISION, &object);
@@ -904,10 +966,23 @@ fn synthetic_v22() -> Vec<u8> {
 }
 
 fn synthetic_single_v22(class_id: i32, path_id: i64, version: &str, data: &[u8]) -> Vec<u8> {
+    // 13 is the standalone Windows player.
+    synthetic_single_v22_on_platform(class_id, path_id, version, 13, data)
+}
+
+/// The same file with a caller-chosen build target, which some readers branch
+/// on: Switch textures are GOB-swizzled and Xbox 360 payloads are byte-swapped.
+fn synthetic_single_v22_on_platform(
+    class_id: i32,
+    path_id: i64,
+    version: &str,
+    target_platform: i32,
+    data: &[u8],
+) -> Vec<u8> {
     let mut metadata = Vec::new();
     metadata.extend_from_slice(version.as_bytes());
     metadata.push(0);
-    push_i32(&mut metadata, 13);
+    push_i32(&mut metadata, target_platform);
     metadata.push(0);
     push_i32(&mut metadata, 1);
     push_i32(&mut metadata, class_id);
@@ -2052,6 +2127,7 @@ fn push_empty_packed_int(output: &mut Vec<u8>) {
 /// Inline rather than streamed so one fixture file is self-contained, which
 /// lets the differential carry a texture per compressed format without a
 /// sibling `.resS` for each.
+#[allow(clippy::too_many_arguments)]
 fn texture2d_inline(
     name: &str,
     width: i32,
@@ -2059,6 +2135,7 @@ fn texture2d_inline(
     format: i32,
     mip_count: i32,
     revision: &str,
+    platform_blob: &[u8],
     data: &[u8],
 ) -> Vec<u8> {
     let mut output = Vec::new();
@@ -2114,7 +2191,9 @@ fn texture2d_inline(
     push_i32(&mut output, 0); // lightmap format
     push_i32(&mut output, 0); // colour space
     if version >= (2020, 2) {
-        push_i32(&mut output, 0); // empty platform blob
+        push_i32(&mut output, i32::try_from(platform_blob.len()).unwrap());
+        output.extend_from_slice(platform_blob);
+        align(&mut output, 4);
     }
     push_i32(&mut output, i32::try_from(data.len()).unwrap());
     output.extend_from_slice(data);
