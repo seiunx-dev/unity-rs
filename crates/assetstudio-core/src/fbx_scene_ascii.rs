@@ -1961,24 +1961,24 @@ fn write_shape_geometry(
     output.write_all(b"            a: ")?;
     let mut first = true;
     for vertex in shape.vertices {
+        let index = usize::try_from(vertex.index)
+            .map_err(|_| io::Error::other("FBX target-shape vertex index does not fit usize"))?;
+        if index >= mesh.vertices.len() {
+            return Err(io::Error::other(
+                "FBX target-shape vertex index is out of range",
+            ));
+        }
         write_array_value(output, &mut first, vertex.index)?;
     }
     output.write_all(b"\n        }\n")?;
+    // FBX stores a target shape as per-index offsets from the base control
+    // points named in `Indexes`, not as absolute positions: importers add
+    // these values to the base vertex. Mirror X to match the base geometry.
     writeln!(output, "        Vertices: *{scalar_count} {{")?;
     output.write_all(b"            a: ")?;
     first = true;
     for vertex in shape.vertices {
-        let index = usize::try_from(vertex.index)
-            .map_err(|_| io::Error::other("FBX target-shape vertex index does not fit usize"))?;
-        let base = mesh
-            .vertices
-            .get(index)
-            .ok_or_else(|| io::Error::other("FBX target-shape vertex index is out of range"))?;
-        for value in [
-            -(base[0] + vertex.vertex[0]),
-            base[1] + vertex.vertex[1],
-            base[2] + vertex.vertex[2],
-        ] {
+        for value in [-vertex.vertex[0], vertex.vertex[1], vertex.vertex[2]] {
             write_array_value(output, &mut first, FbxFloat(value))?;
         }
     }
@@ -2860,7 +2860,11 @@ mod tests {
             "Geometry: 12000000000, \"Geometry::Smile\", \"Shape\" {\n        Version: 100"
         ));
         assert!(text.contains("Indexes: *1 {\n            a: 1"));
-        assert!(text.contains("Vertices: *3 {\n            a: -1.5,0,0"));
+        // Shape vertices are per-index offsets, so this is the mirrored delta
+        // alone. Base control point 1 is (1, 0, 0), so an absolute position
+        // would read -1.5 here and land the target at twice its displacement.
+        assert!(text.contains("Vertices: *3 {\n            a: -0.5,0,0"));
+        assert!(!text.contains("a: -1.5,0,0"));
         assert!(text.contains("Normals: *3 {\n            a: 0,0.25,0"));
         assert!(
             text.contains("Deformer: 10000000000, \"Deformer::skinBlendShape\", \"BlendShape\"")
