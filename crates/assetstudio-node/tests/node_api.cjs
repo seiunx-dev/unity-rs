@@ -468,3 +468,16 @@ console.log('node api: export, extract and fbx ok')
 }
 
 console.log('node api: animation and live2d discovery ok')
+
+// Animated FBX and Live2D materialization on a collection that has neither.
+{
+  const barren = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  // No renderable geometry is refused rather than written as an empty scene.
+  assert.throws(() => barren.readFbx())
+  // No Live2D model is an empty result rather than an error.
+  assert.deepEqual(barren.readLive2DPackages(), [])
+}
+
+console.log('node api: animated fbx and live2d materialization ok')
