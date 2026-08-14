@@ -385,3 +385,31 @@ console.log('node api: additional readers ok')
 }
 
 console.log('node api: settings and version override ok')
+
+// Multi-buffer loading and checked resource ranges.
+{
+  const inputs = [
+    { name: 'text.assets', data: syntheticTextAsset() },
+    { name: 'script.assets', data: syntheticMonoScript() },
+  ]
+  const multi = addon.AssetStudio.fromBuffers(inputs)
+  assert.equal(multi.fileCount, 2)
+  // Each file keeps its own object table.
+  assert.equal(multi.objectPage(0).length, 1)
+  assert.equal(multi.objectPage(1).length, 1)
+  assert.equal(multi.objectPage(1)[0].classId, 115)
+  // The total budget is enforced across the inputs, not per input.
+  assert.throws(() => addon.AssetStudio.fromBuffers(inputs, 16), /exceeding limit/i)
+}
+
+// Scene assembly across the loaded files.
+{
+  // The text fixture has no GameObject, so the hierarchy is legitimately empty
+  // rather than an error.
+  const studioForScene = addon.AssetStudio.fromBuffers([
+    { name: 'text.assets', data: syntheticTextAsset() },
+  ])
+  assert.deepEqual(studioForScene.scene(), [])
+}
+
+console.log('node api: multi-buffer, resource range and scene ok')

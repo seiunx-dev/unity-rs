@@ -66,6 +66,25 @@ export declare class AssetStudio {
   readPlayerSettings(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): PlayerSettings
   /** Reads an `Avatar`'s skeleton summary. */
   readAvatar(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Avatar
+  /**
+   * Opens several in-memory inputs as one collection.
+   *
+   * A serialized file and the `.resS` its textures and audio stream from are
+   * separate files; opening them one at a time leaves every streamed payload
+   * unresolvable, so a caller holding both in memory needs to pass them
+   * together.
+   */
+  static fromBuffers(inputs: Array<MemoryInput>, maximumBytes?: number | undefined | null): AssetStudio
+  /**
+   * Reads one checked byte range of a resource without materializing the
+   * rest, which is how a caller pulls a single texture out of a large
+   * `.resS`.
+   */
+  readResourceRange(resourceIndex: number, offset: bigint, length: bigint, maximumBytes?: number | undefined | null): Buffer
+  /** Finds a resource by the path a serialized file references it through. */
+  resourceIndexByPath(path: string): number | null
+  /** Assembles the `GameObject` hierarchy across every loaded file. */
+  scene(maximumGameObjects?: number | undefined | null): Array<SceneNode>
 }
 
 /** One `AudioClip`'s stored payload and the extension its container implies. */
@@ -116,6 +135,12 @@ export interface Material {
   colorProperties: Array<string>
 }
 
+/** One in-memory input for a multi-file open. */
+export interface MemoryInput {
+  name: string
+  data: Buffer
+}
+
 /**
  * The identity fields of a `MonoScript`, which name the type a
  * `MonoBehaviour` deserializes as.
@@ -162,4 +187,24 @@ export interface RgbaImage {
    * been flipped.
    */
   pixels: Buffer
+}
+
+/**
+ * One `GameObject` in the assembled hierarchy.
+ *
+ * The component flags are separate booleans rather than a bitfield because
+ * this is a JavaScript-facing shape and a bitfield would need decoding on the
+ * other side.
+ */
+export interface SceneNode {
+  fileIndex: number
+  pathId: bigint
+  name: string
+  /** Absent for a `GameObject` with no `Transform`, which cannot be placed. */
+  parentPathId?: bigint
+  childCount: number
+  hasTransform: boolean
+  hasMeshRenderer: boolean
+  hasSkinnedMeshRenderer: boolean
+  hasAnimator: boolean
 }
