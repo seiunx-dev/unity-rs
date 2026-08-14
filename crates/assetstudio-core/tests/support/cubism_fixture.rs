@@ -392,3 +392,55 @@ pub(crate) fn cubism_fade_motion_object(name: &str) -> Vec<u8> {
     push_f32(&mut data, 1.0);
     data
 }
+
+/// The tree for a `CubismExpressionData` behaviour.
+///
+/// Field names and order follow the managed
+/// `CubismUnityClasses/CubismExpressionData.cs`.
+pub(crate) fn cubism_expression_tree() -> Vec<Value> {
+    let mut tree = TreeBuilder::new();
+    tree.push("MonoBehaviour", "Base", -1, 0, 0);
+    pptr(&mut tree, "m_GameObject", "GameObject", 1);
+    tree.byte("m_Enabled", 1);
+    pptr(&mut tree, "m_Script", "MonoScript", 1);
+    tree.string("m_Name", 1);
+
+    tree.string("Type", 1);
+    tree.float("FadeInTime", 1);
+    tree.float("FadeOutTime", 1);
+    tree.open_vector("SerializableExpressionParameter", "Parameters", 1);
+    let parameter = 4;
+    tree.string("Id", parameter);
+    tree.float("Value", parameter);
+    tree.int("Blend", parameter);
+    tree.finish()
+}
+
+/// Writes the bytes `cubism_expression_tree` describes.
+pub(crate) fn cubism_expression_object(name: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_pptr(&mut data);
+    data.push(1);
+    align(&mut data);
+    push_pptr(&mut data);
+    push_string(&mut data, name);
+
+    push_string(&mut data, "Live2D Expression");
+    push_f32(&mut data, 1.0);
+    push_f32(&mut data, 1.234_567_8);
+
+    // One parameter per blend mode, with values that only print the same on
+    // both sides if the number format matches.
+    let parameters: [(&str, f32, i32); 3] = [
+        ("ParamAngleX", 0.8, 0),
+        ("ParamAngleY", -0.000_4, 1),
+        ("ParamMouthOpenY", 2.0, 2),
+    ];
+    push_i32(&mut data, i32::try_from(parameters.len()).unwrap());
+    for (id, value, blend) in parameters {
+        push_string(&mut data, id);
+        push_f32(&mut data, value);
+        push_i32(&mut data, blend);
+    }
+    data
+}

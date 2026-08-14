@@ -243,11 +243,22 @@ static object MonoBehaviourPayload(MonoBehaviour behaviour)
     var parsed = behaviour.ToType();
     string? physics = null;
     string? motion = null;
+    string? expressionJson = null;
     if (parsed != null && parsed.Contains("_rig"))
     {
         // The fps argument is the fallback the converter uses when the rig
         // does not carry one of its own.
         physics = CubismLive2DExtractor.CubismParsers.ParsePhysics(parsed, 30f);
+    }
+    else if (parsed != null && parsed.Contains("Parameters") && parsed.Contains("FadeInTime"))
+    {
+        // exp3.json goes out with no custom converter, so its floats take
+        // Newtonsoft's default format rather than the one the segment lists use.
+        var expression = Newtonsoft.Json.JsonConvert
+            .DeserializeObject<CubismLive2DExtractor.CubismExpression3Json>(
+                Newtonsoft.Json.JsonConvert.SerializeObject(parsed));
+        expressionJson = Newtonsoft.Json.JsonConvert.SerializeObject(
+            expression, Newtonsoft.Json.Formatting.Indented);
     }
     else if (parsed != null && parsed.Contains("ParameterIds"))
     {
@@ -278,6 +289,9 @@ static object MonoBehaviourPayload(MonoBehaviour behaviour)
         Motion = motion == null
             ? (JsonElement?)null
             : JsonSerializer.Deserialize<JsonElement>(motion),
+        Expression = expressionJson == null
+            ? (JsonElement?)null
+            : JsonSerializer.Deserialize<JsonElement>(expressionJson),
     };
 }
 

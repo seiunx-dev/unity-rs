@@ -57,7 +57,7 @@ impl CubismExpressionBlend {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CubismExpressionParameter {
     pub id: String,
-    pub value: f64,
+    pub value: f32,
     pub blend: CubismExpressionBlend,
 }
 
@@ -67,8 +67,8 @@ pub struct CubismExpression {
     pub path_id: i64,
     pub source_name: String,
     pub expression_type: String,
-    pub fade_in_time: f64,
-    pub fade_out_time: f64,
+    pub fade_in_time: f32,
+    pub fade_out_time: f32,
     pub parameters: Vec<CubismExpressionParameter>,
 }
 
@@ -577,16 +577,22 @@ fn required_string<'a>(value: &'a TypeValue, names: &[&str], description: &str) 
     }
 }
 
-fn required_number(value: &TypeValue, names: &[&str], description: &str) -> Result<f64> {
+fn required_number(value: &TypeValue, names: &[&str], description: &str) -> Result<f32> {
     let value = match required_field(value, names, description)? {
-        TypeValue::Float32(value) => f64::from(*value),
-        TypeValue::Float(value) => *value,
-        TypeValue::Signed(value) => value.to_string().parse::<f64>().map_err(|error| {
+        TypeValue::Float32(value) => *value,
+        // A double is out of spec for this document, which is a float
+        // document; Unity writes these fields as floats.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the Cubism documents are float documents"
+        )]
+        TypeValue::Float(value) => *value as f32,
+        TypeValue::Signed(value) => value.to_string().parse::<f32>().map_err(|error| {
             Error::invalid_data(format!(
                 "Cubism expression {description} cannot be converted to a number: {error}"
             ))
         })?,
-        TypeValue::Unsigned(value) => value.to_string().parse::<f64>().map_err(|error| {
+        TypeValue::Unsigned(value) => value.to_string().parse::<f32>().map_err(|error| {
             Error::invalid_data(format!(
                 "Cubism expression {description} cannot be converted to a number: {error}"
             ))
@@ -679,11 +685,15 @@ fn write_json_string(output: &mut impl Write, value: &str) -> Result<()> {
         .map_err(|error| Error::invalid_data(format!("cannot write Cubism JSON string: {error}")))
 }
 
-fn write_number(output: &mut impl Write, value: f64) -> Result<()> {
+/// The managed side serializes exp3.json with no custom converter, so its
+/// floats take Newtonsoft's default format rather than the `"0.###"` the
+/// physics and motion documents use for some of theirs.
+fn write_number(output: &mut impl Write, value: f32) -> Result<()> {
     if !value.is_finite() {
         return Err(Error::invalid_data("Cubism JSON number is not finite"));
     }
-    serde_json::to_writer(output, &value)
+    output
+        .write_all(crate::live2d_number::managed_float(value).as_bytes())
         .map_err(|error| Error::invalid_data(format!("cannot write Cubism JSON number: {error}")))
 }
 

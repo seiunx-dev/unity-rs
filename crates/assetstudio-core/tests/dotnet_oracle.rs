@@ -59,6 +59,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_astc_textures(&executable);
     assert_cubism_physics(&executable);
     assert_cubism_fade_motion(&executable);
+    assert_cubism_expression(&executable);
     assert_switch_textures(&executable);
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
@@ -399,6 +400,50 @@ fn assert_cubism_physics(executable: &Path) {
     );
 
     assert_eq!(managed, rust, "Cubism physics conversion");
+}
+
+/// Compares exp3.json against the managed projection.
+///
+/// The expression document is serialized with no custom converter, so unlike
+/// the other two it uses Newtonsoft's default float format throughout. Having
+/// all three in the differential is what keeps that distinction honest: get it
+/// backwards on any one of them and that document fails while the others pass.
+fn assert_cubism_expression(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+
+    let tree = cubism_fixture::cubism_expression_tree();
+    let object = cubism_fixture::cubism_expression_object("oracle-expression");
+    let file = synthetic_mono_behaviour_v22(116, REVISION, &tree, &object);
+    let fixture = TemporaryFixture::new("oracle-cubism-expression.assets", &file)
+        .expect("the expression fixture is writable");
+    let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+    let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+
+    let managed_expression = &managed["Files"][0]["Objects"][0]["Payload"]["Expression"];
+    assert!(
+        managed_expression.is_object(),
+        "the managed projection produced no exp3.json, so nothing was compared: {managed}"
+    );
+    let parameters = managed_expression["Parameters"]
+        .as_array()
+        .expect("the expression has parameters");
+    assert_eq!(
+        parameters.len(),
+        3,
+        "one parameter per blend mode: {managed}"
+    );
+    // The default float format keeps a trailing .0 where "0.###" would not,
+    // which is the distinction this document exists to hold down.
+    assert_eq!(
+        managed_expression["Parameters"][2]["Value"], 2.0,
+        "an integral value keeps its decimal point in this document"
+    );
+    assert_eq!(
+        managed_expression["FadeOutTime"], 1.234_567_8,
+        "this document does not round to three decimals"
+    );
+
+    assert_eq!(managed, rust, "Cubism expression conversion");
 }
 
 /// Compares the fade-motion route to motion3.json against the managed
