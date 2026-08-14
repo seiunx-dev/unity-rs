@@ -10,9 +10,8 @@
 //! covers. What is new here is only how that content is laid out as records.
 //!
 //! This covers models, geometry, materials, textures, deformers and the
-//! connections between them, plus skin deformers and blend shapes. Animation
-//! stays on the ASCII path until it has been laid out and checked; emitting a
-//! partial version would produce a file that looks complete and quietly is not.
+//! connections between them, plus skin deformers, blend shapes and animation
+//! stacks with their curves.
 
 use std::io::Write;
 
@@ -44,7 +43,18 @@ pub fn write_model_ir_fbx_binary_with_textures<W: Write>(
     output: &mut W,
     maximum_output_bytes: u64,
 ) -> Result<u64> {
-    let scene = StaticScene::from_model(model, None, textures)?;
+    write_model_ir_fbx_binary_full(model, None, textures, output, maximum_output_bytes)
+}
+
+/// Writes a model with its animation tracks and its material textures.
+pub fn write_model_ir_fbx_binary_full<W: Write>(
+    model: &ModelIr,
+    animations: Option<&crate::model_animation::ModelAnimationSet>,
+    textures: Option<&crate::scene_textures::SceneTextureSet>,
+    output: &mut W,
+    maximum_output_bytes: u64,
+) -> Result<u64> {
+    let scene = StaticScene::from_model(model, animations, textures)?;
     let roots = build_scene_nodes(&scene)?;
     let bytes = crate::fbx_binary::read_fbx_binary(&roots, maximum_output_bytes)?;
     output.write_all(&bytes)?;
@@ -99,6 +109,12 @@ fn build_scene_nodes(scene: &StaticScene<'_>) -> Result<Vec<FbxNode>> {
             }
         }
     }
+
+    let mut animation_objects = Vec::new();
+    for animation in &scene.animations {
+        animation_objects.extend(animation_nodes(animation)?);
+    }
+    objects.children.extend(animation_objects);
 
     Ok(vec![
         header_extension(),
@@ -174,7 +190,7 @@ fn documents() -> FbxNode {
 fn definitions(scene: &StaticScene<'_>) -> FbxNode {
     let mut definitions = FbxNode::new("Definitions")
         .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
-        .child(FbxNode::new("Count").with(FbxProperty::I32(6)));
+        .child(FbxNode::new("Count").with(FbxProperty::I32(10)));
     for (name, count) in [
         ("Model", scene.nodes.len()),
         ("Geometry", scene.geometries.len()),
@@ -182,6 +198,10 @@ fn definitions(scene: &StaticScene<'_>) -> FbxNode {
         ("Texture", scene.textures.len()),
         ("Video", scene.textures.len()),
         ("Deformer", deformer_count(scene)),
+        ("AnimationStack", scene.animations.len()),
+        ("AnimationLayer", scene.animations.len()),
+        ("AnimationCurveNode", curve_node_count(scene)),
+        ("AnimationCurve", curve_count(scene)),
     ] {
         definitions.children.push(
             FbxNode::new("ObjectType")
@@ -548,11 +568,183 @@ fn shape_geometry_node(
     Ok(node)
 }
 
+/// One curve node per animated property, plus one per blend-shape channel.
+fn curve_node_count(scene: &StaticScene<'_>) -> usize {
+    scene
+        .animations
+        .iter()
+        .map(|animation| animation.properties.len() + animation.blend_shapes.len())
+        .sum()
+}
+
+/// Three curves per vector property, one per blend-shape channel.
+fn curve_count(scene: &StaticScene<'_>) -> usize {
+    scene
+        .animations
+        .iter()
+        .map(|animation| animation.properties.len() * 3 + animation.blend_shapes.len())
+        .sum()
+}
+
+/// A clip's stack, its layer, and every curve node and curve beneath them.
+fn animation_nodes(animation: &crate::fbx_scene_ascii::AnimationPlan<'_>) -> Result<Vec<FbxNode>> {
+    let mut nodes = Vec::new();
+    let mut stack_properties = FbxNode::new("Properties70");
+    for (name, value) in [("LocalStart", 0), ("LocalStop", animation.stop_time)] {
+        stack_properties.children.push(
+            FbxNode::new("P")
+                .with(FbxProperty::String(name.to_owned()))
+                .with(FbxProperty::String("KTime".to_owned()))
+                .with(FbxProperty::String("Time".to_owned()))
+                .with(FbxProperty::String(String::new()))
+                .with(FbxProperty::I64(value)),
+        );
+    }
+    nodes.push(
+        FbxNode::new("AnimationStack")
+            .with(FbxProperty::I64(animation.stack_id))
+            .with(FbxProperty::String(format!(
+                "AnimStack::{}",
+                animation.name
+            )))
+            .with(FbxProperty::String(String::new()))
+            .child(stack_properties),
+    );
+    nodes.push(
+        FbxNode::new("AnimationLayer")
+            .with(FbxProperty::I64(animation.layer_id))
+            .with(FbxProperty::String("AnimLayer::Base Layer".to_owned()))
+            .with(FbxProperty::String(String::new()))
+            .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
+            .child(FbxNode::new("Weight").with(FbxProperty::F64(100.0)))
+            .child(FbxNode::new("BlendMode").with(FbxProperty::I32(0))),
+    );
+
+    nodes.extend(property_animation_nodes(animation)?);
+    nodes.extend(blend_shape_animation_nodes(animation)?);
+    Ok(nodes)
+}
+
+/// One curve node and three curves per animated vector property.
+fn property_animation_nodes(
+    animation: &crate::fbx_scene_ascii::AnimationPlan<'_>,
+) -> Result<Vec<FbxNode>> {
+    let mut nodes = Vec::new();
+    for property in &animation.properties {
+        let token = property.kind.token();
+        let defaults = property.kind.defaults();
+        let mut curve_properties = FbxNode::new("Properties70");
+        for (component, default) in defaults.iter().enumerate() {
+            curve_properties.children.push(
+                FbxNode::new("P")
+                    .with(FbxProperty::String(format!(
+                        "d|{}",
+                        crate::fbx_scene_ascii::animation_component_name(component)
+                    )))
+                    .with(FbxProperty::String("Number".to_owned()))
+                    .with(FbxProperty::String(String::new()))
+                    .with(FbxProperty::String("A".to_owned()))
+                    .with(FbxProperty::F64(f64::from(*default))),
+            );
+        }
+        nodes.push(
+            FbxNode::new("AnimationCurveNode")
+                .with(FbxProperty::I64(property.node_id))
+                .with(FbxProperty::String(format!("AnimCurveNode::{token}")))
+                .with(FbxProperty::String(String::new()))
+                .child(curve_properties),
+        );
+        for (component, id) in property.curve_ids.iter().enumerate() {
+            let mut times = Vec::with_capacity(property.keys.len());
+            let mut values = Vec::with_capacity(property.keys.len());
+            for key in property.keys {
+                times.push(crate::fbx_scene_ascii::fbx_key_time(key.time)?);
+                values.push(key.value[component]);
+            }
+            nodes.push(curve_node(
+                *id,
+                &format!(
+                    "{token}_{}",
+                    crate::fbx_scene_ascii::animation_component_name(component)
+                ),
+                defaults[component],
+                times,
+                values,
+            ));
+        }
+    }
+
+    Ok(nodes)
+}
+
+/// One curve node and one curve per animated blend-shape channel.
+fn blend_shape_animation_nodes(
+    animation: &crate::fbx_scene_ascii::AnimationPlan<'_>,
+) -> Result<Vec<FbxNode>> {
+    let mut nodes = Vec::new();
+    for blend_shape in &animation.blend_shapes {
+        nodes.push(
+            FbxNode::new("AnimationCurveNode")
+                .with(FbxProperty::I64(blend_shape.node_id))
+                .with(FbxProperty::String(format!(
+                    "AnimCurveNode::{}",
+                    blend_shape.channel_name
+                )))
+                .with(FbxProperty::String(String::new()))
+                .child(
+                    FbxNode::new("Properties70").child(
+                        FbxNode::new("P")
+                            .with(FbxProperty::String("d|DeformPercent".to_owned()))
+                            .with(FbxProperty::String("Number".to_owned()))
+                            .with(FbxProperty::String(String::new()))
+                            .with(FbxProperty::String("A".to_owned()))
+                            .with(FbxProperty::F64(0.0)),
+                    ),
+                ),
+        );
+        let mut times = Vec::with_capacity(blend_shape.keys.len());
+        let mut values = Vec::with_capacity(blend_shape.keys.len());
+        for key in blend_shape.keys {
+            times.push(crate::fbx_scene_ascii::fbx_key_time(key.time)?);
+            values.push(key.value);
+        }
+        nodes.push(curve_node(
+            blend_shape.curve_id,
+            &format!("{}_DeformPercent", blend_shape.channel_name),
+            0.0,
+            times,
+            values,
+        ));
+    }
+    Ok(nodes)
+}
+
+/// One curve: its key times, values and the per-key attribute arrays a reader
+/// expects even when every key shares the same interpolation.
+fn curve_node(id: i64, name: &str, default: f32, times: Vec<i64>, values: Vec<f32>) -> FbxNode {
+    // 24836 is the cubic-auto flag the ASCII writer emits for every key. The
+    // attribute arrays are indexed by KeyAttrRefCount runs, so one entry
+    // covering every key is what a uniform curve looks like.
+    const CUBIC_AUTO: i32 = 24_836;
+    let key_count = i32::try_from(times.len()).unwrap_or(i32::MAX);
+    FbxNode::new("AnimationCurve")
+        .with(FbxProperty::I64(id))
+        .with(FbxProperty::String(format!("AnimCurve::{name}")))
+        .with(FbxProperty::String(String::new()))
+        .child(FbxNode::new("Default").with(FbxProperty::F64(f64::from(default))))
+        .child(FbxNode::new("KeyVer").with(FbxProperty::I32(4008)))
+        .child(FbxNode::new("KeyTime").with(FbxProperty::I64Array(times)))
+        .child(FbxNode::new("KeyValueFloat").with(FbxProperty::F32Array(values)))
+        .child(FbxNode::new("KeyAttrFlags").with(FbxProperty::I32Array(vec![CUBIC_AUTO])))
+        .child(FbxNode::new("KeyAttrDataFloat").with(FbxProperty::F32Array(vec![0.0; 4])))
+        .child(FbxNode::new("KeyAttrRefCount").with(FbxProperty::I32Array(vec![key_count])))
+}
+
 /// Object-to-object links, in the same order the ASCII writer emits them.
 fn connections(scene: &StaticScene<'_>) -> FbxNode {
-    let mut connections = FbxNode::new("Connections");
-    let mut link = |child: i64, parent: i64| {
-        connections.children.push(
+    let mut records: Vec<FbxNode> = Vec::new();
+    let link = |records: &mut Vec<FbxNode>, child: i64, parent: i64| {
+        records.push(
             FbxNode::new("C")
                 .with(FbxProperty::String("OO".to_owned()))
                 .with(FbxProperty::I64(child))
@@ -560,39 +752,78 @@ fn connections(scene: &StaticScene<'_>) -> FbxNode {
         );
     };
     for node in &scene.nodes {
-        link(node.id, node.parent_id);
+        link(&mut records, node.id, node.parent_id);
     }
     for geometry in &scene.geometries {
-        link(geometry.id, geometry.model_id);
+        link(&mut records, geometry.id, geometry.model_id);
         for material_id in &geometry.material_ids {
-            link(*material_id, geometry.model_id);
+            link(&mut records, *material_id, geometry.model_id);
         }
     }
     for texture in &scene.textures {
-        link(texture.video_id, texture.id);
+        link(&mut records, texture.video_id, texture.id);
     }
     for geometry in &scene.geometries {
         if let Some(skin) = &geometry.skin {
-            link(skin.id, geometry.id);
+            link(&mut records, skin.id, geometry.id);
             for cluster in &skin.clusters {
-                link(cluster.id, skin.id);
-                link(cluster.bone_model_id, cluster.id);
+                link(&mut records, cluster.id, skin.id);
+                link(&mut records, cluster.bone_model_id, cluster.id);
             }
         }
         if let Some(morph) = &geometry.morph {
-            link(morph.id, geometry.id);
+            link(&mut records, morph.id, geometry.id);
             for channel in &morph.channels {
-                link(channel.id, morph.id);
+                link(&mut records, channel.id, morph.id);
                 for shape in &channel.shapes {
-                    link(shape.id, channel.id);
+                    link(&mut records, shape.id, channel.id);
                 }
             }
+        }
+    }
+    for animation in &scene.animations {
+        link(&mut records, animation.layer_id, animation.stack_id);
+        for property in &animation.properties {
+            link(&mut records, property.node_id, animation.layer_id);
+            for id in &property.curve_ids {
+                records.push(
+                    FbxNode::new("C")
+                        .with(FbxProperty::String("OP".to_owned()))
+                        .with(FbxProperty::I64(*id))
+                        .with(FbxProperty::I64(property.node_id))
+                        .with(FbxProperty::String("d|X".to_owned())),
+                );
+            }
+            records.push(
+                FbxNode::new("C")
+                    .with(FbxProperty::String("OP".to_owned()))
+                    .with(FbxProperty::I64(property.node_id))
+                    .with(FbxProperty::I64(property.model_id))
+                    .with(FbxProperty::String(property.kind.fbx_property().to_owned())),
+            );
+        }
+        for blend_shape in &animation.blend_shapes {
+            link(&mut records, blend_shape.node_id, animation.layer_id);
+            records.push(
+                FbxNode::new("C")
+                    .with(FbxProperty::String("OP".to_owned()))
+                    .with(FbxProperty::I64(blend_shape.curve_id))
+                    .with(FbxProperty::I64(blend_shape.node_id))
+                    .with(FbxProperty::String("d|DeformPercent".to_owned())),
+            );
+            records.push(
+                FbxNode::new("C")
+                    .with(FbxProperty::String("OP".to_owned()))
+                    .with(FbxProperty::I64(blend_shape.node_id))
+                    .with(FbxProperty::I64(blend_shape.channel_id))
+                    .with(FbxProperty::String("DeformPercent".to_owned())),
+            );
         }
     }
     // Object-to-property links name the material channel the texture drives.
     for material in &scene.materials {
         for texture in &material.textures {
-            connections.children.push(
+            records.push(
                 FbxNode::new("C")
                     .with(FbxProperty::String("OP".to_owned()))
                     .with(FbxProperty::I64(texture.texture_id))
@@ -601,6 +832,8 @@ fn connections(scene: &StaticScene<'_>) -> FbxNode {
             );
         }
     }
+    let mut connections = FbxNode::new("Connections");
+    connections.children = records;
     connections
 }
 
@@ -902,6 +1135,96 @@ mod tests {
             .map(|value| value.trim().parse().expect("a number"))
             .collect();
         assert_eq!(vertices, expected);
+    }
+
+    #[test]
+    fn emits_animation_stacks_layers_and_their_curves() {
+        use crate::model_animation::{
+            ModelAnimationClip, ModelAnimationSet, ModelAnimationTrack, ModelVectorKeyframe,
+        };
+
+        let model = model_fixture();
+        let animations = ModelAnimationSet {
+            clips: vec![ModelAnimationClip {
+                object: key(74),
+                name: "idle".to_owned(),
+                sample_rate: 30.0,
+                tracks: vec![ModelAnimationTrack {
+                    node: key(1),
+                    translations: vec![
+                        ModelVectorKeyframe {
+                            time: 0.0,
+                            value: [0.0, 0.0, 0.0],
+                        },
+                        ModelVectorKeyframe {
+                            time: 1.0,
+                            value: [1.0, 2.0, 3.0],
+                        },
+                    ],
+                    rotations: Vec::new(),
+                    scalings: Vec::new(),
+                }],
+                blend_shapes: Vec::new(),
+            }],
+        };
+
+        let mut output = Vec::new();
+        super::write_model_ir_fbx_binary_full(
+            &model,
+            Some(&animations),
+            None,
+            &mut output,
+            64 * 1024,
+        )
+        .unwrap();
+        let roots = parse_fbx_binary(&output).unwrap();
+        let objects = roots
+            .iter()
+            .find(|node| node.name == "Objects")
+            .expect("an Objects record");
+
+        assert!(
+            objects
+                .children
+                .iter()
+                .any(|node| node.name == "AnimationStack")
+        );
+        assert!(
+            objects
+                .children
+                .iter()
+                .any(|node| node.name == "AnimationLayer")
+        );
+        // One curve node for the translation property, three curves under it.
+        assert_eq!(
+            objects
+                .children
+                .iter()
+                .filter(|node| node.name == "AnimationCurveNode")
+                .count(),
+            1
+        );
+        let curves: Vec<&crate::fbx_binary::FbxNode> = objects
+            .children
+            .iter()
+            .filter(|node| node.name == "AnimationCurve")
+            .collect();
+        assert_eq!(curves.len(), 3);
+
+        // Key times are FBX ticks, not seconds: one second is 46186158000 of
+        // them, and emitting seconds would collapse the whole clip onto frame
+        // zero while still parsing.
+        match &child(curves[0], "KeyTime").properties[0] {
+            FbxProperty::I64Array(times) => {
+                assert_eq!(times, &[0, 46_186_158_000]);
+            }
+            other => panic!("key times are not a long array: {other:?}"),
+        }
+        // The X curve carries the X component of each key.
+        match &child(curves[0], "KeyValueFloat").properties[0] {
+            FbxProperty::F32Array(values) => assert_eq!(values, &[0.0, 1.0]),
+            other => panic!("key values are not a float array: {other:?}"),
+        }
     }
 
     #[test]
