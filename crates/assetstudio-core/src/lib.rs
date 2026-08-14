@@ -19,6 +19,7 @@ pub mod error;
 pub mod export;
 pub mod extraction;
 pub mod fbx_ascii;
+pub mod fbx_binary;
 mod fbx_scene_ascii;
 pub mod file_type;
 mod fsb_vorbis;
