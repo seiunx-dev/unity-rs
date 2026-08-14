@@ -78,6 +78,7 @@
 - `cargo fmt --all -- --check`；
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`；
 - `cargo test --workspace --all-targets --locked --no-fail-fast`；
+- **CI 的全部作业步骤已于 2026-08-15 在本机完整复跑一遍**（`cargo fmt --check`、`clippy -D warnings`、`cargo doc -D warnings`、`cargo package -p assetstudio-core`、workspace 测试、Node 的 build/test/pack、Python 的 release wheel 与 sdist 两条路各跑 `installed_wheel.py` 与 `python_api.py`、UnityPy 差分、托管差分、vgmstream 音频差分），全部通过；无法在本机复现的只剩 Linux/Windows 平台差异。之所以要手工跑一遍：CI 自 LZMA 那次提交起就没跑过，而这一跑就发现 Python 侧其实已经坏了一段时间（见上面 sprite fixture 那条）。
 - Core 482 项普通测试通过，10 项依赖可选 vgmstream oracle 的测试在本机额外执行并全部通过（其中 1 项钉住的是已记录的上游 Opus 偏离，不是一致性）；
 - C#→Rust 托管差分 oracle 通过；
 - TypeTree dump 浮点文本对照 .NET 10 实测生成的 849 个取值（边界值 + 位模式扫描）逐字节一致，期望值以 fixture 形式入库；
