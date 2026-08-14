@@ -5083,6 +5083,8 @@ mod tests {
     /// Records how far SILK/hybrid Opus sits from libopus. This is a known
     /// defect, not a tolerance.
     ///
+    /// Written up with measurements in `docs/upstream-defects.md`.
+    ///
     /// The divergence was isolated to `ruopus` 0.1.2 and reproduces with no
     /// code from this crate involved: feeding the same packets straight to the
     /// decoder and applying the stream's own pre-skip, its output arrives early
