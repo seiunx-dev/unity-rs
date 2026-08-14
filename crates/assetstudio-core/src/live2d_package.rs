@@ -1530,7 +1530,14 @@ impl<'a> PackageState<'a> {
                 model.object.file_index,
             )
         });
-        let physics = self.build_physics_file(&name, physics_controller, motion_fps)?;
+        // physics3.json is a float document and the managed extractor passes
+        // this fallback as a float too, so it narrows here rather than inside
+        // the writer.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the physics document's fps field is a float"
+        )]
+        let physics = self.build_physics_file(&name, physics_controller, motion_fps as f32)?;
         let pose_components = components_for_model(&indexes.pose_parts_by_model, model.object);
         let pose = self.build_pose_file(&name, pose_components)?;
         let parameter_components =
@@ -2422,7 +2429,7 @@ impl<'a> PackageState<'a> {
         &mut self,
         model_name: &str,
         identity: Option<(usize, usize)>,
-        motion_fps: f64,
+        motion_fps: f32,
     ) -> Result<Option<Live2dPackageJsonFile>> {
         let Some((file_index, object_index)) = identity else {
             return Ok(None);

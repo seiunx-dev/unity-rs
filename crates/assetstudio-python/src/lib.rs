@@ -2942,7 +2942,13 @@ impl PyAssetStudio {
             .map_err(|error| {
                 PyMemoryError::new_err(format!("cannot allocate Cubism physics JSON: {error}"))
             })?;
-        rig.write_physics3_json(motion_fps, &mut json, output_limit)
+        // The physics document is a float document; Python has only doubles,
+        // so the width changes at this boundary in both directions.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "physics3.json's fps field is a float"
+        )]
+        rig.write_physics3_json(motion_fps as f32, &mut json, output_limit)
             .map_err(core_error)?;
         let input_count = checked_element_count(
             rig.sub_rigs.iter().map(|value| value.inputs.len()),
@@ -2958,9 +2964,9 @@ impl PyAssetStudio {
         )?;
         Ok(PyCubismPhysics {
             path_id: rig.path_id,
-            fps: rig.fps,
-            gravity: (rig.gravity.x, rig.gravity.y),
-            wind: (rig.wind.x, rig.wind.y),
+            fps: f64::from(rig.fps),
+            gravity: (f64::from(rig.gravity.x), f64::from(rig.gravity.y)),
+            wind: (f64::from(rig.wind.x), f64::from(rig.wind.y)),
             sub_rig_count: rig.sub_rigs.len(),
             input_count,
             output_count,
