@@ -1808,6 +1808,30 @@ def main() -> None:
             pass
         else:
             raise AssertionError("directory traversal limits should be enforced")
+
+        # A game directory mixes readable assets with containers whose layout
+        # has never been verified. By default one of those fails the whole
+        # load; skip_unreadable_inputs keeps everything that did parse.
+        with tempfile.TemporaryDirectory(prefix="assetstudio-mixed-") as mixed_root:
+            mixed = Path(mixed_root)
+            (mixed / "a-good.assets").write_bytes(synthetic_text_asset())
+            archive = (
+                b"UnityArchive\0"
+                + (5).to_bytes(4, "big")
+                + b"5.x.x\0"
+                + b"5.0.0f4\0"
+            )
+            (mixed / "b-archive.unity3d").write_bytes(archive)
+            (mixed / "c-good.assets").write_bytes(synthetic_text_asset())
+            try:
+                AssetStudio(mixed)
+            except NotImplementedError:
+                pass
+            else:
+                raise AssertionError("an unreadable input should fail the load")
+            tolerant = AssetStudio(mixed, skip_unreadable_inputs=True)
+            assert tolerant.file_count == 2, tolerant.file_count
+            assert tolerant.object_count == 2, tolerant.object_count
         assert studio.file_count == 1
         assert studio.object_count == 1
         assert studio.resource_count == 0

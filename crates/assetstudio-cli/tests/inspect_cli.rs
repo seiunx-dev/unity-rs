@@ -167,6 +167,39 @@ fn missing_extract_and_export_inputs_leave_no_output_directory() {
 }
 
 #[test]
+fn one_unreadable_file_does_not_hide_the_rest_of_a_directory() {
+    let root = TestDirectory::new("skip-unreadable");
+    let inputs = root.path().join("game_Data");
+    fs::create_dir_all(&inputs).unwrap();
+    fs::write(inputs.join("a-good.assets"), synthetic_v22_text_asset()).unwrap();
+    // Recognized, and explicitly refused because its layout is unverified.
+    let mut archive = Vec::new();
+    archive.extend_from_slice(b"UnityArchive\0");
+    archive.extend_from_slice(&5_u32.to_be_bytes());
+    archive.extend_from_slice(b"5.x.x\0");
+    archive.extend_from_slice(b"5.0.0f4\0");
+    fs::write(inputs.join("b-archive.unity3d"), &archive).unwrap();
+    fs::write(inputs.join("c-good.assets"), synthetic_v22_text_asset()).unwrap();
+
+    let result = cli(root.path(), ["list".into(), inputs.as_os_str().into()]);
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    // The readable files still load, the skipped one is named, and the run
+    // reports a partial failure instead of a silent success.
+    assert!(stdout.contains("serialized files: 2"), "stdout: {stdout}");
+    assert!(stdout.contains("skipped"), "stdout: {stdout}");
+    assert!(stdout.contains("b-archive"), "stdout: {stdout}");
+    assert_eq!(result.status.code(), Some(3), "stdout: {stdout}");
+
+    // A single input that cannot be parsed is still a hard failure, not an
+    // empty success.
+    let only_bad = root.path().join("only-bad");
+    fs::create_dir_all(&only_bad).unwrap();
+    fs::write(only_bad.join("archive.unity3d"), &archive).unwrap();
+    let result = cli(root.path(), ["list".into(), only_bad.as_os_str().into()]);
+    assert_eq!(result.status.code(), Some(1));
+}
+
+#[test]
 fn unity_version_overrides_a_stripped_serialized_file_version() {
     let root = TestDirectory::new("unity-version");
     let input = root.path().join("stripped.assets");

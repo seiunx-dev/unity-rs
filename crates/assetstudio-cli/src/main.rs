@@ -22,7 +22,7 @@ use assetstudio_core::fbx_ascii::write_model_ir_fbx_ascii_with_animations;
 use assetstudio_core::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
 use assetstudio_core::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
 use assetstudio_core::live2d_package::{Live2dPackage, Live2dPackageLimits, build_live2d_packages};
-use assetstudio_core::loader::{AssetCollection, AssetLoadOptions};
+use assetstudio_core::loader::{AssetCollection, AssetLoadOptions, LoadFailurePolicy};
 use assetstudio_core::model_animation::{ModelAnimationLimits, build_model_animations};
 use assetstudio_core::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
@@ -139,14 +139,10 @@ fn run_with_arguments(arguments: &[OsString], output: &mut impl Write) -> CliRes
     match parse_cli_arguments(&arguments)? {
         CliCommand::Help => print_help(output).map_err(CliError::from),
         CliCommand::Inspect(path) => inspect_path(&path, output),
-        CliCommand::Info(path) => {
-            report_collection(&path, false, &load, output).map_err(CliError::from)
-        }
-        CliCommand::List(path) => {
-            report_collection(&path, true, &load, output).map_err(CliError::from)
-        }
-        CliCommand::Scene(path) => report_scene(&path, &load, output).map_err(CliError::from),
-        CliCommand::Fbx(command) => export_fbx(&command, &load, output).map_err(CliError::from),
+        CliCommand::Info(path) => report_collection(&path, false, &load, output),
+        CliCommand::List(path) => report_collection(&path, true, &load, output),
+        CliCommand::Scene(path) => report_scene(&path, &load, output),
+        CliCommand::Fbx(command) => export_fbx(&command, &load, output),
         CliCommand::FbxBatch(command) => export_fbx_batch(&command, &load, output),
         CliCommand::Live2d(command) => {
             export_live2d(&command.input, &command.output, &load, output)
@@ -925,7 +921,7 @@ fn export_path(
     load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(input, load)?;
+    let collection = load_asset_collection(input, load, output)?;
     let report = export_collection(&collection, output_directory, options)?;
 
     for record in &report.exported {
@@ -963,11 +959,11 @@ fn export_path(
             failures: report.failures.len(),
         });
     }
-    Ok(())
+    skipped_input_result("export", &collection)
 }
 
-fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write) -> Result<()> {
-    let collection = load_asset_collection(&command.input, load)?;
+fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write) -> CliResult<()> {
+    let collection = load_asset_collection(&command.input, load, output)?;
     let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
     let model = build_model_ir(&collection, &hierarchy, ModelIrLimits::default())?;
     let graph = build_animation_graph(&collection, &hierarchy, AnimationGraphLimits::default())?;
@@ -991,7 +987,7 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
         animations.clips.len(),
         command.output.display()
     )?;
-    Ok(())
+    skipped_input_result("FBX export", &collection)
 }
 
 fn export_fbx_batch(
@@ -999,7 +995,7 @@ fn export_fbx_batch(
     load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(&command.input, load)?;
+    let collection = load_asset_collection(&command.input, load, output)?;
     let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
     let candidates = match command.mode {
         FbxBatchMode::SplitObjects => {
@@ -1083,7 +1079,7 @@ fn export_fbx_batch(
             failures,
         });
     }
-    Ok(())
+    skipped_input_result("FBX batch export", &collection)
 }
 
 fn write_fbx_batch_candidate(
@@ -1393,7 +1389,7 @@ fn export_live2d(
     load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(input, load)?;
+    let collection = load_asset_collection(input, load, output)?;
     let candidates = collect_live2d_candidates(&collection)?;
     let read_limits = CubismMocReadLimits {
         maximum_model_bytes: MAX_LIVE2D_MODEL_OUTPUT_BYTES,
@@ -1426,7 +1422,7 @@ fn export_live2d(
             failures: state.failures,
         });
     }
-    Ok(())
+    skipped_input_result("live2d", &collection)
 }
 
 fn collect_live2d_candidates(collection: &AssetCollection) -> CliResult<Vec<Live2dCandidate>> {
@@ -1765,7 +1761,7 @@ fn export_live2d_packages(
     load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(input, load)?;
+    let collection = load_asset_collection(input, load, output)?;
     let set = build_live2d_packages(&collection, live2d_package_limits())?;
     let mut state = Live2dPackageExportState::default();
     for diagnostic in set.diagnostics {
@@ -1845,7 +1841,7 @@ fn export_live2d_packages(
             failures: state.failures,
         });
     }
-    Ok(())
+    skipped_input_result("live2d-package", &collection)
 }
 
 fn live2d_package_limits() -> Live2dPackageLimits {
@@ -2192,14 +2188,55 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_asset_collection(path: &Path, load: &LoadOptions) -> Result<AssetCollection> {
-    AssetCollection::load_path_with_options(
+/// Opens a collection, skipping inputs that cannot be parsed.
+///
+/// A game directory routinely mixes readable assets with encrypted, truncated
+/// or not-yet-supported containers, so refusing the whole load over one of them
+/// would report nothing where the managed tool reports almost everything. Each
+/// skipped input is printed, and a load where nothing at all parsed is still a
+/// hard failure rather than an empty success.
+fn load_asset_collection(
+    path: &Path,
+    load: &LoadOptions,
+    output: &mut impl Write,
+) -> Result<AssetCollection> {
+    let collection = AssetCollection::load_path_with_options(
         path,
         AssetLoadOptions {
             unity_version_override: load.unity_version.clone(),
+            failure_policy: LoadFailurePolicy::SkipInput,
             ..AssetLoadOptions::default()
         },
-    )
+    )?;
+    if collection.serialized_files.is_empty()
+        && collection.resources.is_empty()
+        && let Some(first) = collection.diagnostics.first()
+    {
+        return Err(Error::invalid_data(format!(
+            "{}: {}",
+            first.path, first.message
+        )));
+    }
+    for diagnostic in &collection.diagnostics {
+        writeln!(
+            output,
+            "  skipped {}: {}",
+            escape_text(&diagnostic.path),
+            escape_text(&diagnostic.message)
+        )?;
+    }
+    Ok(collection)
+}
+
+/// Turns skipped inputs into the CLI's partial-failure exit status.
+fn skipped_input_result(operation: &'static str, collection: &AssetCollection) -> CliResult<()> {
+    if collection.diagnostics.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Partial {
+        operation,
+        failures: collection.diagnostics.len(),
+    })
 }
 
 fn inspect_path(path: &Path, output: &mut impl Write) -> CliResult<()> {
@@ -2250,8 +2287,8 @@ fn report_collection(
     include_objects: bool,
     load: &LoadOptions,
     output: &mut impl Write,
-) -> Result<()> {
-    let collection = load_asset_collection(path, load)?;
+) -> CliResult<()> {
+    let collection = load_asset_collection(path, load, output)?;
     let mut total_objects = 0_usize;
     let mut total_object_bytes = 0_u64;
     let mut class_counts = BTreeMap::<i32, usize>::new();
@@ -2339,11 +2376,11 @@ fn report_collection(
             )?;
         }
     }
-    Ok(())
+    skipped_input_result("info/list", &collection)
 }
 
-fn report_scene(path: &Path, load: &LoadOptions, output: &mut impl Write) -> Result<()> {
-    let collection = load_asset_collection(path, load)?;
+fn report_scene(path: &Path, load: &LoadOptions, output: &mut impl Write) -> CliResult<()> {
+    let collection = load_asset_collection(path, load, output)?;
     let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
     writeln!(output, "scene {}", path.display())?;
     writeln!(
@@ -2363,12 +2400,12 @@ fn report_scene(path: &Path, load: &LoadOptions, output: &mut impl Write) -> Res
         visit_scene_root(&collection, &hierarchy, *root, &mut visited, output)?;
     }
     if visited != hierarchy.nodes.len() {
-        return Err(Error::invalid_data(format!(
+        return Err(CliError::Runtime(Error::invalid_data(format!(
             "scene traversal visited {visited} of {} hierarchy nodes",
             hierarchy.nodes.len()
-        )));
+        ))));
     }
-    Ok(())
+    skipped_input_result("scene", &collection)
 }
 
 fn visit_scene_root(
