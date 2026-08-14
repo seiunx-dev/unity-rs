@@ -35,9 +35,9 @@ function alignedString(value) {
 }
 
 // Wraps one tree-less object payload in a v22 little-endian serialized file.
-function finishV22Asset(classId, payload) {
+function finishV22Asset(classId, payload, version = '2022.3.62f1') {
   let metadata = Buffer.concat([
-    Buffer.from('2022.3.62f1\0', 'ascii'),
+    Buffer.from(`${version}\0`, 'ascii'),
     i32(13),
     Buffer.from([0]),
     i32(1),
@@ -132,6 +132,30 @@ function syntheticMonoScript() {
     alignedString('Live2D.Cubism.Core.dll'),
   ])
   return finishV22Asset(115, payload)
+}
+
+function syntheticPlayerSettings() {
+  // The platform prefix a 2022.3 PlayerSettings carries before its names: the
+  // product GUID, the Android profiler flag, the screen orientation and target
+  // device, the on-demand-resources flag, and the accelerometer frequency.
+  // Each flag is a single byte followed by padding to the next four.
+  const payload = Buffer.concat([
+    Buffer.alloc(16),
+    Buffer.from([0, 0, 0, 0]),
+    i32(0),
+    i32(0),
+    Buffer.from([0, 0, 0, 0]),
+    i32(0),
+    alignedString('Team Haruki'),
+    alignedString('unity-rs fixture'),
+  ])
+  return finishV22Asset(129, payload)
+}
+
+// The same object with its Unity version stripped, as a shipped build can be.
+function syntheticStrippedPlayerSettings() {
+  const built = syntheticPlayerSettings()
+  return finishV22Asset(129, built.subarray(Number(built.readBigInt64BE(32))), '0.0.0')
 }
 
 function syntheticTypeTreeIntAsset() {
@@ -321,3 +345,43 @@ testAsyncWorkers().catch((error) => {
 }
 
 console.log('node api: additional readers ok')
+
+// PlayerSettings identity and the Unity version override.
+{
+  const settingsDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'assetstudio-node-settings-'),
+  )
+  try {
+    const settingsPath = path.join(settingsDirectory, 'settings.assets')
+    fs.writeFileSync(settingsPath, syntheticPlayerSettings())
+    const settingsStudio = new addon.AssetStudio(settingsPath)
+    const objects = settingsStudio.objectPage(0)
+    assert.equal(objects[0].classId, 129)
+    const settings = settingsStudio.readPlayerSettings(0, objects[0].pathId)
+    assert.equal(settings.companyName, 'Team Haruki')
+    assert.equal(settings.productName, 'unity-rs fixture')
+
+    // A stripped build carries no version, so its layout cannot be decided
+    // without one. That is what the override is for.
+    const strippedPath = path.join(settingsDirectory, 'stripped.assets')
+    fs.writeFileSync(strippedPath, syntheticStrippedPlayerSettings())
+    const stripped = new addon.AssetStudio(strippedPath)
+    const strippedObjects = stripped.objectPage(0)
+    assert.throws(
+      () => stripped.readPlayerSettings(0, strippedObjects[0].pathId),
+      /version/i,
+    )
+
+    const overridden = addon.AssetStudio.openWithVersion(strippedPath, '2022.3.62f1')
+    const overriddenSettings = overridden.readPlayerSettings(
+      0,
+      overridden.objectPage(0)[0].pathId,
+    )
+    assert.equal(overriddenSettings.companyName, 'Team Haruki')
+    assert.throws(() => addon.AssetStudio.openWithVersion(strippedPath, 'not a version'))
+  } finally {
+    fs.rmSync(settingsDirectory, { recursive: true, force: true })
+  }
+}
+
+console.log('node api: settings and version override ok')
