@@ -31,7 +31,21 @@ pub fn write_model_ir_fbx_binary<W: Write>(
     output: &mut W,
     maximum_output_bytes: u64,
 ) -> Result<u64> {
-    let scene = StaticScene::from_model(model, None, None)?;
+    write_model_ir_fbx_binary_with_textures(model, None, output, maximum_output_bytes)
+}
+
+/// Writes a model's static scene with its material textures.
+///
+/// The records reference each texture by file name, so the caller has to write
+/// the set beside the model for those references to resolve, exactly as with
+/// the ASCII writer.
+pub fn write_model_ir_fbx_binary_with_textures<W: Write>(
+    model: &ModelIr,
+    textures: Option<&crate::scene_textures::SceneTextureSet>,
+    output: &mut W,
+    maximum_output_bytes: u64,
+) -> Result<u64> {
+    let scene = StaticScene::from_model(model, None, textures)?;
     if scene
         .geometries
         .iter()
@@ -74,6 +88,10 @@ fn build_scene_nodes(scene: &StaticScene<'_>) -> Result<Vec<FbxNode>> {
     }
     for material in &scene.materials {
         objects.children.push(material_node(material));
+    }
+    for texture in &scene.textures {
+        objects.children.push(texture_node(texture));
+        objects.children.push(video_node(texture));
     }
 
     Ok(vec![
@@ -150,11 +168,13 @@ fn documents() -> FbxNode {
 fn definitions(scene: &StaticScene<'_>) -> FbxNode {
     let mut definitions = FbxNode::new("Definitions")
         .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
-        .child(FbxNode::new("Count").with(FbxProperty::I32(3)));
+        .child(FbxNode::new("Count").with(FbxProperty::I32(5)));
     for (name, count) in [
         ("Model", scene.nodes.len()),
         ("Geometry", scene.geometries.len()),
         ("Material", scene.materials.len()),
+        ("Texture", scene.textures.len()),
+        ("Video", scene.textures.len()),
     ] {
         definitions.children.push(
             FbxNode::new("ObjectType")
@@ -294,6 +314,93 @@ fn material_node(material: &crate::fbx_scene_ascii::MaterialPlan<'_>) -> FbxNode
         .child(properties)
 }
 
+/// One `Texture` record, carrying the UV transform FBX keeps on the texture
+/// rather than on the binding.
+fn texture_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
+    let mut properties = FbxNode::new("Properties70");
+    properties.children.push(
+        FbxNode::new("P")
+            .with(FbxProperty::String("UVSet".to_owned()))
+            .with(FbxProperty::String("KString".to_owned()))
+            .with(FbxProperty::String(String::new()))
+            .with(FbxProperty::String(String::new()))
+            .with(FbxProperty::String("UVChannel_0".to_owned())),
+    );
+    properties.children.push(
+        FbxNode::new("P")
+            .with(FbxProperty::String("UseMaterial".to_owned()))
+            .with(FbxProperty::String("bool".to_owned()))
+            .with(FbxProperty::String(String::new()))
+            .with(FbxProperty::String(String::new()))
+            .with(FbxProperty::I32(1)),
+    );
+    for (name, values, third) in [
+        ("Translation", texture.translation, 0.0),
+        ("Scaling", texture.scaling, 1.0),
+    ] {
+        properties.children.push(
+            FbxNode::new("P")
+                .with(FbxProperty::String(name.to_owned()))
+                .with(FbxProperty::String("Vector".to_owned()))
+                .with(FbxProperty::String(String::new()))
+                .with(FbxProperty::String("A".to_owned()))
+                .with(FbxProperty::F64(f64::from(values[0])))
+                .with(FbxProperty::F64(f64::from(values[1])))
+                .with(FbxProperty::F64(third)),
+        );
+    }
+    FbxNode::new("Texture")
+        .with(FbxProperty::I64(texture.id))
+        .with(FbxProperty::String(format!(
+            "Texture::{}",
+            texture.file_name
+        )))
+        .with(FbxProperty::String(String::new()))
+        .child(FbxNode::new("Type").with(FbxProperty::String("TextureVideoClip".to_owned())))
+        .child(FbxNode::new("Version").with(FbxProperty::I32(202)))
+        .child(
+            FbxNode::new("TextureName").with(FbxProperty::String(format!(
+                "Texture::{}",
+                texture.file_name
+            ))),
+        )
+        .child(properties)
+        .child(
+            FbxNode::new("Media")
+                .with(FbxProperty::String(format!("Video::{}", texture.file_name))),
+        )
+        .child(FbxNode::new("FileName").with(FbxProperty::String(texture.file_name.to_owned())))
+        .child(
+            FbxNode::new("RelativeFilename")
+                .with(FbxProperty::String(texture.file_name.to_owned())),
+        )
+}
+
+/// The `Video` clip a `Texture` reads its bytes through.
+fn video_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
+    let mut properties = FbxNode::new("Properties70");
+    properties.children.push(
+        FbxNode::new("P")
+            .with(FbxProperty::String("Path".to_owned()))
+            .with(FbxProperty::String("KString".to_owned()))
+            .with(FbxProperty::String("XRefUrl".to_owned()))
+            .with(FbxProperty::String(String::new()))
+            .with(FbxProperty::String(texture.file_name.to_owned())),
+    );
+    FbxNode::new("Video")
+        .with(FbxProperty::I64(texture.video_id))
+        .with(FbxProperty::String(format!("Video::{}", texture.file_name)))
+        .with(FbxProperty::String("Clip".to_owned()))
+        .child(FbxNode::new("Type").with(FbxProperty::String("Clip".to_owned())))
+        .child(properties)
+        .child(FbxNode::new("UseMipMap").with(FbxProperty::I32(0)))
+        .child(FbxNode::new("Filename").with(FbxProperty::String(texture.file_name.to_owned())))
+        .child(
+            FbxNode::new("RelativeFilename")
+                .with(FbxProperty::String(texture.file_name.to_owned())),
+        )
+}
+
 /// Object-to-object links, in the same order the ASCII writer emits them.
 fn connections(scene: &StaticScene<'_>) -> FbxNode {
     let mut connections = FbxNode::new("Connections");
@@ -314,12 +421,30 @@ fn connections(scene: &StaticScene<'_>) -> FbxNode {
             link(*material_id, geometry.model_id);
         }
     }
+    for texture in &scene.textures {
+        link(texture.video_id, texture.id);
+    }
+    // Object-to-property links name the material channel the texture drives.
+    for material in &scene.materials {
+        for texture in &material.textures {
+            connections.children.push(
+                FbxNode::new("C")
+                    .with(FbxProperty::String("OP".to_owned()))
+                    .with(FbxProperty::I64(texture.texture_id))
+                    .with(FbxProperty::I64(material.id))
+                    .with(FbxProperty::String(texture.slot.fbx_property().to_owned())),
+            );
+        }
+    }
     connections
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read_model_ir_fbx_binary, write_model_ir_fbx_binary};
+    use super::{
+        read_model_ir_fbx_binary, write_model_ir_fbx_binary,
+        write_model_ir_fbx_binary_with_textures,
+    };
     use crate::fbx_ascii::write_model_ir_fbx_ascii;
     use crate::fbx_binary::{FbxProperty, parse_fbx_binary};
 
@@ -409,6 +534,46 @@ mod tests {
                 mesh,
             }],
             Vec::new(),
+        )
+    }
+
+    /// The same model with one material slot, so a texture has something to
+    /// bind to.
+    fn material_model_fixture() -> ModelIr {
+        use crate::material::{Material, MaterialPropertySheet};
+        use crate::model_ir::ModelMaterial;
+        use crate::serialized::ObjectReference;
+
+        let model = model_fixture();
+        let material_key = key(61);
+        let material = Material {
+            path_id: material_key.path_id,
+            name: "skin".to_owned(),
+            shader: ObjectReference {
+                file_id: 0,
+                path_id: 0,
+            },
+            legacy_shader_keywords: Vec::new(),
+            valid_keywords: Vec::new(),
+            invalid_keywords: Vec::new(),
+            lightmap_flags: None,
+            enable_instancing_variants: None,
+            custom_render_queue: None,
+            string_tags: Vec::new(),
+            disabled_shader_passes: Vec::new(),
+            saved_properties: MaterialPropertySheet::default(),
+            trailing_bytes: 0,
+        };
+        let mut node = model.nodes[0].clone();
+        node.renderers[0].materials = vec![Some(material_key)];
+        ModelIr::from_test_parts(
+            vec![node],
+            vec![key(1)],
+            model.meshes.clone(),
+            vec![ModelMaterial {
+                object: material_key,
+                material,
+            }],
         )
     }
 
@@ -571,6 +736,102 @@ mod tests {
         // Every object is linked to something; an unlinked object would not
         // appear in an importer's scene at all.
         assert!(!roots[6].children.is_empty());
+    }
+
+    #[test]
+    fn carries_textures_and_the_material_channels_they_drive() {
+        use crate::scene_textures::{
+            SceneTexture, SceneTextureBinding, SceneTextureSet, TextureSlot,
+        };
+
+        let model = model_fixture();
+        let mut set = SceneTextureSet::default();
+        let texture = set.push_texture(SceneTexture {
+            file_name: "Body.png".to_owned(),
+            object: key(81),
+            encoded: Vec::new(),
+        });
+        // The fixture's renderer has no material slots, so nothing binds and no
+        // Texture record should appear; a writer that emitted one anyway would
+        // be inventing a reference the scene does not have.
+        let _ = SceneTextureBinding {
+            property: "_MainTex".to_owned(),
+            texture,
+            slot: Some(TextureSlot::Diffuse),
+            offset: [0.0, 0.0],
+            scale: [1.0, 1.0],
+        };
+        let mut output = Vec::new();
+        write_model_ir_fbx_binary_with_textures(&model, Some(&set), &mut output, 64 * 1024)
+            .unwrap();
+        let roots = parse_fbx_binary(&output).unwrap();
+        let objects = roots
+            .iter()
+            .find(|node| node.name == "Objects")
+            .expect("an Objects record");
+        assert!(!objects.children.iter().any(|node| node.name == "Texture"));
+        assert!(!objects.children.iter().any(|node| node.name == "Video"));
+    }
+
+    #[test]
+    fn emits_a_texture_video_pair_and_the_channel_it_drives() {
+        use crate::scene_textures::{
+            SceneTexture, SceneTextureBinding, SceneTextureSet, TextureSlot,
+        };
+
+        let model = material_model_fixture();
+        let mut set = SceneTextureSet::default();
+        let texture = set.push_texture(SceneTexture {
+            file_name: "Body.png".to_owned(),
+            object: key(81),
+            encoded: Vec::new(),
+        });
+        set.bind(
+            key(61),
+            SceneTextureBinding {
+                property: "_MainTex".to_owned(),
+                texture,
+                slot: Some(TextureSlot::Diffuse),
+                offset: [0.25, 0.5],
+                scale: [2.0, 4.0],
+            },
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        write_model_ir_fbx_binary_with_textures(&model, Some(&set), &mut output, 64 * 1024)
+            .unwrap();
+        let roots = parse_fbx_binary(&output).unwrap();
+        let objects = roots
+            .iter()
+            .find(|node| node.name == "Objects")
+            .expect("an Objects record");
+
+        let texture_record = objects
+            .children
+            .iter()
+            .find(|node| node.name == "Texture")
+            .expect("a Texture record");
+        assert_eq!(
+            texture_record.properties[1],
+            FbxProperty::String("Texture::Body.png".to_owned())
+        );
+        assert_eq!(
+            child(texture_record, "RelativeFilename").properties[0],
+            FbxProperty::String("Body.png".to_owned())
+        );
+        assert!(objects.children.iter().any(|node| node.name == "Video"));
+
+        // The texture drives the material's diffuse channel through an
+        // object-to-property link, which is what makes it show up at all.
+        let connections = roots
+            .iter()
+            .find(|node| node.name == "Connections")
+            .expect("a Connections record");
+        assert!(connections.children.iter().any(|node| {
+            node.properties.first() == Some(&FbxProperty::String("OP".to_owned()))
+                && node.properties.last() == Some(&FbxProperty::String("DiffuseColor".to_owned()))
+        }));
     }
 
     #[test]

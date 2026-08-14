@@ -92,17 +92,17 @@ pub(crate) struct StaticScene<'a> {
 /// The first binding wins, matching the single shared `FbxFileTexture` the
 /// managed exporter creates per texture name.
 pub(crate) struct TexturePlan<'a> {
-    id: i64,
-    video_id: i64,
-    file_name: &'a str,
-    translation: [f32; 2],
-    scaling: [f32; 2],
+    pub(crate) id: i64,
+    pub(crate) video_id: i64,
+    pub(crate) file_name: &'a str,
+    pub(crate) translation: [f32; 2],
+    pub(crate) scaling: [f32; 2],
 }
 
 /// One texture bound to a material channel.
-struct MaterialTexturePlan {
-    texture_id: i64,
-    slot: TextureSlot,
+pub(crate) struct MaterialTexturePlan {
+    pub(crate) texture_id: i64,
+    pub(crate) slot: TextureSlot,
 }
 
 pub(crate) struct NodePlan<'a> {
@@ -195,7 +195,7 @@ enum AnimationProperty {
 pub(crate) struct MaterialPlan<'a> {
     pub(crate) id: i64,
     pub(crate) material: Option<&'a Material>,
-    textures: Vec<MaterialTexturePlan>,
+    pub(crate) textures: Vec<MaterialTexturePlan>,
 }
 
 #[derive(Clone, Copy)]
