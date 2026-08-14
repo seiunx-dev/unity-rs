@@ -319,6 +319,7 @@ fn assert_container_fixtures(executable: &Path) {
     ];
     let cases = uncompressed
         .into_iter()
+        .chain(lzma_bundle_cases(&entries))
         .chain(compressed_bundle_cases(&entries))
         .chain(tail);
     for (name, bytes, allowed) in cases {
@@ -333,6 +334,53 @@ fn assert_container_fixtures(executable: &Path) {
             "container fixture {name} produced no serialized files: {managed}"
         );
     }
+}
+
+/// LZMA-compressed bundle cases.
+///
+/// Unity frames an LZMA block as the five-byte property header followed by the
+/// raw stream, without the `.lzma` container's size field, so the framing
+/// itself is worth comparing and not only the decoded bytes.
+fn lzma_bundle_cases(entries: &[BundleEntry<'_>]) -> [ContainerCase; 3] {
+    const REVISION: &str = "2022.3.62f1";
+
+    [
+        (
+            "oracle-bundle-lzma-blocks.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    blocks: Compression::Lzma,
+                    ..BundleLayout::v6(REVISION)
+                },
+                entries,
+            ),
+            &[],
+        ),
+        (
+            "oracle-bundle-lzma-directory.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    directory: Compression::Lzma,
+                    ..BundleLayout::v6(REVISION)
+                },
+                entries,
+            ),
+            &[],
+        ),
+        (
+            "oracle-bundle-lzma-both-tail.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    info: BlocksInfo::AtEnd,
+                    blocks: Compression::Lzma,
+                    directory: Compression::Lzma,
+                    ..BundleLayout::v6(REVISION)
+                },
+                entries,
+            ),
+            &[],
+        ),
+    ]
 }
 
 fn compressed_bundle_cases(entries: &[BundleEntry<'_>]) -> [ContainerCase; 7] {

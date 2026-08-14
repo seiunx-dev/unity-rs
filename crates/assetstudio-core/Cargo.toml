@@ -24,6 +24,10 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 zstd = { version = "0.13.3", default-features = false }
 
 [dev-dependencies]
+# The shipped library only decodes LZMA, so the encoder feature is off above.
+# Building the differential's LZMA block fixtures needs it; it adds no
+# dependency of its own and never reaches a consumer of the published crate.
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "encoder"] }
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 
 [lints]

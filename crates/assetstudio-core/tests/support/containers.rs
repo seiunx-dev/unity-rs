@@ -40,6 +40,7 @@ const SERIALIZED_FILE_ENTRY: u32 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
+    Lzma,
     Lz4,
     Lz4Hc,
     Zstd,
@@ -49,6 +50,7 @@ impl Compression {
     const fn code(self) -> u32 {
         match self {
             Self::None => 0,
+            Self::Lzma => 1,
             Self::Lz4 => 2,
             Self::Lz4Hc => 3,
             Self::Zstd => 5,
@@ -58,10 +60,34 @@ impl Compression {
     fn apply(self, bytes: &[u8]) -> Vec<u8> {
         match self {
             Self::None => bytes.to_vec(),
+            Self::Lzma => lzma_block(bytes),
             Self::Lz4 | Self::Lz4Hc => lz4_flex::block::compress(bytes),
             Self::Zstd => zstd::bulk::compress(bytes, 3).expect("zstd fixture compression"),
         }
     }
+}
+
+/// Encodes `bytes` the way Unity frames an LZMA bundle block.
+///
+/// A block carries the five-byte LZMA property header -- the packed properties
+/// byte and the little-endian dictionary size -- followed immediately by the
+/// raw range-coded stream. The `.lzma` container's eight-byte uncompressed size
+/// is absent, because the block's own table already records it, so the encoder
+/// is asked for a header and those eight bytes are dropped.
+fn lzma_block(bytes: &[u8]) -> Vec<u8> {
+    use lzma_rust2::{LzmaOptions, LzmaWriter};
+
+    let options = LzmaOptions::with_preset(6);
+    let mut encoded = Vec::new();
+    let mut writer = LzmaWriter::new_use_header(&mut encoded, &options, Some(bytes.len() as u64))
+        .expect("the LZMA fixture encoder starts");
+    writer.write_all(bytes).expect("the LZMA fixture encodes");
+    writer.finish().expect("the LZMA fixture finishes");
+
+    let mut block = Vec::with_capacity(encoded.len() - 8);
+    block.extend_from_slice(&encoded[..5]);
+    block.extend_from_slice(&encoded[13..]);
+    block
 }
 
 /// How one bundle fixture is laid out.
