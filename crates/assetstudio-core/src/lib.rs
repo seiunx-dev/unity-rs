@@ -40,6 +40,7 @@ pub mod model_ir;
 pub mod mono_schema;
 pub mod monobehaviour;
 pub mod object_name;
+pub mod packed_bits;
 pub mod project_settings;
 pub mod renderer;
 pub mod scene;
