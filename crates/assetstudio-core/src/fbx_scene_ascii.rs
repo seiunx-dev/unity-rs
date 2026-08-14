@@ -125,23 +125,23 @@ pub(crate) struct GeometryPlan<'a> {
 }
 
 pub(crate) struct MorphPlan<'a> {
-    id: i64,
-    name: &'a str,
-    channels: Vec<MorphChannelPlan<'a>>,
+    pub(crate) id: i64,
+    pub(crate) name: &'a str,
+    pub(crate) channels: Vec<MorphChannelPlan<'a>>,
 }
 
-struct MorphChannelPlan<'a> {
-    id: i64,
-    name: &'a str,
-    full_weights: &'a [f32],
-    shapes: Vec<ShapePlan<'a>>,
+pub(crate) struct MorphChannelPlan<'a> {
+    pub(crate) id: i64,
+    pub(crate) name: &'a str,
+    pub(crate) full_weights: &'a [f32],
+    pub(crate) shapes: Vec<ShapePlan<'a>>,
 }
 
-struct ShapePlan<'a> {
-    id: i64,
-    name: String,
-    frame: &'a MeshBlendShapeFrame,
-    vertices: &'a [MeshBlendShapeVertex],
+pub(crate) struct ShapePlan<'a> {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) frame: &'a MeshBlendShapeFrame,
+    pub(crate) vertices: &'a [MeshBlendShapeVertex],
 }
 
 pub(crate) struct SkinPlan<'a> {
