@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "assetstudio-rs"
+dynamic = ["version"]
+description = "Native Python bindings for the AssetStudio Rust core"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["unity", "assets", "assetbundle", "assetstudio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/aelurum/AssetStudio"
+
+[tool.maturin]
+features = ["extension-module"]
+module-name = "assetstudio._native"
+python-source = "python"
+strip = true
+exclude = ["dist/**"]
