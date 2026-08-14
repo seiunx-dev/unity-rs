@@ -137,6 +137,90 @@ static object OracleObject(AssetStudio.Object value)
     };
 }
 
+// An absent list and an empty one both mean the clip has no curves of that
+// kind, so both hash as empty rather than one becoming null: the row stays a
+// value comparison instead of a presence check.
+//
+// Curve keyframes hashed as a flat little-endian stream: the path, then every
+// keyframe's time, value and both tangents as raw float bits. Bit patterns
+// rather than decimal text so a rounding difference cannot hide.
+static object QuaternionCurves(List<QuaternionCurve> curves)
+{
+    var values = new List<uint>();
+    foreach (var curve in curves ?? [])
+    {
+        AppendPath(values, curve.path);
+        foreach (var key in curve.curve.m_Curve)
+        {
+            values.Add(BitConverter.SingleToUInt32Bits(key.time));
+            AppendQuaternion(values, key.value);
+            AppendQuaternion(values, key.inSlope);
+            AppendQuaternion(values, key.outSlope);
+        }
+    }
+    return UInt32Values(values);
+}
+
+static object Vector3Curves(List<Vector3Curve> curves)
+{
+    var values = new List<uint>();
+    foreach (var curve in curves ?? [])
+    {
+        AppendPath(values, curve.path);
+        foreach (var key in curve.curve.m_Curve)
+        {
+            values.Add(BitConverter.SingleToUInt32Bits(key.time));
+            AppendVector3(values, key.value);
+            AppendVector3(values, key.inSlope);
+            AppendVector3(values, key.outSlope);
+        }
+    }
+    return UInt32Values(values);
+}
+
+static object FloatCurves(List<FloatCurve> curves)
+{
+    var values = new List<uint>();
+    foreach (var curve in curves ?? [])
+    {
+        AppendPath(values, curve.path);
+        AppendPath(values, curve.attribute);
+        values.Add(unchecked((uint)curve.classID));
+        foreach (var key in curve.curve.m_Curve)
+        {
+            values.Add(BitConverter.SingleToUInt32Bits(key.time));
+            values.Add(BitConverter.SingleToUInt32Bits(key.value));
+            values.Add(BitConverter.SingleToUInt32Bits(key.inSlope));
+            values.Add(BitConverter.SingleToUInt32Bits(key.outSlope));
+        }
+    }
+    return UInt32Values(values);
+}
+
+static void AppendPath(List<uint> values, string path)
+{
+    values.Add((uint)(path?.Length ?? 0));
+    foreach (var character in path ?? string.Empty)
+    {
+        values.Add(character);
+    }
+}
+
+static void AppendVector3(List<uint> values, Vector3 value)
+{
+    values.Add(BitConverter.SingleToUInt32Bits(value.X));
+    values.Add(BitConverter.SingleToUInt32Bits(value.Y));
+    values.Add(BitConverter.SingleToUInt32Bits(value.Z));
+}
+
+static void AppendQuaternion(List<uint> values, Quaternion value)
+{
+    values.Add(BitConverter.SingleToUInt32Bits(value.X));
+    values.Add(BitConverter.SingleToUInt32Bits(value.Y));
+    values.Add(BitConverter.SingleToUInt32Bits(value.Z));
+    values.Add(BitConverter.SingleToUInt32Bits(value.W));
+}
+
 static object AnimationClipPayload(AnimationClip clip)
 {
     var muscle = clip.m_MuscleClip;
@@ -148,6 +232,14 @@ static object AnimationClipPayload(AnimationClip clip)
         SampleRateBits = BitConverter.SingleToUInt32Bits(clip.m_SampleRate),
         WrapMode = clip.m_WrapMode,
         EulerCurveCount = clip.m_EulerCurves?.Count ?? 0,
+        // Keyframe values, not just curve counts. Everything below used to be
+        // compared by shape alone, so the times, values and tangents each
+        // reader produced were only ever checked against its own expectations.
+        RotationCurves = QuaternionCurves(clip.m_RotationCurves),
+        EulerCurves = Vector3Curves(clip.m_EulerCurves),
+        PositionCurves = Vector3Curves(clip.m_PositionCurves),
+        ScaleCurves = Vector3Curves(clip.m_ScaleCurves),
+        FloatCurves = FloatCurves(clip.m_FloatCurves),
         MusclePresent = muscle is not null,
         StreamedCurveCount = muscle?.m_Clip?.data?.m_StreamedClip?.curveCount,
         Acl = acl is null ? null : new

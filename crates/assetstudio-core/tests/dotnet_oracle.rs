@@ -48,6 +48,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
         let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
         assert_eq!(managed, rust, "fixture {}", fixture.path.display());
         assert_converted_shader(fixture, &managed);
+        assert_animation_curves(fixture, &managed);
     }
 
     assert_version_matrix(&executable);
@@ -91,6 +92,7 @@ fn assert_split_group_fixture(executable: &Path) {
 /// One fixture per object-level reader the gate compares.
 fn object_fixtures() -> Vec<TemporaryFixture> {
     let mut fixtures = mesh_fixtures();
+    fixtures.extend(animation_fixtures());
     fixtures.extend(vec![
         TemporaryFixture::new("oracle-v13-big-endian.assets", &synthetic_v13_big_endian()).unwrap(),
         TemporaryFixture::new(
@@ -171,6 +173,25 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
             &synthetic_single_v22(74, 74, "6000.2.0f1", &animation_clip()),
         )
         .unwrap(),
+        TemporaryFixture::with_resource(
+            "oracle-v22.assets",
+            &synthetic_v22(),
+            "oracle.resS",
+            &oracle_resource(),
+        )
+        .unwrap(),
+    ]);
+    fixtures
+}
+
+/// The `AnimationClip` fixtures, including one carrying real keyframes.
+fn animation_fixtures() -> Vec<TemporaryFixture> {
+    vec![
+        TemporaryFixture::new(
+            "oracle-animation-curves.assets",
+            &synthetic_single_v22(74, 74, "6000.2.0f1", &animation_clip_with_curves(true)),
+        )
+        .unwrap(),
         TemporaryFixture::new(
             "oracle-animation-tuanjie-1.6.assets",
             &synthetic_single_v22(74, 74, "2022.3.61t1", &tuanjie_animation_clip()),
@@ -181,15 +202,7 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
             &synthetic_single_v22(74, 74, "2022.3.55t4", &tuanjie_embedded_animation_clip()),
         )
         .unwrap(),
-        TemporaryFixture::with_resource(
-            "oracle-v22.assets",
-            &synthetic_v22(),
-            "oracle.resS",
-            &oracle_resource(),
-        )
-        .unwrap(),
-    ]);
-    fixtures
+    ]
 }
 
 /// The Mesh fixtures, including both shapes of packed geometry.
@@ -206,6 +219,31 @@ fn mesh_fixtures() -> Vec<TemporaryFixture> {
         )
         .unwrap(),
     ]
+}
+
+/// Confirms the curve fixture really carried keyframes.
+///
+/// Both readers report an empty hash when a clip has no curves, so a fixture
+/// whose curve block failed to parse would still make them agree while proving
+/// nothing about a single keyframe.
+fn assert_animation_curves(fixture: &TemporaryFixture, manifest: &Value) {
+    if !fixture.path.to_string_lossy().contains("animation-curves") {
+        return;
+    }
+    let payload = &manifest["Files"][0]["Objects"][0]["Payload"];
+    for row in [
+        "RotationCurves",
+        "EulerCurves",
+        "PositionCurves",
+        "ScaleCurves",
+        "FloatCurves",
+    ] {
+        let count = payload[row]["Count"].as_i64().unwrap_or(0);
+        assert!(
+            count > 0,
+            "{row} carried no values, so the comparison proved nothing: {payload}"
+        );
+    }
 }
 
 /// Confirms the 5.3 fixture really took the converted-text path.
@@ -1679,12 +1717,38 @@ fn tuanjie_animator_controller() -> Vec<u8> {
 }
 
 fn animation_clip() -> Vec<u8> {
+    animation_clip_with_curves(false)
+}
+
+/// The clip body, optionally carrying one curve of each explicit kind.
+///
+/// The differential compared curve counts and never a keyframe, so the times,
+/// values and tangents each reader produced were checked only against its own
+/// expectations.
+fn animation_clip_with_curves(curves: bool) -> Vec<u8> {
     let mut output = Vec::new();
     push_string(&mut output, "oracle-animation");
     output.extend_from_slice(&[0, 0, 0]);
     align(&mut output, 4);
-    for _ in 0..7 {
+    if curves {
+        // Rotation, then an empty compressed list, then Euler, position, scale,
+        // float and an empty PPtr list.
+        push_i32(&mut output, 1);
+        push_quaternion_curve(&mut output, "Root/Bone");
         push_i32(&mut output, 0);
+        push_i32(&mut output, 1);
+        push_vector3_curve(&mut output, "Root/Bone", 1.0);
+        push_i32(&mut output, 1);
+        push_vector3_curve(&mut output, "Root", 2.0);
+        push_i32(&mut output, 1);
+        push_vector3_curve(&mut output, "Root/Bone/Tip", 3.0);
+        push_i32(&mut output, 1);
+        push_float_curve(&mut output, "Root", "m_LocalScale.x");
+        push_i32(&mut output, 0);
+    } else {
+        for _ in 0..7 {
+            push_i32(&mut output, 0);
+        }
     }
     push_f32(&mut output, 60.0);
     push_i32(&mut output, 2);
@@ -1867,6 +1931,66 @@ fn tuanjie_embedded_animation_clip() -> Vec<u8> {
     push_i32(&mut output, 0);
     align(&mut output, 4);
     output
+}
+
+/// A two-keyframe quaternion curve. Values are chosen so every component
+/// differs, which makes a swapped axis or tangent visible in the hash.
+fn push_quaternion_curve(output: &mut Vec<u8>, path: &str) {
+    push_i32(output, 2);
+    for (base, time) in [(0.0_f32, 0.0_f32), (1.0, 0.5)] {
+        push_f32(output, time);
+        push_floats(output, &[base, base + 0.25, base + 0.5, 1.0]);
+        push_floats(output, &[0.125, 0.25, 0.375, 0.5]);
+        push_floats(output, &[0.625, 0.75, 0.875, 1.0]);
+        push_i32(output, 0); // weighted mode
+        push_floats(output, &[0.33, 0.33, 0.33, 0.33]);
+        push_floats(output, &[0.66, 0.66, 0.66, 0.66]);
+    }
+    push_i32(output, 0); // pre-infinity
+    push_i32(output, 0); // post-infinity
+    push_i32(output, 4); // rotation order
+    push_string(output, path);
+}
+
+/// A two-keyframe vector curve, offset by `bias` so each curve differs.
+fn push_vector3_curve(output: &mut Vec<u8>, path: &str, bias: f32) {
+    push_i32(output, 2);
+    for (step, time) in [(0.0_f32, 0.0_f32), (1.0, 1.0)] {
+        let base = bias + step;
+        push_f32(output, time);
+        push_floats(output, &[base, base + 0.5, base + 1.5]);
+        push_floats(output, &[0.1, 0.2, 0.3]);
+        push_floats(output, &[0.4, 0.5, 0.6]);
+        push_i32(output, 0);
+        push_floats(output, &[0.33, 0.33, 0.33]);
+        push_floats(output, &[0.66, 0.66, 0.66]);
+    }
+    push_i32(output, 0);
+    push_i32(output, 0);
+    push_i32(output, 4);
+    push_string(output, path);
+}
+
+/// A two-keyframe scalar curve plus the binding fields that follow it.
+fn push_float_curve(output: &mut Vec<u8>, path: &str, attribute: &str) {
+    push_i32(output, 2);
+    for (step, time) in [(0.0_f32, 0.0_f32), (1.0, 0.25)] {
+        push_f32(output, time);
+        push_f32(output, 1.5 + step);
+        push_f32(output, 0.75);
+        push_f32(output, 0.875);
+        push_i32(output, 0);
+        push_f32(output, 0.33);
+        push_f32(output, 0.66);
+    }
+    push_i32(output, 0);
+    push_i32(output, 0);
+    push_i32(output, 4);
+    push_string(output, attribute);
+    push_string(output, path);
+    push_i32(output, 4); // Transform
+    push_pptr(output);
+    push_i32(output, 0); // flags, 2022.2 and up
 }
 
 fn push_animation_xform(output: &mut Vec<u8>) {
