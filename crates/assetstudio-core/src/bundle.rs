@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::source::Region;
+use crate::unity_cn::{
+    ARCHIVE_ENCRYPTED_FLAG as UNITY_CN_ENCRYPTED_FLAG, ArchiveDecryptor,
+    HEADER_BYTES as UNITY_CN_HEADER_BYTES, UnityCnHeader, UnityCnKey,
+};
 use crate::unity_version::UnityVersion;
 use crate::{Error, Result};
 
@@ -15,7 +19,6 @@ const BLOCKS_INFO_AT_END: u32 = 0x80;
 const BLOCK_INFO_NEEDS_PADDING_AT_START: u32 = 0x200;
 const UNITY_CN_V1_FLAG: u32 = 0x200;
 const UNITY_CN_V2_V3_FLAGS: u32 = 0x1400;
-const UNITY_CN_HEADER_BYTES: u64 = 70;
 const STORAGE_BLOCK_COMPRESSION_MASK: u16 = 0x3f;
 
 /// Common prefix shared by `UnityWeb`, `UnityRaw`, `UnityArchive`, and `UnityFS`.
@@ -205,6 +208,7 @@ pub struct UnityFsBundle {
     max_lzma_memory_kib: u32,
     max_zstd_window_log: u32,
     oodle_decoder: OodleDecoderSlot,
+    decryptor: Option<ArchiveDecryptor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +246,8 @@ impl Default for BundleParseLimits {
 pub struct BundleOpenOptions {
     pub limits: BundleParseLimits,
     pub oodle_decoder: Option<Arc<dyn OodleDecoder>>,
+    /// Key for UnityCN-encrypted bundles. Without one they stay refused.
+    pub unity_cn_key: Option<UnityCnKey>,
 }
 
 impl fmt::Debug for BundleOpenOptions {
@@ -253,6 +259,7 @@ impl fmt::Debug for BundleOpenOptions {
                 "oodle_decoder",
                 &self.oodle_decoder.as_ref().map(|_| "<configured>"),
             )
+            .field("unity_cn_key", &self.unity_cn_key)
             .finish()
     }
 }
@@ -279,6 +286,7 @@ impl UnityFsBundle {
         let BundleOpenOptions {
             limits,
             oodle_decoder,
+            unity_cn_key,
         } = options;
         let mut reader = EndianReader::new(region.cursor(), Endian::Big);
         let bundle_start = reader.position()?;
@@ -315,7 +323,6 @@ impl UnityFsBundle {
             ));
         }
 
-        let blocks_info_header_position = reader.position()?;
         let compressed_size = u64::from(compressed_blocks_info_size);
         let uncompressed_size = u64::from(uncompressed_blocks_info_size);
         if compressed_size > limits.max_blocks_info_size
@@ -326,22 +333,22 @@ impl UnityFsBundle {
                 limits.max_blocks_info_size
             )));
         }
-        if detects_unity_cn(
-            region,
-            bundle_start,
-            blocks_info_header_position,
-            &common,
-            flags,
-            bundle_end,
-            compressed_size,
-            uncompressed_size,
-            limits,
-            oodle_decoder.as_deref(),
-        ) {
-            return Err(Error::unsupported(
-                "UnityCN-encrypted UnityFS bundles are detected but cannot be decrypted",
-            ));
-        }
+        // UnityCN puts its encryption header immediately after the archive
+        // flags, before the alignment the ordinary layout applies.
+        let decryptor = if has_unity_cn_flag(&common, flags) {
+            let Some(key) = unity_cn_key else {
+                return Err(Error::unsupported(
+                    "UnityCN-encrypted UnityFS bundles need a caller-supplied key",
+                ));
+            };
+            let length = usize::try_from(UNITY_CN_HEADER_BYTES).map_err(|_| {
+                Error::invalid_data("UnityCN header size does not fit this platform")
+            })?;
+            let header = UnityCnHeader::parse(reader.read_bytes(length)?.as_slice())?;
+            Some(ArchiveDecryptor::new(&header, key)?)
+        } else {
+            None
+        };
 
         align_blocks_info(&mut reader, bundle_start, &common, flags, bundle_end)?;
         let blocks_info_return_position = reader.position()?;
@@ -376,6 +383,13 @@ impl UnityFsBundle {
             reader.set_position(blocks_info_return_position)?;
         }
 
+        let mut blocks_info_bytes = blocks_info_bytes;
+        if let Some(decryptor) = &decryptor
+            && flags.0 & UNITY_CN_ENCRYPTED_FLAG != 0
+            && flags.compression() != CompressionType::None
+        {
+            decryptor.decrypt_block(&mut blocks_info_bytes, 0)?;
+        }
         let blocks_info = decompress_blocks_info(
             flags.compression(),
             blocks_info_bytes,
@@ -385,7 +399,7 @@ impl UnityFsBundle {
         )?;
         let (blocks_info_hash, mut blocks, entries) = parse_blocks_info(&blocks_info, limits)?;
 
-        if flags.block_info_needs_padding() {
+        if block_info_needs_padding(&common, flags) {
             align_relative(&mut reader, bundle_start, 16, bundle_end)?;
         }
         let data_offset = reader.position()?;
@@ -464,6 +478,7 @@ impl UnityFsBundle {
             max_lzma_memory_kib: limits.max_lzma_memory_kib,
             max_zstd_window_log: limits.max_zstd_window_log,
             oodle_decoder: OodleDecoderSlot(oodle_decoder),
+            decryptor,
         })
     }
 
@@ -474,6 +489,24 @@ impl UnityFsBundle {
 
     /// Streams one bundle entry to `output` without materializing the complete
     /// uncompressed bundle.
+    /// Reads one block's stored bytes, decrypting them when the block is marked
+    /// encrypted.
+    ///
+    /// `UnityCN` obfuscates only compressed blocks; an uncompressed block is
+    /// stored in the clear and never reaches here.
+    fn block_bytes(&self, block: &StorageBlock, block_index: usize) -> Result<Vec<u8>> {
+        let mut bytes = self
+            .region
+            .subregion(block.compressed_offset, u64::from(block.compressed_size))?
+            .read_to_vec(u64::from(block.compressed_size))?;
+        if let Some(decryptor) = &self.decryptor
+            && u32::from(block.flags) & UNITY_CN_ENCRYPTED_FLAG != 0
+        {
+            decryptor.decrypt_block(&mut bytes, block_index)?;
+        }
+        Ok(bytes)
+    }
+
     pub fn copy_entry<W: Write>(&self, index: usize, output: &mut W) -> Result<u64> {
         let entry = self.entries.get(index).ok_or_else(|| {
             Error::invalid_data(format!("UnityFS entry index {index} is out of range"))
@@ -484,7 +517,7 @@ impl UnityFsBundle {
             .ok_or_else(|| Error::invalid_data("UnityFS entry range overflowed"))?;
         let mut written = 0_u64;
 
-        for block in &self.blocks {
+        for (block_index, block) in self.blocks.iter().enumerate() {
             let block_end = block
                 .uncompressed_offset
                 .checked_add(u64::from(block.uncompressed_size))
@@ -504,10 +537,7 @@ impl UnityFsBundle {
                     self.region.copy_range(source_offset, length, output)?;
                 }
                 CompressionType::Lz4 | CompressionType::Lz4Hc => {
-                    let compressed = self
-                        .region
-                        .subregion(block.compressed_offset, u64::from(block.compressed_size))?
-                        .read_to_vec(u64::from(block.compressed_size))?;
+                    let compressed = self.block_bytes(block, block_index)?;
                     let decoded = decompress_lz4(
                         &compressed,
                         u64::from(block.uncompressed_size),
@@ -525,10 +555,7 @@ impl UnityFsBundle {
                     )?)?;
                 }
                 CompressionType::Lzma | CompressionType::Zstd | CompressionType::Oodle => {
-                    let compressed = self
-                        .region
-                        .subregion(block.compressed_offset, u64::from(block.compressed_size))?
-                        .read_to_vec(u64::from(block.compressed_size))?;
+                    let compressed = self.block_bytes(block, block_index)?;
                     let decoded = decompress_unity_block(
                         block.compression,
                         &compressed,
@@ -591,56 +618,23 @@ impl UnityFsBundle {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn detects_unity_cn(
-    region: &Region,
-    bundle_start: u64,
-    header_position: u64,
-    common: &BundleHeader,
-    flags: ArchiveFlags,
-    bundle_end: u64,
-    compressed_size: u64,
-    uncompressed_size: u64,
-    limits: BundleParseLimits,
-    oodle_decoder: Option<&dyn OodleDecoder>,
-) -> bool {
-    if flags.blocks_info_at_end() || !has_unity_cn_flag(common, flags) {
+fn uses_legacy_flag_vocabulary(common: &BundleHeader) -> bool {
+    if common.unity_revision.is_stripped() {
         return false;
     }
-    let Some(candidate_position) = header_position.checked_add(UNITY_CN_HEADER_BYTES) else {
-        return false;
-    };
-    if candidate_position > bundle_end {
-        return false;
-    }
+    let revision = &common.unity_revision;
+    revision.components().0 < 2020
+        || revision.is_in_range((2020, 0, 0), (2020, 3, 34))
+        || revision.is_in_range((2021, 0, 0), (2021, 3, 2))
+        || revision.is_in_range((2022, 0, 0), (2022, 1, 1))
+}
 
-    let candidate = (|| -> Result<()> {
-        let mut reader = EndianReader::new(region.cursor(), Endian::Big);
-        reader.set_position(candidate_position)?;
-        align_blocks_info(&mut reader, bundle_start, common, flags, bundle_end)?;
-        let offset = reader.position()?;
-        let end = offset
-            .checked_add(compressed_size)
-            .ok_or_else(|| Error::invalid_data("UnityCN probe block-info range overflowed"))?;
-        if offset < bundle_start || end > bundle_end {
-            return Err(Error::invalid_data(
-                "UnityCN probe block info is outside the bundle",
-            ));
-        }
-        let length = usize::try_from(compressed_size)
-            .map_err(|_| Error::invalid_data("UnityCN probe is too large for this platform"))?;
-        let compressed = reader.read_bytes(length)?;
-        let blocks_info = decompress_blocks_info(
-            flags.compression(),
-            compressed,
-            uncompressed_size,
-            limits,
-            oodle_decoder,
-        )?;
-        parse_blocks_info(&blocks_info, limits)?;
-        Ok(())
-    })();
-    candidate.is_ok()
+/// Reports whether the block data is preceded by 16-byte alignment padding.
+///
+/// Only meaningful under the newer flag vocabulary; where 0x200 marks `UnityCN`
+/// encryption it says nothing about padding.
+fn block_info_needs_padding(common: &BundleHeader, flags: ArchiveFlags) -> bool {
+    !uses_legacy_flag_vocabulary(common) && flags.block_info_needs_padding()
 }
 
 fn has_unity_cn_flag(common: &BundleHeader, flags: ArchiveFlags) -> bool {
@@ -653,11 +647,7 @@ fn has_unity_cn_flag(common: &BundleHeader, flags: ArchiveFlags) -> bool {
     // where 0x200 is an ordinary BlockInfoNeedPaddingAtStart rather than the
     // UnityCN V1 marker, so a perfectly good bundle could be probed as
     // encrypted. is_in_range already implements the half-open comparison.
-    let revision = &common.unity_revision;
-    let uses_v1_flag = revision.components().0 < 2020
-        || revision.is_in_range((2020, 0, 0), (2020, 3, 34))
-        || revision.is_in_range((2021, 0, 0), (2021, 3, 2))
-        || revision.is_in_range((2022, 0, 0), (2022, 1, 1));
+    let uses_v1_flag = uses_legacy_flag_vocabulary(common);
     let mask = if uses_v1_flag {
         UNITY_CN_V1_FLAG
     } else {
@@ -1175,8 +1165,16 @@ mod tests {
 
     #[test]
     fn honors_block_data_padding_flag() {
+        // 0x200 only means padding under the newer flag vocabulary; on a
+        // pre-2020 revision it is the UnityCN marker instead.
         let flags = BLOCKS_AND_DIRECTORY_INFO_COMBINED | BLOCK_INFO_NEEDS_PADDING_AT_START;
-        let bytes = make_bundle(7, flags, u64::try_from(PAYLOAD.len()).unwrap());
+        let bytes = make_bundle_with_revision(
+            b"UnityFS\0",
+            7,
+            flags,
+            u64::try_from(PAYLOAD.len()).unwrap(),
+            "2022.3.62f1",
+        );
         let bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
 
         assert_eq!(bundle.data_offset % 16, 0);
@@ -1221,11 +1219,15 @@ mod tests {
     }
 
     #[test]
-    fn detects_and_explicitly_rejects_unity_cn_encryption() {
+    fn unity_cn_bundles_report_the_missing_key_rather_than_a_parse_error() {
+        // The flag decides this now, not a speculative parse at header+70. That
+        // matters because the common case has an encrypted blocks-info table,
+        // which the old probe could not read, so it fell through and reported a
+        // misleading "invalid LZ4 data" instead of naming UnityCN.
         let bytes = make_unity_cn_bundle();
         let error = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap_err();
         assert!(
-            matches!(error, Error::Unsupported(message) if message.contains("UnityCN") && message.contains("cannot be decrypted"))
+            matches!(error, Error::Unsupported(message) if message.contains("UnityCN") && message.contains("caller-supplied key"))
         );
     }
 
@@ -1388,6 +1390,7 @@ mod tests {
                     ..BundleParseLimits::default()
                 },
                 oodle_decoder: Some(decoder.clone()),
+                unity_cn_key: None,
             },
         )
         .unwrap_err();
@@ -1405,6 +1408,7 @@ mod tests {
                     ..BundleParseLimits::default()
                 },
                 oodle_decoder: Some(decoder.clone()),
+                unity_cn_key: None,
             },
         )
         .unwrap_err();
@@ -1421,6 +1425,7 @@ mod tests {
                     ..BundleParseLimits::default()
                 },
                 oodle_decoder: Some(decoder.clone()),
+                unity_cn_key: None,
             },
         )
         .unwrap_err();
@@ -1485,6 +1490,16 @@ mod tests {
         flags: u32,
         node_size: u64,
     ) -> Vec<u8> {
+        make_bundle_with_revision(signature, version, flags, node_size, "2018.4.0f1")
+    }
+
+    fn make_bundle_with_revision(
+        signature: &[u8],
+        version: u32,
+        flags: u32,
+        node_size: u64,
+        revision: &str,
+    ) -> Vec<u8> {
         let blocks_info = make_blocks_info(node_size);
         let blocks_info_size = u32::try_from(blocks_info.len()).unwrap();
 
@@ -1492,7 +1507,8 @@ mod tests {
         bytes.extend_from_slice(signature);
         bytes.extend_from_slice(&version.to_be_bytes());
         bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
+        bytes.extend_from_slice(revision.as_bytes());
+        bytes.push(0);
         let size_position = bytes.len();
         bytes.extend_from_slice(&0_i64.to_be_bytes());
         bytes.extend_from_slice(&blocks_info_size.to_be_bytes());

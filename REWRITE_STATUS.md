@@ -111,7 +111,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - Unity 6000.2 `MeshLodInfo` 和虚拟几何布局缺少可验证公开样本；
    - Tuanjie 虚拟几何 cluster 尚未解码；
    - UnityArchive 没有样本验证的公开格式，当前仅识别并明确拒绝；
-   - UnityCN 加密 payload 仅检测，不包含解密器。
+   - **UnityCN 加密已实现解密（2026-08-14）**：需调用方通过 `BundleOpenOptions`/`AssetLoadOptions` 或 Python `unity_cn_key=` 提供 16 字节密钥，仓库不内置任何密钥；无密钥时仍明确拒绝。检测改为 flag 驱动（不再用推测式解析探测），因此 blocks-info 本身被加密的常见情况会直接指出是 UnityCN，而不是报"LZ4 数据无效"。密钥校验与表派生所需的 AES-128 在本 crate 内实现并用 FIPS-197 向量验证；解密走 LZ4 token 流，literal 段不动，两条 0xFF 扩展链和每次偏移推进都做了边界检查。算法理解来自 UnityPy 与其致谢的 PGRStudio，代码为按行为重写。
 
 4. **Tuanjie ACL 尚无内置纯 Rust 解码器**
    - ACL 容器、边界、hash、decoder map 和输出形状已验证；

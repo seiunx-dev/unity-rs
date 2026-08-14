@@ -46,6 +46,7 @@ use assetstudio_core::sprite::SpriteReadLimits;
 use assetstudio_core::studio::{Studio, StudioFile, StudioObject, StudioResource};
 use assetstudio_core::texture::TextureReadLimits;
 use assetstudio_core::texture_array::TextureArrayReadLimits;
+use assetstudio_core::unity_cn::UnityCnKey;
 use assetstudio_core::unity_version::UnityVersion;
 use pyo3::exceptions::{
     PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError,
@@ -1539,7 +1540,8 @@ impl PyAssetStudio {
         maximum_input_directories=1_000_000,
         maximum_directory_entries=2_000_000,
         oodle_decoder=None,
-        skip_unreadable_inputs=false
+        skip_unreadable_inputs=false,
+        unity_cn_key=None
     ))]
     // PyO3 keyword arguments are the Python signature, so they cannot be
     // grouped into a struct without changing the public API.
@@ -1553,6 +1555,7 @@ impl PyAssetStudio {
         maximum_directory_entries: usize,
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
+        unity_cn_key: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let unity_version_override = parse_unity_version_override(unity_version)?;
         let oodle_decoder = python_oodle_decoder(py, oodle_decoder)?;
@@ -1565,6 +1568,7 @@ impl PyAssetStudio {
             },
             unity_version_override,
             oodle_decoder,
+            unity_cn_key: parse_unity_cn_key(py, unity_cn_key)?,
             failure_policy: failure_policy(skip_unreadable_inputs),
         };
         py.detach(move || Studio::open_with_options(path, options))
@@ -1614,7 +1618,8 @@ impl PyAssetStudio {
         maximum_file_bytes=DEFAULT_MEMORY_FILE_LIMIT,
         maximum_total_bytes=DEFAULT_INPUT_LIMIT,
         oodle_decoder=None,
-        skip_unreadable_inputs=false
+        skip_unreadable_inputs=false,
+        unity_cn_key=None
     ))]
     // PyO3 keyword arguments are the Python signature, so they cannot be
     // grouped into a struct without changing the public API.
@@ -1628,6 +1633,7 @@ impl PyAssetStudio {
         maximum_total_bytes: u64,
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
+        unity_cn_key: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let inputs = copy_python_files(
             py,
@@ -1645,6 +1651,7 @@ impl PyAssetStudio {
             },
             unity_version_override: parse_unity_version_override(unity_version)?,
             oodle_decoder: python_oodle_decoder(py, oodle_decoder)?,
+            unity_cn_key: parse_unity_cn_key(py, unity_cn_key)?,
             failure_policy: failure_policy(skip_unreadable_inputs),
         };
         py.detach(move || Studio::open_regions_with_options(inputs, options))
@@ -3302,6 +3309,31 @@ fn python_resource_info(resource: StudioResource<'_>) -> PyResult<PyResourceInfo
     })
 }
 
+/// Parses a caller-supplied `UnityCN` key from 16 bytes or a 16-byte string.
+///
+/// The package never ships or derives keys; obtaining one for a title is the
+/// caller's responsibility.
+fn parse_unity_cn_key(py: Python<'_>, value: Option<Py<PyAny>>) -> PyResult<Option<UnityCnKey>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bound = value.bind(py);
+    let bytes = if let Ok(text) = bound.extract::<String>() {
+        text.into_bytes()
+    } else {
+        bound.extract::<Vec<u8>>().map_err(|_| {
+            PyValueError::new_err("unity_cn_key must be 16 bytes or a 16-byte string")
+        })?
+    };
+    let key: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+        PyValueError::new_err(format!(
+            "unity_cn_key must be exactly 16 bytes; got {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(Some(UnityCnKey::new(key)))
+}
+
 const fn failure_policy(skip_unreadable_inputs: bool) -> LoadFailurePolicy {
     if skip_unreadable_inputs {
         LoadFailurePolicy::SkipInput
@@ -3456,7 +3488,8 @@ fn check_metadata_page_limit(limit: usize) -> PyResult<()> {
     *,
     overwrite=false,
     limits=None,
-    oodle_decoder=None
+    oodle_decoder=None,
+    unity_cn_key=None
 ))]
 fn extract(
     py: Python<'_>,
@@ -3465,11 +3498,13 @@ fn extract(
     overwrite: bool,
     limits: Option<PyRef<'_, PyExtractionLimits>>,
     oodle_decoder: Option<Py<PyAny>>,
+    unity_cn_key: Option<Py<PyAny>>,
 ) -> PyResult<PyExtractionReport> {
     let limits = limits.map_or_else(ExtractionLimits::default, |limits| {
         ExtractionLimits::from(*limits)
     });
     let oodle_decoder = python_oodle_decoder(py, oodle_decoder)?;
+    let unity_cn_key = parse_unity_cn_key(py, unity_cn_key)?;
     let report = py
         .detach(move || {
             Studio::extract(
@@ -3479,6 +3514,7 @@ fn extract(
                     limits,
                     overwrite_existing: overwrite,
                     oodle_decoder,
+                    unity_cn_key,
                 },
             )
         })

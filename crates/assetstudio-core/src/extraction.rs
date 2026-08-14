@@ -13,6 +13,7 @@ use crate::endian::{Endian, EndianReader};
 use crate::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
 use crate::legacy_bundle::LegacyBundle;
 use crate::source::Region;
+use crate::unity_cn::UnityCnKey;
 use crate::web_file::{WebFile, WebParseLimits};
 use crate::{Error, Result};
 
@@ -50,6 +51,8 @@ pub struct ExtractionOptions {
     pub limits: ExtractionLimits,
     pub overwrite_existing: bool,
     pub oodle_decoder: Option<Arc<dyn OodleDecoder>>,
+    /// Key for UnityCN-encrypted bundles. Without one they stay refused.
+    pub unity_cn_key: Option<UnityCnKey>,
 }
 
 impl fmt::Debug for ExtractionOptions {
@@ -62,6 +65,7 @@ impl fmt::Debug for ExtractionOptions {
                 "oodle_decoder",
                 &self.oodle_decoder.as_ref().map(|_| "<configured>"),
             )
+            .field("unity_cn_key", &self.unity_cn_key)
             .finish()
     }
 }
@@ -387,6 +391,7 @@ impl Extractor {
                 BundleOpenOptions {
                     limits,
                     oodle_decoder: self.options.oodle_decoder.clone(),
+                    unity_cn_key: self.options.unity_cn_key,
                 },
             )?;
             self.process_unity_fs_entries(label, desired_path, depth, &bundle)
