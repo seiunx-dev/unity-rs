@@ -25,6 +25,13 @@ export declare class AssetStudio {
    */
   readFbxWithAclDecoder(decoder: AclCallback, maximumBytes?: number | undefined | null): Promise<Buffer>
   /**
+   * Opens a path with any combination of the load options.
+   *
+   * The single-option factories remain for the cases they already cover;
+   * this is the one that can express two facts about the same file.
+   */
+  static openWith(path: string, options?: OpenOptions | undefined | null): AssetStudio
+  /**
    * Opens a path whose bundles are Oodle-compressed, using a
    * caller-supplied decoder.
    *
@@ -35,7 +42,7 @@ export declare class AssetStudio {
    * The callback receives the compressed bytes and the exact expected output
    * length, and must return precisely that many bytes.
    */
-  static openWithOodle(path: string, decoder: OodleCallback): Promise<AssetStudio>
+  static openWithOodle(path: string, decoder: OodleCallback, options?: OpenOptions | undefined | null): Promise<AssetStudio>
   /**
    * Opens a path on a libuv worker so container discovery does not block
    * the JavaScript event loop.
@@ -199,7 +206,7 @@ export declare class AssetStudio {
    * Returned in memory rather than written, so the caller decides where the
    * files land and stays inside whatever budget it set.
    */
-  readLive2DPackages(maximumBytes?: number | undefined | null): Array<Live2DPackageFiles>
+  readLive2DPackages(maximumBytes?: number | undefined | null): Live2DPackageSet
   /**
    * Writes the collection as ASCII FBX with its animations and returns the
    * material textures it references.
@@ -434,6 +441,21 @@ export interface FileInfo {
   objectCount: number
 }
 
+/**
+ * Something a package could not carry, and why.
+ *
+ * A Live2D model routinely resolves partly: a fade-motion list points at a
+ * clip in a bundle that was not loaded, or a component's schema is not
+ * available. Discovery keeps going, and these say what was left out. Without
+ * them a short package looks like a complete one.
+ */
+export interface Live2DDiagnostic {
+  fileIndex: number
+  pathId: bigint
+  kind: string
+  detail: string
+}
+
 /** One file belonging to a materialized Live2D package. */
 export interface Live2DFile {
   /** Path relative to the package directory. */
@@ -459,6 +481,12 @@ export interface Live2DPackageInfo {
   hasPhysics: boolean
   hasPose: boolean
   hasDisplayInfo: boolean
+}
+
+/** Materialized packages and what discovery could not include. */
+export interface Live2DPackageSet {
+  packages: Array<Live2DPackageFiles>
+  diagnostics: Array<Live2DDiagnostic>
 }
 
 /** A `Material`'s shader reference and its named property sheets. */
@@ -522,6 +550,39 @@ export interface ObjectInfo {
   byteSize: bigint
   name?: string
   container?: string
+}
+
+/**
+ * How an input is opened.
+ *
+ * Every field is optional and omitting one keeps Core's default. This exists
+ * because the alternatives do not combine: a separate factory per option
+ * cannot open a UnityCN-encrypted bundle whose header version was also
+ * stripped, which is an ordinary pair of facts about one file.
+ */
+export interface OpenOptions {
+  /**
+   * Parse against this version instead of the one the files declare, for
+   * files whose own version was stripped at build time.
+   */
+  unityVersion?: string
+  /**
+   * The 16-byte UnityCN key for an encrypted archive.
+   *
+   * Caller-supplied only: this project ships no key material, and none is
+   * recovered from anything. The key is never printed, including in error
+   * text.
+   */
+  unityCnKey?: Buffer
+  /**
+   * Keep the inputs that parsed instead of refusing the whole load over one
+   * that did not. A game directory routinely mixes readable assets with
+   * encrypted or not-yet-supported containers.
+   */
+  skipUnreadableInputs?: boolean
+  maximumInputFiles?: number
+  maximumInputDirectories?: number
+  maximumDirectoryEntries?: number
 }
 
 /** The identity fields of a `PlayerSettings` object. */

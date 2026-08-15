@@ -13,7 +13,7 @@ use assetstudio_core::live2d_motion::{CubismFadeMotionReadLimits, CubismMotionTa
 use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMaterializeLimits};
 use assetstudio_core::live2d_physics::CubismPhysicsReadLimits;
 use assetstudio_core::live2d_schema::CubismExpressionReadLimits;
-use assetstudio_core::loader::AssetLoadOptions;
+use assetstudio_core::loader::{AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy};
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
@@ -32,6 +32,7 @@ use assetstudio_core::sprite::SpriteReadLimits;
 use assetstudio_core::studio::{Studio, StudioObject};
 use assetstudio_core::texture::TextureReadLimits;
 use assetstudio_core::texture_array::TextureArrayReadLimits;
+use assetstudio_core::unity_cn::UnityCnKey;
 use assetstudio_core::unity_version::UnityVersion;
 use napi::bindgen_prelude::{AsyncTask, BigInt, Buffer, FnArgs};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -312,6 +313,27 @@ pub struct Live2dPackageFiles {
     pub files: Vec<Live2dFile>,
 }
 
+/// Something a package could not carry, and why.
+///
+/// A Live2D model routinely resolves partly: a fade-motion list points at a
+/// clip in a bundle that was not loaded, or a component's schema is not
+/// available. Discovery keeps going, and these say what was left out. Without
+/// them a short package looks like a complete one.
+#[napi(object)]
+pub struct Live2dDiagnostic {
+    pub file_index: u32,
+    pub path_id: BigInt,
+    pub kind: String,
+    pub detail: String,
+}
+
+/// Materialized packages and what discovery could not include.
+#[napi(object)]
+pub struct Live2dPackageSet {
+    pub packages: Vec<Live2dPackageFiles>,
+    pub diagnostics: Vec<Live2dDiagnostic>,
+}
+
 /// An FBX plus the texture files it references by name.
 #[napi(object)]
 pub struct TexturedFbx {
@@ -420,6 +442,94 @@ pub struct MonoBehaviourJson {
     pub source: String,
 }
 
+/// How an input is opened.
+///
+/// Every field is optional and omitting one keeps Core's default. This exists
+/// because the alternatives do not combine: a separate factory per option
+/// cannot open a UnityCN-encrypted bundle whose header version was also
+/// stripped, which is an ordinary pair of facts about one file.
+#[napi(object)]
+pub struct OpenOptions {
+    /// Parse against this version instead of the one the files declare, for
+    /// files whose own version was stripped at build time.
+    pub unity_version: Option<String>,
+    /// The 16-byte UnityCN key for an encrypted archive.
+    ///
+    /// Caller-supplied only: this project ships no key material, and none is
+    /// recovered from anything. The key is never printed, including in error
+    /// text.
+    pub unity_cn_key: Option<Buffer>,
+    /// Keep the inputs that parsed instead of refusing the whole load over one
+    /// that did not. A game directory routinely mixes readable assets with
+    /// encrypted or not-yet-supported containers.
+    pub skip_unreadable_inputs: Option<bool>,
+    pub maximum_input_files: Option<u32>,
+    pub maximum_input_directories: Option<u32>,
+    pub maximum_directory_entries: Option<u32>,
+}
+
+fn load_options(
+    options: Option<OpenOptions>,
+    oodle: Option<Arc<dyn assetstudio_core::bundle::OodleDecoder>>,
+) -> Result<AssetLoadOptions> {
+    let Some(options) = options else {
+        return Ok(AssetLoadOptions {
+            oodle_decoder: oodle,
+            ..AssetLoadOptions::default()
+        });
+    };
+    let unity_version_override = match options.unity_version {
+        None => None,
+        Some(text) => Some(
+            text.parse::<UnityVersion>()
+                .map_err(|_| invalid_arg(format!("unsupported Unity version: {text}")))?,
+        ),
+    };
+    let unity_cn_key = match options.unity_cn_key {
+        None => None,
+        Some(buffer) => {
+            let key: [u8; 16] = buffer.as_ref().try_into().map_err(|_| {
+                // The length is the caller's own input, not key material.
+                invalid_arg(format!(
+                    "unityCnKey must be exactly 16 bytes; got {}",
+                    buffer.len()
+                ))
+            })?;
+            Some(UnityCnKey::new(key))
+        }
+    };
+    let defaults = AssetLoadLimits::default();
+    Ok(AssetLoadOptions {
+        limits: AssetLoadLimits {
+            maximum_input_files: count_limit(
+                options.maximum_input_files,
+                defaults.maximum_input_files,
+            ),
+            maximum_input_directories: count_limit(
+                options.maximum_input_directories,
+                defaults.maximum_input_directories,
+            ),
+            maximum_directory_entries: count_limit(
+                options.maximum_directory_entries,
+                defaults.maximum_directory_entries,
+            ),
+            ..defaults
+        },
+        unity_version_override,
+        oodle_decoder: oodle,
+        unity_cn_key,
+        failure_policy: if options.skip_unreadable_inputs.unwrap_or(false) {
+            LoadFailurePolicy::SkipInput
+        } else {
+            LoadFailurePolicy::Abort
+        },
+    })
+}
+
+fn count_limit(value: Option<u32>, default: usize) -> usize {
+    value.map_or(default, |value| value as usize)
+}
+
 /// One opened collection. All format work is delegated to `assetstudio-core`.
 #[napi]
 pub struct AssetStudio {
@@ -485,6 +595,19 @@ impl AssetStudio {
         }))
     }
 
+    /// Opens a path with any combination of the load options.
+    ///
+    /// The single-option factories remain for the cases they already cover;
+    /// this is the one that can express two facts about the same file.
+    #[napi(factory)]
+    pub fn open_with(path: String, options: Option<OpenOptions>) -> Result<Self> {
+        Studio::open_with_options(path, load_options(options, None)?)
+            .map(|studio| Self {
+                studio: Arc::new(studio),
+            })
+            .map_err(core_error)
+    }
+
     /// Opens a path whose bundles are Oodle-compressed, using a
     /// caller-supplied decoder.
     ///
@@ -496,10 +619,15 @@ impl AssetStudio {
     /// length, and must return precisely that many bytes.
     #[must_use]
     #[napi(ts_return_type = "Promise<AssetStudio>")]
-    pub fn open_with_oodle(path: String, decoder: OodleCallback) -> AsyncTask<OpenWithOodleTask> {
+    pub fn open_with_oodle(
+        path: String,
+        decoder: OodleCallback,
+        options: Option<OpenOptions>,
+    ) -> AsyncTask<OpenWithOodleTask> {
         AsyncTask::new(OpenWithOodleTask {
             path,
             decoder: Arc::new(JsOodleDecoder { callback: decoder }),
+            options,
         })
     }
 
@@ -1540,10 +1668,7 @@ impl AssetStudio {
     /// Returned in memory rather than written, so the caller decides where the
     /// files land and stays inside whatever budget it set.
     #[napi]
-    pub fn read_live2d_packages(
-        &self,
-        maximum_bytes: Option<i64>,
-    ) -> Result<Vec<Live2dPackageFiles>> {
+    pub fn read_live2d_packages(&self, maximum_bytes: Option<i64>) -> Result<Live2dPackageSet> {
         let maximum = byte_limit(maximum_bytes)?;
         let set = self
             .studio
@@ -1584,13 +1709,38 @@ impl AssetStudio {
                     data: motion.json.into(),
                 });
             }
+            // The physics, pose and display-info documents are materialized
+            // with the rest and were being dropped here, so a package that had
+            // them arrived without them and nothing said so.
+            for auxiliary in [package.physics, package.pose, package.display_info]
+                .into_iter()
+                .flatten()
+            {
+                files.push(Live2dFile {
+                    file_name: auxiliary.file_name,
+                    data: auxiliary.bytes.into(),
+                });
+            }
             packages.push(Live2dPackageFiles {
                 name: package.name,
                 directory_name: package.directory_name,
                 files,
             });
         }
-        Ok(packages)
+        let mut diagnostics = Vec::with_capacity(set.diagnostics.len());
+        for diagnostic in set.diagnostics {
+            diagnostics.push(Live2dDiagnostic {
+                file_index: u32::try_from(diagnostic.object.file_index)
+                    .map_err(|_| invalid_arg("serialized file index does not fit u32"))?,
+                path_id: BigInt::from(diagnostic.object.path_id),
+                kind: format!("{:?}", diagnostic.kind),
+                detail: diagnostic.message,
+            });
+        }
+        Ok(Live2dPackageSet {
+            packages,
+            diagnostics,
+        })
     }
 
     /// Writes the collection as ASCII FBX with its animations and returns the
@@ -1907,6 +2057,7 @@ impl Task for FbxWithAclTask {
 pub struct OpenWithOodleTask {
     path: String,
     decoder: Arc<JsOodleDecoder>,
+    options: Option<OpenOptions>,
 }
 
 impl Task for OpenWithOodleTask {
@@ -1914,16 +2065,9 @@ impl Task for OpenWithOodleTask {
     type JsValue = AssetStudio;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        Studio::open_with_options(
-            &self.path,
-            AssetLoadOptions {
-                oodle_decoder: Some(
-                    Arc::clone(&self.decoder) as Arc<dyn assetstudio_core::bundle::OodleDecoder>
-                ),
-                ..AssetLoadOptions::default()
-            },
-        )
-        .map_err(core_error)
+        let oodle = Arc::clone(&self.decoder) as Arc<dyn assetstudio_core::bundle::OodleDecoder>;
+        let options = load_options(self.options.take(), Some(oodle))?;
+        Studio::open_with_options(&self.path, options).map_err(core_error)
     }
 
     fn resolve(&mut self, _env: Env, studio: Self::Output) -> Result<Self::JsValue> {

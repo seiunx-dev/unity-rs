@@ -779,9 +779,44 @@ console.log('node api: animation and live2d discovery ok')
   ])
   // No renderable geometry is refused rather than written as an empty scene.
   assert.throws(() => barren.readFbx())
-  // No Live2D model is an empty result rather than an error.
-  assert.deepEqual(barren.readLive2DPackages(), [])
+  // No Live2D model is an empty result rather than an error, and the result
+  // carries its diagnostics: a package that could not include something has to
+  // be able to say so, or a short package reads as a complete one.
+  assert.deepEqual(barren.readLive2DPackages(), { packages: [], diagnostics: [] })
 }
+
+// The load options, which have to combine: a UnityCN-encrypted archive whose
+// header version was also stripped is one file with two facts about it, and a
+// factory per option can only state one of them.
+{
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'assetstudio-node-options-'))
+  const fixture = path.join(directory, 'options.assets')
+  try {
+    fs.writeFileSync(fixture, syntheticTextAsset())
+    const opened = addon.AssetStudio.openWith(fixture, {
+      unityVersion: '2022.3.62f1',
+      skipUnreadableInputs: true,
+      maximumInputFiles: 8,
+    })
+    assert.equal(opened.fileCount, 1)
+    assert.deepEqual(opened.readText(0, 7n), Buffer.from('hello node'))
+    // Omitting the options entirely is the same as opening plainly.
+    assert.equal(addon.AssetStudio.openWith(fixture).fileCount, 1)
+    // A key is 16 bytes, and a wrong length is refused rather than padded.
+    assert.throws(
+      () => addon.AssetStudio.openWith(fixture, { unityCnKey: Buffer.alloc(8) }),
+      /exactly 16 bytes/,
+    )
+    assert.throws(
+      () => addon.AssetStudio.openWith(fixture, { unityVersion: 'not-a-version' }),
+      /unsupported Unity version/,
+    )
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+}
+
+console.log('node api: load options ok')
 
 console.log('node api: animated fbx and live2d materialization ok')
 
