@@ -2701,7 +2701,10 @@ def main() -> None:
         assert model_obj.material_library_name == "python-model.mtl"
         assert b"mtllib python-model.mtl" in model_obj.obj
         assert b"v " in model_obj.obj and b"f " in model_obj.obj
-        assert model_obj.material_library.startswith(b"#")
+        # One `newmtl` per submesh slot, which is what the OBJ's `usemtl`
+        # lines refer to; an empty library would leave every face unmaterialed.
+        assert model_obj.material_library.startswith(b"newmtl ")
+        assert b"usemtl " in model_obj.obj
         # This fixture has no material textures, which is an empty list rather
         # than an error, and nothing was skipped for a reason worth reporting.
         assert model_obj.textures == []

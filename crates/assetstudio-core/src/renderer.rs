@@ -1,8 +1,16 @@
 //! Bounded readers for the renderer fields used by model conversion.
 //!
-//! The verified range covers standard Unity 2017.3 through 6000.2 and Tuanjie
+//! The verified range covers standard Unity 2017.3 through 6000.3 and Tuanjie
 //! 2022.3.x. Tuanjie's virtual-geometry, shading-rate, and GRD flags are read
 //! from their managed-reader version gates without interpreting mesh clusters.
+//!
+//! 6000.3 was checked rather than assumed: a shipping 6000.3.12f1 build's own
+//! type tree for `MeshRenderer` lists exactly the fields this reader reads, in
+//! this order, with nothing added after 6000.2's `m_ForceMeshLod` and
+//! `m_MeshLodSelectionBias`. That corpus carries no `SkinnedMeshRenderer`, so
+//! its tree came from `UnityPy`'s type-tree database at development time --
+//! consulted, not vendored -- and the same database's `MeshRenderer` matches
+//! the real build's field for field, which is what makes it usable here.
 
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::scene::{ComponentHeader, EditorExtensionHeader};
@@ -15,7 +23,7 @@ pub const SKINNED_MESH_RENDERER_CLASS_ID: i32 = 137;
 
 const NO_TARGET_PLATFORM: i32 = -2;
 const MINIMUM_RENDERER_VERSION: (u32, u32, u32) = (2017, 3, 0);
-const MAXIMUM_RENDERER_VERSION: (u32, u32, u32) = (6000, 2, u32::MAX);
+const MAXIMUM_RENDERER_VERSION: (u32, u32, u32) = (6000, 3, u32::MAX);
 
 /// Defensive limits for one renderer object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +184,7 @@ fn validate_renderer_version(file: &SerializedFile) -> Result<()> {
     };
     if !supported {
         return Err(Error::unsupported(format!(
-            "Renderer is verified for standard Unity 2017.3 through 6000.2 and Tuanjie 2022.3.x, got {}",
+            "Renderer is verified for standard Unity 2017.3 through 6000.3 and Tuanjie 2022.3.x, got {}",
             file.unity_version
         )));
     }
@@ -577,7 +585,9 @@ mod tests {
         );
         let early_tuanjie = parse_asset(MESH_RENDERER_CLASS_ID, "2022.3.1t1", &object);
         assert!(read_mesh_renderer(&early_tuanjie, 0, RendererReadLimits::default()).is_err());
-        let future = parse_asset(MESH_RENDERER_CLASS_ID, "6000.3.0f1", &object);
+        // The upper bound moved to 6000.3 on the evidence in the module doc,
+        // so the refusal case moves with it.
+        let future = parse_asset(MESH_RENDERER_CLASS_ID, "6000.4.0f1", &object);
         assert!(read_mesh_renderer(&future, 0, RendererReadLimits::default()).is_err());
     }
 
