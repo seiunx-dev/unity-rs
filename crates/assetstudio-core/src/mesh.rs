@@ -1865,7 +1865,9 @@ impl MeshObjectReader {
     /// mesh, not its LOD chain -- but the bytes have to be walked, because
     /// `finish` refuses a mesh whose layout did not account for the object.
     fn read_mesh_lod_info(&mut self) -> Result<()> {
-        self.align(4)?;
+        // No align before the first field: the type tree gives `m_MeshLodInfo`
+        // no align flag, and one here would silently absorb a misalignment
+        // left by anything earlier rather than letting it surface.
         self.skip(4, "Mesh LOD selection slope")?;
         self.skip(4, "Mesh LOD selection bias")?;
         self.align(4)?;
