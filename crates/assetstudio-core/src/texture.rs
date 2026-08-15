@@ -430,6 +430,17 @@ impl Texture2D {
                 self.dimension
             )));
         }
+        // A texture with no bytes is not a broken one. Unity builds dynamic
+        // font atlases empty and fills them at runtime, and a real 2022.3 game
+        // ships several; without this the export reports
+        // "subregion 0..1 exceeds region length 0", which describes the reader
+        // rather than the asset.
+        if self.data.is_empty() {
+            return Err(Error::unsupported(format!(
+                "Texture2D {}x{} carries no image data",
+                self.width, self.height
+            )));
+        }
         if self.uses_switch_swizzle() {
             return self.decode_switch_mip0_rgba8(mip_level, limits);
         }
