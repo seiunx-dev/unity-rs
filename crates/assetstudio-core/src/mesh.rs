@@ -448,12 +448,14 @@ fn read_mesh_inner(
     } else {
         // 6000.2 appends a `MeshLodInfo` tail; everything before it is
         // unchanged, and the tail's shape comes from the type tree a 6000.3
-        // build writes rather than from a guess.
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || version.0 == 6000
+        // build writes rather than from a guess. 6000.4 and later are refused
+        // for the same reason 6000.2 was before that tree was read: nothing
+        // here has seen one.
+        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
     };
     if !supported {
         return Err(Error::unsupported(format!(
-            "resident Mesh layout for Unity {}; implemented ranges are standard Unity 2017.3-2023 and 6000.x plus Tuanjie 2022.3.x",
+            "resident Mesh layout for Unity {}; implemented ranges are standard Unity 2017.3-2023 and 6000.0-6000.3 plus Tuanjie 2022.3.x",
             file.unity_version
         )));
     }
