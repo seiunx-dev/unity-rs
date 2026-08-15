@@ -578,9 +578,18 @@ impl<'a> ModelBuildState<'a> {
             self.limits.maximum_material_references,
             "model material references",
         )?;
-        if let Some(mesh) = mesh {
-            self.register_mesh(mesh)?;
-        }
+        // A renderer whose mesh this reader declines contributes no geometry,
+        // and losing it is the right outcome: one empty mesh among a bundle's
+        // 152 otherwise cost the whole scene. A malformed mesh still fails --
+        // that is a statement about the bytes, not about the asset.
+        let mesh = match mesh {
+            None => None,
+            Some(key) => match self.register_mesh(key) {
+                Ok(()) => Some(key),
+                Err(Error::Unsupported(_)) => None,
+                Err(error) => return Err(error),
+            },
+        };
         for material in materials.iter().flatten().copied() {
             self.register_material(material)?;
         }
