@@ -244,11 +244,20 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 |---|---|
 | Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足；C ABI crate 已排除在 workspace 外，只作历史参考 |
 | 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷；2021+/2022+ 的 shader 已实现（见下），其结构正确性由 46 个真实 shader 与 UnityPy 的逐一比对背书；托管差分覆盖的仍是 5.2/5.3，因为托管侧对 2021+ 根本不产出对象 |
-| 代表性真实 corpus 稳定通过 | **部分满足（2026-08-15 首次实跑）**；本机 `~/Desktop/pjsksc/extract` 是一份完整的 Unity 2022.3.62f2 播放器目录（387 MB），corpus 门已在其上跑通：21 个文件、570,445 个对象、177,384 个有解析载荷，零错误。另有四个真实 UnityFS v8 bundle（PJSK，含 ASTC 贴图/Sprite/MonoBehaviour/视频）也已纳入同一道闸门，对象数与 class 分布与 UnityPy 逐一相符。这一条从「没有语料」变成「播放器目录 + AssetBundle 两种形态各有一份、且都已通过」；仍缺的是多引擎版本/多平台的覆盖面（Tuanjie、Switch、旧版本），以及带托管快照的取值比对 |
+| 代表性真实 corpus 稳定通过 | **部分满足，且已扩到第二款游戏与第二个引擎世代（2026-08-15）**；(1) 一份完整的 Unity 2022.3.62f2 播放器目录（21 文件 / 570,445 对象 / 177,384 个有解析载荷）；(2) 四个真实 UnityFS v8 bundle；(3) **2,778 个 Unity 6000.3.12f1 的 Addressables bundle（926 MB / 243,617 对象）**，全部零错误通过。仍缺的是 Tuanjie / Switch / 更老版本，以及带托管快照的取值比对 |
 | 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
 | 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux 的 x86-64 与 arm64 两个架构上，core+CLI 测试、Python wheel 构建与两套测试、Node addon 构建与测试均已在容器里实跑通过；Windows 侧验证了编译。缺的是 Windows 上的真实运行——本机查过 wine（未安装）、Windows 容器（macOS 上不支持）与 Parallels（只有一个无效的 Debian 虚拟机），都不具备条件，装 wine 属于往你机器上装东西，没有自作主张——以及 CI 自己的发布产物流程 |
 | 导出/解包有界、拒绝穿越与符号链接、原子发布 | 满足 |
 | C# 仅作历史参考或可选 oracle | 满足 |
+
+**第二款游戏（Unity 6000.3.12f1）接入，又抓到六处（2026-08-15）**：`~/ida/outnoteida/sirius_assets/bundles` 是一份 2,778 个 Addressables bundle 的完整导出（926 MB、243,617 对象、Unity 6000.3.12f1）。容器层一次通过——v8 之前已支持——对象层则一个接一个地挡住后面所有文件：
+
+1. **shader 的 pass 布局又变了两次**。Unity 2023.1 把 `m_EditorDataHash` 与 `m_Platforms` 从 `SerializedPass` 里删了，而本项目只按「2020.2 加入」设了下界，于是读 Unity 6 的 shader 时会多读两个数组——一个 pass 报出 1,952,671,082 个 platform 就是这么来的。6000.3 还在 asset GUID 之后追加了 `m_AssetLocalIdentifierInFile`。两个边界同样取自序列化布局本身，语料里 58 个 shader 现已全部解析。
+2. **空的贴图引用被当成损坏**。Addressables 会把 sprite 与它的图集拆到不同 bundle，逐个 bundle 读时天天遇到；这是关于资产的陈述，不是关于字节的，现已归为「声明性拒绝」。
+3. **type tree 描述的字节少于对象本身**时报的是字节数不符。现代 Unity 里那段余数几乎总是 `SerializeReference` 的托管引用注册表——这里一个 CriWare 音频组件是 176 字节的有类型字段加 712,292 字节的注册表，挂在一个 `rid` 后面。注册表未实现，现改为明确说明而不是描述读取器自己的困惑。
+4. **三处上限低于普通内容**，每一处现在都由实测定：一个 Live2D 模型的单个数组有 3,892,672 个元素（上限 100 万）；同一个模型物化需要 439 MB（上限 256 MB，corpus 闸门现按用例声明的预算来放宽，这本就是该闸门写明的契约）；一张 lane-skin sprite 需要 536,921,219 次紧密网格像素测试（上限 536,870,912，只超了 0.01%）。
+
+**顺带纠正一处我自己写错的归因**：早些时候我把「真实游戏里 ASTC 与 UnityPy 差 1」归因于 UnityPy 绑了未修补的 crate。这是错的——那些贴图是 LDR，而 vendored 的舍入修复在 HDR 路径上；而且 UnityPy 解 ASTC 用的根本不是那个 crate，是 `astc_encoder`（ARM 参考实现，`USE_DECODE_UNORM8`）。测量本身站得住，且说明了更好的一件事：本项目的 LDR ASTC 解码与托管原生解码器逐字节相同，同时与 ARM 参考实现每通道相差不超过 1。新增 `tools/unitypy_texture_diff.py` 把这条界限变成可检查的：不需要解码的格式必须逐字节相同，ASTC 最多差 1（含 alpha——ASTC 块四个通道走同一套端点运算，`ASTC_RGB_*` 也可能带变化的 alpha），其余一律报出；把某个 ASTC 通道挪 3 会被抓。
 
 **用 88 个独立 agent 对着仓库审计了一遍七条完成判定（2026-08-15）**：不看本文的自述、只看代码与测试，每条「缺口」还要另一个 agent 去反驳，反驳不掉才留下。结果 52 条留存（21 条 material、31 条 minor、0 条 blocking），两条判定为满足、一条未满足（跨平台发布）、六条部分满足。当场按结论修掉的：
 
