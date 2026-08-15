@@ -1017,6 +1017,13 @@ def synthetic_tuanjie_animator_controller() -> bytes:
     push_i32(payload, 1)
     push_i32(payload, 0)
     payload.extend(struct.pack("<q", 74))
+    # The state-machine-behaviour tail every real controller ends with: two
+    # empty collections, an empty behaviour vector, and the threading flag.
+    push_i32(payload, 0)
+    push_i32(payload, 0)
+    push_i32(payload, 0)
+    payload.append(1)
+    align(payload, 4)
     return finish_v22_asset(91, payload, "2022.3.55t4")
 
 
@@ -2115,24 +2122,19 @@ def main() -> None:
         else:
             raise AssertionError("missing external resource index should raise KeyError")
 
+        # Unity changed the serialized shader in 2021 and neither this reader
+        # nor the managed one implements the new layout, so a 6000 shader is
+        # declined rather than parsed. This used to assert the parsed text,
+        # from a fixture built to a layout no Unity writes.
         shader_path = Path(directory) / "unity6-shader.assets"
         shader_path.write_bytes(synthetic_unity6_shader())
         shader_studio = AssetStudio(shader_path)
-        shader = shader_studio.read_shader(0, 7)
-        shader_header = (
-            b"//////////////////////////////////////////\n"
-            b"//\n"
-            b"// NOTE: This is *not* a valid shader file\n"
-            b"//\n"
-            b"///////////////////////////////////////////\n"
-        )
-        assert shader == shader_header + b'Shader "Parsed/Unity6" {\nProperties {\n}\n}'
         try:
-            shader_studio.read_shader(0, 7, maximum_bytes=len(shader) - 1)
-        except ValueError:
-            pass
+            shader_studio.read_shader(0, 7)
+        except NotImplementedError as error:
+            assert "2021" in str(error), error
         else:
-            raise AssertionError("Shader output limit should be enforced")
+            raise AssertionError("a Unity 6 shader should be declined, not parsed")
 
         mesh_path = Path(directory) / "mesh.assets"
         mesh_path.write_bytes(synthetic_mesh())

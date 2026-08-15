@@ -401,6 +401,12 @@ export interface ExportRecord {
 export interface ExportReport {
   exported: Array<ExportRecord>
   failures: Array<ExportFailure>
+  /**
+   * Objects declined by design rather than broken, kept separate so a
+   * caller can tell "this build carries shaders we do not read" from "the
+   * export went wrong".
+   */
+  unsupported: Array<ExportFailure>
 }
 
 /** What an extraction run produced. */
