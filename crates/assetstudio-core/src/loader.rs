@@ -1214,16 +1214,73 @@ fn prepare_directory_inputs(
     Ok(inputs)
 }
 
+/// Finds the streamed-data files Unity writes beside a serialized file.
+///
+/// Unity keeps a serialized file's texture, mesh and audio bytes in a
+/// companion whose name is the file's own plus an extension:
+/// `resources.assets` and `resources.assets.resS`, `level0` and `level0.resS`.
+/// Pointed at a directory this loader picks them up with everything else, but
+/// pointed at one file it used to load only that file -- so every streamed
+/// object in it failed with "external resource was not found", naming a file
+/// sitting right beside the one it had been given. Exporting a single
+/// `globalgamemanagers.assets` lost all 48 of its streamed objects that way.
+///
+/// Only real siblings are considered, matched by name against the input's own,
+/// so nothing here can reach outside the directory the caller named.
+fn companion_resource_inputs(
+    path: &Path,
+    limits: &AssetLoadLimits,
+) -> Result<Vec<(String, Region)>> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = format!("{name}.");
+    let mut companions = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        let Some(candidate_name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !candidate_name.starts_with(&prefix) {
+            continue;
+        }
+        if companions.len() >= limits.maximum_input_files {
+            return Err(Error::invalid_data(format!(
+                "companion resource files for {name} exceed {} inputs",
+                limits.maximum_input_files
+            )));
+        }
+        companions.push((
+            candidate.to_string_lossy().into_owned(),
+            Region::from_file(&candidate)?,
+        ));
+    }
+    // `read_dir` order is whatever the filesystem gives, and a collection that
+    // depends on it is a collection that differs between machines.
+    companions.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(companions)
+}
+
 fn prepare_single_file_input(
     path: &Path,
     limits: &AssetLoadLimits,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<(String, Region)>> {
     let Some(base) = split_base_path(path) else {
-        return Ok(vec![(
+        let mut inputs = vec![(
             path.to_string_lossy().into_owned(),
             Region::from_file(path)?,
-        )]);
+        )];
+        inputs.extend(companion_resource_inputs(path, limits)?);
+        return Ok(inputs);
     };
     if base.is_file() {
         return Ok(vec![(
@@ -1416,6 +1473,55 @@ mod tests {
     use super::{
         AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy, LoadedSerializedFile,
     };
+
+    #[test]
+    fn loads_the_streamed_companions_beside_a_single_file_input() {
+        // Unity puts a serialized file's streamed bytes in a companion named
+        // after it. Given the directory this loader always found them; given
+        // the file it did not, and every streamed object failed with "external
+        // resource was not found" naming a file sitting right beside it.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("assetstudio-companion-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("resources.assets");
+        fs::write(&input, b"not a serialized file, but a real one on disk").unwrap();
+        fs::write(root.join("resources.assets.resS"), b"streamed").unwrap();
+        fs::write(root.join("resources.assets.resource"), b"also streamed").unwrap();
+        // Neither of these shares the input's name, so neither is a companion.
+        fs::write(root.join("resources.resS"), b"different file").unwrap();
+        fs::write(root.join("other.assets.resS"), b"another file entirely").unwrap();
+
+        let collection = AssetCollection::load_path(&input).unwrap();
+
+        let names: Vec<_> = collection
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                Path::new(&resource.path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert!(
+            names.contains(&"resources.assets.resS".to_owned())
+                && names.contains(&"resources.assets.resource".to_owned()),
+            "the companions beside the input were not loaded: {names:?}"
+        );
+        assert!(
+            !names.contains(&"other.assets.resS".to_owned()),
+            "a file that is not this input's companion was loaded: {names:?}"
+        );
+        assert!(
+            collection
+                .resource("archive:/CAB-x/resources.assets.resS")
+                .is_some(),
+            "the companion should resolve by the name an asset refers to it by"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn loads_directory_roots_deterministically_and_limits_input_files() {
