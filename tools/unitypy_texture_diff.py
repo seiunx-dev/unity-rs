@@ -13,6 +13,14 @@ What it checks:
 
 * a format that needs no decoding -- `RGBA32` and friends -- must match byte
   for byte, since neither side is doing anything but moving pixels;
+* a format that stores fewer than four channels is the exception to that. In
+  `Alpha8` only alpha is in the file, so red, green and blue are a convention:
+  this project reproduces the managed converter, which fills `0xFF` and writes
+  alpha over it, giving opaque white, while UnityPy fills zero. Both are
+  self-consistent, and the corpus's 4096x4096 font atlas has all 16,777,216
+  alpha bytes identical between them. Alpha still has to agree exactly, so a
+  wrong alpha is a defect; only the channels the format does not store are
+  excused, and the count is reported rather than hidden;
 * ASTC may differ, but by at most one level per channel. Two correct
   implementations of the same block format can land either side of a half;
   more than that is a decode defect. Alpha is included: an ASTC block decodes
@@ -65,6 +73,17 @@ INDEPENDENTLY_DECODED = {
     66, 67, 68, 69, 70, 71,  # ASTC HDR 4x4 .. 12x12
 }
 
+# Formats that store fewer than four channels, where what fills the rest is a
+# convention rather than an answer. This project reproduces the managed
+# converter, which fills 0xFF and writes the stored channel over it; UnityPy
+# fills zero. Both are self-consistent, and the stored channel has to agree
+# either way, which is what `alpha_agrees` requires.
+CHANNEL_CONVENTION = {1}  # Alpha8
+
+
+def alpha_agrees(mine: bytes, theirs: bytes) -> bool:
+    return all(mine[i] == theirs[i] for i in range(3, len(mine), 4))
+
 
 def decoded_by_this_crate(
     bundle: Path, output: Path, unity_version: str | None
@@ -73,7 +92,14 @@ def decoded_by_this_crate(
     command = ["cargo", "run", "--release", "--quiet", "-p", "assetstudio-cli", "--locked", "--"]
     if unity_version:
         command += ["--unity-version", unity_version]
-    command += ["export", "--filename", "path-id", "--image-format", "raw-rgba",
+    # Only the class this compares. Exporting the whole bundle means an
+    # unrelated object can fail the run -- two Live2D bundles here hold a
+    # `MonoBehaviour` that materializes eleven bytes past the type-tree ceiling
+    # -- and the caller below treats an empty result as "nothing to compare",
+    # so every texture in those bundles was dropped over something that is not
+    # a texture.
+    command += ["export", "--class", "28",
+                "--filename", "path-id", "--image-format", "raw-rgba",
                 str(bundle), str(output)]
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     if result.returncode != 0:
@@ -110,12 +136,16 @@ def main() -> int:
     stats: dict[int, collections.Counter] = collections.defaultdict(collections.Counter)
     problems: list[str] = []
     compared = 0
+    skipped = 0
 
     with tempfile.TemporaryDirectory(prefix="assetstudio-texdiff-") as work:
         for bundle in bundles:
             output = Path(work) / bundle.stem
             ours = decoded_by_this_crate(bundle, output, unity_version)
             if not ours:
+                # Counted, not passed over. A bundle that silently produced
+                # nothing looks exactly like one that agreed.
+                skipped += 1
                 continue
             try:
                 env = UnityPy.load(str(bundle))
@@ -147,6 +177,18 @@ def main() -> int:
                 counter["differing"] += 1
                 worst = max(abs(a - b) for a, b in zip(mine, theirs) if a != b)
                 counter["worst"] = max(counter["worst"], worst)
+                if fmt in CHANNEL_CONVENTION and alpha_agrees(mine, theirs):
+                    # Not a decode difference. `Alpha8` stores alpha and
+                    # nothing else, so what lands in red, green and blue is a
+                    # convention: the managed converter this project reproduces
+                    # fills 0xFF and writes alpha over it, giving opaque white,
+                    # while UnityPy gives black. Every alpha byte of the
+                    # 16,777,216-pixel font atlas here matches, which is the
+                    # data; the rest is spelling. Requiring alpha to agree
+                    # exactly keeps the real check -- a wrong alpha is still a
+                    # defect -- while not calling the convention one.
+                    counter["convention"] += 1
+                    continue
                 if fmt not in INDEPENDENTLY_DECODED:
                     problems.append(
                         f"{bundle.name}:{obj.path_id} format {fmt} differs by up to {worst}, "
@@ -158,13 +200,21 @@ def main() -> int:
                         "more than the one level two correct decoders can differ by"
                     )
 
-    print(f"compared {compared} textures from {len(bundles)} bundle(s)")
+    print(
+        f"compared {compared} textures from {len(bundles) - skipped} bundle(s)"
+        f" ({skipped} skipped, having produced nothing to compare)"
+    )
     for fmt, counter in sorted(stats.items()):
         note = " (ARM reference decoder)" if fmt in INDEPENDENTLY_DECODED else ""
-        print(
-            f"  format {fmt}{note}: {counter['identical']}/{counter['textures']} identical"
-            + (f", worst difference {counter['worst']}" if counter["differing"] else "")
-        )
+        line = f"  format {fmt}{note}: {counter['identical']}/{counter['textures']} identical"
+        if counter["differing"]:
+            line += f", worst difference {counter['worst']}"
+        if counter["convention"]:
+            line += (
+                f", {counter['convention']} differing only in the channels the"
+                " format does not store, with alpha identical"
+            )
+        print(line)
     if problems:
         print(f"\n{len(problems)} unexplained difference(s):", file=sys.stderr)
         for line in problems[:20]:
