@@ -62,6 +62,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
 
     assert_version_matrix(&executable);
     assert_compressed_texture_formats(&executable);
+    assert_channel_convention_textures(&executable);
     assert_first_surface_textures(&executable);
     assert_crunched_textures(&executable);
     assert_astc_textures(&executable);
@@ -1195,6 +1196,120 @@ fn assert_compressed_texture_formats(executable: &Path) {
     assert!(
         disagreed.is_empty(),
         "decoded pixels disagree for {} format(s):\n{}",
+        disagreed.len(),
+        disagreed.join("\n")
+    );
+}
+
+/// Builds a payload for one channel-convention format.
+///
+/// Integer formats take arbitrary bytes: every bit pattern is a valid pixel.
+/// The half and float formats do not. The managed converter writes
+/// `(byte)MathF.Round(value * 255f)`, and that cast is unchecked, so a value
+/// outside zero to one -- which is most of what random bytes decode to, NaN and
+/// infinities included -- lands in conversion behaviour C# does not define.
+/// Comparing there measures two languages' out-of-range casts rather than two
+/// decoders, the same trap the ASTC fixtures avoid by using a real encoder. So
+/// these get values that are exactly representable in both `f16` and `f32` and
+/// lie in range, where the format does define an answer.
+fn channel_convention_payload(format: i32, length: usize, seed: u64) -> Vec<u8> {
+    // 0.0, 0.125, 0.25, 0.375, 0.75, 1.0 as IEEE 754 binary16.
+    const HALVES: [u16; 6] = [0x0000, 0x3000, 0x3400, 0x3600, 0x3A00, 0x3C00];
+    const FLOATS: [f32; 6] = [0.0, 0.125, 0.25, 0.375, 0.75, 1.0];
+
+    let mut payload = Vec::with_capacity(length);
+    match format {
+        // RHalf, RGHalf
+        15 | 16 => {
+            for index in 0..length / 2 {
+                payload.extend_from_slice(&HALVES[index % HALVES.len()].to_le_bytes());
+            }
+        }
+        // RFloat, RGFloat
+        18 | 19 => {
+            for index in 0..length / 4 {
+                payload.extend_from_slice(&FLOATS[index % FLOATS.len()].to_le_bytes());
+            }
+        }
+        _ => return block_payload(length, seed),
+    }
+    payload
+}
+
+/// Compares the uncompressed formats whose unused channels are a convention.
+///
+/// A block format has one right answer per block, so two implementations either
+/// agree or one has a defect. These do not: `Alpha8` stores only alpha, and what
+/// belongs in red, green and blue is a decision. The managed converter fills the
+/// buffer with `0xFF` and writes alpha over it, so it produces opaque white with
+/// the stored alpha; a different tool's extraction of the same corpus produces
+/// black instead, and both are self-consistent. A real 4096x4096 `Alpha8` font
+/// atlas in a Unity 6000.3 corpus is where that turned up, with all 16,777,216
+/// pixels disagreeing, and nothing here covered it -- the format list above is
+/// entirely block-compressed. The same question applies to every one- and
+/// two-channel format, so they are all compared rather than only the one that
+/// was caught.
+fn assert_channel_convention_textures(executable: &Path) {
+    // (name, format code, bytes per pixel)
+    const FORMATS: &[(&str, i32, usize)] = &[
+        ("alpha8", 1, 1),
+        ("argb4444", 2, 2),
+        ("rgb24", 3, 3),
+        ("rgb565", 7, 2),
+        ("r16", 9, 2),
+        ("rgba4444", 13, 2),
+        ("bgra32", 14, 4),
+        ("rhalf", 15, 2),
+        ("rghalf", 16, 4),
+        ("rfloat", 18, 4),
+        ("rgfloat", 19, 8),
+        ("rg16", 62, 2),
+        ("r8", 63, 1),
+    ];
+    const SIZE: i32 = 4;
+    const REVISION: &str = "2022.3.62f1";
+
+    let mut disagreed = Vec::new();
+    for (index, (name, format, pixel_bytes)) in FORMATS.iter().enumerate() {
+        let pixels = (SIZE * SIZE) as usize;
+        let payload = channel_convention_payload(
+            *format,
+            pixels * pixel_bytes,
+            0x2545_F491_4F6C_DD1D ^ index as u64,
+        );
+        let object = texture2d_inline(
+            &format!("oracle-{name}"),
+            SIZE,
+            SIZE,
+            *format,
+            1,
+            REVISION,
+            &[],
+            &payload,
+        );
+        let file = synthetic_single_v22(28, 28, REVISION, &object);
+        let fixture = TemporaryFixture::new(&format!("oracle-channel-{name}.assets"), &file)
+            .expect("the texture fixture is writable");
+        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+        let managed_decoded = &managed["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+        let rust_decoded = &rust["Files"][0]["Objects"][0]["Payload"]["Decoded"];
+        if managed_decoded != rust_decoded {
+            disagreed.push(format!(
+                "{name} ({format}): managed {managed_decoded} vs Rust {rust_decoded}"
+            ));
+            continue;
+        }
+        assert_eq!(managed, rust, "texture format {name} ({format})");
+        assert!(
+            !managed_decoded.is_null(),
+            "texture format {name} decoded to nothing on both sides, so the \
+             comparison proved nothing: {managed}"
+        );
+    }
+    assert!(
+        disagreed.is_empty(),
+        "decoded pixels disagree for {} channel-convention format(s):\n{}",
         disagreed.len(),
         disagreed.join("\n")
     );
