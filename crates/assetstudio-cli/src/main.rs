@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use assetstudio_core::compression::{
 use assetstudio_core::cubism_moc::{CubismMoc, CubismMocReadLimits, try_read_cubism_moc};
 use assetstudio_core::endian::{Endian, EndianReader};
 use assetstudio_core::export::{
-    AudioExportFormat, ExportMode, ExportOptions, FilenameFormat, export_collection,
+    AudioExportFormat, ExportMode, ExportOptions, FilenameFormat, export_collection_with_schemas,
 };
 use assetstudio_core::extraction::{ExtractionOptions, extract_path};
 use assetstudio_core::fbx_ascii::{
@@ -33,6 +33,7 @@ use assetstudio_core::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
 };
 use assetstudio_core::model_ir::{ModelIrLimits, build_model_ir, build_model_ir_for_game_object};
+use assetstudio_core::mono_schema::{MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry};
 use assetstudio_core::monobehaviour::MONO_BEHAVIOUR_CLASS_ID;
 use assetstudio_core::obj_scene::{write_model_ir_mtl, write_model_ir_obj};
 use assetstudio_core::scene_hierarchy::{
@@ -175,43 +176,126 @@ fn run_with_arguments(arguments: &[OsString], output: &mut impl Write) -> CliRes
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LoadOptions {
     unity_version: Option<UnityVersion>,
+    /// Schema documents describing `MonoBehaviour` layouts, in the order
+    /// given: the first document holding a class wins.
+    mono_schemas: Vec<PathBuf>,
+    /// Read through the schemas even where the file carries its own type tree.
+    mono_schema_override: bool,
+}
+
+impl LoadOptions {
+    /// Reads every schema document into one registry.
+    ///
+    /// `None` when no document was named, which leaves a stripped
+    /// `MonoBehaviour` reported as unsupported rather than guessed at.
+    fn mono_schema_registry(&self) -> CliResult<Option<MonoBehaviourSchemaRegistry>> {
+        if self.mono_schemas.is_empty() {
+            if self.mono_schema_override {
+                return Err(CliError::Usage(format!(
+                    "{MONO_SCHEMA_OVERRIDE_FLAG} has nothing to override with: pass --mono-schema"
+                )));
+            }
+            return Ok(None);
+        }
+        let mut registry = MonoBehaviourSchemaRegistry::new();
+        registry.set_overrides_embedded_tree(self.mono_schema_override);
+        for path in &self.mono_schemas {
+            let document = fs::read(path).map_err(|error| {
+                CliError::Usage(format!(
+                    "--mono-schema {}: {error}",
+                    escape_text(&path.display().to_string())
+                ))
+            })?;
+            let loaded = MonoBehaviourSchemaRegistry::from_json(&document).map_err(|error| {
+                CliError::Usage(format!(
+                    "--mono-schema {}: {error}",
+                    escape_text(&path.display().to_string())
+                ))
+            })?;
+            registry.extend(loaded)?;
+        }
+        Ok(Some(registry))
+    }
+}
+
+/// The load options this parser understands.
+#[derive(Debug, Clone, Copy)]
+enum LoadFlag {
+    UnityVersion,
+    MonoSchema,
+}
+
+/// A load option that is on or off rather than carrying a value.
+const MONO_SCHEMA_OVERRIDE_FLAG: &str = "--mono-schema-override";
+
+impl LoadFlag {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::UnityVersion => "--unity-version",
+            Self::MonoSchema => "--mono-schema",
+        }
+    }
+
+    const fn expects(self) -> &'static str {
+        match self {
+            Self::UnityVersion => "a version such as 2022.3.62f1",
+            Self::MonoSchema => "a path to a schema document",
+        }
+    }
 }
 
 /// Removes the load options from the argument list before command parsing.
 ///
 /// These apply to every command that opens a collection, so handling them once
-/// here keeps each command parser unaware of them and makes the flag work with
+/// here keeps each command parser unaware of them and makes the flags work with
 /// the legacy `<input> -m <mode>` spellings too.
 fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadOptions)> {
-    const FLAG: &str = "--unity-version";
     let mut remaining = Vec::new();
     let mut load = LoadOptions::default();
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         let text = argument.to_str();
-        let value = if text == Some(FLAG) {
-            arguments
-                .next()
-                .ok_or_else(|| {
-                    CliError::Usage(format!("{FLAG} requires a version such as 2022.3.62f1"))
-                })?
-                .to_str()
+        let (flag, inline) = if text == Some(LoadFlag::UnityVersion.name()) {
+            (LoadFlag::UnityVersion, None)
         } else if let Some(value) = text.and_then(|text| text.strip_prefix("--unity-version=")) {
-            Some(value)
+            (LoadFlag::UnityVersion, Some(OsStr::new(value)))
+        } else if text == Some(LoadFlag::MonoSchema.name()) {
+            (LoadFlag::MonoSchema, None)
+        } else if let Some(value) = text.and_then(|text| text.strip_prefix("--mono-schema=")) {
+            (LoadFlag::MonoSchema, Some(OsStr::new(value)))
+        } else if text == Some(MONO_SCHEMA_OVERRIDE_FLAG) {
+            load.mono_schema_override = true;
+            continue;
         } else {
             remaining.push(argument.clone());
             continue;
         };
-        let value =
-            value.ok_or_else(|| CliError::Usage(format!("{FLAG} value must be valid UTF-8")))?;
-        if load.unity_version.is_some() {
-            return Err(CliError::Usage(format!("{FLAG} was given more than once")));
+        let name = flag.name();
+        let value = match inline {
+            Some(value) => value,
+            None => arguments
+                .next()
+                .map(OsString::as_os_str)
+                .ok_or_else(|| CliError::Usage(format!("{name} requires {}", flag.expects())))?,
+        };
+        match flag {
+            LoadFlag::UnityVersion => {
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| CliError::Usage(format!("{name} value must be valid UTF-8")))?;
+                if load.unity_version.is_some() {
+                    return Err(CliError::Usage(format!("{name} was given more than once")));
+                }
+                load.unity_version = Some(UnityVersion::from_str(value).map_err(|error| {
+                    CliError::Usage(format!(
+                        "{name} value {value:?} is not a Unity version: {error}"
+                    ))
+                })?);
+            }
+            // Repeatable: a game's classes are spread over several assemblies,
+            // and one document per assembly is the shape a generator produces.
+            LoadFlag::MonoSchema => load.mono_schemas.push(PathBuf::from(value)),
         }
-        load.unity_version = Some(UnityVersion::from_str(value).map_err(|error| {
-            CliError::Usage(format!(
-                "{FLAG} value {value:?} is not a Unity version: {error}"
-            ))
-        })?);
     }
     Ok((remaining, load))
 }
@@ -489,7 +573,14 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          Load options (accepted by every command that opens a collection):\n  \
          --unity-version <VERSION>   Parse against this version, for example 2022.3.62f1.\n  \
          Required for files whose own version was stripped at build time, and\n  \
-         overrides both the declared version and any enclosing bundle revision.\n\n\
+         overrides both the declared version and any enclosing bundle revision.\n  \
+         --mono-schema <PATH>        Read MonoBehaviour layouts from a schema document.\n  \
+         A release build usually ships no type tree for its own scripts, and\n  \
+         those objects are reported unsupported without one. Repeatable; the\n  \
+         first document holding a class wins. See docs/mono-schema.md.\n  \
+         --mono-schema-override      Read through the schemas even where the file carries\n  \
+         its own type tree. For checking a generated schema against a build\n  \
+         that still ships trees; extraction should not use it.\n\n\
          FBX export:\n  Writes deterministic ASCII FBX 7.4 for transform hierarchies, resident\n  \
          triangle meshes, submeshes, material slots, normals, UV0, local TRS, direct/hash bones,\n  \
          skinning, static blend shapes, explicit/packed legacy curves, and streamed/dense/constant\n  \
@@ -998,7 +1089,15 @@ fn export_path(
     output: &mut impl Write,
 ) -> CliResult<()> {
     let collection = load_asset_collection(input, load, output)?;
-    let report = export_collection(&collection, output_directory, options)?;
+    let schemas = load.mono_schema_registry()?;
+    let report = export_collection_with_schemas(
+        &collection,
+        output_directory,
+        options,
+        schemas
+            .as_ref()
+            .map(|registry| registry as &dyn MonoBehaviourSchemaProvider),
+    )?;
 
     for record in &report.exported {
         writeln!(
@@ -3200,8 +3299,8 @@ mod tests {
         MAX_LIVE2D_OUTPUT_MODELS, MAX_LIVE2D_TOTAL_OUTPUT_BYTES, SceneObjectKey,
         charge_live2d_model, obj_material_library_name, parse_cli_arguments,
         parse_export_arguments, parse_extract_arguments, parse_live2d_arguments,
-        parse_live2d_package_arguments, sanitize_live2d_base_name, write_object_reference,
-        write_scene_key,
+        parse_live2d_package_arguments, sanitize_live2d_base_name, split_load_options,
+        write_object_reference, write_scene_key,
     };
     use assetstudio_core::serialized::ObjectReference;
     use std::ffi::OsString;
@@ -3209,6 +3308,52 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn mono_schema_documents_accumulate_and_leave_the_command_untouched() {
+        let (remaining, load) = split_load_options(&arguments(&[
+            "--mono-schema",
+            "first.json",
+            "export",
+            "--mono-schema=second.json",
+            "input.assets",
+            "out",
+            "--mono-schema-override",
+        ]))
+        .unwrap();
+        // Both spellings are taken out of the way before the command parses,
+        // wherever they appear, and the order they were given is the order
+        // that decides which document wins a class.
+        assert_eq!(remaining, arguments(&["export", "input.assets", "out"]));
+        assert_eq!(
+            load.mono_schemas,
+            vec![PathBuf::from("first.json"), PathBuf::from("second.json")]
+        );
+        assert!(load.mono_schema_override);
+        assert!(
+            load.mono_schema_registry().is_err(),
+            "first.json does not exist"
+        );
+    }
+
+    #[test]
+    fn mono_schema_flags_refuse_the_shapes_that_would_do_nothing() {
+        // A path is required, and so is something to override with: silently
+        // ignoring either would leave the caller believing their schemas were
+        // in use.
+        assert!(split_load_options(&arguments(&["--mono-schema"])).is_err());
+        let (_, load) =
+            split_load_options(&arguments(&["--mono-schema-override", "info"])).unwrap();
+        assert!(load.mono_schema_registry().is_err());
+        assert!(
+            split_load_options(&arguments(&["info"]))
+                .unwrap()
+                .1
+                .mono_schema_registry()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
