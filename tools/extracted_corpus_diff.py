@@ -104,6 +104,12 @@ differing. The remaining 5 are Unity's vertex-less meshes, which the export
 path declines as unsupported and the extraction writes as empty files. A
 mismatched name masquerading as a missing export is precisely the alarm this
 arm exists to raise, raised by the arm itself.
+
+Where all of that lands, over the whole 2,778-bundle corpus: 637 OBJs
+compared with 632 identical and 5 declined as vertex-less; 2,609 images with
+248 identical, 2,147 inside the decoder allowance, 214 disagreeing on
+tight-mesh boundaries and none missing; 577 text assets with 6 identical, 571
+attributed to the extraction's re-encoding, none missing and none differing.
 """
 
 from __future__ import annotations
