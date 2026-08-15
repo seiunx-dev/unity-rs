@@ -1189,6 +1189,170 @@ fn synthetic_v22_fsb5_vorbis() -> Vec<u8> {
     finish_single_v22(83, "2022.3.62f1", &object)
 }
 
+#[test]
+fn exports_a_stripped_mono_behaviour_through_a_schema_document() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("assetstudio-cli-schema-{unique}"));
+    let input = root.join("stripped.assets");
+    let schema = root.join("schema.json");
+    let output = root.join("output");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&input, synthetic_v22_stripped_mono_behaviour()).unwrap();
+    fs::write(&schema, STRIPPED_MONO_BEHAVIOUR_SCHEMA).unwrap();
+
+    // Without the document the object has no stated shape and is declined,
+    // which is the state a release build leaves every script asset in.
+    let declined = Command::new(env!("CARGO_BIN_EXE_assetstudio"))
+        .arg("export")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(declined.status.success());
+    let declined = String::from_utf8_lossy(&declined.stdout);
+    assert!(
+        declined.contains("1 succeeded, 1 unsupported, 0 failed"),
+        "stdout: {declined}"
+    );
+
+    let result = Command::new(env!("CARGO_BIN_EXE_assetstudio"))
+        .arg("--mono-schema")
+        .arg(&schema)
+        .arg("export")
+        .arg(&input)
+        .arg(root.join("with-schema"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("2 succeeded, 0 unsupported, 0 failed"),
+        "stdout: {stdout}"
+    );
+    // Named apart from an embedded-tree read: the layout came from the
+    // caller's document, and the report should not blur the two.
+    assert!(
+        stdout.contains("(class 114, typetree_json_schema)"),
+        "stdout: {stdout}"
+    );
+
+    let written = fs::read_to_string(
+        root.join("with-schema")
+            .join("0000_stripped.assets")
+            .join("Hero.json"),
+    )
+    .unwrap();
+    // The trailing field is the one the schema alone describes: everything
+    // before it is the engine prefix the file states on its own.
+    assert!(written.contains(r#""m_Name": "Hero""#), "{written}");
+    assert!(written.contains(r#""score": 123"#), "{written}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The layout `tools/monoschema` writes for the class below.
+const STRIPPED_MONO_BEHAVIOUR_SCHEMA: &str = r#"{
+    "version": 1,
+    "entries": [{
+        "assembly": "Assembly-CSharp",
+        "namespace": "Game",
+        "class": "Stats",
+        "nodes": [
+            {"level": 0, "type": "MonoBehaviour", "name": "Base"},
+            {"level": 1, "type": "PPtr<GameObject>", "name": "m_GameObject"},
+            {"level": 2, "type": "int", "name": "m_FileID"},
+            {"level": 2, "type": "SInt64", "name": "m_PathID"},
+            {"level": 1, "type": "UInt8", "name": "m_Enabled", "meta_flags": 16384},
+            {"level": 1, "type": "PPtr<MonoScript>", "name": "m_Script"},
+            {"level": 2, "type": "int", "name": "m_FileID"},
+            {"level": 2, "type": "SInt64", "name": "m_PathID"},
+            {"level": 1, "type": "string", "name": "m_Name"},
+            {"level": 2, "type": "Array", "name": "Array"},
+            {"level": 3, "type": "int", "name": "size"},
+            {"level": 3, "type": "char", "name": "data"},
+            {"level": 1, "type": "SInt32", "name": "score"}
+        ]
+    }]
+}"#;
+
+/// A `MonoBehaviour` with no type tree of its own, and the `MonoScript` naming
+/// the class it was compiled from -- what a player build actually ships.
+fn synthetic_v22_stripped_mono_behaviour() -> Vec<u8> {
+    let mut behaviour = Vec::new();
+    push_i32_le(&mut behaviour, 0);
+    behaviour.extend_from_slice(&1_i64.to_le_bytes());
+    behaviour.push(1);
+    align_vec(&mut behaviour, 4);
+    push_i32_le(&mut behaviour, 0);
+    behaviour.extend_from_slice(&8_i64.to_le_bytes());
+    push_aligned_string(&mut behaviour, "Hero");
+    push_i32_le(&mut behaviour, 123);
+
+    let mut script = Vec::new();
+    push_aligned_string(&mut script, "Stats script");
+    push_i32_le(&mut script, 0);
+    script.extend_from_slice(&[0; 16]);
+    push_aligned_string(&mut script, "Stats");
+    push_aligned_string(&mut script, "Game");
+    push_aligned_string(&mut script, "Assembly-CSharp");
+
+    finish_v22_objects(&[(114, 7, behaviour), (115, 8, script)])
+}
+
+fn finish_v22_objects(objects: &[(i32, i64, Vec<u8>)]) -> Vec<u8> {
+    let mut classes = objects.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    classes.sort_unstable();
+    classes.dedup();
+    let mut metadata = Vec::new();
+    metadata.extend_from_slice(b"2022.3.62f1\0");
+    push_i32_le(&mut metadata, 13);
+    metadata.push(0);
+    push_i32_le(&mut metadata, i32::try_from(classes.len()).unwrap());
+    for class_id in &classes {
+        push_i32_le(&mut metadata, *class_id);
+        metadata.push(0);
+        metadata.extend_from_slice(&(-1_i16).to_le_bytes());
+        if *class_id == 114 {
+            // MonoBehaviour carries the script identity hash before the type hash.
+            metadata.extend_from_slice(&[0; 16]);
+        }
+        metadata.extend_from_slice(&[0; 16]);
+    }
+
+    let mut data = Vec::new();
+    let mut records = Vec::new();
+    for (class_id, path_id, payload) in objects {
+        align_vec(&mut data, 4);
+        records.push((
+            *path_id,
+            i64::try_from(data.len()).unwrap(),
+            u32::try_from(payload.len()).unwrap(),
+            i32::try_from(classes.iter().position(|value| value == class_id).unwrap()).unwrap(),
+        ));
+        data.extend_from_slice(payload);
+    }
+    push_i32_le(&mut metadata, i32::try_from(records.len()).unwrap());
+    for (path_id, offset, size, type_index) in records {
+        align_vec_with_base(&mut metadata, 48, 4);
+        metadata.extend_from_slice(&path_id.to_le_bytes());
+        metadata.extend_from_slice(&offset.to_le_bytes());
+        metadata.extend_from_slice(&size.to_le_bytes());
+        push_i32_le(&mut metadata, type_index);
+    }
+    for _ in 0..3 {
+        push_i32_le(&mut metadata, 0);
+    }
+    metadata.push(0);
+    finish_v22(&metadata, &data)
+}
+
 fn finish_single_v22(class_id: i32, version: &str, object: &[u8]) -> Vec<u8> {
     let mut metadata = Vec::new();
     metadata.extend_from_slice(version.as_bytes());

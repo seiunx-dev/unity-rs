@@ -10,6 +10,9 @@ use crate::image_export::{
 use crate::json::write_type_value_json;
 use crate::loader::AssetCollection;
 use crate::mesh::{MESH_CLASS_ID, Mesh, MeshReadLimits, read_mesh_with_collection, write_mesh_obj};
+use crate::mono_schema::{
+    MonoBehaviourSchemaProvider, MonoBehaviourSchemaSource, read_mono_behaviour_json_with_provider,
+};
 use crate::monobehaviour::{
     MONO_BEHAVIOUR_CLASS_ID, MonoBehaviourReadLimits, read_mono_behaviour, read_mono_behaviour_json,
 };
@@ -156,6 +159,8 @@ pub struct ExportReport {
 struct ObjectExportContext<'a> {
     collection: &'a AssetCollection,
     file: &'a SerializedFile,
+    file_index: usize,
+    schemas: Option<&'a dyn MonoBehaviourSchemaProvider>,
     source: &'a str,
     output_directory: &'a Path,
     options: ExportOptions,
@@ -165,6 +170,22 @@ pub fn export_collection(
     collection: &AssetCollection,
     output_root: &Path,
     options: ExportOptions,
+) -> Result<ExportReport> {
+    export_collection_with_schemas(collection, output_root, options, None)
+}
+
+/// The same export, with schemas for `MonoBehaviour` objects whose own type
+/// tree was stripped from the build.
+///
+/// Without them a stripped behaviour is declined, and in a modern game that is
+/// most of the file: exporting one Unity 2022.3 title reports 172,192 objects
+/// unsupported for this reason alone. The provider supplies the layout as
+/// data; nothing here opens or executes the managed assembly it came from.
+pub fn export_collection_with_schemas(
+    collection: &AssetCollection,
+    output_root: &Path,
+    options: ExportOptions,
+    schemas: Option<&dyn MonoBehaviourSchemaProvider>,
 ) -> Result<ExportReport> {
     let object_count = collection
         .serialized_files
@@ -201,6 +222,8 @@ pub fn export_collection(
             let context = ObjectExportContext {
                 collection,
                 file: &loaded.file,
+                file_index,
+                schemas,
                 source: &loaded.path,
                 output_directory: &group_path,
                 options,
@@ -263,9 +286,11 @@ fn export_object(
     let (base_name, extension, payload_kind, payload) = select_export_payload(
         context.collection,
         context.file,
+        context.file_index,
         object_index,
         object.class_id,
         context.options,
+        context.schemas,
     )?;
     if matches!(&payload, ExportPayload::Raw)
         && object.byte_size > context.options.maximum_raw_object_bytes
@@ -405,12 +430,22 @@ type ExportSelection = (String, String, &'static str, ExportPayload);
 fn select_export_payload(
     collection: &AssetCollection,
     file: &SerializedFile,
+    file_index: usize,
     object_index: usize,
     class_id: i32,
     options: ExportOptions,
+    schemas: Option<&dyn MonoBehaviourSchemaProvider>,
 ) -> Result<ExportSelection> {
     if options.mode == ExportMode::Auto {
-        return select_auto_export_payload(collection, file, object_index, class_id, options);
+        return select_auto_export_payload(
+            collection,
+            file,
+            file_index,
+            object_index,
+            class_id,
+            options,
+            schemas,
+        );
     }
     Ok(match options.mode {
         ExportMode::Raw => (
@@ -420,7 +455,14 @@ fn select_export_payload(
             ExportPayload::Raw,
         ),
         ExportMode::TypeTreeJson if class_id == MONO_BEHAVIOUR_CLASS_ID => {
-            return select_mono_behaviour_json(file, object_index, options);
+            return select_mono_behaviour_json(
+                collection,
+                file,
+                file_index,
+                object_index,
+                options,
+                schemas,
+            );
         }
         ExportMode::TypeTreeJson => {
             let value = file.read_type_tree_value(object_index)?;
@@ -452,9 +494,11 @@ fn select_export_payload(
 fn select_auto_export_payload(
     collection: &AssetCollection,
     file: &SerializedFile,
+    file_index: usize,
     object_index: usize,
     class_id: i32,
     options: ExportOptions,
+    schemas: Option<&dyn MonoBehaviourSchemaProvider>,
 ) -> Result<ExportSelection> {
     Ok(match class_id {
         TEXT_ASSET_CLASS_ID => {
@@ -548,7 +592,14 @@ fn select_auto_export_payload(
             )
         }
         MONO_BEHAVIOUR_CLASS_ID => {
-            return select_mono_behaviour_json(file, object_index, options);
+            return select_mono_behaviour_json(
+                collection,
+                file,
+                file_index,
+                object_index,
+                options,
+                schemas,
+            );
         }
         MESH_CLASS_ID => {
             let limits = MeshReadLimits {
@@ -614,16 +665,41 @@ fn select_auto_export_payload(
 }
 
 fn select_mono_behaviour_json(
+    collection: &AssetCollection,
     file: &SerializedFile,
+    file_index: usize,
     object_index: usize,
     options: ExportOptions,
+    schemas: Option<&dyn MonoBehaviourSchemaProvider>,
 ) -> Result<ExportSelection> {
     let limits = MonoBehaviourReadLimits {
         maximum_json_bytes: options.maximum_monobehaviour_json_bytes,
         ..MonoBehaviourReadLimits::default()
     };
     let behaviour = read_mono_behaviour(file, object_index, limits)?;
-    let json = read_mono_behaviour_json(file, object_index, options.pretty_json, limits)?;
+    let (json, kind) = match schemas {
+        Some(schemas) => {
+            let resolved = read_mono_behaviour_json_with_provider(
+                collection,
+                file_index,
+                object_index,
+                schemas,
+                options.pretty_json,
+                limits,
+            )?;
+            // Named apart because it is a weaker claim: the layout came from a
+            // schema the caller supplied, not from anything Unity wrote.
+            let kind = match resolved.source {
+                MonoBehaviourSchemaSource::Embedded => "typetree_json",
+                MonoBehaviourSchemaSource::External => "typetree_json_schema",
+            };
+            (resolved.json, kind)
+        }
+        None => (
+            read_mono_behaviour_json(file, object_index, options.pretty_json, limits)?,
+            "typetree_json",
+        ),
+    };
     let name = if behaviour.name.is_empty() {
         fallback_object_name(file, object_index)
     } else {
@@ -632,7 +708,7 @@ fn select_mono_behaviour_json(
     Ok((
         name,
         ".json".to_owned(),
-        "typetree_json",
+        kind,
         ExportPayload::Bytes(json.into_bytes()),
     ))
 }

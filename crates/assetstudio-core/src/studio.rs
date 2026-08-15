@@ -42,7 +42,9 @@ use crate::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
 };
 use crate::model_ir::{ModelIrLimits, build_model_ir, build_model_ir_for_game_object};
-use crate::mono_schema::{MonoBehaviourSchemaProvider, read_mono_behaviour_json_with_provider};
+use crate::mono_schema::{
+    MonoBehaviourSchemaProvider, ResolvedMonoBehaviourJson, read_mono_behaviour_json_with_provider,
+};
 use crate::monobehaviour::{MonoBehaviourReadLimits, MonoScript, read_mono_script};
 use crate::project_settings::{
     BuildSettings, PlayerSettings, ProjectSettingsReadLimits, read_build_settings,
@@ -971,7 +973,7 @@ impl StudioObject<'_> {
         provider: &dyn MonoBehaviourSchemaProvider,
         pretty: bool,
         limits: MonoBehaviourReadLimits,
-    ) -> Result<String> {
+    ) -> Result<ResolvedMonoBehaviourJson> {
         read_mono_behaviour_json_with_provider(
             &self.studio.collection,
             self.file_index,
