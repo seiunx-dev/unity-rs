@@ -76,6 +76,17 @@ CLI_BINARY = ROOT / "target" / "release" / (
     "assetstudio.exe" if os.name == "nt" else "assetstudio"
 )
 
+# Several steps below verify with `assert` -- the inline `-c` snippets here and
+# the Python gates they invoke -- and `-O` or `PYTHONOPTIMIZE` deletes those
+# outright rather than skipping them. Children inherit this interpreter's
+# environment, so one such run would report every group green having checked
+# nothing. Each gate refuses on its own too; this catches it once, up front.
+if not __debug__:
+    raise SystemExit(
+        "refusing to run with assertions disabled (-O / PYTHONOPTIMIZE): "
+        "the steps below verify with asserts"
+    )
+
 
 @dataclass
 class Step:

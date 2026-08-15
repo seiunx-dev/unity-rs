@@ -12,6 +12,16 @@ LEGAL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.txt")
 FORBIDDEN_COMPONENTS = {"assetstudio-ffi", "assetstudio-gui", "assetstudiogui"}
 FORBIDDEN_SUFFIXES = (".cs", ".csproj", ".fsproj", ".sln", ".slnx", ".vbproj")
 
+# Every check here is an `assert`, and `-O` or `PYTHONOPTIMIZE` deletes those
+# outright rather than skipping them: a crate carrying a stale NOTICE, or none
+# at all, would print the reassuring line below and exit zero. That is the
+# defect this gate was written to catch, so refuse to run instead.
+if not __debug__:
+    raise SystemExit(
+        "refusing to run with assertions disabled (-O / PYTHONOPTIMIZE): "
+        "every check in this gate is an assert"
+    )
+
 
 def forbidden_delivery_path(name: str) -> bool:
     lowered = name.casefold().replace("\\", "/")

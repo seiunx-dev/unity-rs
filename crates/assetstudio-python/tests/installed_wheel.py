@@ -14,6 +14,16 @@ import assetstudio
 FORBIDDEN_COMPONENTS = {"assetstudio-ffi", "assetstudio-gui", "assetstudiogui"}
 FORBIDDEN_SUFFIXES = (".cs", ".csproj", ".fsproj", ".sln", ".slnx", ".vbproj")
 
+# Every check here is an `assert`, and `-O` or `PYTHONOPTIMIZE` deletes those
+# outright rather than skipping them: this is the gate that compares the
+# runtime surface against the stub and every default parameter against it, so a
+# vacuous run is exactly the drift it exists to catch. Refuse to run instead.
+if not __debug__:
+    raise SystemExit(
+        "refusing to run with assertions disabled (-O / PYTHONOPTIMIZE): "
+        "every check in this gate is an assert"
+    )
+
 
 def forbidden_delivery_path(name: str) -> bool:
     lowered = name.casefold().replace("\\", "/")

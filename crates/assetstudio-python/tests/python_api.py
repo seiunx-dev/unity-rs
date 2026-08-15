@@ -40,6 +40,18 @@ from assetstudio import (
     extract,
 )
 
+# Every check here is an `assert`, and `-O` or `PYTHONOPTIMIZE` deletes those
+# outright rather than skipping them: this suite would import the package,
+# build every fixture, call every reader and exit zero without comparing one
+# value. A suite that silently stops checking is the failure mode this project
+# has already been bitten by twice, so refuse to run instead.
+if not __debug__:
+    raise SystemExit(
+        "refusing to run with assertions disabled (-O / PYTHONOPTIMIZE): "
+        "every check in this suite is an assert"
+    )
+
+
 def push_i32(output: bytearray, value: int) -> None:
     output.extend(struct.pack("<i", value))
 
