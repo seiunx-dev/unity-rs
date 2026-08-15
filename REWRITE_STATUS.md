@@ -385,12 +385,12 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 | 条件 | 状态 |
 |---|---|
-| Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足；C ABI crate 已排除在 workspace 外，只作历史参考 |
+| Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足，且**从 2026-08-15 起有门禁把守而不再只是约定**；C ABI crate 已排除在 workspace 外，只作历史参考。`tools/check_delivery_scope.py` 读 `cargo metadata` 的解析结果（不是读清单文本）核对：workspace 恰好四个成员、各自的 target kind 正确、清单都在本仓库内、三个前端都直接依赖 Core，且任何一个的普通依赖里都不许出现 GUI/旧 FFI 包名。产物侧另有 Core `.crate`、npm tarball、wheel 与 sdist 的内容检查，拒收 `.cs`/`.csproj`/GUI 目录 |
 | 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷；2021+/2022+ 的 shader 已实现（见下），其结构正确性由 46 个真实 shader 与 UnityPy 的逐一比对背书；托管差分覆盖的仍是 5.2/5.3，因为托管侧对 2021+ 根本不产出对象 |
 | 代表性真实 corpus 稳定通过 | **部分满足，且已扩到第二款游戏与第二个引擎世代（2026-08-15）**；(1) 一份完整的 Unity 2022.3.62f2 播放器目录（23 文件 / 610,552 对象 / 190,300 个有解析载荷）；(2) 四个真实 UnityFS v8 bundle；(3) **2,778 个 Unity 6000.3.12f1 的 Addressables bundle（926 MB / 243,617 对象）**，全部零错误通过。仍缺的是 Tuanjie / Switch / 更老版本，以及带托管快照的取值比对 |
 | 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
 | 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux 的 x86-64 与 arm64 两个架构上，core+CLI 测试及 release CLI 构建/执行/staging、Python release wheel 构建与两套安装后测试、Node release addon 与 npm tarball 构建/测试均已在容器里实跑通过；Windows 侧验证了编译。CI 已配置 Python wheel、CLI 和可选 Node 包的 Linux/Windows/macOS × x86-64/ARM64 六路发布矩阵，并对 CLI 二进制和 Node release addon 做产物自身 smoke，但该发布矩阵尚未在 GitHub runner 上实际跑通。缺的仍是 Windows 上的真实运行——本机查过 wine（未安装）、Windows 容器（macOS 上不支持）与 Parallels（只有一个无效的 Debian 虚拟机），都不具备条件，装 wine 属于往你机器上装东西，没有自作主张——以及 CI 发布作业的实际绿色记录 |
-| 导出/解包有界、拒绝穿越与符号链接、原子发布 | 满足 |
+| 导出/解包有界、拒绝穿越与符号链接、原子发布 | **现在才算满足（2026-08-15 修）**；此前这一行写"满足"是**说大了**：主导出与解包路径确实是临时文件加原子发布，但模型同级贴图那条不是——它直接以最终文件名 `create_new` 然后往里写，写到一半失败就留下一张截断的图片，而下一次导出会因为"已存在"跳过它，于是一张坏图会被当成成功的结果永远留在那里。现已改成同目录临时文件、`sync_all`、硬链接 no-clobber 发布，放弃时由 Drop 清掉临时文件。这一行的教训与本文其他几处同源：断言覆盖面时要按路径逐条数，而不是按"这个模块做过这件事"泛化 |
 | C# 仅作历史参考或可选 oracle | 满足 |
 
 **第二款游戏（Unity 6000.3.12f1）接入，又抓到六处（2026-08-15）**：`~/ida/outnoteida/sirius_assets/bundles` 是一份 2,778 个 Addressables bundle 的完整导出（926 MB、243,617 对象、Unity 6000.3.12f1）。容器层一次通过——v8 之前已支持——对象层则一个接一个地挡住后面所有文件：
