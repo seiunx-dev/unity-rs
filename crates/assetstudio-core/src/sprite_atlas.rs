@@ -19,7 +19,10 @@ const NO_TARGET_PLATFORM: i32 = -2;
 const FIRST_SPRITE_ATLAS_VERSION: (u32, u32, u32) = (2017, 1, 0);
 const LAST_VERIFIED_UNITY_MAJOR: u32 = 2023;
 const UNITY_6_MAJOR: u32 = 6000;
-const LAST_VERIFIED_UNITY_6_MINOR: u32 = 2;
+// 6000.3 checked rather than assumed: a shipping 6000.3.12f1 build's own type
+// tree for `SpriteAtlas` lists exactly the fields below, in this order, with
+// nothing added after 2020.2's secondary textures.
+const LAST_VERIFIED_UNITY_6_MINOR: u32 = 3;
 
 /// Allocation and input-size limits for one `SpriteAtlas` object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +197,7 @@ pub fn read_sprite_atlas(
     let version = file.unity_version.components();
     if !is_verified_sprite_atlas_version(version) {
         return Err(Error::unsupported(format!(
-            "SpriteAtlas layout is verified for Unity 2017.1 through 2023.x and Unity 6000.0 through 6000.2, got {}",
+            "SpriteAtlas layout is verified for Unity 2017.1 through 2023.x and Unity 6000.0 through 6000.3, got {}",
             file.unity_version
         )));
     }
@@ -843,7 +846,9 @@ mod tests {
 
     #[test]
     fn rejects_unverified_versions_and_wrong_class() {
-        for version in ["2017.0.4f1", "2024.1.0f1", "6000.3.0f1", ""] {
+        // The upper bound moved to 6000.3 on the evidence in the constant's
+        // comment, so the refusal case moves with it.
+        for version in ["2017.0.4f1", "2024.1.0f1", "6000.4.0f1", ""] {
             let object = atlas_object((2022, 3, 62), Endian::Little, 13, &[FIRST_KEY]);
             let file = parse_asset(
                 version,
