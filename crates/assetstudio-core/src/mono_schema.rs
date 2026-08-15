@@ -14,7 +14,9 @@ use crate::monobehaviour::{
 };
 use crate::scene::resolve_object_reference;
 use crate::serialized::{ObjectReference, TypeTree, TypeTreeNode};
-use crate::type_tree::{TypeValue, read_type_tree_from_reader_with_reference_types};
+use crate::type_tree::{
+    TypeValue, read_type_tree_from_reader_with_reference_types, validate_tree_shape,
+};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +199,14 @@ fn schema_entry_from_json(
             tree_nodes[0].level
         )));
     }
+    // Checked here rather than left to the first read: a document with a level
+    // jump in it would otherwise load cleanly and then fail once per object,
+    // naming the object rather than the schema that is actually wrong.
+    validate_tree_shape(&tree_nodes).map_err(|error| {
+        Error::invalid_data(format!(
+            "MonoBehaviour schema entry {index} is not one tree: {error}"
+        ))
+    })?;
     Ok(MonoBehaviourSchemaEntry {
         assembly_name: text("assembly")?,
         namespace: entry
@@ -746,6 +756,17 @@ mod tests {
             (
                 r#"{"version": 1, "entries": [{"assembly": "A", "class": "C", "nodes": [{"level": 0, "type": "T", "name": "Base", "byte_size": 99999999999}]}]}"#,
                 "does not fit",
+            ),
+            // A level jump: the document loads and every read through it fails
+            // unless the shape is checked here.
+            (
+                r#"{"version": 1, "entries": [{"assembly": "A", "class": "C", "nodes": [{"level": 0, "type": "T", "name": "Base"}, {"level": 2, "type": "int", "name": "deep"}]}]}"#,
+                "not one tree",
+            ),
+            // Two roots in one entry describe two classes, not one.
+            (
+                r#"{"version": 1, "entries": [{"assembly": "A", "class": "C", "nodes": [{"level": 0, "type": "T", "name": "Base"}, {"level": 0, "type": "U", "name": "Other"}]}]}"#,
+                "not one tree",
             ),
         ] {
             let error = MonoBehaviourSchemaRegistry::from_json(document.as_bytes())

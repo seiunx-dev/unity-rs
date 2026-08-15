@@ -822,7 +822,9 @@ fn subtree_end(nodes: &[TypeTreeNode], index: usize) -> usize {
         .map_or(nodes.len(), |relative| index + 1 + relative)
 }
 
-fn validate_tree_shape(nodes: &[TypeTreeNode]) -> Result<()> {
+/// Checks that a node list describes one tree: a single level-0 root, and no
+/// level jumping by more than one.
+pub fn validate_tree_shape(nodes: &[TypeTreeNode]) -> Result<()> {
     let root = nodes
         .first()
         .ok_or_else(|| Error::invalid_data("type tree has no root node"))?;
