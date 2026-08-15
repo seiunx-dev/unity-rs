@@ -70,6 +70,11 @@ PYTHON = ROOT / "crates" / "assetstudio-python"
 # project afterwards. System site packages stay visible so an already-installed
 # UnityPy is still importable for the differential.
 VENV = PYTHON / ".ci-venv"
+VENV_314 = PYTHON / ".ci-venv-314"
+MYPY_VERSION = "1.18.2"
+CLI_BINARY = ROOT / "target" / "release" / (
+    "assetstudio.exe" if os.name == "nt" else "assetstudio"
+)
 
 
 @dataclass
@@ -87,6 +92,9 @@ class Group:
     # A tool that must exist for the group to mean anything. None means the
     # group only needs cargo, which the runner requires up front.
     requires: str | None = None
+    # Optional semantic prerequisite, such as an import inside a virtualenv.
+    # A failed probe skips the group just like a missing executable does.
+    probe: list[str] | None = None
     reason: str = ""
 
 
@@ -95,6 +103,13 @@ def venv_interpreter() -> str:
     if os.name == "nt":
         return str(VENV / "Scripts" / "python.exe")
     return str(VENV / "bin" / "python")
+
+
+def python314_interpreter() -> str:
+    """The Python 3.14 interpreter inside `VENV_314`."""
+    if os.name == "nt":
+        return str(VENV_314 / "Scripts" / "python.exe")
+    return str(VENV_314 / "bin" / "python")
 
 
 def groups(interpreter: str) -> list[Group]:
@@ -117,13 +132,51 @@ def groups(interpreter: str) -> list[Group]:
                 ),
                 Step(
                     "package the core crate",
-                    ["cargo", "package", "--locked", "-p", "assetstudio-core"],
+                    [
+                        "cargo", "package", "--allow-dirty", "--locked",
+                        "-p", "assetstudio-core",
+                    ],
+                ),
+                Step(
+                    "locked dependency licenses",
+                    [
+                        "python3", "tools/generate_dependency_licenses.py",
+                        "--check",
+                    ],
+                ),
+                Step(
+                    "headless delivery scope",
+                    ["python3", "tools/check_delivery_scope.py"],
+                ),
+                Step(
+                    "Core crate legal files",
+                    ["python3", "tools/check_core_package.py"],
                 ),
             ],
         ),
         Group(
             "rust",
-            [Step("workspace tests", ["cargo", "test", "--workspace", "--locked"])],
+            [
+                Step("build workspace", ["cargo", "build", "--workspace", "--locked"]),
+                Step("workspace tests", ["cargo", "test", "--workspace", "--locked"]),
+            ],
+        ),
+        Group(
+            "cli-package",
+            [
+                Step(
+                    "build release CLI",
+                    [
+                        "cargo", "build", "--release", "--locked",
+                        "-p", "assetstudio-cli",
+                    ],
+                ),
+                Step("smoke exact release CLI", [str(CLI_BINARY), "--help"]),
+                Step(
+                    "stage release CLI",
+                    [sys.executable, "-c", STAGE_CLI_ARTIFACT, str(CLI_BINARY)],
+                ),
+            ],
         ),
         Group(
             "oracle",
@@ -134,7 +187,11 @@ def groups(interpreter: str) -> list[Group]:
                         "cargo", "test", "-p", "assetstudio-core", "--test",
                         "dotnet_oracle", "--locked", "--", "--ignored",
                     ],
-                )
+                ),
+                Step(
+                    "MonoBehaviour schema generator",
+                    ["python3", "tools/test_monoschema.py"],
+                ),
             ],
             requires="dotnet",
             reason="the managed differential needs the .NET SDK and an AssetStudio checkout",
@@ -205,7 +262,7 @@ def groups(interpreter: str) -> list[Group]:
                 # directory so the two do not fight over one cache.
                 *(
                     Step(
-                        f"workspace tests on Linux {architecture}",
+                        f"Core/CLI tests and release CLI on Linux {architecture}",
                         [
                             "docker", "run", "--rm",
                             "--platform", f"linux/{architecture}",
@@ -217,25 +274,36 @@ def groups(interpreter: str) -> list[Group]:
                     )
                     for architecture in ("amd64", "arm64")
                 ),
-                Step(
-                    "Python wheel on Linux",
-                    [
-                        "docker", "run", "--rm", "--platform", "linux/amd64",
-                        "-v", f"{ROOT}:/src", "-w", "/src/crates/assetstudio-python",
-                        "-e", "CARGO_TARGET_DIR=/tmp/target",
-                        LINUX_IMAGE,
-                        "sh", "-c", LINUX_WHEEL,
-                    ],
+                *(
+                    Step(
+                        f"Python wheel on Linux {architecture}",
+                        [
+                            "docker", "run", "--rm",
+                            "--platform", f"linux/{architecture}",
+                            "-v", f"{ROOT}:/src", "-w", "/src/crates/assetstudio-python",
+                            "-e", f"CARGO_TARGET_DIR=/tmp/target-python-{architecture}",
+                            LINUX_IMAGE,
+                            "sh", "-c", LINUX_WHEEL,
+                        ],
+                    )
+                    for architecture in ("amd64", "arm64")
                 ),
-                Step(
-                    "Node addon on Linux",
-                    [
-                        "docker", "run", "--rm", "--platform", "linux/amd64",
-                        "-v", f"{ROOT}:/src", "-w", "/src/crates/assetstudio-node",
-                        "-e", "CARGO_TARGET_DIR=/tmp/target",
-                        LINUX_IMAGE,
-                        "sh", "-c", LINUX_NODE,
-                    ],
+                *(
+                    Step(
+                        f"Node addon on Linux {architecture}",
+                        [
+                            "docker", "run", "--rm",
+                            "--platform", f"linux/{architecture}",
+                            "-v", f"{ROOT}:/src:ro", "-w", "/tmp",
+                            "-e", f"CARGO_TARGET_DIR=/tmp/target-node-{architecture}",
+                            LINUX_IMAGE,
+                            "sh", "-c", linux_node_command(node_architecture, addon_architecture),
+                        ],
+                    )
+                    for architecture, node_architecture, addon_architecture in (
+                        ("amd64", "x64", "x64"),
+                        ("arm64", "arm64", "arm64"),
+                    )
                 ),
             ],
             requires="docker",
@@ -247,7 +315,19 @@ def groups(interpreter: str) -> list[Group]:
                 Step("install", ["npm", "ci"], cwd=NODE),
                 Step("build addon", ["npm", "run", "build:debug"], cwd=NODE),
                 Step("addon tests", ["npm", "test"], cwd=NODE),
-                Step("package contents", ["npm", "pack", "--dry-run"], cwd=NODE),
+                Step("package contents", ["npm", "run", "test:package"], cwd=NODE),
+                Step("build release addon", ["npm", "run", "build"], cwd=NODE),
+                Step("release addon tests", ["npm", "test"], cwd=NODE),
+                Step(
+                    "release package contents",
+                    ["npm", "run", "test:package"],
+                    cwd=NODE,
+                ),
+                Step(
+                    "package tarball",
+                    [sys.executable, "-c", PACKAGE_NODE_TARBALL],
+                    cwd=NODE,
+                ),
             ],
             requires="npm",
             reason="the Node addon needs npm",
@@ -259,14 +339,44 @@ def groups(interpreter: str) -> list[Group]:
                     "build wheel",
                     [
                         "maturin", "build", "--release", "--locked",
-                        "--interpreter", interpreter, "--out", "dist",
+                        "--compatibility", "pypi", "--interpreter", interpreter,
+                        "--out", "dist",
                     ],
+                    cwd=PYTHON,
+                ),
+                Step(
+                    "build source distribution",
+                    [
+                        "maturin", "build", "--release", "--sdist",
+                        "--compatibility", "pypi", "--interpreter", interpreter,
+                        "--out", "sdist-dist",
+                    ],
+                    cwd=PYTHON,
+                ),
+                Step(
+                    "source distribution contents",
+                    [interpreter, "tests/sdist_contents.py", "sdist-dist"],
                     cwd=PYTHON,
                 ),
                 Step(
                     "create venv",
                     [interpreter, "-m", "venv", "--clear",
                      "--system-site-packages", str(VENV)],
+                ),
+                Step(
+                    "install source-distribution wheel",
+                    [venv_interpreter(), "-c", INSTALL_SDIST_WHEEL],
+                    cwd=PYTHON,
+                ),
+                Step(
+                    "source-distribution wheel surface",
+                    [venv_interpreter(), "-I", "tests/installed_wheel.py"],
+                    cwd=PYTHON,
+                ),
+                Step(
+                    "source-distribution Python API",
+                    [venv_interpreter(), "-I", "tests/python_api.py"],
+                    cwd=PYTHON,
                 ),
                 Step("install wheel", [venv_interpreter(), "-c", INSTALL_WHEEL], cwd=PYTHON),
                 Step(
@@ -277,7 +387,48 @@ def groups(interpreter: str) -> list[Group]:
                 Step("python api", [venv_interpreter(), "-I", "tests/python_api.py"], cwd=PYTHON),
             ],
             requires="maturin",
-            reason="the Python wheel needs maturin",
+            reason="the Python wheel and source distribution need maturin",
+        ),
+        Group(
+            "python314",
+            [
+                Step(
+                    "create Python 3.14 venv",
+                    ["python3.14", "-m", "venv", "--clear", str(VENV_314)],
+                ),
+                Step(
+                    "install abi3 wheel",
+                    [python314_interpreter(), "-c", INSTALL_WHEEL],
+                    cwd=PYTHON,
+                ),
+                Step(
+                    "Python 3.14 wheel surface",
+                    [python314_interpreter(), "-I", "tests/installed_wheel.py"],
+                    cwd=PYTHON,
+                ),
+                Step(
+                    "Python 3.14 API",
+                    [python314_interpreter(), "-I", "tests/python_api.py"],
+                    cwd=PYTHON,
+                ),
+            ],
+            requires="python3.14",
+            reason="abi3 forward-compatibility needs a Python 3.14 interpreter",
+        ),
+        Group(
+            "typing",
+            [
+                Step(
+                    "strict Python 3.9 API consumer",
+                    [
+                        "uvx", "--from", f"mypy=={MYPY_VERSION}",
+                        "mypy", "tests/typecheck_api.py",
+                    ],
+                    cwd=PYTHON,
+                )
+            ],
+            requires="uvx",
+            reason="the Python typing surface needs the pinned mypy checker",
         ),
         Group(
             "unitypy",
@@ -288,7 +439,7 @@ def groups(interpreter: str) -> list[Group]:
                     cwd=PYTHON,
                 )
             ],
-            requires="maturin",
+            probe=[venv_interpreter(), "-c", "import assetstudio, UnityPy"],
             reason="needs the built wheel and UnityPy in the same interpreter",
         ),
     ]
@@ -303,7 +454,13 @@ LINUX_SETUP = "apt-get update -qq >/dev/null && apt-get install -y -qq gcc >/dev
 # The Node addon has its own step, since it needs a Node runtime the image
 # does not carry.
 LINUX_TESTS = (
-    f"{LINUX_SETUP} && cargo test -p assetstudio-core -p assetstudio-cli --locked"
+    f"{LINUX_SETUP} && apt-get install -y -qq python3 >/dev/null"
+    " && cargo test -p assetstudio-core -p assetstudio-cli --locked"
+    " && cargo build --release --locked -p assetstudio-cli"
+    ' && "$CARGO_TARGET_DIR/release/assetstudio" --help >/dev/null'
+    " && python3 tools/stage_cli_artifact.py"
+    ' "$CARGO_TARGET_DIR/release/assetstudio" /tmp/cli-artifact'
+    ' && test "$(find /tmp/cli-artifact -maxdepth 1 -type f | wc -l)" -eq 4'
 )
 
 LINUX_WHEEL = (
@@ -320,17 +477,29 @@ LINUX_WHEEL = (
 # The image has no Node, and Debian's is older than the one CI uses, so the
 # official build is fetched instead of installed from a package manager.
 LINUX_NODE_VERSION = "24.0.0"
-LINUX_NODE = (
-    f"{LINUX_SETUP} && apt-get install -y -qq curl xz-utils >/dev/null"
-    f" && curl -fsSL https://nodejs.org/dist/v{LINUX_NODE_VERSION}"
-    f"/node-v{LINUX_NODE_VERSION}-linux-x64.tar.xz -o /tmp/node.tar.xz"
-    " && tar -xJf /tmp/node.tar.xz -C /tmp"
-    f" && export PATH=/tmp/node-v{LINUX_NODE_VERSION}-linux-x64/bin:$PATH"
-    " && npm ci --silent && npm run build:debug && npm test"
-    # The addon lands in the mounted tree; leaving a foreign binary behind
-    # would confuse the next host build.
-    " && rm -f assetstudio-node.linux-x64-gnu.node"
-)
+
+
+def linux_node_command(node_architecture: str, addon_architecture: str) -> str:
+    archive = f"node-v{LINUX_NODE_VERSION}-linux-{node_architecture}"
+    return (
+        f"{LINUX_SETUP} && apt-get install -y -qq curl xz-utils >/dev/null"
+        f" && curl -fsSL https://nodejs.org/dist/v{LINUX_NODE_VERSION}"
+        f"/{archive}.tar.xz -o /tmp/node.tar.xz"
+        " && tar -xJf /tmp/node.tar.xz -C /tmp"
+        f" && export PATH=/tmp/{archive}/bin:$PATH"
+        # Build from a clean copy: the read-only mounted host tree may already
+        # contain its own platform addon, which must not leak into this package.
+        " && mkdir /tmp/repository"
+        " && tar --exclude=.git --exclude=target --exclude=node_modules"
+        " --exclude='*.node' -C /src -cf - . | tar -C /tmp/repository -xf -"
+        " && cd /tmp/repository/crates/assetstudio-node"
+        " && npm ci --silent && npm run build"
+        f" && test -f assetstudio-node.linux-{addon_architecture}-gnu.node"
+        " && npm test && npm run test:package"
+        " && mkdir /tmp/node-pack"
+        " && npm pack --silent --pack-destination /tmp/node-pack >/dev/null"
+        " && test \"$(find /tmp/node-pack -maxdepth 1 -name '*.tgz' | wc -l)\" -eq 1"
+    )
 
 INSTALL_WHEEL = (
     "import glob, subprocess, sys; "
@@ -338,6 +507,36 @@ INSTALL_WHEEL = (
     "assert len(wheels) == 1, wheels; "
     "subprocess.check_call([sys.executable, '-m', 'pip', 'install', "
     "'--force-reinstall', '--no-deps', wheels[0]])"
+)
+
+INSTALL_SDIST_WHEEL = (
+    "import glob, subprocess, sys; "
+    "wheels = glob.glob('sdist-dist/*.whl'); "
+    "assert len(wheels) == 1, wheels; "
+    "subprocess.check_call([sys.executable, '-m', 'pip', 'install', "
+    "'--force-reinstall', '--no-deps', wheels[0]])"
+)
+
+STAGE_CLI_ARTIFACT = (
+    "import pathlib, subprocess, sys, tempfile; "
+    "temporary = tempfile.TemporaryDirectory(); "
+    "output = pathlib.Path(temporary.name) / 'artifact'; "
+    "subprocess.check_call([sys.executable, 'tools/stage_cli_artifact.py', "
+    "sys.argv[1], str(output)]); "
+    "expected = {'LICENSE', 'THIRD_PARTY_NOTICES.md', "
+    "'THIRD_PARTY_LICENSES.txt', pathlib.Path(sys.argv[1]).name}; "
+    "actual = {path.name for path in output.iterdir()}; "
+    "assert actual == expected, (actual, expected); "
+    "temporary.cleanup()"
+)
+
+PACKAGE_NODE_TARBALL = (
+    "import pathlib, subprocess, tempfile; "
+    "temporary = tempfile.TemporaryDirectory(); "
+    "subprocess.check_call(['npm', 'pack', '--pack-destination', temporary.name]); "
+    "archives = list(pathlib.Path(temporary.name).glob('*.tgz')); "
+    "assert len(archives) == 1, archives; "
+    "temporary.cleanup()"
 )
 
 
@@ -380,7 +579,12 @@ def main() -> int:
 
     if arguments.list:
         for group in available:
-            note = f"  (needs {group.requires})" if group.requires else ""
+            if group.requires:
+                note = f"  (needs {group.requires})"
+            elif group.probe:
+                note = f"  (optional: {group.reason})"
+            else:
+                note = ""
             print(f"{group.name}{note}")
             for step in group.steps:
                 print(f"    {' '.join(step.command)}")
@@ -397,6 +601,20 @@ def main() -> int:
             skipped.append(f"{group.name}: {group.reason}")
             print(f"skip {group.name}: {group.requires} not found")
             continue
+        if group.probe:
+            try:
+                probe = subprocess.run(
+                    group.probe,
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError:
+                probe = None
+            if probe is None or probe.returncode != 0:
+                skipped.append(f"{group.name}: {group.reason}")
+                print(f"skip {group.name}: {group.reason}")
+                continue
         for step in group.steps:
             label = f"{group.name}/{step.name}"
             print(f"run  {label}", flush=True)
