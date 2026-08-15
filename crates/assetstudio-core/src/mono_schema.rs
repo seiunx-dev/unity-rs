@@ -4,6 +4,7 @@
 //! The Core never opens or executes the named managed assembly.
 
 use std::io::{self, Write};
+use std::str::FromStr;
 
 use crate::endian::{Endian, EndianReader};
 use crate::json::write_type_value_json;
@@ -17,6 +18,7 @@ use crate::serialized::{ObjectReference, TypeTree, TypeTreeNode};
 use crate::type_tree::{
     TypeValue, read_type_tree_from_reader_with_reference_types, validate_tree_shape,
 };
+use crate::unity_version::UnityVersion;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
@@ -207,6 +209,22 @@ fn schema_entry_from_json(
             "MonoBehaviour schema entry {index} is not one tree: {error}"
         ))
     })?;
+    let unity_version = match entry.get("unity_version") {
+        None => None,
+        Some(serde_json::Value::String(version)) => {
+            UnityVersion::from_str(version).map_err(|error| {
+                Error::invalid_data(format!(
+                    "MonoBehaviour schema entry {index} has invalid unity_version {version:?}: {error}"
+                ))
+            })?;
+            Some(version.to_owned())
+        }
+        Some(_) => {
+            return Err(Error::invalid_data(format!(
+                "MonoBehaviour schema entry {index} unity_version is not a string"
+            )));
+        }
+    };
     Ok(MonoBehaviourSchemaEntry {
         assembly_name: text("assembly")?,
         namespace: entry
@@ -215,10 +233,7 @@ fn schema_entry_from_json(
             .unwrap_or_default()
             .to_owned(),
         class_name: text("class")?,
-        unity_version: entry
-            .get("unity_version")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
+        unity_version,
         tree: TypeTree {
             nodes: tree_nodes,
             // A schema is a layout, not a slice of a file: nothing refers to
@@ -697,6 +712,10 @@ mod tests {
         let collection = fixture();
         let registry = MonoBehaviourSchemaRegistry::from_json(SCHEMA_DOCUMENT.as_bytes()).unwrap();
         assert_eq!(registry.entries().len(), 1);
+        assert_eq!(
+            registry.entries()[0].unity_version.as_deref(),
+            Some("2022.3.62f1")
+        );
         assert_eq!(registry.entries()[0].tree.nodes, full_tree().nodes);
 
         let json = read_mono_behaviour_json_with_provider(
@@ -732,6 +751,14 @@ mod tests {
             (
                 r#"{"version": 1, "entries": [{"assembly": "A", "nodes": [{"level": 0, "type": "T", "name": "Base"}]}]}"#,
                 "no class",
+            ),
+            (
+                r#"{"version": 1, "entries": [{"assembly": "A", "class": "C", "unity_version": 42, "nodes": [{"level": 0, "type": "T", "name": "Base"}]}]}"#,
+                "unity_version is not a string",
+            ),
+            (
+                r#"{"version": 1, "entries": [{"assembly": "A", "class": "C", "unity_version": "not-a-version", "nodes": [{"level": 0, "type": "T", "name": "Base"}]}]}"#,
+                "invalid unity_version",
             ),
             (
                 r#"{"version": 1, "entries": [{"assembly": "A", "class": "C", "nodes": [{"type": "T", "name": "Base"}]}]}"#,
@@ -850,6 +877,7 @@ mod tests {
             "assembly": "Assembly-CSharp",
             "namespace": "Game",
             "class": "Stats",
+            "unity_version": "2022.3.62f1",
             "nodes": [
                 {"level": 0, "type": "MonoBehaviour", "name": "Base"},
                 {"level": 1, "type": "PPtr<GameObject>", "name": "m_GameObject"},

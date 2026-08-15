@@ -9,11 +9,13 @@
 // MonoBehaviourSchemaRegistry::from_json reads.
 //
 //     dotnet run --project tools/monoschema -- <dll-directory> <unity-version> <output.json>
-//                                              [--assembly <name>]...
+//                                              [--assembly <name>]... [--unversioned]
 //
 // --assembly narrows the output to the named assemblies, repeatable and
 // matched without the .dll suffix; without it every assembly in the directory
 // is walked, which for a large game is tens of megabytes of JSON.
+// Entries are scoped to the supplied Unity version by default. --unversioned
+// deliberately emits the historical cross-version fallback form.
 //
 // This is deliberately a separate program. Opening a game's managed assemblies
 // is a different trust decision from reading its data files, and nothing in
@@ -42,6 +44,7 @@ string[] integralTypeNames =
 
 var positional = new List<string>();
 var assemblyFilter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+var versionEntries = true;
 for (var index = 0; index < args.Length; index++)
 {
     if (args[index] == "--assembly")
@@ -54,13 +57,18 @@ for (var index = 0; index < args.Length; index++)
         assemblyFilter.Add(TrimDllSuffix(args[++index]));
         continue;
     }
+    if (args[index] == "--unversioned")
+    {
+        versionEntries = false;
+        continue;
+    }
     positional.Add(args[index]);
 }
 
 if (positional.Count != 3)
 {
     Console.Error.WriteLine(
-        "usage: monoschema <dll-directory> <unity-version> <output.json> [--assembly <name>]...");
+        "usage: monoschema <dll-directory> <unity-version> <output.json> [--assembly <name>]... [--unversioned]");
     return 2;
 }
 
@@ -166,7 +174,7 @@ foreach (var (moduleName, module) in modules.OrderBy(pair => pair.Key, StringCom
                 + $"{string.Join(", ", dropped)} dropped, their types resolve to nothing");
         }
 
-        entries.Add(new Dictionary<string, object?>
+        var entry = new Dictionary<string, object?>
         {
             ["assembly"] = moduleName,
             ["namespace"] = type.Namespace ?? string.Empty,
@@ -181,7 +189,12 @@ foreach (var (moduleName, module) in modules.OrderBy(pair => pair.Key, StringCom
                 ["meta_flags"] = node.m_MetaFlag,
                 ["type_flags"] = node.m_TypeFlags,
             }).ToList(),
-        });
+        };
+        if (versionEntries)
+        {
+            entry["unity_version"] = unityVersion.FullVersion;
+        }
+        entries.Add(entry);
     }
 }
 
@@ -194,9 +207,8 @@ if (entries.Count == 0)
 var document = new Dictionary<string, object?>
 {
     ["version"] = 1,
-    // Informational: the reader ignores it. Entries carry no unity_version
-    // because they apply wherever their layout does, and recording an exact
-    // build string here would decline every file whose own string differs.
+    // Informational summary for humans. The reader deliberately scopes on the
+    // per-entry unity_version instead, unless --unversioned omitted it.
     ["generated_for"] = unityVersion.FullVersion,
     ["entries"] = entries,
 };
