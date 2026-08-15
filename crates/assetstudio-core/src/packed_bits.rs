@@ -108,9 +108,18 @@ impl PackedFloatVector {
 
         // `2^bit_size - 1` is the largest packed value; the reference divides by
         // it, so a width of 32 must not overflow the shift.
-        let maximum = f64::from(u32::MAX >> (32 - u32::from(self.bit_size)));
-        #[allow(clippy::cast_possible_truncation)]
-        let scale = (f64::from(self.range) / maximum) as f32;
+        //
+        // The order of operations is the reference's, not a tidier equivalent.
+        // It takes the reciprocal of the range in `f32`, multiplies that by the
+        // largest packed value, and then divides and adds -- three roundings.
+        // Computing one scale in `f64` and fusing the multiply-add is the same
+        // arithmetic and different bits: `mul_add` rounds once. The two agree
+        // whenever the scale comes out exactly 1, which is what a range of 255
+        // at eight bits does, and that is precisely the shape the differential
+        // fixture used to have, so the divergence sat here unseen.
+        #[allow(clippy::cast_precision_loss)]
+        let maximum = (u32::MAX >> (32 - u32::from(self.bit_size))) as f32;
+        let denominator = (1.0_f32 / self.range) * maximum;
 
         let mut reader = PackedBitReader::new(&self.data);
         reader.seek_to_item(first_item, self.bit_size)?;
@@ -121,7 +130,7 @@ impl PackedFloatVector {
         for _ in 0..total {
             #[allow(clippy::cast_precision_loss)]
             let value = reader.read(self.bit_size)? as f32;
-            output.push(value.mul_add(scale, self.start));
+            output.push(value / denominator + self.start);
         }
         Ok(output)
     }

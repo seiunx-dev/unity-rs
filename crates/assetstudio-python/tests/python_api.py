@@ -96,10 +96,15 @@ def synthetic_unity6_shader() -> bytes:
     push_i32(payload, 0)  # nested compressed lengths
     push_i32(payload, 0)  # nested decompressed lengths
     push_i32(payload, 0)  # compressed blob
+    # 2022.2 added a per-platform stage count here, and Unity 6 appends the
+    # source asset's GUID. Without them this described a file Unity does not
+    # write, which is how three missing fields stayed hidden.
+    push_i32(payload, 0)  # stage counts
     push_i32(payload, 0)  # object dependencies
     push_i32(payload, 0)  # non-modifiable textures
     payload.append(0)  # baked
     align(payload, 4)
+    payload.extend(b"\x00" * 16)  # asset GUID
     return finish_v22_asset(48, payload, "6000.2.0f1")
 
 
@@ -2122,19 +2127,28 @@ def main() -> None:
         else:
             raise AssertionError("missing external resource index should raise KeyError")
 
-        # Unity changed the serialized shader in 2021 and neither this reader
-        # nor the managed one implements the new layout, so a 6000 shader is
-        # declined rather than parsed. This used to assert the parsed text,
-        # from a fixture built to a layout no Unity writes.
+        # Unity changed the serialized shader in 2021 and again in 2022.2. The
+        # managed implementation followed neither and refuses the class from
+        # 2021 on; this reader implements the additions, so a Unity 6 shader
+        # reads.
         shader_path = Path(directory) / "unity6-shader.assets"
         shader_path.write_bytes(synthetic_unity6_shader())
         shader_studio = AssetStudio(shader_path)
+        shader = shader_studio.read_shader(0, 7)
+        shader_header = (
+            b"//////////////////////////////////////////\n"
+            b"//\n"
+            b"// NOTE: This is *not* a valid shader file\n"
+            b"//\n"
+            b"///////////////////////////////////////////\n"
+        )
+        assert shader == shader_header + b'Shader "Parsed/Unity6" {\nProperties {\n}\n}'
         try:
-            shader_studio.read_shader(0, 7)
-        except NotImplementedError as error:
-            assert "2021" in str(error), error
+            shader_studio.read_shader(0, 7, maximum_bytes=len(shader) - 1)
+        except ValueError:
+            pass
         else:
-            raise AssertionError("a Unity 6 shader should be declined, not parsed")
+            raise AssertionError("Shader output limit should be enforced")
 
         mesh_path = Path(directory) / "mesh.assets"
         mesh_path.write_bytes(synthetic_mesh())

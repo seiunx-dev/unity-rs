@@ -2913,9 +2913,23 @@ fn mesh_payload(
     align(&mut output, 4);
 
     if compressed {
-        // A range of 255 at eight bits makes every packed value decode to
-        // itself, so the expected geometry is readable in the fixture.
-        push_packed_float_data(&mut output, 9, 255.0, 0.0, &[1, 0, 0, 0, 2, 0, 0, 0, 3], 8);
+        // Deliberately not readable. A range of 255 at eight bits makes the
+        // dequantization scale exactly 1 and the offset exactly 0, so the
+        // formula degenerates to identity: the packed values come out as
+        // themselves, the fixture is pleasant to read, and dropping `start`
+        // from the decode -- or reading the bits a byte at a time -- changes
+        // nothing anyone can see. These numbers make it show. Twelve bits
+        // straddle byte boundaries, the range is not the maximum a twelve-bit
+        // value can hold, and the offset is negative, so scale, offset and bit
+        // packing each have to be right for the geometry to match.
+        push_packed_float_data(
+            &mut output,
+            9,
+            100.0,
+            -25.0,
+            &[0, 4095, 1, 2048, 4094, 7, 819, 3277, 2],
+            12,
+        );
         push_empty_packed_float(&mut output); // UVs
         push_empty_packed_float(&mut output); // normals
         push_empty_packed_float(&mut output); // tangents
@@ -2924,7 +2938,8 @@ fn mesh_payload(
         push_empty_packed_int(&mut output); // tangent signs
         push_empty_packed_float(&mut output); // float colours
         push_empty_packed_int(&mut output); // bone indices
-        push_packed_int_data(&mut output, &[0, 1, 2], 8);
+        // Ten bits, so the triangle indices also cross byte boundaries.
+        push_packed_int_data(&mut output, &[0, 1, 2], 10);
         push_u32(&mut output, 0); // UV info
     } else {
         for _ in 0..4 {
