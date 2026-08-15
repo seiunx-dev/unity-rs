@@ -52,7 +52,8 @@ criteria, and prioritized gap list live in
 | Unity 2019+ Texture2DArray parsing, ordered raw-RGBA layer bundles, and direct per-layer Rust/Python RGBA8 access | Implemented for the Texture2D decoder formats; arrays remain linear on Switch, matching the managed synthetic-layer path (which has no platform blob) |
 | Sprite JPEG/PNG/BMP/TGA/lossless-WebP or raw-RGBA export, including legacy/modern tight-mesh masking, local/cross-file SpriteAtlas and color/alpha Texture2D references, collection-level `packedSprites` atlas backfill/master-over-variant replacement, ImageSharp-compatible downscaling/alpha-mask resampling, and packed flip/rotation transforms | Implemented for validated legacy and modern triangle meshes; malformed mesh geometry deliberately falls back to the rectangular crop |
 | SpriteAtlas class 687078895 metadata and render-data-key lookup | Implemented for sample-verified 2017.1-2023 and Unity 6000.0-6000.2 layouts and wired into explicit Sprite atlas references |
-| MonoBehaviour embedded-TypeTree JSON, MonoScript metadata, and non-executing external full-object schema fallback | Implemented in Rust and Python; automatic managed-assembly schema extraction remains a separate trusted tooling step |
+| `SerializeReference` managed-references registry | Implemented; the registry Unity writes after an object body is read through the serialized file's own reference types, matched by class, namespace and assembly. A null entry stores nothing and an entry naming an undeclared type is declined rather than skipped, since its length is only knowable from a layout that is not present. 93 registry-bearing objects in a Unity 6000.3 corpus match UnityPy byte for byte, including one with 712,288 bytes stored behind a single `rid`; the managed reader does not implement the registry, so there is no oracle row for it |
+| MonoBehaviour embedded-TypeTree JSON, MonoScript metadata, and non-executing external full-object schema fallback | Implemented in Rust, the CLI (`--mono-schema`), Node and Python. `tools/monoschema` generates the schema document from a game's managed assemblies as a separate trusted step, and `tools/mono_schema_diff.py` checks a generated document against builds that still carry Unity's own type trees. See `docs/mono-schema.md` |
 | Common resident or externally streamed, uncompressed standard Unity 2017.3-2023/6000.0-6000.1 and non-virtual Tuanjie 2022.3.x Mesh to bounded OBJ | Implemented with source-bound resource offsets, bounded Tuanjie SharedCluster rev1/rev2/rev3 consumption, and collection-wide resolution. Triangle-list, triangle-strip and quad submesh topologies are all expanded to triangles, following the managed reader's degenerate skipping, odd-position winding flip and pre-Unity-4 strip rule; lines and points remain an explicit unsupported case. Position, normal and UV0 channels decode from every floating-point vertex format the managed reader accepts - Float32, Float16, and the normalized 8- and 16-bit formats - so meshes built with Unity's Vertex Compression setting are covered; integer formats remain an explicit unsupported case for those channels. Packed/compressed `CompressedMesh` geometry, Tuanjie virtual-geometry cluster decoding, and Unity 6000.2's new MeshLodInfo tail remain explicit gaps |
 | Material shader references, keyword/tag lists, and ordered saved texture/integer/float/color properties | Implemented for Unity 4.1+ managed-reader layouts; newer unparsed tail fields remain explicit |
 | BuildSettings scene/level paths and PlayerSettings company/product metadata | Implemented with version-gated, endian-aware, bounded readers and high-level Rust/Python access |
@@ -170,7 +171,14 @@ For stripped `MonoBehaviour` data, the Python package also accepts a complete
 `MonoBehaviourSchema` produced by a trusted offline schema tool. Multiple
 schemas can be collected in `MonoBehaviourSchemas` and passed to Live2D
 package materialization. The assembly name is used only for matching; the
-runtime never loads or executes the DLL.
+runtime never loads or executes the DLL. Reads through a schema return the
+JSON alongside the tree it came from, `"embedded"` or `"schema"`, because a
+value read through a supplied schema is only as good as that schema.
+
+The CLI takes the same schemas as a document: `--mono-schema <path>`,
+repeatable, on any command that opens a collection. `docs/mono-schema.md`
+describes the document, the generator that writes one, and how a generated
+schema is checked against builds that still carry Unity's own type trees.
 
 A game directory routinely mixes readable assets with encrypted, truncated or
 not-yet-supported containers. By default Core refuses the whole load over any
@@ -283,8 +291,9 @@ JPEG, PNG (default), BMP, TGA, lossless WebP, or raw-RGBA Texture2D/Sprite image
 Texture2DArray layer bundles, and common
 resident Mesh OBJ for the implemented paths. Generic objects use
 TypeTree JSON where a usable tree exists and otherwise fall back to bounded raw
-data; MonoBehaviour deliberately reports a missing-schema error instead of
-guessing script fields. `extract` recursively unwraps supported bundles, web
+data; MonoBehaviour reads through `--mono-schema` documents where one matches
+and otherwise reports a missing-schema error instead of guessing script
+fields. `extract` recursively unwraps supported bundles, web
 containers, ZIP, gzip, and Brotli while enforcing enclosed paths, no-follow
 symbolic-link rules, atomic no-clobber writes, and cumulative limits. Texture,
 Sprite, Mesh, AnimationClip and Live2D paths now pass differential tests
