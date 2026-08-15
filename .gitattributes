@@ -1,0 +1,9 @@
+# The dependency license aggregate and the vendored fallback texts reproduce
+# upstream licenses byte for byte, and some of them -- MPL-2.0 among them --
+# carry trailing spaces. `git diff --check` flags those, and the only way to
+# satisfy it would be to edit a license, so exclude the legal texts from the
+# whitespace check. Everything else in the tree keeps it, which is the point:
+# a real trailing space in source should still be reported.
+LICENSE whitespace=-trailing-space
+THIRD_PARTY_LICENSES.txt whitespace=-trailing-space
+tools/legal-fallbacks/** whitespace=-trailing-space
