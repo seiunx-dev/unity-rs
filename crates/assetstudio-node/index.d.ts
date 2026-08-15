@@ -226,7 +226,7 @@ export declare class AssetStudio {
    * matched by assembly, namespace, class and optionally Unity version, and
    * nothing in them is executed.
    */
-  readMonoBehaviourJsonWithSchemas(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): Buffer
+  readMonoBehaviourJsonWithSchemas(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): MonoBehaviourJson
 }
 
 /**
@@ -475,6 +475,17 @@ export interface Material {
 export interface MemoryInput {
   name: string
   data: Buffer
+}
+
+/** A `MonoBehaviour` read as JSON, and which tree it was read through. */
+export interface MonoBehaviourJson {
+  json: Buffer
+  /**
+   * `"embedded"` when the file carried its own type tree, `"schema"` when
+   * the layout came from a supplied schema. Worth distinguishing: a value
+   * read through a schema is only as good as that schema.
+   */
+  source: string
 }
 
 /** A complete object schema for one managed script type. */

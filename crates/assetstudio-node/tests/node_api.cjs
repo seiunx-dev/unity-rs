@@ -825,6 +825,23 @@ console.log('node api: textured fbx and acl inspection ok')
       },
     ]),
   )
+
+  // A file that carries its own tree is read through that tree, and the read
+  // says so: the caller cannot otherwise tell whether a value came from Unity
+  // or from a schema they supplied.
+  const embedded = addon.AssetStudio.fromBuffers([
+    { name: 'expression.assets', data: syntheticCubismExpression() },
+  ])
+  const behaviour = embedded.objectPage(0)[0]
+  const read = embedded.readMonoBehaviourJsonWithSchemas(0, behaviour.pathId, [
+    {
+      assemblyName: 'Nothing.dll',
+      className: 'Nothing',
+      nodes: [{ typeName: 'Nothing', fieldName: 'Base', level: 0, align: false }],
+    },
+  ])
+  assert.strictEqual(read.source, 'embedded')
+  assert.strictEqual(JSON.parse(read.json.toString('utf8')).m_Name, 'node-expression')
 }
 
 console.log('node api: monobehaviour schemas ok')

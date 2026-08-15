@@ -17,7 +17,9 @@ use assetstudio_core::loader::AssetLoadOptions;
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
-use assetstudio_core::mono_schema::{MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry};
+use assetstudio_core::mono_schema::{
+    MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry, MonoBehaviourSchemaSource,
+};
 use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
@@ -398,6 +400,24 @@ pub struct MonoBehaviourSchema {
     /// that applies to every version.
     pub unity_version: Option<String>,
     pub nodes: Vec<SchemaNode>,
+}
+
+/// The name the bindings report for a schema source.
+const fn schema_source_name(source: MonoBehaviourSchemaSource) -> &'static str {
+    match source {
+        MonoBehaviourSchemaSource::Embedded => "embedded",
+        MonoBehaviourSchemaSource::External => "schema",
+    }
+}
+
+/// A `MonoBehaviour` read as JSON, and which tree it was read through.
+#[napi(object)]
+pub struct MonoBehaviourJson {
+    pub json: Buffer,
+    /// `"embedded"` when the file carried its own type tree, `"schema"` when
+    /// the layout came from a supplied schema. Worth distinguishing: a value
+    /// read through a schema is only as good as that schema.
+    pub source: String,
 }
 
 /// One opened collection. All format work is delegated to `assetstudio-core`.
@@ -1672,17 +1692,21 @@ impl AssetStudio {
         schemas: Vec<MonoBehaviourSchema>,
         pretty: Option<bool>,
         maximum_bytes: Option<i64>,
-    ) -> Result<Buffer> {
+    ) -> Result<MonoBehaviourJson> {
         let maximum = byte_limit(maximum_bytes)?;
         let registry = build_schema_registry(schemas)?;
         let limits = MonoBehaviourReadLimits {
             maximum_json_bytes: usize::try_from(maximum).unwrap_or(usize::MAX),
             ..MonoBehaviourReadLimits::default()
         };
-        self.object(file_index, bigint_i64(path_id, "pathId")?)?
+        let resolved = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
             .read_mono_behaviour_json(&registry, pretty.unwrap_or(false), limits)
-            .map(Into::into)
-            .map_err(core_error)
+            .map_err(core_error)?;
+        Ok(MonoBehaviourJson {
+            json: resolved.json.into(),
+            source: schema_source_name(resolved.source).to_owned(),
+        })
     }
 }
 
