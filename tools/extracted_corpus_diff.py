@@ -49,9 +49,16 @@ the half of the extraction it belongs to. Matching them in one pass silently
 compares a sprite against its own source texture, which differs everywhere the
 sprite was cropped.
 
-Everything else in an extraction is ignored: the game-specific JSON and `.bin`
-files come from a decoder for that game's own table format, which this project
-does not implement and should not pretend to.
+Everything else in an extraction is ignored, and for two different reasons.
+The game-specific JSON and `.bin` files come from a decoder for that game's
+own table format, which this project does not implement and should not pretend
+to. The `.shader` files are skipped on purpose even though both sides write
+shader text: the extraction's writer emits less of it -- for one stencil
+shader it writes `ZWrite Off` where this project writes `ColorMask`, `ZWrite`
+and the whole `Stencil` block, and it spells a float property default `0.0`
+where the managed writer spells it `0`. This project's shader text is held to
+the managed writer by an exact differential, so comparing it against a weaker
+writer would only invite matching the weaker one.
 
 A file this project does not produce is counted and named rather than passed
 over, because "we exported nothing" would otherwise look like agreement.
