@@ -19,6 +19,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   MATURIN_VERSION: "1.13.3"
+  MYPY_VERSION: "1.18.2"
   VGMSTREAM_VERSION: "r2117"
 
 jobs:
@@ -42,6 +43,12 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
       - name: Verify publishable Rust core crate
         run: cargo package --locked -p assetstudio-core
+      - name: Verify locked third-party license bundle
+        run: python3 tools/generate_dependency_licenses.py --check
+      - name: Verify headless delivery scope
+        run: python3 tools/check_delivery_scope.py
+      - name: Verify Core crate legal files
+        run: python3 tools/check_core_package.py
       - name: Upload Rust core crate
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
@@ -106,7 +113,7 @@ jobs:
       - name: Run installed-addon API tests
         run: npm test
       - name: Verify package contents
-        run: npm pack --dry-run
+        run: npm run test:package
 
   python:
     name: Python abi3 wheel (${{ matrix.artifact }})
@@ -174,6 +181,12 @@ jobs:
         run: |
           python -I tests/installed_wheel.py
           python -I tests/python_api.py
+      - name: Install the Python 3.9-compatible type checker
+        if: matrix.artifact == 'linux-x64'
+        run: python -m pip install "mypy==${{ env.MYPY_VERSION }}"
+      - name: Type-check a strict public API consumer
+        if: matrix.artifact == 'linux-x64'
+        run: python -m mypy tests/typecheck_api.py
       - name: Install Python 3.14 for abi3 forward-compatibility
         uses: actions/setup-python@v6
         with:
@@ -227,6 +240,8 @@ jobs:
         run: dotnet restore oracle/AssetStudioOracle.csproj --ignore-failed-sources -p:NuGetAudit=false -p:AssetStudioRepo="$ASSETSTUDIO_REPO"
       - name: Compare managed and Rust manifests
         run: cargo +1.88.0 test -p assetstudio-core --test dotnet_oracle --locked -- --ignored --nocapture
+      - name: Verify version-scoped MonoBehaviour schema generation
+        run: python3 tools/test_monoschema.py
 
   audio-oracle:
     name: vgmstream audio differential
@@ -277,7 +292,7 @@ jobs:
         run: python -I tests/unitypy_oracle.py
 
   package-cli:
-    name: Native CLI artifact on ${{ matrix.os }}
+    name: Native CLI artifact (${{ matrix.artifact }})
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs:
       - quality
@@ -290,22 +305,100 @@ jobs:
           - os: ubuntu-latest
             artifact: linux-x64
             binary: target/release/assetstudio
+            smoke: ./target/release/assetstudio --help
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+            binary: target/release/assetstudio
+            smoke: ./target/release/assetstudio --help
           - os: windows-latest
             artifact: windows-x64
             binary: target/release/assetstudio.exe
-          - os: macos-latest
-            artifact: macos
+            smoke: .\target\release\assetstudio.exe --help
+          - os: windows-11-arm
+            artifact: windows-arm64
+            binary: target/release/assetstudio.exe
+            smoke: .\target\release\assetstudio.exe --help
+          - os: macos-15-intel
+            artifact: macos-x64
             binary: target/release/assetstudio
+            smoke: ./target/release/assetstudio --help
+          - os: macos-latest
+            artifact: macos-arm64
+            binary: target/release/assetstudio
+            smoke: ./target/release/assetstudio --help
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Install minimum Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+      - name: Install artifact staging Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
       - name: Build release CLI
         run: cargo +1.88.0 build --release --locked -p assetstudio-cli
+      - name: Smoke-test the exact CLI artifact
+        run: ${{ matrix.smoke }}
+      - name: Stage binary with license and notices
+        run: python tools/stage_cli_artifact.py "${{ matrix.binary }}" target/release/artifact
       - name: Upload native CLI
         uses: actions/upload-artifact@v4
         with:
           name: assetstudio-cli-${{ matrix.artifact }}
-          path: ${{ matrix.binary }}
+          path: target/release/artifact
+          if-no-files-found: error
+
+  package-node:
+    name: Node package artifact (${{ matrix.artifact }})
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs:
+      - quality
+      - test
+      - node
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x64
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+          - os: windows-latest
+            artifact: windows-x64
+          - os: windows-11-arm
+            artifact: windows-arm64
+          - os: macos-15-intel
+            artifact: macos-x64
+          - os: macos-latest
+            artifact: macos-arm64
+    defaults:
+      run:
+        working-directory: crates/assetstudio-node
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Install minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+      - name: Install Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: crates/assetstudio-node/package-lock.json
+      - name: Install locked Node build tooling
+        run: npm ci
+      - name: Build release Node-API addon
+        run: npm run build
+      - name: Test the exact release addon
+        run: npm test
+      - name: Verify package contents
+        run: npm run test:package
+      - name: Build platform package
+        run: npm pack
+      - name: Upload Node package
+        uses: actions/upload-artifact@v4
+        with:
+          name: assetstudio-node-${{ matrix.artifact }}
+          path: crates/assetstudio-node/*.tgz
           if-no-files-found: error
