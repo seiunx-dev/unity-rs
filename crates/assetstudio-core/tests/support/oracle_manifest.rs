@@ -25,11 +25,15 @@ use assetstudio_core::mesh::{MeshReadLimits, read_mesh_with_collection, write_me
 use assetstudio_core::project_settings::{
     ProjectSettingsReadLimits, read_build_settings, read_player_settings,
 };
+use assetstudio_core::serialized::ObjectReference;
 use assetstudio_core::shader::{ShaderReadLimits, read_shader};
 use assetstudio_core::simple_assets::{
     SimpleAssetReadLimits, read_audio_clip_asset, read_font, read_movie_texture, read_video_clip,
 };
 use assetstudio_core::sprite::{SpriteReadLimits, decode_sprite_rgba8, read_sprite};
+use assetstudio_core::sprite_atlas::{
+    SPRITE_ATLAS_CLASS_ID, SpriteAtlasReadLimits, read_sprite_atlas,
+};
 use assetstudio_core::studio::Studio;
 use assetstudio_core::texture::{TextureReadLimits, read_texture2d};
 use assetstudio_core::type_tree::TypeValue;
@@ -303,7 +307,20 @@ fn rust_payload_inner(
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     match class_id {
-        21 | 28 | 43 | 48 | 49 | 74 | 83 | 90 | 91 | 128 | 152 | 213 | 329 => {
+        21
+        | 28
+        | 43
+        | 48
+        | 49
+        | 74
+        | 83
+        | 90
+        | 91
+        | 128
+        | 152
+        | 213
+        | 329
+        | SPRITE_ATLAS_CLASS_ID => {
             rust_binary_payload(studio, file_index, object_index, class_id, maximum_bytes)
         }
         114 | 129 | 141 | 123_456 => {
@@ -356,6 +373,9 @@ fn rust_binary_payload(
             maximum_bytes,
         )?,
         213 => sprite_manifest(studio, file_index, object_index, maximum_bytes)?,
+        SPRITE_ATLAS_CLASS_ID => {
+            sprite_atlas_manifest(studio, file_index, object_index, maximum_bytes)?
+        }
         329 => simple_binary_manifest(
             read_video_clip(studio.collection(), loaded, object_index, simple_limits)?,
             maximum_bytes,
@@ -601,6 +621,99 @@ fn sprite_manifest(
         "Height": image.height,
         "Pixels": bytes_manifest(&image.pixels),
     }))
+}
+
+/// The atlas compared as a lookup table rather than as an image.
+///
+/// Its whole job is to answer a Sprite's render-data key with the right crop,
+/// and the sprite rows already compare the rendered result. What is not
+/// covered there is the table itself: the key equality, the per-version fields
+/// (`atlasRectOffset` from 2017.2, the secondary textures from 2020.2) and the
+/// offsets everything after them depends on.
+fn sprite_atlas_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let maximum = usize::try_from(maximum_bytes)?;
+    let atlas = read_sprite_atlas(
+        loaded,
+        object_index,
+        SpriteAtlasReadLimits {
+            maximum_string_bytes: maximum,
+            maximum_total_string_bytes: maximum,
+            ..SpriteAtlasReadLimits::default()
+        },
+    )?;
+    // Not re-sorted here: `read_sprite_atlas` already orders by the key's own
+    // bytes, which is the order the managed side is asked to produce. Sorting
+    // the manifest instead would sort by the hashed GUID, which has no
+    // relation to the byte order and put the entries back in disagreement.
+    let render_data = atlas
+        .render_data_entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "Guid": bytes_manifest(&entry.key.guid_bytes),
+                "Value": entry.key.value,
+                "Texture": reference_manifest(entry.data.texture),
+                "AlphaTexture": reference_manifest(entry.data.alpha_texture),
+                // Bit patterns rather than numbers, as the material rows
+                // already do: the two serializers disagree about how to spell
+                // a float whose value is whole, and a rounding difference
+                // would hide behind that disagreement either way.
+                "TextureRect": [
+                    entry.data.texture_rect.x.to_bits(),
+                    entry.data.texture_rect.y.to_bits(),
+                    entry.data.texture_rect.width.to_bits(),
+                    entry.data.texture_rect.height.to_bits(),
+                ],
+                "TextureRectOffset": [
+                    entry.data.texture_rect_offset.x.to_bits(),
+                    entry.data.texture_rect_offset.y.to_bits(),
+                ],
+                "AtlasRectOffset": [
+                    entry.data.atlas_rect_offset.x.to_bits(),
+                    entry.data.atlas_rect_offset.y.to_bits(),
+                ],
+                "UvTransform": [
+                    entry.data.uv_transform.x.to_bits(),
+                    entry.data.uv_transform.y.to_bits(),
+                    entry.data.uv_transform.z.to_bits(),
+                    entry.data.uv_transform.w.to_bits(),
+                ],
+                "DownscaleMultiplier": entry.data.downscale_multiplier.to_bits(),
+                "SettingsRaw": entry.data.settings.raw,
+                "SecondaryTextures": entry.data.secondary_textures.as_ref().map(|textures| {
+                    textures
+                        .iter()
+                        .map(|secondary| {
+                            json!({
+                                "Name": secondary.name,
+                                "Texture": reference_manifest(secondary.texture),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "Name": atlas.name,
+        "IsVariant": atlas.is_variant,
+        "PackedSprites": atlas
+            .packed_sprites
+            .iter()
+            .map(|sprite| reference_manifest(*sprite))
+            .collect::<Vec<_>>(),
+        "RenderData": render_data,
+    }))
+}
+
+fn reference_manifest(reference: ObjectReference) -> Value {
+    json!({ "FileId": reference.file_id, "PathId": reference.path_id })
 }
 
 fn material_manifest(

@@ -140,6 +140,7 @@ static object OracleObject(AssetStudio.Object value)
         Material material => MaterialPayload(material),
         Mesh mesh => MeshPayload(mesh),
         Sprite sprite => SpritePayload(sprite),
+        SpriteAtlas atlas => SpriteAtlasPayload(atlas),
         Shader shader => ShaderPayload(shader),
         TextAsset text => new
         {
@@ -601,6 +602,85 @@ static object SpritePayload(Sprite sprite)
         Pixels = Bytes(pixels),
     };
 }
+
+// The atlas is compared as parsed rather than as rendered: it is a lookup
+// table, and its only job is to answer a Sprite's render-data key with the
+// right crop. The GUID goes out as the bytes it was built from -- a .NET Guid
+// reorders its first three fields for display, and comparing that spelling
+// against the raw key the Rust side keeps would fail for reasons that have
+// nothing to do with either reader.
+static object SpriteAtlasPayload(SpriteAtlas atlas)
+{
+    return new
+    {
+        Name = atlas.m_Name,
+        IsVariant = atlas.m_IsVariant,
+        PackedSprites = atlas.m_PackedSprites.Select(sprite => new
+        {
+            FileId = sprite.m_FileID,
+            PathId = sprite.m_PathID,
+        }).ToArray(),
+        // Ordered by key so two dictionaries with the same contents compare
+        // equal; the Rust side keeps its entries sorted for lookup anyway.
+        RenderData = atlas.m_RenderDataMap
+            .OrderBy(entry => Convert.ToHexString(entry.Key.Key.ToByteArray()), StringComparer.Ordinal)
+            .ThenBy(entry => entry.Key.Value)
+            .Select(entry => new
+            {
+                Guid = Bytes(entry.Key.Key.ToByteArray()),
+                Value = entry.Key.Value,
+                Texture = new
+                {
+                    FileId = entry.Value.texture.m_FileID,
+                    PathId = entry.Value.texture.m_PathID,
+                },
+                AlphaTexture = new
+                {
+                    FileId = entry.Value.alphaTexture.m_FileID,
+                    PathId = entry.Value.alphaTexture.m_PathID,
+                },
+                TextureRect = new[]
+                {
+                    Bits(entry.Value.textureRect.x),
+                    Bits(entry.Value.textureRect.y),
+                    Bits(entry.Value.textureRect.width),
+                    Bits(entry.Value.textureRect.height),
+                },
+                TextureRectOffset = new[]
+                {
+                    Bits(entry.Value.textureRectOffset.X),
+                    Bits(entry.Value.textureRectOffset.Y),
+                },
+                AtlasRectOffset = new[]
+                {
+                    Bits(entry.Value.atlasRectOffset.X),
+                    Bits(entry.Value.atlasRectOffset.Y),
+                },
+                UvTransform = new[]
+                {
+                    Bits(entry.Value.uvTransform.X),
+                    Bits(entry.Value.uvTransform.Y),
+                    Bits(entry.Value.uvTransform.Z),
+                    Bits(entry.Value.uvTransform.W),
+                },
+                DownscaleMultiplier = Bits(entry.Value.downscaleMultiplier),
+                SettingsRaw = entry.Value.settingsRaw.settingsRaw,
+                SecondaryTextures = entry.Value.secondaryTextures?.Select(secondary => new
+                {
+                    Name = secondary.name,
+                    Texture = new
+                    {
+                        FileId = secondary.texture.m_FileID,
+                        PathId = secondary.texture.m_PathID,
+                    },
+                }).ToArray(),
+            }).ToArray(),
+    };
+}
+
+/// A float as its bit pattern, so the two serializers cannot disagree about
+/// how to spell a whole number and hide a rounding difference behind it.
+static uint Bits(float value) => BitConverter.SingleToUInt32Bits(value);
 
 static object MaterialPayload(Material material)
 {
