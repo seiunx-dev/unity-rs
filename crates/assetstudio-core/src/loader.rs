@@ -1216,17 +1216,29 @@ fn prepare_directory_inputs(
 
 /// Finds the streamed-data files Unity writes beside a serialized file.
 ///
-/// Unity keeps a serialized file's texture, mesh and audio bytes in a
-/// companion whose name is the file's own plus an extension:
-/// `resources.assets` and `resources.assets.resS`, `level0` and `level0.resS`.
+/// Unity keeps a serialized file's texture, mesh and audio bytes in companions
+/// named after it, and it uses two conventions rather than one:
+///
+/// * the whole file name plus an extension -- `resources.assets` and
+///   `resources.assets.resS`, `level0` and `level0.resS`;
+/// * the stem plus an extension -- `resources.assets` and
+///   `resources.resource`, which is where a player build keeps its audio.
+///
 /// Pointed at a directory this loader picks them up with everything else, but
-/// pointed at one file it used to load only that file -- so every streamed
+/// pointed at one file it used to load only that file, so every streamed
 /// object in it failed with "external resource was not found", naming a file
 /// sitting right beside the one it had been given. Exporting a single
-/// `globalgamemanagers.assets` lost all 48 of its streamed objects that way.
+/// `globalgamemanagers.assets` lost all 48 of its streamed objects that way,
+/// and the stem form -- missed on the first attempt at this -- cost two audio
+/// clips in `resources.assets`.
 ///
-/// Only real siblings are considered, matched by name against the input's own,
-/// so nothing here can reach outside the directory the caller named.
+/// The stem form is restricted to the streamed-data extensions. Matching any
+/// sibling that merely shares a stem would pull in `resources.txt` and
+/// anything else a game happens to keep next door. Only real siblings are
+/// considered either way, so nothing here can reach outside the directory the
+/// caller named.
+const STREAMED_EXTENSIONS: [&str; 2] = ["ress", "resource"];
+
 fn companion_resource_inputs(
     path: &Path,
     limits: &AssetLoadLimits,
@@ -1239,6 +1251,7 @@ fn companion_resource_inputs(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let prefix = format!("{name}.");
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
     let mut companions = Vec::new();
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
@@ -1249,7 +1262,18 @@ fn companion_resource_inputs(
         let Some(candidate_name) = candidate.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !candidate_name.starts_with(&prefix) {
+        if candidate_name == name {
+            continue;
+        }
+        let shares_stem = stem.is_some_and(|stem| {
+            candidate.file_stem().and_then(|value| value.to_str()) == Some(stem)
+        }) && candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                STREAMED_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+            });
+        if !candidate_name.starts_with(&prefix) && !shares_stem {
             continue;
         }
         if companions.len() >= limits.maximum_input_files {
@@ -1490,8 +1514,11 @@ mod tests {
         fs::write(&input, b"not a serialized file, but a real one on disk").unwrap();
         fs::write(root.join("resources.assets.resS"), b"streamed").unwrap();
         fs::write(root.join("resources.assets.resource"), b"also streamed").unwrap();
-        // Neither of these shares the input's name, so neither is a companion.
-        fs::write(root.join("resources.resS"), b"different file").unwrap();
+        // The stem form, which is where a player build keeps its audio.
+        fs::write(root.join("resources.resource"), b"stem companion").unwrap();
+        // Shares the stem but is not streamed data, so it is not a companion.
+        fs::write(root.join("resources.txt"), b"not streamed data").unwrap();
+        // Shares neither, so it is not a companion either.
         fs::write(root.join("other.assets.resS"), b"another file entirely").unwrap();
 
         let collection = AssetCollection::load_path(&input).unwrap();
@@ -1511,7 +1538,12 @@ mod tests {
             "the companions beside the input were not loaded: {names:?}"
         );
         assert!(
-            !names.contains(&"other.assets.resS".to_owned()),
+            names.contains(&"resources.resource".to_owned()),
+            "the stem-named companion was not loaded: {names:?}"
+        );
+        assert!(
+            !names.contains(&"other.assets.resS".to_owned())
+                && !names.contains(&"resources.txt".to_owned()),
             "a file that is not this input's companion was loaded: {names:?}"
         );
         assert!(
