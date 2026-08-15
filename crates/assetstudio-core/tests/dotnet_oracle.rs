@@ -336,6 +336,9 @@ fn sprite_atlas_fixtures() -> Vec<TemporaryFixture> {
         ("2017.2.5f1", (2017, 2)),
         ("2020.1.17f1", (2020, 1)),
         ("2022.3.62f1", (2022, 3)),
+        // The top of the verified range, so widening it further has to bring
+        // a fixture with it.
+        ("6000.3.12f1", (6000, 3)),
     ]
     .into_iter()
     .map(|(revision, version)| {
