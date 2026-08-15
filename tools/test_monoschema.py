@@ -14,6 +14,16 @@ ROOT = Path(__file__).resolve().parent.parent
 GENERATOR = ROOT / "tools" / "monoschema" / "MonoSchemaGenerator.csproj"
 UNITY_VERSION = "2022.3.62f1"
 
+# Every check here is an `assert`, and `-O` or `PYTHONOPTIMIZE` deletes those
+# outright rather than skipping them: a generator that emitted no entries at
+# all would still exit zero. Refuse to run instead of reporting a success that
+# checked nothing.
+if not __debug__:
+    raise SystemExit(
+        "refusing to run with assertions disabled (-O / PYTHONOPTIMIZE): "
+        "every check in this gate is an assert"
+    )
+
 
 def run(command: list[str], *, cwd: Path = ROOT) -> None:
     result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)

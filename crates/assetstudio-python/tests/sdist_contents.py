@@ -10,6 +10,16 @@ from pathlib import Path
 FORBIDDEN_COMPONENTS = {"assetstudio-ffi", "assetstudio-gui", "assetstudiogui"}
 FORBIDDEN_SUFFIXES = (".cs", ".csproj", ".fsproj", ".sln", ".slnx", ".vbproj")
 
+# Every check here is an `assert`, and `-O` or `PYTHONOPTIMIZE` deletes those
+# outright rather than skipping them: an sdist carrying none of the required
+# sources and none of the three legal files exits zero under `PYTHONOPTIMIZE=1`.
+# Refuse to run instead of reporting a success that checked nothing.
+if not __debug__:
+    raise SystemExit(
+        "refusing to run with assertions disabled (-O / PYTHONOPTIMIZE): "
+        "every check in this gate is an assert"
+    )
+
 
 def forbidden_delivery_path(name: str) -> bool:
     lowered = name.casefold().replace("\\", "/")
