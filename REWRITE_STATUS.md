@@ -1,6 +1,6 @@
 # AssetStudio Rust 重写进度与缺口
 
-最后更新：2026-08-15
+最后更新：2026-08-16
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
