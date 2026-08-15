@@ -427,9 +427,13 @@ impl ShaderObjectReader {
         }
         let _shader_is_baked = self.reader.read_bool()?;
         self.align(4)?;
-        // Unity 6 appends the source asset's GUID, four unsigned ints.
+        // Unity 6 appends the source asset's GUID, four unsigned ints, and
+        // 6000.3 appends its local identifier after that.
         if self.version.major >= 6000 {
             self.skip(16, "Shader asset GUID")?;
+        }
+        if self.version.components() >= (6000, 3, 0) {
+            self.skip(8, "Shader asset local identifier")?;
         }
         Ok(())
     }
@@ -2243,7 +2247,12 @@ impl ShaderObjectReader {
     }
 
     fn read_serialized_pass(&mut self) -> Result<SerializedPass> {
-        if self.version.components() >= (2020, 2, 0) {
+        // 2020.2 added the editor-data hashes and the per-pass platform list;
+        // 2023.1 removed both again. Reading them from a Unity 6 shader walks
+        // two arrays' worth of bytes off the structure, which is what made a
+        // 6000.3 game report a pass with 1,952,671,082 platforms -- four bytes
+        // of something else read as a count.
+        if ((2020, 2, 0)..(2023, 1, 0)).contains(&self.version.components()) {
             let hash_count = self.read_count("Shader pass editor-data hash")?;
             let hash_bytes = u64::try_from(hash_count)
                 .map_err(|_| Error::invalid_data("Shader hash count does not fit in u64"))?

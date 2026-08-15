@@ -23,8 +23,15 @@ impl Default for TypeTreeReadLimits {
     fn default() -> Self {
         Self {
             maximum_depth: 128,
-            maximum_values: 1_000_000,
-            maximum_array_elements: 1_000_000,
+            // A million of either is below what ordinary game content holds: a
+            // Live2D model in a shipping Unity 6000.3 build carries a single
+            // array of 3,892,672 elements, and the count alone is a poor guard
+            // anyway -- `maximum_materialized_bytes` is what actually bounds
+            // the heap, and it bounds it by what was allocated rather than by
+            // how many things were counted. These stay as a coarse ceiling on
+            // absurd counts, set where real assets fit under them.
+            maximum_values: 32_000_000,
+            maximum_array_elements: 32_000_000,
             maximum_string_bytes: 16 * 1024 * 1024,
             maximum_typeless_bytes: 256 * 1024 * 1024,
             maximum_materialized_bytes: 256 * 1024 * 1024,
@@ -158,8 +165,17 @@ pub fn read_type_tree_from_reader<R: Read + Seek>(
     let consumed = parser.reader.position()?;
     let length = parser.reader.len()?;
     if consumed != length {
-        return Err(Error::invalid_data(format!(
-            "type tree consumed {consumed} of {length} object bytes"
+        // The tree was walked to its last node, so the layout it describes was
+        // read in full and what remains is data the tree does not describe.
+        // In modern Unity that is almost always the managed-references
+        // registry a `SerializeReference` field writes after the body: a
+        // CriWare sound component in a shipping 6000.3 build has 176 bytes of
+        // typed fields and 712,292 bytes of registry behind one `rid`. This
+        // reader does not model the registry, so the object is declined rather
+        // than reported as a byte mismatch, which describes the reader instead
+        // of the asset.
+        return Err(Error::unsupported(format!(
+            "type tree describes {consumed} of {length} object bytes; the rest              is data this reader does not model, most likely a              SerializeReference managed-references registry"
         )));
     }
     Ok(value)

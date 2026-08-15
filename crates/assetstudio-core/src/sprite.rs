@@ -35,7 +35,13 @@ impl Default for SpriteReadLimits {
             maximum_output_pixels: 128 * 1024 * 1024,
             maximum_output_bytes: 512 * 1024 * 1024,
             maximum_working_bytes: 512 * 1024 * 1024,
-            maximum_raster_operations: 512 * 1024 * 1024,
+            // A tight sprite's cost is triangles times bounding-box area, and
+            // ordinary content lands just the wrong side of half a billion: a
+            // lane-skin sprite in a shipping Unity 6000.3 build needs
+            // 536,921,219 tests against the 536,870,912 this used to allow,
+            // 0.01% over. Four times that still bounds the work while leaving
+            // room above what real atlases ask for.
+            maximum_raster_operations: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -574,7 +580,13 @@ fn resolve_object_target<'a>(
     field: &str,
 ) -> Result<(&'a SerializedFile, usize)> {
     if reference.is_null() {
-        return Err(Error::invalid_data(format!("{field} reference is null")));
+        // A null reference is a statement about the asset, not about its
+        // bytes: a Sprite whose texture was stripped, or one whose atlas is
+        // published in a bundle the caller did not open, is a shape this
+        // reader declines rather than a file it failed to parse. A real
+        // Addressables build splits sprites and their textures across bundles,
+        // so reading one bundle at a time meets this constantly.
+        return Err(Error::unsupported(format!("{field} reference is null")));
     }
 
     let target_file = if reference.file_id == 0 {
@@ -2935,9 +2947,27 @@ mod tests {
                 TextureReadLimits::default(),
             )
             .unwrap_err();
+            // A null reference says the asset has no texture, which this
+            // reader declines; the other cases say the bytes disagree with
+            // themselves, which is a parse failure. Both must surface rather
+            // than fall back to resident data, and the kind is part of what
+            // callers act on -- an export counts one as unsupported and the
+            // other as failed.
+            let declined = expected.contains("is null");
+            let matched = match (&error, declined) {
+                (Error::Unsupported(message), true) | (Error::InvalidData(message), false) => {
+                    message.contains(expected)
+                }
+                _ => false,
+            };
             assert!(
-                matches!(error, Error::InvalidData(message) if message.contains(expected)),
-                "expected invalid-data error containing {expected:?}"
+                matched,
+                "expected {} error containing {expected:?}, got {error:?}",
+                if declined {
+                    "unsupported"
+                } else {
+                    "invalid-data"
+                }
             );
         }
     }

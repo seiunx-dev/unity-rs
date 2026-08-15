@@ -812,7 +812,8 @@ fn rust_metadata_payload(
         }
         114 => mono_behaviour_manifest(studio, file_index, loaded, object_index)?,
         123_456 => {
-            let value = loaded.read_type_tree_value(object_index)?;
+            let value = loaded
+                .read_type_tree_value_with_limits(object_index, type_tree_limits(maximum_bytes))?;
             let tree = loaded.object_type_tree(object_index)?;
             let mut dump = Vec::new();
             write_type_tree_dump(tree, &value, &mut dump, maximum_bytes)?;
@@ -898,7 +899,8 @@ fn mono_behaviour_manifest(
         }));
     }
 
-    let value = loaded.read_type_tree_value(object_index)?;
+    let value = loaded
+        .read_type_tree_value_with_limits(object_index, type_tree_limits(u64::from(u32::MAX)))?;
     let name = match &value {
         TypeValue::Object(fields) => fields
             .iter()
@@ -979,6 +981,22 @@ fn cubism_documents(
         Err(_) => None,
     };
     Ok((expression, motion, physics))
+}
+
+/// Type-tree limits scaled to what the corpus case allows an object to be.
+///
+/// The library defaults bound a materialized tree at 256 MB, which ordinary
+/// game content exceeds: one `Live2D` model in a shipping Unity 6000.3 build
+/// materializes to 439 MB. A gate reading real files has to say how much it
+/// will allow rather than inherit a ceiling that was chosen for a caller who
+/// has not looked at the input.
+fn type_tree_limits(maximum_bytes: u64) -> assetstudio_core::type_tree::TypeTreeReadLimits {
+    let ceiling = usize::try_from(maximum_bytes.max(512 * 1024 * 1024)).unwrap_or(usize::MAX);
+    assetstudio_core::type_tree::TypeTreeReadLimits {
+        maximum_materialized_bytes: ceiling,
+        maximum_typeless_bytes: ceiling,
+        ..assetstudio_core::type_tree::TypeTreeReadLimits::default()
+    }
 }
 
 fn bytes_manifest(input: &[u8]) -> Value {
