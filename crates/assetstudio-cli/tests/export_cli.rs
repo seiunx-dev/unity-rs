@@ -139,13 +139,11 @@ fn exports_switch_mip_chain_base_image_from_the_native_cli() {
 }
 
 #[test]
-fn reports_a_unity6_shader_as_unsupported_rather_than_failing() {
-    // This used to assert the CLI wrote Unity6Object.shader. Unity changed the
-    // serialized shader in 2021 and neither implementation reads the new
-    // layout, so what it actually wrote was a file parsed from a fixture no
-    // Unity produces. Declining is the honest outcome -- and it is not a
-    // failure: a 2022 game carries hundreds of these, and an export that
-    // exits non-zero because of them cannot be told from one that broke.
+fn exports_a_unity6_shader_from_the_native_cli() {
+    // Unity changed the serialized shader in 2021 and again in 2022.2; the
+    // managed implementation followed neither, which is why its object table
+    // skips class 48 from 2021 on. This reader implements the additions, so a
+    // Unity 6 shader exports rather than being declined.
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -165,17 +163,24 @@ fn reports_a_unity6_shader_as_unsupported_rather_than_failing() {
 
     assert!(
         result.status.success(),
-        "an unsupported object is not a failed export; stderr: {}",
+        "stderr: {}",
         String::from_utf8_lossy(&result.stderr)
+    );
+    let shader = fs::read(
+        output
+            .join("0000_unity6-shader.assets")
+            .join("Unity6Object.shader"),
+    )
+    .unwrap();
+    let text = String::from_utf8_lossy(&shader);
+    assert!(
+        text.contains("Shader \"Parsed/Unity6\""),
+        "the exported shader should carry its parsed name: {text}"
     );
     let stdout = String::from_utf8_lossy(&result.stdout);
     assert!(
-        stdout.contains("unsupported ") && stdout.contains("2021"),
-        "the run should say which object it declined and why: {stdout}"
-    );
-    assert!(
-        stdout.contains("0 succeeded, 1 unsupported, 0 failed"),
-        "summary should separate the three outcomes: {stdout}"
+        stdout.contains("1 succeeded, 0 unsupported, 0 failed"),
+        "summary should report a plain success: {stdout}"
     );
     let _ = fs::remove_dir_all(&root);
 }
@@ -810,11 +815,18 @@ fn synthetic_v22_unity6_shader() -> Vec<u8> {
     push_i32_le(&mut object, 0); // render-pipeline custom editors
     object.push(0); // disable no-subshaders message
     align_vec(&mut object, 4);
-    for _ in 0..7 {
-        push_i32_le(&mut object, 0); // platforms/tables/blob/object tail counts
+    for _ in 0..5 {
+        push_i32_le(&mut object, 0); // platforms, offsets, lengths, blob
     }
+    // 2022.2 put a per-platform stage count here, and Unity 6 appends the
+    // source asset's GUID. A fixture without them is a file Unity does not
+    // write, which is what this one used to be.
+    push_i32_le(&mut object, 0); // stage counts
+    push_i32_le(&mut object, 0); // object dependencies
+    push_i32_le(&mut object, 0); // non-modifiable textures
     object.push(0); // baked
     align_vec(&mut object, 4);
+    object.extend_from_slice(&[0_u8; 16]); // asset GUID
 
     let mut metadata = Vec::new();
     metadata.extend_from_slice(b"6000.2.0f1\0");

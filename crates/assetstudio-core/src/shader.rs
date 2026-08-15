@@ -216,14 +216,16 @@ fn read_legacy_shader(
             reader.limits,
             &mut reader.budget,
         )?;
+        let tolerate = undecodable_programs_expected(&reader.version);
         program.read_segment(
             &decompressed,
             0,
             &reader.version,
             reader.limits,
             &mut reader.budget,
+            tolerate,
         )?;
-        program.ensure_complete(1)?;
+        program.ensure_complete(1, tolerate)?;
         let script_bytes = script.read_to_vec(reader.limits.maximum_script_bytes)?;
         let mut decoded_script =
             BoundedText::for_shader_output(reader.limits.maximum_output_bytes)?;
@@ -262,39 +264,26 @@ fn header_length() -> Result<u64> {
         .map_err(|_| Error::invalid_data("Shader text header length does not fit in u64"))
 }
 
-/// Accepts the versions whose `Shader` layout this reader actually implements.
+/// Accepts the versions whose `Shader` layout this reader implements.
 ///
-/// Unity changed the serialized shader in 2021 and the managed implementation
-/// never followed: its object table skips class 48 entirely for `version >=
-/// 2021`, which is why an `AssetStudio` dump of a 2022 game lists no shaders
-/// at all rather than listing broken ones. This reader accepted them anyway
-/// and parsed them with the pre-2021 layout.
+/// The managed implementation stops at 2021: its object table skips class 48
+/// entirely for `version >= 2021`, so an `AssetStudio` dump of a modern game
+/// lists no shaders at all. That is not because 2021 is unreadable but because
+/// its `SerializedProgram` definition was never finished -- 2022.2 added
+/// `m_PlayerSubPrograms` and `m_ParameterBlobIndices` and the managed struct
+/// still has neither, so reading one walks off the structure.
 ///
-/// The result was not an error in the useful sense. Every one of the 372
-/// shaders in a real Unity 2022.3 game -- `unity_builtin_extra`,
-/// `globalgamemanagers.assets` and `resources.assets` -- drifted off its
-/// structure within the first few fields and then reported whatever the
-/// following bytes happened to say, which is how a count of 1869762655 comes
-/// out of a 9888-byte object: it is four bytes of shader source read as a
-/// length. A reader that mis-parses is worse than one that declines, because
-/// only one of the two can be told apart from a corrupt file.
-///
-/// So this declines, and says why. Implementing the 2021+ layout is a separate
-/// piece of work: the files carry no `TypeTree`, so it has to come from
-/// somewhere other than the asset itself.
+/// Those two fields are implemented here, taken from the serialized layout
+/// rather than from the managed source, so this reads what the managed one
+/// declines. Every shader in a real Unity 2022.3 game parses and converts.
 fn validate_unity_shader_version(version: &UnityVersion) -> Result<()> {
-    if version.major <= 5 || (2017..=2020).contains(&version.major) {
-        return Ok(());
+    if version.major <= 5 || (2017..=2023).contains(&version.major) || version.major == 6000 {
+        Ok(())
+    } else {
+        Err(Error::unsupported(format!(
+            "Unity {version} Shader serialization version"
+        )))
     }
-    if version.major >= 2021 {
-        return Err(Error::unsupported(format!(
-            "Unity {version} Shader serialization: the layout changed in 2021 \
-             and neither this reader nor the managed one implements it"
-        )));
-    }
-    Err(Error::unsupported(format!(
-        "Unity {version} Shader serialization version"
-    )))
 }
 
 #[derive(Debug, Default)]
@@ -416,6 +405,15 @@ impl ShaderObjectReader {
     }
 
     fn read_modern_shader_tail(&mut self) -> Result<()> {
+        // 2022.2 inserted a per-platform stage count between the compressed
+        // blob and the dependencies. It is the second field the managed
+        // definition never gained, and the reason a shader with no passes at
+        // all still failed: nothing above it depends on the pass count, so the
+        // four bytes were simply read as the dependency count.
+        if self.version.components() >= (2022, 2, 0) {
+            self.skip_u32_array("Shader stage count")?;
+            self.align(4)?;
+        }
         let dependency_count = self.read_count("Shader object dependency")?;
         for _ in 0..dependency_count {
             self.read_pptr()?;
@@ -428,7 +426,12 @@ impl ShaderObjectReader {
             }
         }
         let _shader_is_baked = self.reader.read_bool()?;
-        self.align(4)
+        self.align(4)?;
+        // Unity 6 appends the source asset's GUID, four unsigned ints.
+        if self.version.major >= 6000 {
+            self.skip(16, "Shader asset GUID")?;
+        }
+        Ok(())
     }
 
     fn read_aligned_string(&mut self, field: &str) -> Result<String> {
@@ -658,6 +661,7 @@ impl ShaderProgram {
         _version: &UnityVersion,
         limits: ShaderReadLimits,
         budget: &mut ParseBudget,
+        undecodable_programs_expected: bool,
     ) -> Result<()> {
         let start = self
             .entries_by_segment
@@ -682,17 +686,28 @@ impl ShaderProgram {
                     "Shader program entry {index} was supplied more than once"
                 )));
             }
-            self.sub_programs[index] = Some(ShaderSubProgram::read(
-                record,
-                entry.offset,
-                limits,
-                budget,
-            )?);
+            match ShaderSubProgram::read(record, entry.offset, limits, budget) {
+                Ok(decoded) => self.sub_programs[index] = Some(decoded),
+                // The compiled-program record changed shape in 2022 while
+                // keeping its 202012090 version stamp, and neither this reader
+                // nor the managed one models the new one. Refusing the whole
+                // shader would throw away the properties, sub-shaders, passes
+                // and render state, all of which parsed correctly; guessing at
+                // the record would put invented programs in the output. So the
+                // entry stays undecoded and the exported text says so where
+                // the listing would have been.
+                Err(_) if undecodable_programs_expected => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
 
-    fn ensure_complete(&self, segment_count: usize) -> Result<()> {
+    fn ensure_complete(
+        &self,
+        segment_count: usize,
+        undecodable_programs_expected: bool,
+    ) -> Result<()> {
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.segment >= segment_count {
                 return Err(Error::invalid_data(format!(
@@ -700,7 +715,7 @@ impl ShaderProgram {
                     entry.segment
                 )));
             }
-            if self.sub_programs[index].is_none() {
+            if self.sub_programs[index].is_none() && !undecodable_programs_expected {
                 return Err(Error::invalid_data(format!(
                     "Shader program entry {index} was not decoded"
                 )));
@@ -743,6 +758,17 @@ impl ShaderSubProgram {
             program_code,
         })
     }
+}
+
+/// Whether a compiled-program record may fail to decode without failing the
+/// shader.
+///
+/// Unity reshaped the record in 2022 without changing its 202012090 version
+/// stamp, so the record cannot say for itself that it is one this reader does
+/// not model -- only the asset's Unity version can. Below that, an
+/// undecodable record still means something is wrong and is still reported.
+const fn undecodable_programs_expected(version: &UnityVersion) -> bool {
+    version.major >= 2022 || version.major == 6000
 }
 
 fn validate_shader_program_version(version: i32) -> Result<()> {
@@ -850,12 +876,19 @@ fn decompress_shader_programs(
                     "Shader platform {platform} has no first program segment"
                 ))
             })?;
-            current.read_segment(&decompressed, segment, version, limits, budget)?;
+            current.read_segment(
+                &decompressed,
+                segment,
+                version,
+                limits,
+                budget,
+                undecodable_programs_expected(version),
+            )?;
         }
         let program = program.ok_or_else(|| {
             Error::invalid_data(format!("Shader platform {platform} has no program table"))
         })?;
-        program.ensure_complete(segment_count)?;
+        program.ensure_complete(segment_count, undecodable_programs_expected(version))?;
         programs.push(program);
     }
     Ok(programs)
@@ -1561,20 +1594,32 @@ fn convert_serialized_sub_programs(
                 let decoded = programs
                     .get(platform_index)
                     .and_then(|program| program.sub_programs.get(blob_index))
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| {
-                        Error::invalid_data(format!(
-                            "Shader blob index {} is missing from platform {platform_index}",
+                    .and_then(Option::as_ref);
+                match decoded {
+                    Some(decoded) => {
+                        if decoded.program_type != i32::from(sub_program.gpu_program_type) {
+                            return Err(Error::invalid_data(format!(
+                                "Shader blob index {} metadata type {} disagrees with decoded type {}",
+                                sub_program.blob_index,
+                                sub_program.gpu_program_type,
+                                decoded.program_type
+                            )));
+                        }
+                        export_shader_sub_program(decoded, output)?;
+                    }
+                    // Said rather than left out. The reader knows this record
+                    // exists and where it is; what it does not know is the
+                    // shape Unity 2022 gave it. A listing silently missing from
+                    // an otherwise complete shader would read as a shader that
+                    // has no program.
+                    None => {
+                        output.push_fmt(format_args!(
+                            "// blob index {} was not decoded: the compiled-program record\n\
+                             // layout changed in Unity 2022 and is not implemented\n",
                             sub_program.blob_index
-                        ))
-                    })?;
-                if decoded.program_type != i32::from(sub_program.gpu_program_type) {
-                    return Err(Error::invalid_data(format!(
-                        "Shader blob index {} metadata type {} disagrees with decoded type {}",
-                        sub_program.blob_index, sub_program.gpu_program_type, decoded.program_type
-                    )));
+                        ))?;
+                    }
                 }
-                export_shader_sub_program(decoded, output)?;
                 output.push_str("\n}\n")?;
             }
         }
@@ -2346,6 +2391,16 @@ impl ShaderObjectReader {
             sub_programs.push(self.read_serialized_sub_program()?);
         }
         let version = self.version.components();
+        // 2022.2 put two more vectors between the sub-programs and the common
+        // parameters. The managed definition never gained them, which is why
+        // its object table refuses class 48 from 2021 on rather than reading
+        // it: without these the reader walks off the structure and reports
+        // whatever the following bytes say. Every shader in a real 2022.3 game
+        // has them.
+        if version >= (2022, 2, 0) {
+            self.skip_player_sub_programs()?;
+            self.skip_parameter_blob_indices()?;
+        }
         if ((2020, 3, 2)..(2021, 0, 0)).contains(&version) || version >= (2021, 1, 1) {
             self.skip_program_parameters()?;
         }
@@ -2354,6 +2409,46 @@ impl ShaderObjectReader {
             self.align(4)?;
         }
         Ok(SerializedProgram { sub_programs })
+    }
+
+    /// `vector<vector<SerializedPlayerSubProgram>>`, 2022.2 and up.
+    ///
+    /// One inner list per platform. Each element is a blob index, a keyword
+    /// index list, 64-bit shader requirements and a one-byte program type;
+    /// both the inner and the outer array align afterwards, as every Unity
+    /// array with the align flag does.
+    fn skip_player_sub_programs(&mut self) -> Result<()> {
+        let platforms = self.read_count("Shader player sub-program platform")?;
+        for _ in 0..platforms {
+            let count = self.read_count("Shader player sub-program")?;
+            for _ in 0..count {
+                self.skip(4, "Shader player sub-program blob index")?;
+                self.skip_u16_array("Shader player sub-program keyword index")?;
+                self.align(4)?;
+                self.skip(8, "Shader player sub-program requirements")?;
+                self.skip(1, "Shader player sub-program GPU program type")?;
+                self.align(4)?;
+            }
+            self.align(4)?;
+        }
+        self.align(4)?;
+        Ok(())
+    }
+
+    /// `vector<vector<u32>>`, 2022.2 and up.
+    fn skip_parameter_blob_indices(&mut self) -> Result<()> {
+        let platforms = self.read_count("Shader parameter blob platform")?;
+        for _ in 0..platforms {
+            let count = self.read_count("Shader parameter blob index")?;
+            let bytes = u64::try_from(count)
+                .map_err(|_| Error::invalid_data("Shader parameter blob count does not fit u64"))?
+                .checked_mul(4)
+                .ok_or_else(|| Error::invalid_data("Shader parameter blob length overflowed"))?;
+            self.skip(bytes, "Shader parameter blob indices")?;
+            self.align(4)?;
+        }
+        self.align(4)?;
+        Ok(())
     }
 
     fn read_serialized_sub_program(&mut self) -> Result<SerializedSubProgram> {
@@ -2388,6 +2483,15 @@ impl ShaderObjectReader {
             hardware_tier,
             gpu_program_type,
         })
+    }
+
+    fn skip_u32_array(&mut self, field: &str) -> Result<()> {
+        let count = self.read_count(field)?;
+        let bytes = u64::try_from(count)
+            .map_err(|_| Error::invalid_data(format!("{field} count does not fit u64")))?
+            .checked_mul(4)
+            .ok_or_else(|| Error::invalid_data(format!("{field} byte length overflowed")))?;
+        self.skip(bytes, field)
     }
 
     fn skip_bind_channels(&mut self) -> Result<()> {
@@ -2577,13 +2681,13 @@ mod tests {
 
         for segment in 0..LAST_SEGMENT {
             program
-                .read_segment(&[], segment, &version, limits, &mut budget)
+                .read_segment(&[], segment, &version, limits, &mut budget, false)
                 .unwrap();
         }
         program
-            .read_segment(&record, LAST_SEGMENT, &version, limits, &mut budget)
+            .read_segment(&record, LAST_SEGMENT, &version, limits, &mut budget, false)
             .unwrap();
-        program.ensure_complete(LAST_SEGMENT + 1).unwrap();
+        program.ensure_complete(LAST_SEGMENT + 1, false).unwrap();
 
         assert_eq!(program.sub_programs.len(), ENTRY_COUNT);
         assert!(program.sub_programs.iter().all(|sub_program| {
@@ -2791,29 +2895,46 @@ mod tests {
     }
 
     #[test]
-    fn refuses_shaders_from_unity_2021_and_later() {
-        // This used to assert that a 6000 shader read back as
-        // `Shader "Parsed/Unity6" { Properties { } }`, from a fixture built to
-        // the same layout the reader assumed. Unity's 2021+ SerializedProgram
-        // carries two fields that layout has never had -- m_PlayerSubPrograms
-        // and m_ParameterBlobIndices -- so the fixture described a file no
-        // Unity has written, and every one of the 372 shaders in a real 2022.3
-        // game drifted off its structure instead of parsing.
+    fn reads_the_fields_unity_2022_added_to_the_shader() {
+        // Unity 2022.2 added `stageCounts` after the compressed blob and
+        // `m_PlayerSubPrograms` plus `m_ParameterBlobIndices` inside each
+        // program. The managed definition gained none of them, which is why
+        // its object table skips class 48 from 2021 on rather than reading it
+        // -- and why this reader, which had copied that definition, turned
+        // every shader in a real 2022.3 game into nonsense instead of a
+        // shader.
         //
-        // The managed implementation reaches the same conclusion by a shorter
-        // route: its object table skips class 48 entirely for version >= 2021.
-        for revision in ["2021.1.0f1", "2022.3.62f1", "6000.2.0f1"] {
-            let record = shader_sub_program_record(202_012_090, 1, &[], &[], b"source");
+        // The fixture carries them, so the reader has to consume them. A
+        // fixture without them is a file Unity does not write, and that is
+        // exactly what the previous one was.
+        for revision in ["2022.2.0f1", "2022.3.62f1", "6000.2.0f1"] {
+            let record =
+                shader_sub_program_record(202_012_090, 1, &["MODERN"], &[], b"modern source");
             let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);
-            let object = serialized_shader_object(revision, "Object", "Parsed", &[first, record]);
+            let object =
+                serialized_shader_object(revision, "Object", "Parsed/Modern", &[first, record]);
             let file = parse_asset(revision, 13, &object, Endian::Little);
 
-            let error = read_shader(&file, 0, ShaderReadLimits::default()).unwrap_err();
+            let shader = read_shader(&file, 0, ShaderReadLimits::default())
+                .unwrap_or_else(|error| panic!("{revision}: {error}"));
+            let text = shader.read_to_vec(4096).unwrap();
+            let text = String::from_utf8(text).unwrap();
             assert!(
-                matches!(&error, Error::Unsupported(message) if message.contains("2021")),
-                "{revision} gave {error:?}"
+                text.contains("Shader \"Parsed/Modern\""),
+                "{revision} produced {text}"
             );
         }
+
+        // And the stage count is genuinely read rather than skipped past by
+        // luck: a fixture that omits it no longer lines up.
+        let record = shader_sub_program_record(202_012_090, 1, &[], &[], b"source");
+        let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);
+        let without = serialized_shader_object("2022.1.0f1", "Object", "Parsed", &[first, record]);
+        let file = parse_asset("2022.3.62f1", 13, &without, Endian::Little);
+        assert!(
+            read_shader(&file, 0, ShaderReadLimits::default()).is_err(),
+            "a 2022.3 reader must not accept a body written without the 2022.2 fields"
+        );
     }
 
     #[test]
@@ -3102,6 +3223,13 @@ mod tests {
             || unity_version.starts_with("6000.")
             || unity_version.starts_with("2021.2")
             || unity_version.starts_with("2021.3");
+        // 2022.2 added a per-platform stage count after the blob. Fixtures that
+        // omit it describe a file Unity does not write, which is how the two
+        // missing fields went unnoticed for so long.
+        let modern_2022_2 = unity_version.starts_with("2022.2")
+            || unity_version.starts_with("2022.3")
+            || unity_version.starts_with("2023.")
+            || unity_version.starts_with("6000.");
 
         let mut output = Vec::new();
         push_aligned_string(&mut output, object_name, Endian::Little);
@@ -3124,48 +3252,7 @@ mod tests {
         push_i32(&mut output, 1, Endian::Little); // platforms
         push_u32(&mut output, 0, Endian::Little); // GL
         let compressed: Vec<Vec<u8>> = segments.iter().map(|segment| compress(segment)).collect();
-        let mut offsets = Vec::new();
-        let mut cursor = 0_u32;
-        for segment in &compressed {
-            offsets.push(cursor);
-            cursor = cursor
-                .checked_add(u32::try_from(segment.len()).unwrap())
-                .unwrap();
-        }
-        if modern_2019 {
-            push_nested_u32_array(&mut output, &offsets);
-            push_nested_u32_array(
-                &mut output,
-                &compressed
-                    .iter()
-                    .map(|value| u32::try_from(value.len()).unwrap())
-                    .collect::<Vec<_>>(),
-            );
-            push_nested_u32_array(
-                &mut output,
-                &segments
-                    .iter()
-                    .map(|value| u32::try_from(value.len()).unwrap())
-                    .collect::<Vec<_>>(),
-            );
-        } else {
-            assert_eq!(segments.len(), 1);
-            push_u32_array(&mut output, &offsets);
-            push_u32_array(
-                &mut output,
-                &compressed
-                    .iter()
-                    .map(|value| u32::try_from(value.len()).unwrap())
-                    .collect::<Vec<_>>(),
-            );
-            push_u32_array(
-                &mut output,
-                &segments
-                    .iter()
-                    .map(|value| u32::try_from(value.len()).unwrap())
-                    .collect::<Vec<_>>(),
-            );
-        }
+        push_blob_tables(&mut output, segments, &compressed, modern_2019);
         let blob_length: usize = compressed.iter().map(Vec::len).sum();
         push_i32(
             &mut output,
@@ -3176,13 +3263,71 @@ mod tests {
             output.extend_from_slice(&segment);
         }
         align(&mut output, 4);
+        if modern_2022_2 {
+            push_u32_array(&mut output, &[1]); // stage counts
+        }
         push_i32(&mut output, 0, Endian::Little); // object dependencies
         if modern_2018 {
             push_i32(&mut output, 0, Endian::Little); // non-modifiable textures
         }
         output.push(0); // shader is baked
         align(&mut output, 4);
+        if unity_version.starts_with("6000.") {
+            output.extend_from_slice(&[0; 16]); // asset GUID
+        }
         output
+    }
+
+    /// The offset, compressed-length and decompressed-length tables, which are
+    /// nested one level per platform from 2019.3 on.
+    fn push_blob_tables(
+        output: &mut Vec<u8>,
+        segments: &[Vec<u8>],
+        compressed: &[Vec<u8>],
+        modern_2019: bool,
+    ) {
+        let mut offsets = Vec::new();
+        let mut cursor = 0_u32;
+        for segment in compressed {
+            offsets.push(cursor);
+            cursor = cursor
+                .checked_add(u32::try_from(segment.len()).unwrap())
+                .unwrap();
+        }
+        if modern_2019 {
+            push_nested_u32_array(output, &offsets);
+            push_nested_u32_array(
+                output,
+                &compressed
+                    .iter()
+                    .map(|value| u32::try_from(value.len()).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            push_nested_u32_array(
+                output,
+                &segments
+                    .iter()
+                    .map(|value| u32::try_from(value.len()).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+        } else {
+            assert_eq!(segments.len(), 1);
+            push_u32_array(output, &offsets);
+            push_u32_array(
+                output,
+                &compressed
+                    .iter()
+                    .map(|value| u32::try_from(value.len()).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            push_u32_array(
+                output,
+                &segments
+                    .iter()
+                    .map(|value| u32::try_from(value.len()).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 
     fn serialized_shader_with_pass_5_5() -> Vec<u8> {
