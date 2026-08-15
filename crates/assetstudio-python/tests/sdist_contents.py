@@ -7,6 +7,17 @@ import tarfile
 from pathlib import Path
 
 
+FORBIDDEN_COMPONENTS = {"assetstudio-ffi", "assetstudio-gui", "assetstudiogui"}
+FORBIDDEN_SUFFIXES = (".cs", ".csproj", ".fsproj", ".sln", ".slnx", ".vbproj")
+
+
+def forbidden_delivery_path(name: str) -> bool:
+    lowered = name.casefold().replace("\\", "/")
+    return any(part in FORBIDDEN_COMPONENTS for part in lowered.split("/")) or lowered.endswith(
+        FORBIDDEN_SUFFIXES
+    )
+
+
 def main() -> None:
     distribution_directory = Path(sys.argv[1]) if len(sys.argv) == 2 else Path("dist")
     archives = sorted(distribution_directory.glob("*.tar.gz"))
@@ -20,15 +31,22 @@ def main() -> None:
         for name in names
         if name.endswith((".whl", *native_binary_suffixes))
         or "/dist/" in f"/{name}/"
+        or forbidden_delivery_path(name)
     ]
-    assert not forbidden, f"sdist contains build artifacts: {forbidden}"
+    assert not forbidden, f"sdist contains build artifacts or out-of-scope files: {forbidden}"
 
     required_suffixes = (
+        "/crates/assetstudio-core/LICENSE",
+        "/crates/assetstudio-core/THIRD_PARTY_NOTICES.md",
+        "/crates/assetstudio-core/THIRD_PARTY_LICENSES.txt",
         "/crates/assetstudio-core/src/lib.rs",
         "/crates/assetstudio-core/src/fsb_vorbis_headers.bin",
         "/crates/assetstudio-python/src/lib.rs",
         "/python/assetstudio/__init__.py",
         "/python/assetstudio/__init__.pyi",
+        "/python/assetstudio/LICENSE",
+        "/python/assetstudio/THIRD_PARTY_NOTICES.md",
+        "/python/assetstudio/THIRD_PARTY_LICENSES.txt",
         "/python/assetstudio/py.typed",
     )
     missing = [
