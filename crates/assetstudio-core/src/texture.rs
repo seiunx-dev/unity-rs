@@ -397,6 +397,12 @@ impl Texture2D {
     }
 
     pub fn mip_region(&self, mip_level: u32) -> Result<Region> {
+        self.validate_surface_mip(mip_level)?;
+        if self.uses_switch_swizzle() {
+            return Err(Error::unsupported(
+                "Nintendo Switch block-linear Texture2D data has no directly sliceable linear mip region; decode mip zero instead",
+            ));
+        }
         let (width, height) = self.mip_dimensions(mip_level)?;
         if self.format.is_crunched() {
             if mip_level != 0 || self.mips_stripped != 0 {
@@ -418,16 +424,23 @@ impl Texture2D {
     }
 
     pub fn decode_mip_rgba8(&self, mip_level: u32, limits: TextureReadLimits) -> Result<RgbaImage> {
-        if self.image_count != 1 {
+        // AssetStudio's managed converter ignores both metadata fields and
+        // decodes the first width-by-height surface from the start of
+        // `image_data`. Mirror that observable behaviour for ordinary linear
+        // payloads. Lower-mip placement across multiple images, Crunch face
+        // framing and Switch block-linear face layout are not established by
+        // that converter path, so do not infer them from the first-surface
+        // behaviour.
+        let first_surface_only = self.validate_surface_mip(mip_level)?;
+        if first_surface_only && (self.uses_switch_swizzle() || self.format.is_crunched()) {
+            let layout = if self.uses_switch_swizzle() {
+                "Nintendo Switch block-linear"
+            } else {
+                "Crunch"
+            };
             return Err(Error::unsupported(format!(
-                "Texture2D image count {} (only a single 2D image is implemented)",
-                self.image_count
-            )));
-        }
-        if self.dimension != 2 {
-            return Err(Error::unsupported(format!(
-                "Texture2D dimension {} (only Tex2D dimension 2 is implemented)",
-                self.dimension
+                "{layout} Texture2D image count {} and dimension {} have no sample-verified multi-surface layout",
+                self.image_count, self.dimension
             )));
         }
         // A texture with no bytes is not a broken one. Unity builds dynamic
@@ -498,6 +511,17 @@ impl Texture2D {
             height,
             pixels,
         })
+    }
+
+    fn validate_surface_mip(&self, mip_level: u32) -> Result<bool> {
+        let first_surface_only = self.image_count != 1 || self.dimension != 2;
+        if first_surface_only && mip_level != 0 {
+            return Err(Error::unsupported(format!(
+                "Texture2D image count {} and dimension {} expose only the first surface at mip zero",
+                self.image_count, self.dimension
+            )));
+        }
+        Ok(first_surface_only)
     }
 
     fn decode_crunched_mip0_rgba8(
@@ -4223,6 +4247,80 @@ mod tests {
         assert_eq!(texture.data.len(), 15);
         assert_eq!((image.width, image.height), (1, 1));
         assert_eq!(image.pixels, [21, 22, 23, 255]);
+    }
+
+    #[test]
+    fn multi_image_and_non_2d_linear_textures_decode_only_the_first_surface() {
+        let mut texture = Texture2D {
+            path_id: 1,
+            name: "cube".to_owned(),
+            width: 1,
+            height: 1,
+            complete_image_size: 24,
+            mips_stripped: 0,
+            mip_count: 1,
+            format: TextureFormat::RGBA32,
+            image_count: 6,
+            dimension: 4,
+            platform_blob_size: 0,
+            platform_blob: None,
+            target_platform: NO_TARGET_PLATFORM,
+            uses_unity_crunch: false,
+            data: Region::from_bytes([
+                1, 2, 3, 4, 9, 8, 7, 6, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33, 40, 41, 42,
+                43,
+            ]),
+        };
+
+        assert_eq!(
+            texture
+                .decode_mip_rgba8(0, TextureReadLimits::default())
+                .unwrap()
+                .pixels,
+            [1, 2, 3, 4]
+        );
+
+        texture.image_count = 1;
+        texture.dimension = 3;
+        assert_eq!(
+            texture
+                .decode_mip_rgba8(0, TextureReadLimits::default())
+                .unwrap()
+                .pixels,
+            [1, 2, 3, 4]
+        );
+
+        texture.image_count = 6;
+        texture.dimension = 4;
+        texture.mip_count = 2;
+        assert!(matches!(
+            texture.decode_mip_rgba8(1, TextureReadLimits::default()),
+            Err(crate::Error::Unsupported(message)) if message.contains("first surface at mip zero")
+        ));
+        assert!(matches!(
+            texture.mip_region(1),
+            Err(crate::Error::Unsupported(message)) if message.contains("first surface at mip zero")
+        ));
+
+        let mut switch = switch_texture(1, 1, TextureFormat::RGBA32, 0, &[0; 512]);
+        switch.image_count = 6;
+        switch.dimension = 4;
+        assert!(matches!(
+            switch.decode_mip_rgba8(0, TextureReadLimits::default()),
+            Err(crate::Error::Unsupported(message)) if message.contains("block-linear")
+        ));
+        assert!(matches!(
+            switch.mip_region(0),
+            Err(crate::Error::Unsupported(message)) if message.contains("directly sliceable")
+        ));
+
+        let mut crunched = crunched_texture(TextureFormat::DXT1_CRUNCHED, false, CLASSIC_DXT1_CRN);
+        crunched.image_count = 6;
+        crunched.dimension = 4;
+        assert!(matches!(
+            crunched.decode_mip_rgba8(0, TextureReadLimits::default()),
+            Err(crate::Error::Unsupported(message)) if message.contains("Crunch")
+        ));
     }
 
     #[test]

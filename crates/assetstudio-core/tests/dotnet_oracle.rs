@@ -62,6 +62,7 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
 
     assert_version_matrix(&executable);
     assert_compressed_texture_formats(&executable);
+    assert_first_surface_textures(&executable);
     assert_crunched_textures(&executable);
     assert_astc_textures(&executable);
     assert_bc6h_textures(&executable);
@@ -74,6 +75,54 @@ fn managed_and_rust_manifests_match_for_shared_fixture() {
     assert_container_fixtures(&executable);
     assert_split_group_fixture(&executable);
     assert_truncated_fixture(&executable);
+}
+
+/// Confirms the managed converter's unusual multi-surface contract.
+///
+/// `Texture2DConverter` reads `m_ImageCount` and `m_TextureDimension` only as
+/// part of the object layout; it then decodes exactly one width-by-height
+/// surface from the start of `image_data`. Rust deliberately mirrors that for
+/// mip zero without claiming a layout for later faces or mips.
+fn assert_first_surface_textures(executable: &Path) {
+    const REVISION: &str = "2022.3.62f1";
+    const FIRST_SURFACE: [u8; 4] = [1, 2, 3, 4];
+    const CASES: &[(&str, i32, i32, usize)] = &[
+        ("two-images", 2, 2, 2),
+        ("three-dimensional", 1, 3, 2),
+        ("cubemap", 6, 4, 6),
+    ];
+
+    for (name, image_count, dimension, surface_count) in CASES {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&FIRST_SURFACE);
+        for surface in 1..*surface_count {
+            let marker = u8::try_from(surface).unwrap().wrapping_add(16);
+            payload.extend_from_slice(&[marker, marker, marker, marker]);
+        }
+        let object = texture2d_inline_with_shape(
+            &format!("oracle-{name}"),
+            1,
+            1,
+            4,
+            1,
+            REVISION,
+            &[],
+            &payload,
+            *image_count,
+            *dimension,
+        );
+        let file = synthetic_single_v22(28, 28, REVISION, &object);
+        let fixture = TemporaryFixture::new(&format!("oracle-{name}.assets"), &file)
+            .expect("the first-surface fixture is writable");
+        let managed = managed_manifest(executable, fixture.input_path()).unwrap();
+        let rust = rust_manifest(fixture.input_path(), 1024 * 1024).unwrap();
+        assert_eq!(managed, rust, "first-surface texture {name}");
+        assert_eq!(
+            managed["Files"][0]["Objects"][0]["Payload"]["Decoded"]["Fnv64"],
+            format!("{:016x}", fnv1a64(&FIRST_SURFACE)),
+            "the managed converter did not select the first surface for {name}: {managed}"
+        );
+    }
 }
 
 /// Compares a serialized file delivered as a Unity split group.
@@ -3417,6 +3466,33 @@ fn texture2d_inline(
     platform_blob: &[u8],
     data: &[u8],
 ) -> Vec<u8> {
+    texture2d_inline_with_shape(
+        name,
+        width,
+        height,
+        format,
+        mip_count,
+        revision,
+        platform_blob,
+        data,
+        1,
+        2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn texture2d_inline_with_shape(
+    name: &str,
+    width: i32,
+    height: i32,
+    format: i32,
+    mip_count: i32,
+    revision: &str,
+    platform_blob: &[u8],
+    data: &[u8],
+    image_count: i32,
+    dimension: i32,
+) -> Vec<u8> {
     let mut output = Vec::new();
     push_string(&mut output, name);
     // The fallback-format block arrives at 2017.3, and its alpha-channel byte
@@ -3464,8 +3540,8 @@ fn texture2d_inline(
         push_i32(&mut output, 0);
     }
 
-    push_i32(&mut output, 1); // image count
-    push_i32(&mut output, 2); // dimension
+    push_i32(&mut output, image_count);
+    push_i32(&mut output, dimension);
     output.extend_from_slice(&[0; 24]); // GL texture settings
     push_i32(&mut output, 0); // lightmap format
     push_i32(&mut output, 0); // colour space
