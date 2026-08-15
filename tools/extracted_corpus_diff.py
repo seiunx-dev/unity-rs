@@ -91,8 +91,19 @@ Counts matter as much as extremes here. Reporting only the worst pixel made a
 21-pixel edge case read as "alpha differs by 255" -- indistinguishable from a
 texture that decoded wrongly from end to end. For the same reason the problem
 list is capped per kind rather than globally: a single flat cap filled with
-image rows and hid 39 meshes this project exported nothing for, which were
-visible only in the totals.
+image rows and hid 39 meshes reported as never exported, which were visible
+only in the totals.
+
+Those 39 are worth recording, because 34 of them were this tool's fault. The
+name normalization handled spaces and stopped there, so a Spine mesh -- named
+`Skeleton Prefab Mesh [Spine GameObject (x)]` in the asset and
+`Skeleton_Prefab_Mesh__Spine_GameObject__x__` in the extraction -- looked like
+a file this project never wrote. It wrote all 34, and with the names matched
+they compare value for value: 632 of 637 OBJs compared, 632 identical, none
+differing. The remaining 5 are Unity's vertex-less meshes, which the export
+path declines as unsupported and the extraction writes as empty files. A
+mismatched name masquerading as a missing export is precisely the alarm this
+arm exists to raise, raised by the arm itself.
 """
 
 from __future__ import annotations
@@ -136,6 +147,14 @@ def obj_values(path: Path) -> list[list[object]]:
                 row.append(token)
         rows.append(row)
     return rows
+
+
+def sanitized_name(stem: str) -> str:
+    """The extraction's spelling of an asset name: one `_` per unsafe character."""
+    return "".join(
+        character if character.isalnum() or character in "_.-" else "_"
+        for character in stem
+    )
 
 
 def lossy_utf8_reencode(raw: bytes) -> bytes:
@@ -310,6 +329,14 @@ def main() -> int:
                     # Without this the file reads as one this project never
                     # produced, which is a much more alarming thing to report.
                     mine.setdefault(stem.replace(" ", "_") + path.suffix, path)
+                    # Spaces are not the only thing it replaces. A Spine mesh is
+                    # `Skeleton Prefab Mesh [Spine GameObject (name)]` in the
+                    # asset and `Skeleton_Prefab_Mesh__Spine_GameObject__name__`
+                    # in the extraction, so brackets and parentheses go the same
+                    # way. Matching only on spaces reported 34 of these as never
+                    # exported when all 34 were written and correct -- the alarm
+                    # this arm exists to prevent, raised by the arm itself.
+                    mine.setdefault(sanitized_name(stem) + path.suffix, path)
             if failed:
                 subprocess.run(["rm", "-rf", str(root)], check=True)
                 root.mkdir()
