@@ -113,21 +113,30 @@ copy is held to the same standard as the rest of the texture path rather
 than trusted because it was copied. Drop the directory and restore the two
 call sites in `texture.rs` when upstream releases the fix.
 
-### It shows up in shipped game art, not only in synthetic blocks
+### Scope, and a correction
 
-Measured on 2026-08-15 against a real Project Sekai bundle, an
-`ASTC_RGB_6x6` sprite atlas of 600x576:
+This defect is in the HDR path. `select_color_hdr` is reached by the six ASTC
+HDR formats, and `f32_to_u8` by BC6H, which is HDR-only. LDR ASTC does not go
+through either, so nothing below is evidence for this fix -- the evidence for
+it is the managed differential, where all eighteen ASTC formats and BC6H are
+compared against the reference decoder and required to agree exactly.
 
-* this crate's decode and the managed native decoder produce the same
-  1,382,400 bytes, FNV-1a `c6687283ffa9acde`;
-* UnityPy, which binds the unpatched crate, differs from both.
+An earlier version of this section claimed otherwise. It measured an
+`ASTC_RGB_6x6` sprite atlas from a shipping game, found this crate agreeing
+with the managed native decoder byte for byte (1,382,400 bytes, FNV-1a
+`c6687283ffa9acde`) while UnityPy differed by one level, and attributed
+UnityPy's difference to the unpatched crate. That attribution was wrong twice
+over: the texture is LDR, so this fix cannot touch it, and UnityPy does not
+decode ASTC with `texture2ddecoder` at all -- it uses `astc_encoder`, a
+binding to ARM's reference codec, with `USE_DECODE_UNORM8`.
 
-The differences are not scattered noise. Across twenty sprites from that
-bundle every differing byte is off by exactly one, always in R, G or B, never
-in alpha -- the signature of a truncation where the reference rounds. So the
-defect does not corrupt an image so much as shift a third of its colour
-channels down by one level, which is why it survives visual inspection and
-why nothing short of a byte comparison against another decoder finds it.
+What those measurements do show is worth keeping, stated correctly. On two
+shipping games this crate's LDR ASTC decode is byte-identical to the managed
+native decoder, and within one level per channel of ARM's reference decoder --
+including alpha, since an ASTC block decodes all four channels through the
+same endpoint arithmetic and an `ASTC_RGB_*` texture can still carry a varying
+alpha. `tools/unitypy_texture_diff.py` checks exactly that and reports
+anything outside it.
 
 ---
 
