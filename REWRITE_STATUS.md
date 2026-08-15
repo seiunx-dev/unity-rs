@@ -174,8 +174,9 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - 新增 codec 必须先有真实样本和独立 oracle，不能只凭推测实现。
 
 3. **MonoBehaviour schema 来源**
-   - 内嵌 TypeTree 和调用方提供的可信完整 schema 已支持；
-   - 自动从 managed assembly/dummy DLL 生成 schema 仍是独立的离线可信工具工作，不会在解析进程中加载或执行 DLL。
+   - 内嵌 TypeTree、调用方提供的可信完整 schema、以及生成器写出的 JSON 文档均已支持，CLI/Core/Node/Python 四个面都可达；
+   - 从 managed assembly/dummy DLL 生成 schema 仍是独立的离线可信工具（`tools/monoschema`），不会在解析进程中加载或执行 DLL；
+   - 仍未做：生成器不产出 `unity_version`（条目因此对所有版本生效），以及重建的树在字段命名上与 Unity 自己的树有已知分歧（枚举、`UnityEngine.Rect` 等引擎结构），两者都写在 `docs/mono-schema.md` 里。
 
 4. **Node 专用 reader 完整度**
    - Node 公开面从 15 个同步方法加 9 个 Promise 方法扩到 35 + 9：读取面新增 `readAudio`、`readMonoScript`、`readMaterial`、`readBuildSettings`、`readPlayerSettings`、`readAvatar`、`readAnimationClipInfo`、`readAnimatorController`、`readAclTracks`（只读 ACL 头，够调用方判断自己的 decoder 能不能处理）、`readMonoBehaviourJsonWithSchemas`（用调用方提供的可信 schema 还原被剥掉的托管字段；schema 是纯数据，查找过程不执行任何资产控制的代码）、`readResourceRange`、`resourceIndexByPath`、`scene`；输出面新增 `readStaticFbx`、`readFbx`（含动画）、`readFbxWithTextures`（贴图随 FBX 一起返回，由调用方决定写哪）、`export`、静态 `extract`、`live2DPackages`、`readLive2DPackages`；加载面新增工厂方法 `openWithVersion`、`fromBuffers` 与 `openWithOodle`。Material 属性值刻意只给名字不给值：它们按表分类型，硬摊平到 JS 只会丢信息。
@@ -235,6 +236,23 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 - Rust crate、Python wheel/sdist、可选 Node 包和 CLI 的跨平台发布任务通过；
 - 导出/解包保持有界、拒绝路径穿越和符号链接目标，并采用安全原子发布；
 - C# 只需作为历史参考或可选 oracle，不再承担用户运行时功能。
+
+### 本轮进展（2026-08-15 晚）
+
+**MonoBehaviour schema 从「接口存在」做成了「能用且被验证过」**。此前 Core 有 provider trait 和 registry，但没有任何东西能把一份真实的 schema 送进去：CLI 没有开关，`export` 根本不接 provider。现在补齐了三段：`MonoBehaviourSchemaRegistry::from_json` 读生成器写出的文档（对每一种「描述不了任何东西」的形状都明确拒绝，而不是收下之后静默读错）；`export` 走 `ExportPlan` 拿到 provider 与文件下标（解析跨文件 `m_Script` 需要后者）；CLI 加 `--mono-schema <path>`（可重复）与 `--mono-schema-override`。经由 schema 读出的对象在导出报告里叫 `typetree_json_schema` 而不是 `typetree_json`——这是更弱的一句话，报告不该把两者混为一谈。
+
+- **一个真实缺陷**：`MonoScript` 里的程序集名是 `Fwk`，而按目录生成的 schema 写的是 `Fwk.dll`，registry 逐字比较，于是每一次查找都落空——调用方可以送进一整套 schema，什么都不发生，也没有任何提示。一款 Unity 6000.3 游戏里 115 个不同的 MonoScript，修之前命中 0 个，修之后命中 81 个（其余是这份 dummy DLL 集里确实没有的类）。
+- **生成器 `tools/monoschema`**：读游戏的托管程序集（Mono 的 `Managed` 目录或 IL2CPP dump 的 DummyDll），产出 JSON。读程序集与读数据文件是两种不同的信任判断，因此它是独立程序：Rust 侧不链接任何托管 reader，也不打开 DLL，只消费这份 JSON。
+- **dummy DLL 的两处失真**，都安静到值得单独写出来。其一：Il2CppDumper 写出的 enum 基类是底层类型（`System.Int32`）而不是 `System.Enum`，Cecil 因此看不见 enum，Unity 的序列化逻辑答「不是可序列化值类型」，字段被丢掉且没有任何提示——schema 短四个字节，唯一症状是很久之后读越界；光 `UnityEngine.UI.ScrollRect` 就丢三个字段。生成器按形状把它认回来（一个名为 `value__` 的整型实例字段），这份语料修回了 1,680 个 enum。其二：字段类型所在的程序集不在目录里时，`Resolve()` 失败，字段同样被安静丢掉——生成器把这些类和字段打到 stderr（下游无从得知 schema 为什么短），而 Rust 侧仍然拒收这种对象，因为它的树覆盖不了对象的全部字节。
+- **验证**：schema 对着它所来自的构建是无法验证的——reader 没有可以反对的东西，布局错了就会读出自信的胡话。`tools/mono_schema_diff.py` 用唯一有意义的方式验：拿到**仍然带 TypeTree 的构建**，同一个对象读两遍再比。全部 2,777 个 bundle、94,713 个经 schema 读出的对象，取值与 Unity 自己的树逐一相同（53,350 个连 JSON 都逐字节相同，其余 41,363 个只差字段名——重建的树按 C# 源码命名，Unity 不总是同意，比如 `UnityEngine.Rect` 序列化成 `x, y, width, height` 而字段叫 `m_XMin, m_YMin, m_Width, m_Height`）。细节见 `docs/mono-schema.md`。
+
+**`SerializeReference` 托管引用注册表已实现**。此前那段余数被当成「读不了的对象」拒收，注释里还断言它「几乎总是」注册表——两份语料都不支持这个说法，措辞已改。真正的实现是：注册表自己的形状在 type tree 里，每条记录里存的对象的形状不在，要从文件声明的 reference types 按 class/namespace/assembly 取。三处细节各由一个「去掉就挂」的测试钉住：不命名类的记录是 Unity 的 null 引用，不存任何东西，因此字段不写出来而不是编一个；命名了文件未声明的类型的记录直接拒收，因为它的长度只能从不存在的布局得知，没有东西可以跳过；只读最外层的注册表声明，reference type 自己的树里可以再声明一个，读它会吃掉不属于它的字节。一款 6000.3 游戏的 CriWare bundle 里 93 个对象现在能读，且与 UnityPy 逐字节相同（其中一个是 176 字节有类型字段加一个 `rid` 后面 712,288 字节的载荷）；托管 reader 根本没实现注册表，所以这条没有 oracle 行可比。
+
+**Node 补上三处真实缺口**。此前 Node 是「一个选项一个工厂」：路径、路径加 Unity 版本、路径加 Oodle decoder——这些组合不起来，而组合是常事（一个 UnityCN 加密、同时头部版本被剥掉的档案就是同一个文件的两件事）；UnityCN key 与 skip-unreadable 则根本没有入口。现在 `openWith(path, options)` 全部接受，`openWithOodle` 也接同一份 options。`readLive2DPackages` 一直在丢掉它自己文档里承诺的 physics/pose/display-info 三份文档（它们跟包一起物化，只是没被拷出来），而且只返回包不返回 diagnostics——于是一个「因为动作的 clip 在没加载的 bundle 里」而不完整的模型，看起来和完整的一样。两处都已修。
+
+**两处线性搜索改掉**（都是「在已经做过的事情里再线性找一遍」）：`ZipContainer::read_entry` 每次调用都重开档案，于是中央目录被解析 N 次；解包器的已占用路径集合按路径建键却靠扫描每个键来查（因为大小写不同的两个名字在目标平台上是同一个文件）。一万条目的档案原本花 29 秒 CPU、且条目数翻倍代价约翻四倍，现在是 0.54 秒且线性。墙钟时间不变，全部落在每文件一次的 `sync_all` 上——那是耐久性取舍，不是缺陷。
+
+**`SpriteAtlas` 补上托管差分**。此前完全没有：sprite 行比的是渲染结果，只在恰好经由图集解析时才碰到它，图集这张表本身（键相等、版本门字段、以及依赖它们的每一个偏移）没有任何东西在比。四个 fixture 各守一道版本门，2020.1 那个是变异测试逼出来的——没有它，把 secondary texture 的门往前挪一年，任何 fixture 都看不出来。两处细节决定这条差分有没有意义：GUID 按构造它的字节输出（.NET `Guid` 会把前三个字段按显示顺序倒过来，拿那个拼写去比 Rust 保留的原始键，失败的原因与两边的 reader 都无关），以及两条记录特意选成「按原始字节排序」与「按显示顺序排序」结果不同，这样顺序错了的比较不可能通过。浮点按位模式输出，跟 material 行一样：两个序列化器对整数值浮点的拼写不同（`8` 与 `8.0`），真正的舍入差异会藏在这个分歧后面。
 
 ### 对照结论（2026-08-15）
 
