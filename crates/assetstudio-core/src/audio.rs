@@ -4714,7 +4714,13 @@ mod tests {
 
     fn ima_block(channels: u16) -> Vec<u8> {
         let channels = usize::from(channels);
-        let mut block = vec![0x10; channels * 36];
+        // Every nibble value, rather than 0x10 repeated. At 0x10 the only
+        // nibbles that ever appear are 0 and 1: the sign bit is never set, so
+        // a decoder that mishandles negative deltas passes, and the step-index
+        // table is only ever walked at its first entries.
+        let mut block: Vec<u8> = (0..channels * 36)
+            .map(|index| u8::try_from((index * 37 + 11) % 256).unwrap())
+            .collect();
         if channels <= 2 {
             for channel in 0..channels {
                 let offset = channel * 4;
@@ -4737,10 +4743,22 @@ mod tests {
 
     fn fsb5_dsp(channels: u16, non_interleaved: bool) -> Vec<u8> {
         let channels_usize = usize::from(channels);
+        // All sixteen coefficients per channel, not just the first pair. With
+        // the rest left at zero, every predictor index but 0 multiplies by
+        // nothing, so choosing the wrong pair is invisible -- and the frame
+        // headers below never chose anything else either.
         let mut coefficients = vec![0_u8; channels_usize * 0x2e];
         for channel in 0..channels_usize {
             let offset = channel * 0x2e;
-            coefficients[offset..offset + 2].copy_from_slice(&2048_i16.to_be_bytes());
+            for index in 0..16 {
+                let value = i16::try_from(
+                    1024 + i32::try_from(index).unwrap() * 137
+                        - i32::try_from(channel).unwrap() * 53,
+                )
+                .unwrap();
+                let at = offset + index * 2;
+                coefficients[at..at + 2].copy_from_slice(&value.to_be_bytes());
+            }
         }
         let frames: Vec<[u8; 8]> = (0..channels_usize).map(dsp_frame).collect();
         let mut data = Vec::with_capacity(channels_usize * 8);
@@ -4782,10 +4800,17 @@ mod tests {
         fsb
     }
 
+    /// One DSP frame, whose header selects a predictor pair and a scale.
+    ///
+    /// The header used to be zero in every frame, which pins the predictor to
+    /// pair 0 and the scale shift to 0: two of the three things a DSP decoder
+    /// has to get right, held at the one value that hides a mistake. It now
+    /// varies per channel, and the sample nibbles already did.
     fn dsp_frame(channel: usize) -> [u8; 8] {
         const NIBBLES: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        const HEADERS: [u8; 6] = [0x13, 0x25, 0x071, 0x42, 0x56, 0x34];
         let mut frame = [NIBBLES[channel]; 8];
-        frame[0] = 0;
+        frame[0] = HEADERS[channel];
         frame
     }
 
