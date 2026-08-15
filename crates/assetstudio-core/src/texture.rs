@@ -2393,10 +2393,10 @@ fn decode_external_compressed_pixels(
             texture2ddecoder::decode_etc1(input, width, height, &mut decoded)
         }
         TextureFormat::ATC_RGB4 => {
-            texture2ddecoder::decode_atc_rgb4(input, width, height, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_atc_rgb4(input, width, height, &mut decoded)
         }
         TextureFormat::ATC_RGBA8 => {
-            texture2ddecoder::decode_atc_rgba8(input, width, height, &mut decoded)
+            crate::vendor::texture2ddecoder::decode_atc_rgba8(input, width, height, &mut decoded)
         }
         TextureFormat::EAC_R => decode_eac(input, width, height, &mut decoded, EacLayout::R),
         TextureFormat::EAC_R_SIGNED => {

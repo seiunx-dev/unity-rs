@@ -131,7 +131,75 @@ why nothing short of a byte comparison against another decoder finds it.
 
 ---
 
-## 2. `ruopus` 0.1.2 — SILK output is early and inexact
+## 2. `texture2ddecoder` 0.1.2 — ATC's alternate-mode palette entry wraps
+
+### What is wrong
+
+`decode_atc_rgb4_block` builds the palette for the alternate interpolation
+mode -- the one selected when bit 15 of the first colour is set -- like this:
+
+```rust
+colors[4] = max(
+    0,
+    ((colors[8] as u16).overflowing_sub(colors[12] as u16).0 / 4) as u8,
+);
+```
+
+The entry is meant to be `max(0, c0 - c1 / 4)`. Three things go wrong in one
+expression:
+
+* the divide is applied to the difference rather than to `c1`;
+* the subtraction is `overflowing_sub`, so `c0 < c1` wraps to about 65530
+  instead of clamping;
+* `max(0, _)` is applied to an unsigned value, so it can never clamp anything.
+
+Whenever `c0 < c1` in any channel -- which is half the blocks that use this
+mode -- the entry becomes whatever the low byte of `(65536 + c0 - c1) / 4`
+happens to be.
+
+### Measurement
+
+The differential fixture is four 8-byte blocks of pseudo-random bytes, two of
+which land in the alternate mode. Every mode-0 block agrees with the managed
+decoder exactly. Both mode-1 blocks disagree, at the three texels that select
+palette index 1:
+
+| block | c0 | c1 | managed | this crate |
+|---|---|---|---|---|
+| 0 | (132,132,74) | (41,36,165) | (122,123,33) | (22,24,233) |
+| 1 | (66,214,173) | (8,28,148) | (64,207,136) | (14,46,6) |
+
+The managed values are `max(0, c0 - c1/4)` to the byte. The crate's are
+`((c0 - c1) mod 65536) / 4` truncated to eight bits, to the byte. Channels
+move by up to 200 of 255, so this is not a rounding step -- an ATC texture
+using the mode decodes to the wrong colours.
+
+### The fix
+
+```diff
+-        colors[4] = max(
+-            0,
+-            ((colors[8] as u16).overflowing_sub(colors[12] as u16).0 / 4) as u8,
+-        );
++        colors[4] = colors[8].saturating_sub(colors[12] / 4);
+```
+
+and the same for `colors[5]` and `colors[6]`.
+
+### Status
+
+Present on `master` as of 2026-08-15; 0.1.2 is the latest release. Not filed.
+
+**Fixed here by vendoring**, alongside the two rounding defects above:
+`crates/assetstudio-core/src/vendor/texture2ddecoder/atc.rs` carries the
+decoder with that one expression corrected. `ATC_RGB4` and `ATC_RGBA8` are now
+in the managed differential and agree exactly, which is also how the defect
+was found -- adding the two formats to the comparison was an audit's
+suggestion, because until then neither had a test of any kind.
+
+---
+
+## 3. `ruopus` 0.1.2 — SILK output is early and inexact
 
 **Affects** FSB5 Opus decoding wherever the stream uses SILK or hybrid packets,
 which is what libopus selects at lower bitrates. CELT-only packets are correct.
@@ -180,18 +248,19 @@ audio decoding is otherwise pure Rust.
 
 ---
 
-## Why one is fixed here and the other is not
+## Why the texture defects are fixed here and the Opus one is not
 
-Neither can be corrected from outside the dependency. For the texture defect
-the reason is precise: the conversion is the decoder's last step, so nothing
-downstream can recover what it discarded. For the Opus one it is that the
-divergence has been characterised from the outside but not located in the
-source -- the measurements above say what `ruopus` does and where it does it
-by packet mode, not which line is responsible.
+None can be corrected from outside the dependency. For the two rounding
+defects the reason is precise: the conversion is the decoder's last step, so
+nothing downstream can recover what it discarded. The ATC one is a palette
+entry, equally interior. For the Opus defect it is that the divergence has
+been characterised from the outside but not located in the source -- the
+measurements above say what `ruopus` does and where it does it by packet mode,
+not which line is responsible.
 
-The texture defect is fixed by vendoring the two decoders that carry it, a
-change of one expression each. That was worth roughly 3,000 lines because it
-makes seven texture formats byte-exact against the managed implementation, and
+The texture defects are fixed by vendoring the three decoders that carry them,
+a change of one expression each. That was worth roughly 3,000 lines because it
+makes nine texture formats byte-exact against the managed implementation, and
 because the managed differential proves the copy correct rather than the copy
 being taken on trust.
 

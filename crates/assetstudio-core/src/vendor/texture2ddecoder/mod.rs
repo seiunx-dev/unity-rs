@@ -1,4 +1,4 @@
-//! Vendored ASTC and BC6H decoders from `texture2ddecoder` 0.1.2.
+//! Vendored ASTC, BC6H and ATC decoders from `texture2ddecoder` 0.1.2.
 //!
 //! The workspace still depends on that crate for every other format. These two
 //! decoders are copied here because both of their ports of the reference
@@ -14,6 +14,13 @@
 //!   `floor(f * 255.0 + 0.5)`.
 //! * `bc6.rs`, `f32_to_u8`: the truncating `as u8` becomes an explicit
 //!   clamp-then-round.
+//! * `atc.rs`, the alternate-mode palette: `(c0 - c1) / 4` computed with
+//!   `overflowing_sub` becomes `c0.saturating_sub(c1 / 4)`, which is what the
+//!   format calls for. Upstream divides the difference rather than the
+//!   subtrahend and then clamps an unsigned value with `max(0, _)`, which
+//!   cannot clamp; whenever c0 < c1 the subtraction wraps and the entry
+//!   becomes a byte of noise. This one is not a rounding step -- it moves
+//!   whole channels by up to 200 of 255 on ordinary blocks.
 //!
 //! Both restore `roundf(f * 255)` from the C++ these were ported from. Without
 //! them every HDR channel landing at or above a half comes out a step low --
@@ -30,6 +37,8 @@
 //! the arrangement.
 
 mod astc;
+mod atc;
+mod bc3_alpha;
 mod bc6;
 mod bitreader;
 mod color;
@@ -37,6 +46,7 @@ mod consts;
 mod f16;
 
 pub(crate) use astc::decode_astc;
+pub(crate) use atc::{decode_atc_rgb4, decode_atc_rgba8};
 
 /// Decodes a whole BC6H (unsigned) image.
 ///
