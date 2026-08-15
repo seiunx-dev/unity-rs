@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <NuGetAudit>false</NuGetAudit>
+    <RestoreIgnoreFailedSources>true</RestoreIgnoreFailedSources>
+    <AssemblyName>monoschema</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    A release build ships no type tree for its own scripts, so the layout has
+    to come from the assemblies. Reading a game's managed assemblies is a
+    different trust decision from reading its data files, which is why this is
+    a separate tool run by hand rather than anything the Rust crates link: they
+    consume the JSON this writes and never open a DLL.
+
+    The managed reader lives in Team-Haruki/AssetStudio. Point AssetStudioRepo
+    at a checkout, or keep that repository beside this one.
+  -->
+  <PropertyGroup>
+    <AssetStudioRepo Condition="'$(AssetStudioRepo)' == ''">$(MSBuildThisFileDirectory)../../../AssetStudio</AssetStudioRepo>
+    <AssetStudioProject>$(AssetStudioRepo)/AssetStudio/AssetStudio.csproj</AssetStudioProject>
+    <AssetStudioUtilityProject>$(AssetStudioRepo)/AssetStudioUtility/AssetStudioUtility.csproj</AssetStudioUtilityProject>
+  </PropertyGroup>
+
+  <Target Name="RequireAssetStudioCheckout" BeforeTargets="PrepareForBuild;CollectPackageReferences">
+    <Error
+      Condition="!Exists('$(AssetStudioProject)') Or !Exists('$(AssetStudioUtilityProject)')"
+      Text="The schema generator needs a Team-Haruki/AssetStudio checkout. Looked for '$(AssetStudioProject)'. Clone it beside this repository, or pass -p:AssetStudioRepo=&lt;path&gt;." />
+  </Target>
+
+  <ItemGroup>
+    <ProjectReference
+      Include="$(AssetStudioProject)"
+      SetTargetFramework="TargetFramework=net10.0" />
+    <ProjectReference
+      Include="$(AssetStudioUtilityProject)"
+      SetTargetFramework="TargetFramework=net10.0" />
+  </ItemGroup>
+
+</Project>
