@@ -920,6 +920,8 @@ fn unity_minor_version(revision: &str) -> (u32, u32) {
 fn assert_compressed_texture_formats(executable: &Path) {
     // (name, format code, bytes per 4x4 block)
     const FORMATS: &[(&str, i32, usize)] = &[
+        ("atc-rgb4", 35, 8),
+        ("atc-rgba8", 36, 16),
         ("bc4", 26, 8),
         ("bc5", 27, 16),
         ("bc7", 25, 16),

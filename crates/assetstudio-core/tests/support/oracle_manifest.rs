@@ -726,6 +726,12 @@ fn mesh_manifest(
     }))
 }
 
+fn dump_pixels(name: &str, pixels: &[u8]) {
+    if let Ok(directory) = std::env::var("ORACLE_PIXEL_DUMP") {
+        let _ = std::fs::write(format!("{directory}/{name}.rust.rgba"), pixels);
+    }
+}
+
 fn texture_manifest(
     studio: &Studio,
     file_index: usize,
@@ -744,7 +750,14 @@ fn texture_manifest(
     // format it cannot handle decodes to null on both sides rather than failing
     // the comparison.
     let decoded = match texture.decode_mip_rgba8(0, limits) {
-        Ok(image) => bytes_manifest(&image.pixels),
+        Ok(image) => {
+            dump_pixels(&texture.name, &image.pixels);
+            dump_pixels(
+                &format!("{}.input", texture.name),
+                &texture.data.read_to_vec(maximum_bytes)?,
+            );
+            bytes_manifest(&image.pixels)
+        }
         Err(_) => Value::Null,
     };
     Ok(json!({

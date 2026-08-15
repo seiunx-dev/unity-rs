@@ -517,6 +517,10 @@ static object TexturePayload(Texture2D texture)
                 }
             }
             decoded = Bytes(rgba);
+            if (Environment.GetEnvironmentVariable("ORACLE_PIXEL_DUMP") is string pixelDump)
+            {
+                File.WriteAllBytes(Path.Combine(pixelDump, $"{texture.m_Name}.rgba"), rgba);
+            }
         }
     }
     return new
