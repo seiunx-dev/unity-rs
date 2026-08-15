@@ -107,9 +107,15 @@ arm exists to raise, raised by the arm itself.
 
 Where all of that lands, over the whole 2,778-bundle corpus: 637 OBJs
 compared with 632 identical and 5 declined as vertex-less; 2,609 images with
-248 identical, 2,147 inside the decoder allowance, 214 disagreeing on
-tight-mesh boundaries and none missing; 577 text assets with 6 identical, 571
+248 identical, 2,147 inside the decoder allowance, 212 disagreeing, 2 refused
+as ambiguous names and none missing; 577 text assets with 6 identical, 571
 attributed to the extraction's re-encoding, none missing and none differing.
+
+Of those 212, exactly one is a colour disagreement rather than a mask edge --
+a 4096x4096 Alpha8 font atlas, where this project matches the managed
+converter's opaque white and the extraction writes black. That format is now
+covered by the managed differential directly, so this arm is no longer the
+only thing watching it. The other 211 are 4,496 mask-edge pixels in total.
 """
 
 from __future__ import annotations
