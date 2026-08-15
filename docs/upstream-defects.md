@@ -113,6 +113,22 @@ copy is held to the same standard as the rest of the texture path rather
 than trusted because it was copied. Drop the directory and restore the two
 call sites in `texture.rs` when upstream releases the fix.
 
+### It shows up in shipped game art, not only in synthetic blocks
+
+Measured on 2026-08-15 against a real Project Sekai bundle, an
+`ASTC_RGB_6x6` sprite atlas of 600x576:
+
+* this crate's decode and the managed native decoder produce the same
+  1,382,400 bytes, FNV-1a `c6687283ffa9acde`;
+* UnityPy, which binds the unpatched crate, differs from both.
+
+The differences are not scattered noise. Across twenty sprites from that
+bundle every differing byte is off by exactly one, always in R, G or B, never
+in alpha -- the signature of a truncation where the reference rounds. So the
+defect does not corrupt an image so much as shift a third of its colour
+channels down by one level, which is why it survives visual inspection and
+why nothing short of a byte comparison against another decoder finds it.
+
 ---
 
 ## 2. `ruopus` 0.1.2 — SILK output is early and inexact
