@@ -438,6 +438,45 @@ class MonoScript:
     @property
     def is_editor_script(self) -> Optional[bool]: ...
 
+class SceneLimits:
+    def __new__(
+        cls,
+        *,
+        maximum_game_objects: int = 1_000_000,
+        maximum_total_components: int = 10_000_000,
+        maximum_total_transform_child_references: int = 10_000_000,
+        maximum_total_material_references: int = 10_000_000,
+        maximum_total_bone_references: int = 10_000_000,
+        maximum_hierarchy_edges: int = 1_000_000,
+    ) -> SceneLimits: ...
+    @property
+    def maximum_game_objects(self) -> int: ...
+    @property
+    def maximum_total_components(self) -> int: ...
+    @property
+    def maximum_total_transform_child_references(self) -> int: ...
+    @property
+    def maximum_total_material_references(self) -> int: ...
+    @property
+    def maximum_total_bone_references(self) -> int: ...
+    @property
+    def maximum_hierarchy_edges(self) -> int: ...
+
+class ModelTextureLimits:
+    def __new__(
+        cls,
+        *,
+        maximum_textures: int = 4_096,
+        maximum_total_encoded_bytes: int = 2_147_483_648,
+        maximum_single_texture_bytes: int = 536_870_912,
+    ) -> ModelTextureLimits: ...
+    @property
+    def maximum_textures(self) -> int: ...
+    @property
+    def maximum_total_encoded_bytes(self) -> int: ...
+    @property
+    def maximum_single_texture_bytes(self) -> int: ...
+
 class SceneNode:
     @property
     def file_index(self) -> int: ...
@@ -750,7 +789,11 @@ class AssetStudio:
         *,
         maximum_bytes: int = 536_870_912,
     ) -> bytes: ...
-    def scene(self) -> list[SceneNode]: ...
+    def scene(
+        self,
+        *,
+        limits: Optional[SceneLimits] = None,
+    ) -> list[SceneNode]: ...
     def read_static_fbx(
         self,
         *,
@@ -817,12 +860,16 @@ class AssetStudio:
         self,
         *,
         material_library_name: str = "model.mtl",
-        maximum_bytes: int = 1_073_741_824,
+        texture_format: str = "png",
+        maximum_bytes: int = 536_870_912,
+        texture_limits: Optional[ModelTextureLimits] = None,
     ) -> ModelObj: ...
     def read_fbx_with_textures(
         self,
         *,
-        maximum_bytes: int = 1_073_741_824,
+        texture_format: str = "png",
+        maximum_bytes: int = 536_870_912,
+        texture_limits: Optional[ModelTextureLimits] = None,
     ) -> TexturedFbx: ...
     def read_mesh_obj(
         self,

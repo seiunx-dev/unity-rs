@@ -1,5 +1,7 @@
 """Native, bounded Unity asset parsing powered by AssetStudio's Rust core."""
 
+from typing import Callable as _Callable, Optional as _Optional
+
 from ._native import (
     __version__,
     AclCompressedTracks,
@@ -39,6 +41,7 @@ from ._native import (
     Material,
     ModelFile,
     ModelObj,
+    ModelTextureLimits,
     MonoBehaviourJson,
     MonoBehaviourSchema,
     MonoBehaviourSchemas,
@@ -49,13 +52,21 @@ from ._native import (
     RgbaImage,
     ResourceInfo,
     ResourceIterator,
+    SceneLimits,
     SceneNode,
     TexturedFbx,
     extract,
 )
 
+OodleDecoder = _Callable[[bytes, int], bytes]
+AclDecoder = _Callable[
+    [bytes, list[int], int, int, float, _Optional[int], _Optional[bool]],
+    tuple[list[float], list[int], list[float], int],
+]
+
 __all__ = [
     "__version__",
+    "AclDecoder",
     "AclCompressedTracks",
     "AclDecodedClip",
     "AnimationClip",
@@ -93,16 +104,19 @@ __all__ = [
     "Material",
     "ModelFile",
     "ModelObj",
+    "ModelTextureLimits",
     "MonoBehaviourJson",
     "MonoBehaviourSchema",
     "MonoBehaviourSchemas",
     "MonoScript",
     "ObjectInfo",
     "ObjectIterator",
+    "OodleDecoder",
     "PlayerSettings",
     "RgbaImage",
     "ResourceInfo",
     "ResourceIterator",
+    "SceneLimits",
     "SceneNode",
     "TexturedFbx",
     "extract",
