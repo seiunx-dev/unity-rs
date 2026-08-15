@@ -136,7 +136,12 @@ fn bundle(signature: &str, layout: &BundleLayout<'_>, entries: &[BundleEntry<'_>
         blocks,
         directory,
     } = *layout;
-    assert!(matches!(version, 6 | 7), "bundle fixtures cover v6 and v7");
+    // 8 shares v7's header and blocks info; the writer below already keys the
+    // alignment off `>= 7`, so it needs nothing else to emit one.
+    assert!(
+        matches!(version, 6..=8),
+        "bundle fixtures cover v6, v7 and v8"
+    );
     let legacy = signature != "UnityFS";
 
     let mut data = Vec::new();
