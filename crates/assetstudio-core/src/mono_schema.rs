@@ -14,7 +14,7 @@ use crate::monobehaviour::{
 };
 use crate::scene::resolve_object_reference;
 use crate::serialized::{ObjectReference, TypeTree, TypeTreeNode};
-use crate::type_tree::{TypeValue, read_type_tree_from_reader};
+use crate::type_tree::{TypeValue, read_type_tree_from_reader_with_reference_types};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
@@ -405,11 +405,14 @@ pub fn read_mono_behaviour_value_with_provider(
     } else {
         Endian::Big
     };
-    let value = read_type_tree_from_reader(
+    let value = read_type_tree_from_reader_with_reference_types(
         tree,
         EndianReader::new(payload.cursor(), endian),
         object.byte_start,
         limits.type_tree,
+        // A supplied schema describes the object body; a SerializeReference
+        // field in it still stores through the file's own reference types.
+        &loaded.file.reference_types,
     )?;
     Ok(ResolvedMonoBehaviourValue {
         value,

@@ -1,10 +1,48 @@
 use std::io::{Read, Seek};
 
 use crate::endian::{Endian, EndianReader, checked_length};
-use crate::serialized::{SerializedFile, TypeTree, TypeTreeNode};
+use crate::serialized::{SerializedFile, SerializedType, TypeTree, TypeTreeNode};
 use crate::{Error, Result};
 
 const ALIGN_BYTES_FLAG: i32 = 0x4000;
+
+/// The node names Unity gives the managed-references registry it writes after
+/// an object body for `SerializeReference` fields.
+const MANAGED_REFERENCES_REGISTRY: &str = "ManagedReferencesRegistry";
+const REFERENCED_MANAGED_TYPE: &str = "ReferencedManagedType";
+const REFERENCED_OBJECT_DATA: &str = "ReferencedObjectData";
+
+/// The class, namespace and assembly one registry entry names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedTypeIdentity {
+    class_name: String,
+    namespace: String,
+    assembly_name: String,
+}
+
+fn managed_type_identity(value: &TypeValue) -> Result<ManagedTypeIdentity> {
+    let TypeValue::Object(fields) = value else {
+        return Err(Error::invalid_data(
+            "managed reference type is not a record of class, namespace and assembly",
+        ));
+    };
+    let text = |name: &str| -> Result<String> {
+        match fields.iter().find(|field| field.name == name) {
+            Some(TypeField {
+                value: TypeValue::String(value),
+                ..
+            }) => Ok(value.clone()),
+            _ => Err(Error::invalid_data(format!(
+                "managed reference type has no {name} string"
+            ))),
+        }
+    };
+    Ok(ManagedTypeIdentity {
+        class_name: text("class")?,
+        namespace: text("ns")?,
+        assembly_name: text("asm")?,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeTreeReadLimits {
@@ -131,11 +169,12 @@ impl SerializedFile {
         } else {
             Endian::Big
         };
-        read_type_tree_from_reader(
+        read_type_tree_from_reader_with_reference_types(
             tree,
             EndianReader::new(payload.cursor(), endian),
             object.byte_start,
             limits,
+            &self.reference_types,
         )
     }
 }
@@ -146,6 +185,26 @@ pub fn read_type_tree_from_reader<R: Read + Seek>(
     absolute_start: u64,
     limits: TypeTreeReadLimits,
 ) -> Result<TypeValue> {
+    read_type_tree_from_reader_with_reference_types(tree, reader, absolute_start, limits, &[])
+}
+
+/// The same read, with the reference types the serialized file declares.
+///
+/// A `SerializeReference` field stores nothing where it is declared: the value
+/// lives in a managed-references registry written after the object body, keyed
+/// by `rid`. The registry's own shape is in the type tree, but the shape of
+/// each stored object is not -- that comes from the file's reference types,
+/// matched by class, namespace and assembly. Without them such an object can
+/// be walked to its last node and still have most of its bytes left over: one
+/// `CriWare` sound component in a shipping Unity 6000.3 build has 176 bytes of
+/// typed fields and 712,292 bytes of registry behind a single `rid`.
+pub fn read_type_tree_from_reader_with_reference_types<R: Read + Seek>(
+    tree: &TypeTree,
+    reader: EndianReader<R>,
+    absolute_start: u64,
+    limits: TypeTreeReadLimits,
+    reference_types: &[SerializedType],
+) -> Result<TypeValue> {
     validate_tree_shape(&tree.nodes)?;
     let mut parser = TypeTreeValueReader {
         nodes: &tree.nodes,
@@ -154,6 +213,9 @@ pub fn read_type_tree_from_reader<R: Read + Seek>(
         limits,
         values_read: 0,
         materialized_bytes: 0,
+        reference_types,
+        validated_reference_types: Vec::new(),
+        has_registry: false,
     };
     let (value, next) = parser.read_node(0, 0)?;
     if next != tree.nodes.len() {
@@ -167,15 +229,15 @@ pub fn read_type_tree_from_reader<R: Read + Seek>(
     if consumed != length {
         // The tree was walked to its last node, so the layout it describes was
         // read in full and what remains is data the tree does not describe.
-        // In modern Unity that is almost always the managed-references
-        // registry a `SerializeReference` field writes after the body: a
-        // CriWare sound component in a shipping 6000.3 build has 176 bytes of
-        // typed fields and 712,292 bytes of registry behind one `rid`. This
-        // reader does not model the registry, so the object is declined rather
-        // than reported as a byte mismatch, which describes the reader instead
-        // of the asset.
+        // The managed-references registry a `SerializeReference` field writes
+        // after the body is read above when the tree declares one, so what is
+        // left here is a tree that does not match its object -- most often a
+        // supplied schema built from an assembly that has since changed, or
+        // one whose generator dropped a field. Declining says that, where a
+        // byte mismatch would describe the reader instead of the asset.
         return Err(Error::unsupported(format!(
-            "type tree describes {consumed} of {length} object bytes; the rest              is data this reader does not model, most likely a              SerializeReference managed-references registry"
+            "type tree describes {consumed} of {length} object bytes; the tree does \
+             not match this object"
         )));
     }
     Ok(value)
@@ -188,6 +250,17 @@ struct TypeTreeValueReader<'a, R> {
     limits: TypeTreeReadLimits,
     values_read: usize,
     materialized_bytes: usize,
+    /// The file's reference types, which is where the layout of a
+    /// `SerializeReference` value comes from.
+    reference_types: &'a [SerializedType],
+    /// Indices of the reference-type trees whose shape has been checked.
+    /// Checking is per tree rather than per use: an object can hold thousands
+    /// of `rid`s naming the same handful of types.
+    validated_reference_types: Vec<usize>,
+    /// Unity writes one registry per object, at the outermost level. A
+    /// reference type's own tree can declare another, and reading that one
+    /// would consume bytes that are not there.
+    has_registry: bool,
 }
 
 impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
@@ -275,6 +348,9 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
                 self.reader.set_position(end)?;
                 (TypeValue::TypelessData { offset, size }, subtree_end)
             }
+            ValueKind::ReferencedObject => {
+                (self.read_referenced_object(index, depth)?, subtree_end)
+            }
             ValueKind::Other if is_array_parent(self.nodes, index) => {
                 let (value, array_align) = self.read_array(index, depth)?;
                 align |= array_align;
@@ -319,12 +395,132 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
         child = index + 1;
         while child < end {
             let node = &self.nodes[child];
+            if node.type_name == MANAGED_REFERENCES_REGISTRY {
+                if self.has_registry {
+                    // Unity wrote one registry, at the outermost level. This is
+                    // a second declaration of the same thing, and reading it
+                    // would consume bytes belonging to whatever follows.
+                    child = subtree_end(self.nodes, child);
+                    continue;
+                }
+                self.has_registry = true;
+            }
             let name = self.clone_field_name(&node.field_name)?;
             let (value, next) = self.read_node(child, depth + 1)?;
             fields.push(TypeField { name, value });
             child = next;
         }
         Ok(TypeValue::Object(fields))
+    }
+
+    /// Reads one registry entry: its `rid`, the managed type it names, and the
+    /// stored value laid out by that type's own tree.
+    fn read_referenced_object(&mut self, index: usize, depth: usize) -> Result<TypeValue> {
+        let parent_level = self.nodes[index].level;
+        let end = subtree_end(self.nodes, index);
+        let mut fields = Vec::new();
+        let mut identity = None;
+        let mut child = index + 1;
+        while child < end {
+            let node = &self.nodes[child];
+            if node.level != parent_level + 1 {
+                return Err(Error::invalid_data(format!(
+                    "managed reference child at index {child} has level {}, expected {}",
+                    node.level,
+                    parent_level + 1
+                )));
+            }
+            let name = self.clone_field_name(&node.field_name)?;
+            if node.type_name == REFERENCED_OBJECT_DATA {
+                let identity = identity.as_ref().ok_or_else(|| {
+                    Error::invalid_data("managed reference stores its data before naming its type")
+                })?;
+                // An entry naming no class is Unity's null reference. It
+                // stores nothing, and the field is left out rather than
+                // invented.
+                if let Some(tree_index) = self.reference_type_index(identity)? {
+                    let value = self.read_reference_type(tree_index, depth + 1)?;
+                    self.push_field(&mut fields, TypeField { name, value })?;
+                }
+                child = subtree_end(self.nodes, child);
+                continue;
+            }
+            let (value, next) = self.read_node(child, depth + 1)?;
+            if node.type_name == REFERENCED_MANAGED_TYPE {
+                identity = Some(managed_type_identity(&value)?);
+            }
+            self.push_field(&mut fields, TypeField { name, value })?;
+            child = next;
+        }
+        Ok(TypeValue::Object(fields))
+    }
+
+    fn push_field(&mut self, fields: &mut Vec<TypeField>, field: TypeField) -> Result<()> {
+        self.charge_materialized(std::mem::size_of::<TypeField>(), "managed reference field")?;
+        fields.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow managed reference fields: {error}"))
+        })?;
+        fields.push(field);
+        Ok(())
+    }
+
+    /// Finds the reference type an entry names, or `None` for a null entry.
+    fn reference_type_index(&self, identity: &ManagedTypeIdentity) -> Result<Option<usize>> {
+        if identity.class_name.is_empty() {
+            return Ok(None);
+        }
+        self.reference_types
+            .iter()
+            .position(|kind| {
+                kind.class_name.as_deref() == Some(identity.class_name.as_str())
+                    && kind.namespace.as_deref() == Some(identity.namespace.as_str())
+                    && kind.assembly_name.as_deref() == Some(identity.assembly_name.as_str())
+            })
+            .map(Some)
+            .ok_or_else(|| {
+                // Declining rather than skipping: the entry's bytes are in the
+                // stream and their length is only known from the layout, so
+                // there is no way to step over what cannot be read.
+                Error::unsupported(format!(
+                    "managed reference names {}::{} in {}, which the file does not declare",
+                    identity.namespace, identity.class_name, identity.assembly_name
+                ))
+            })
+    }
+
+    fn read_reference_type(&mut self, tree_index: usize, depth: usize) -> Result<TypeValue> {
+        let tree = self.reference_types[tree_index]
+            .type_tree
+            .as_ref()
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "reference type {tree_index} carries no type tree, so its stored \
+                     value has no stated layout"
+                ))
+            })?;
+        if !self.validated_reference_types.contains(&tree_index) {
+            validate_tree_shape(&tree.nodes)?;
+            self.validated_reference_types
+                .try_reserve(1)
+                .map_err(|error| {
+                    Error::invalid_data(format!("cannot record a checked reference type: {error}"))
+                })?;
+            self.validated_reference_types.push(tree_index);
+        }
+        // The stored value is laid out by another tree entirely, so the node
+        // slice is swapped for the duration and put back however this ends.
+        let outer = self.nodes;
+        self.nodes = &tree.nodes;
+        let result = self.read_node(0, depth);
+        self.nodes = outer;
+        let (value, next) = result?;
+        if next != tree.nodes.len() {
+            return Err(Error::invalid_data(format!(
+                "reference type root covers {next} of {} nodes",
+                tree.nodes.len()
+            )));
+        }
+        Ok(value)
     }
 
     fn read_array(&mut self, index: usize, depth: usize) -> Result<(TypeValue, bool)> {
@@ -445,6 +641,9 @@ enum ValueKind {
     String,
     Map,
     TypelessData,
+    /// One entry of a managed-references registry. Its `data` field has no
+    /// children: the layout comes from the file's reference types.
+    ReferencedObject,
     Other,
 }
 
@@ -466,6 +665,7 @@ impl ValueKind {
             "string" => Self::String,
             "map" => Self::Map,
             "TypelessData" => Self::TypelessData,
+            "ReferencedObject" => Self::ReferencedObject,
             _ => Self::Other,
         }
     }
@@ -655,9 +855,12 @@ mod tests {
     use std::io::Cursor;
 
     use crate::endian::{Endian, EndianReader};
-    use crate::serialized::{TypeTree, TypeTreeNode};
+    use crate::serialized::{SerializedType, TypeTree, TypeTreeNode};
 
-    use super::{TypeField, TypeTreeReadLimits, TypeValue, read_type_tree_from_reader};
+    use super::{
+        TypeField, TypeTreeReadLimits, TypeValue, read_type_tree_from_reader,
+        read_type_tree_from_reader_with_reference_types,
+    };
 
     #[test]
     fn reads_classes_strings_and_aligned_arrays() {
@@ -800,6 +1003,290 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("materialized type tree bytes"));
+    }
+
+    /// The registry Unity writes after an object body for a
+    /// `SerializeReference` field, spelled exactly as a shipping Unity 6000.3
+    /// bundle spells it.
+    fn registry_nodes(level: u32) -> Vec<TypeTreeNode> {
+        vec![
+            node("ManagedReferencesRegistry", "references", level, true),
+            node("int", "version", level + 1, false),
+            node("vector", "RefIds", level + 1, true),
+            node("Array", "Array", level + 2, true),
+            node("int", "size", level + 3, false),
+            node("ReferencedObject", "data", level + 3, true),
+            node("SInt64", "rid", level + 4, false),
+            node("ReferencedManagedType", "type", level + 5 - 1, true),
+            node("string", "class", level + 5, true),
+            node("Array", "Array", level + 6, true),
+            node("int", "size", level + 7, false),
+            node("char", "data", level + 7, false),
+            node("string", "ns", level + 5, true),
+            node("Array", "Array", level + 6, true),
+            node("int", "size", level + 7, false),
+            node("char", "data", level + 7, false),
+            node("string", "asm", level + 5, true),
+            node("Array", "Array", level + 6, true),
+            node("int", "size", level + 7, false),
+            node("char", "data", level + 7, false),
+            node("ReferencedObjectData", "data", level + 4, false),
+        ]
+    }
+
+    fn reference_type(class_name: &str, nodes: Vec<TypeTreeNode>) -> SerializedType {
+        named_reference_type(class_name, "Game", "Game.dll", nodes)
+    }
+
+    fn named_reference_type(
+        class_name: &str,
+        namespace: &str,
+        assembly_name: &str,
+        nodes: Vec<TypeTreeNode>,
+    ) -> SerializedType {
+        SerializedType {
+            class_id: 114,
+            is_stripped_type: false,
+            script_type_index: -1,
+            script_id: None,
+            old_type_hash: None,
+            type_tree: Some(TypeTree {
+                nodes,
+                string_buffer: Vec::new(),
+            }),
+            type_dependencies: Vec::new(),
+            class_name: Some(class_name.to_owned()),
+            namespace: Some(namespace.to_owned()),
+            assembly_name: Some(assembly_name.to_owned()),
+        }
+    }
+
+    fn push_registry_entry(bytes: &mut Vec<u8>, rid: i64, class_name: &str) {
+        let string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend_from_slice(&i32::try_from(value.len()).unwrap().to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+            while !bytes.len().is_multiple_of(4) {
+                bytes.push(0);
+            }
+        };
+        bytes.extend_from_slice(&rid.to_le_bytes());
+        string(bytes, class_name);
+        string(bytes, if class_name.is_empty() { "" } else { "Game" });
+        string(
+            bytes,
+            if class_name.is_empty() {
+                ""
+            } else {
+                "Game.dll"
+            },
+        );
+    }
+
+    #[test]
+    fn reads_a_serialize_reference_registry_through_the_file_reference_types() {
+        let mut nodes = vec![
+            node("Root", "Base", 0, false),
+            node("int", "m_Value", 1, false),
+        ];
+        nodes.extend(registry_nodes(1));
+        let tree = TypeTree {
+            nodes,
+            string_buffer: Vec::new(),
+        };
+        // All three name the class the entry names. Only one is a match, and
+        // picking a near miss reads a different number of bytes from here on,
+        // so the trailing-byte check turns any confusion into a failure.
+        let references = [
+            named_reference_type(
+                "Payload",
+                "Game",
+                "Other.dll",
+                vec![
+                    node("Payload", "Base", 0, true),
+                    node("SInt64", "m_Stored", 1, false),
+                ],
+            ),
+            named_reference_type(
+                "Payload",
+                "Other",
+                "Game.dll",
+                vec![
+                    node("Payload", "Base", 0, true),
+                    node("int", "m_Stored", 1, false),
+                    node("int", "m_Extra", 1, false),
+                ],
+            ),
+            reference_type(
+                "Payload",
+                vec![
+                    node("Payload", "Base", 0, true),
+                    node("int", "m_Stored", 1, false),
+                ],
+            ),
+        ];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7_i32.to_le_bytes()); // m_Value
+        bytes.extend_from_slice(&2_i32.to_le_bytes()); // registry version
+        bytes.extend_from_slice(&1_i32.to_le_bytes()); // one entry
+        push_registry_entry(&mut bytes, 1000, "Payload");
+        // Distinctive rather than small: a near miss that reads a narrower
+        // field would otherwise recover the same number from the low bytes.
+        bytes.extend_from_slice(&0x0102_0304_i32.to_le_bytes()); // the stored value
+
+        let value = read_type_tree_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            &references,
+        )
+        .unwrap();
+
+        let TypeValue::Object(fields) = &value else {
+            panic!("root is {value:?}")
+        };
+        assert_eq!(fields[0].value, TypeValue::Signed(7));
+        let TypeValue::Object(registry) = &fields[1].value else {
+            panic!("registry is {:?}", fields[1].value)
+        };
+        assert_eq!(registry[0].value, TypeValue::Signed(2));
+        let TypeValue::Array(entries) = &registry[1].value else {
+            panic!("RefIds is {:?}", registry[1].value)
+        };
+        let TypeValue::Object(entry) = &entries[0] else {
+            panic!("entry is {:?}", entries[0])
+        };
+        assert_eq!(entry[0].value, TypeValue::Signed(1000));
+        // The stored value is laid out by the reference type, not by anything
+        // in the object's own tree.
+        assert_eq!(entry[2].name, "data");
+        assert_eq!(
+            entry[2].value,
+            TypeValue::Object(vec![TypeField {
+                name: "m_Stored".to_owned(),
+                value: TypeValue::Signed(0x0102_0304),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_null_registry_entry_stores_nothing_and_an_undeclared_one_is_declined() {
+        let mut nodes = vec![node("Root", "Base", 0, false)];
+        nodes.extend(registry_nodes(1));
+        let tree = TypeTree {
+            nodes,
+            string_buffer: Vec::new(),
+        };
+        let references = [reference_type(
+            "Payload",
+            vec![
+                node("Payload", "Base", 0, true),
+                node("int", "m_Stored", 1, false),
+            ],
+        )];
+
+        // An entry naming no class is Unity's null reference: it occupies its
+        // rid and identity and nothing more, and the read has to end exactly
+        // at the end of the object to prove that.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        push_registry_entry(&mut bytes, -2, "");
+        let value = read_type_tree_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            &references,
+        )
+        .unwrap();
+        let TypeValue::Object(fields) = &value else {
+            panic!("root is {value:?}")
+        };
+        let TypeValue::Object(registry) = &fields[0].value else {
+            panic!("registry is {:?}", fields[0].value)
+        };
+        let TypeValue::Array(entries) = &registry[1].value else {
+            panic!("RefIds is {:?}", registry[1].value)
+        };
+        let TypeValue::Object(entry) = &entries[0] else {
+            panic!("entry is {:?}", entries[0])
+        };
+        assert_eq!(entry.len(), 2, "a null entry stores no data field");
+
+        // A named type the file never declared cannot be stepped over: its
+        // length is only known from a layout that is not there.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        push_registry_entry(&mut bytes, 5, "Absent");
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        let error = read_type_tree_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            &references,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("which the file does not declare"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_the_outermost_registry_declaration_is_read() {
+        // A reference type's own tree can declare a registry; Unity still
+        // wrote one, at the outermost level. Reading the inner declaration
+        // would consume four bytes that belong to nothing.
+        let mut nodes = vec![node("Root", "Base", 0, false)];
+        nodes.extend(registry_nodes(1));
+        let tree = TypeTree {
+            nodes,
+            string_buffer: Vec::new(),
+        };
+        let mut inner = vec![
+            node("Payload", "Base", 0, true),
+            node("int", "m_Stored", 1, false),
+        ];
+        inner.extend(registry_nodes(1));
+        let references = [reference_type("Payload", inner)];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        push_registry_entry(&mut bytes, 1000, "Payload");
+        bytes.extend_from_slice(&99_i32.to_le_bytes());
+
+        let value = read_type_tree_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            &references,
+        )
+        .unwrap();
+        let TypeValue::Object(fields) = &value else {
+            panic!("root is {value:?}")
+        };
+        let TypeValue::Object(registry) = &fields[0].value else {
+            panic!("registry is {:?}", fields[0].value)
+        };
+        let TypeValue::Array(entries) = &registry[1].value else {
+            panic!("RefIds is {:?}", registry[1].value)
+        };
+        let TypeValue::Object(entry) = &entries[0] else {
+            panic!("entry is {:?}", entries[0])
+        };
+        let TypeValue::Object(stored) = &entry[2].value else {
+            panic!("stored is {:?}", entry[2].value)
+        };
+        assert_eq!(stored.len(), 1, "the inner registry was read: {stored:?}");
+        assert_eq!(stored[0].value, TypeValue::Signed(99));
     }
 
     fn node(type_name: &str, field_name: &str, level: u32, align: bool) -> TypeTreeNode {
