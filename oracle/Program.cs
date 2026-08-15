@@ -6,14 +6,26 @@ using AssetStudio;
 using System.Text;
 using K4os.Compression.LZ4;
 
-if (args.Length != 1)
+if (args.Length is < 1 or > 2)
 {
-    Console.Error.WriteLine("usage: AssetStudioOracle <asset-file>");
+    Console.Error.WriteLine("usage: AssetStudioOracle <asset-file> [unity-version]");
     return 2;
 }
 
 Logger.Default = new OracleLogger();
 var manager = new AssetsManager { LoadViaTypeTree = false };
+// A shipping bundle often has its header version stripped, and every
+// version-dependent reader then declines it. The caller supplies what the file
+// does not, the same way the Rust side takes --unity-version.
+if (args.Length == 2)
+{
+    if (!UnityVersion.TryParse(args[1], out var custom))
+    {
+        Console.Error.WriteLine($"unrecognised Unity version: {args[1]}");
+        return 2;
+    }
+    manager.Options.CustomUnityVersion = custom;
+}
 try
 {
     manager.LoadFilesAndFolders(args[0]);
