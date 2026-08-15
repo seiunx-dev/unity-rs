@@ -109,6 +109,7 @@ fn assert_split_group_fixture(executable: &Path) {
 fn object_fixtures() -> Vec<TemporaryFixture> {
     let mut fixtures = mesh_fixtures();
     fixtures.extend(animation_fixtures());
+    fixtures.extend(sprite_atlas_fixtures());
     fixtures.extend(vec![
         TemporaryFixture::new("oracle-v13-big-endian.assets", &synthetic_v13_big_endian()).unwrap(),
         TemporaryFixture::new(
@@ -198,6 +199,36 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
         .unwrap(),
     ]);
     fixtures
+}
+
+/// One `SpriteAtlas` per version gate.
+///
+/// Every field after a gate shifts when the gate is wrong, so one reading
+/// covers the offsets as well as the values. 2020.1 is here because it sits
+/// just below the secondary-texture gate: without it, moving that gate down a
+/// year changes nothing any fixture can see.
+fn sprite_atlas_fixtures() -> Vec<TemporaryFixture> {
+    [
+        ("2017.1.5f1", (2017, 1)),
+        ("2017.2.5f1", (2017, 2)),
+        ("2020.1.17f1", (2020, 1)),
+        ("2022.3.62f1", (2022, 3)),
+    ]
+    .into_iter()
+    .map(|(revision, version)| {
+        let (major, minor) = version;
+        TemporaryFixture::new(
+            &format!("oracle-sprite-atlas-{major}.{minor}.assets"),
+            &synthetic_single_v22(
+                SPRITE_ATLAS_CLASS,
+                SPRITE_ATLAS_PATH_ID,
+                revision,
+                &sprite_atlas(version),
+            ),
+        )
+        .unwrap()
+    })
+    .collect()
 }
 
 /// The `AnimationClip` fixtures, including one carrying real keyframes.
@@ -1740,6 +1771,82 @@ fn push_blob_type_tree_v19(output: &mut Vec<u8>, nodes: &[Value]) {
         output.extend_from_slice(&0_u64.to_le_bytes());
     }
     output.extend_from_slice(&buffer);
+}
+
+const SPRITE_ATLAS_CLASS: i32 = 687_078_895;
+const SPRITE_ATLAS_PATH_ID: i64 = 500;
+
+/// A `SpriteAtlas` whose render-data map has two entries, laid out for the
+/// version given.
+///
+/// Two entries rather than one because the map is a dictionary on the managed
+/// side and a sorted vector here: with one entry any ordering agrees. The keys
+/// are chosen so that sorting by the raw GUID bytes and sorting by .NET's
+/// display spelling disagree -- the first field is byte-reversed for display,
+/// so `01 00 ..` and `00 02 ..` swap places.
+fn sprite_atlas(version: (u32, u32)) -> Vec<u8> {
+    let mut output = Vec::new();
+    push_string(&mut output, "oracle-sprite-atlas");
+    // m_PackedSprites
+    push_i32(&mut output, 2);
+    push_i32(&mut output, 0);
+    output.extend_from_slice(&213_i64.to_le_bytes());
+    push_i32(&mut output, 0);
+    output.extend_from_slice(&214_i64.to_le_bytes());
+    // m_PackedSpriteNamesToIndex: read and dropped by the managed reader, so
+    // nothing compares its values -- but everything after it moves if the
+    // strings or their padding are read wrongly.
+    push_string_array(&mut output, &["first", "second-name-with-padding"]);
+
+    push_i32(&mut output, 2);
+    let mut first_guid = [0_u8; 16];
+    first_guid[0] = 1;
+    let mut second_guid = [0_u8; 16];
+    second_guid[1] = 2;
+    push_sprite_atlas_entry(&mut output, version, first_guid, -7, 1);
+    push_sprite_atlas_entry(&mut output, version, second_guid, 9_000_000_000, 2);
+
+    push_string(&mut output, "oracle-tag");
+    output.push(1);
+    align(&mut output, 4);
+    output
+}
+
+fn push_sprite_atlas_entry(
+    output: &mut Vec<u8>,
+    version: (u32, u32),
+    guid: [u8; 16],
+    value: i64,
+    seed: i32,
+) {
+    output.extend_from_slice(&guid);
+    output.extend_from_slice(&value.to_le_bytes());
+    // texture, alphaTexture
+    push_i32(output, 0);
+    output.extend_from_slice(&i64::from(seed + 213).to_le_bytes());
+    push_i32(output, 0);
+    output.extend_from_slice(&i64::from(seed + 313).to_le_bytes());
+    let texture_seed = seed;
+    // Small whole numbers only, so the cast is exact and the fixture values
+    // stay legible in a failure message.
+    let seed = f32::from(i16::try_from(seed).unwrap());
+    // textureRect, textureRectOffset
+    push_floats(output, &[seed, seed + 0.5, 4.0, 8.0]);
+    push_floats(output, &[seed + 1.25, seed + 2.5]);
+    if version >= (2017, 2) {
+        push_floats(output, &[seed + 3.75, seed + 4.5]);
+    }
+    // uvTransform, downscaleMultiplier, settingsRaw
+    push_floats(output, &[1.0, 0.0, 0.0, 1.0]);
+    push_f32(output, 0.5);
+    push_u32(output, 3);
+    if version >= (2020, 2) {
+        push_i32(output, 1);
+        push_i32(output, 0);
+        output.extend_from_slice(&i64::from(texture_seed + 413).to_le_bytes());
+        push_string(output, "secondary");
+        align(output, 4);
+    }
 }
 
 fn synthetic_sprite_v22() -> Vec<u8> {
