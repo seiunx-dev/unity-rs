@@ -251,9 +251,31 @@ that is correct; both need `vgmstream-cli` and run under `--ignored`.
 
 ### Status
 
-Not filed. No workaround short of a different decoder, and the alternatives are
-libopus bindings, which would add a second native dependency to a crate whose
-audio decoding is otherwise pure Rust.
+Not filed. There is no downstream correction that can recover the samples the
+decoder should have produced.
+
+The independent pure-Rust `opus-rs` crate was evaluated before accepting a
+native libopus dependency. Published releases 0.1.26 and 0.1.28 were each fed
+the exact two packet fixtures used by this repository's `vgmstream` gate. The
+comparison used a 48 kHz mono decoder, a 960-sample output buffer per packet,
+the fixture's 312-sample pre-skip, and the crate's documented
+`sample * 32768` conversion back to PCM16. Results against the same
+`vgmstream-cli` output were:
+
+| decoder | CELT offset | CELT worst | SILK/hybrid offset | SILK/hybrid worst |
+|---------|------------:|-----------:|-------------------:|------------------:|
+| `ruopus` 0.1.2 | 0 | 1 | -2 | 276 |
+| `opus-rs` 0.1.26 | 0 | 36 | -5 | 164 |
+| `opus-rs` 0.1.28 | 0 | 36 | -5 | 164 |
+
+The lower SILK amplitude difference is not a fix: its timing moves three more
+samples away from libopus, while the already-correct CELT path regresses from
+one unit to 36. The 0.1.28 crates.io package and repository head
+`a1d4c31f245ddeb007a219f3fed7f1e92a502304` produced the same measurements.
+Consequently it is not a safe replacement either. The only known replacement
+that passes the existing oracle remains a libopus binding, which would add a
+second native dependency to a crate whose audio decoding is otherwise pure
+Rust.
 
 ---
 
@@ -274,10 +296,12 @@ because the managed differential proves the copy correct rather than the copy
 being taken on trust.
 
 The Opus defect is not, for two reasons. The equivalent step would be vendoring
-or replacing an Opus decoder, and the alternatives are libopus bindings: a
-second native dependency, for a codec whose CELT path is already correct. (The
-first is `zstd`, whose C sources this workspace already builds, so the point is
-the cost of adding another rather than a pure-Rust property to protect.) And there is no one-line fix to apply: finding it means working through
+or replacing an Opus decoder. The currently published independent pure-Rust
+alternative was tested above and does not pass the oracle; the remaining known
+alternative is a libopus binding, a second native dependency for a codec whose
+CELT path is already correct. (The first is `zstd`, whose C sources this
+workspace already builds, so the point is the cost of adding another rather
+than a pure-Rust property to protect.) And there is no one-line fix to apply: finding it means working through
 `ruopus`'s SILK resampler, which is upstream's work to do with the measurements
 above rather than a patch waiting to be written. Its tests hold the current behaviour in place and will fail if the
 divergence changes shape or disappears.

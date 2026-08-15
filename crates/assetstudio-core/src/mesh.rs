@@ -15,7 +15,7 @@ const NO_TARGET_PLATFORM: i32 = -2;
 const STREAM_ALIGNMENT: usize = 16;
 
 /// Defensive bounds for the resident, uncompressed `Mesh` slice implemented
-/// here. Standard Unity 2017.3 through 2023 and 6000.0 through 6000.1, plus
+/// here. Standard Unity 2017.3 through 2023 and 6000.0 through 6000.3, plus
 /// Tuanjie 2022.3.x meshes whose virtual-geometry flag is clear, use the
 /// covered layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,9 +138,10 @@ pub struct Mesh {
 }
 
 /// Parses the common resident `Mesh` representation used by standard Unity
-/// 2017.3-2023 and 6000.0-6000.1, and by non-virtual Tuanjie 2022.3.x meshes.
-/// Unity 6000.2 adds a serialized mesh-LOD tail that remains explicit
-/// unsupported until its structure is sample-verified.
+/// 2017.3-2023 and 6000.0-6000.3, and by non-virtual Tuanjie 2022.3.x meshes.
+/// Unity 6000.2's serialized mesh-LOD tail is walked from its sample-verified
+/// `TypeTree` layout; the levels are not exposed because this reader exports the
+/// mesh itself rather than an LOD chain.
 /// Packed/compressed geometry, non-triangle topology, non-zero base vertices,
 /// and non-float position/normal/UV layouts are rejected explicitly instead of
 /// being interpreted heuristically. Use [`read_mesh_with_collection`] when the
