@@ -31,7 +31,7 @@ use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
 use assetstudio_core::mono_schema::{
     MonoBehaviourSchemaEntry, MonoBehaviourSchemaIdentity, MonoBehaviourSchemaProvider,
-    MonoBehaviourSchemaRegistry,
+    MonoBehaviourSchemaRegistry, MonoBehaviourSchemaSource,
 };
 use assetstudio_core::monobehaviour::{MonoBehaviourReadLimits, MonoScript};
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
@@ -1007,6 +1007,25 @@ impl PyRgbaImage {
     fn __repr__(&self) -> String {
         format!("RgbaImage(width={}, height={})", self.width, self.height)
     }
+}
+
+/// The name the bindings report for a schema source.
+const fn schema_source_name(source: MonoBehaviourSchemaSource) -> &'static str {
+    match source {
+        MonoBehaviourSchemaSource::Embedded => "embedded",
+        MonoBehaviourSchemaSource::External => "schema",
+    }
+}
+
+/// A `MonoBehaviour` read as JSON, and which tree it was read through.
+#[pyclass(name = "MonoBehaviourJson", frozen, get_all)]
+#[derive(Debug)]
+struct PyMonoBehaviourJson {
+    json: String,
+    /// `"embedded"` when the file carried its own type tree, `"schema"` when
+    /// the layout came from a supplied schema. Worth distinguishing: a value
+    /// read through a schema is only as good as that schema.
+    source: String,
 }
 
 #[pyclass(name = "ExportReport", frozen, get_all)]
@@ -2490,17 +2509,21 @@ impl PyAssetStudio {
         schema: PyRef<'_, PyMonoBehaviourSchema>,
         pretty: bool,
         maximum_bytes: usize,
-    ) -> PyResult<String> {
+    ) -> PyResult<PyMonoBehaviourJson> {
         let registry = Arc::clone(&schema.registry);
         drop(schema);
         let limits = MonoBehaviourReadLimits {
             maximum_json_bytes: maximum_bytes,
             ..MonoBehaviourReadLimits::default()
         };
-        py.detach(move || {
+        let resolved = py.detach(move || {
             self.object(file_index, path_id)?
                 .read_mono_behaviour_json(registry.as_ref(), pretty, limits)
                 .map_err(core_error)
+        })?;
+        Ok(PyMonoBehaviourJson {
+            json: resolved.json,
+            source: schema_source_name(resolved.source).to_owned(),
         })
     }
 
@@ -2521,17 +2544,21 @@ impl PyAssetStudio {
         schemas: PyRef<'_, PyMonoBehaviourSchemas>,
         pretty: bool,
         maximum_bytes: usize,
-    ) -> PyResult<String> {
+    ) -> PyResult<PyMonoBehaviourJson> {
         let provider = Arc::clone(&schemas.provider);
         drop(schemas);
         let limits = MonoBehaviourReadLimits {
             maximum_json_bytes: maximum_bytes,
             ..MonoBehaviourReadLimits::default()
         };
-        py.detach(move || {
+        let resolved = py.detach(move || {
             self.object(file_index, path_id)?
                 .read_mono_behaviour_json(provider.as_ref(), pretty, limits)
                 .map_err(core_error)
+        })?;
+        Ok(PyMonoBehaviourJson {
+            json: resolved.json,
+            source: schema_source_name(resolved.source).to_owned(),
         })
     }
 
@@ -4202,6 +4229,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMaterial>()?;
     module.add_class::<PyMonoScript>()?;
     module.add_class::<PyExportReport>()?;
+    module.add_class::<PyMonoBehaviourJson>()?;
     module.add_class::<PyExportLimits>()?;
     module.add_class::<PyExtractionLimits>()?;
     module.add_class::<PyExtractionRecord>()?;

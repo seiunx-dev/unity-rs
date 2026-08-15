@@ -2932,12 +2932,16 @@ def main() -> None:
         )
         schemas = MonoBehaviourSchemas([schema, exact_schema])
         assert schemas.schema_count == 2
-        decoded = json.loads(stripped.read_mono_behaviour_json(0, 7, schema))
+        read = stripped.read_mono_behaviour_json(0, 7, schema)
+        # The file ships no tree of its own, so this can only have come from
+        # the schema, and the read says so rather than leaving it to be guessed.
+        assert read.source == "schema"
+        decoded = json.loads(read.json)
         assert decoded["m_Name"] == "Hero"
         assert decoded["score"] == 123
-        exact_decoded = json.loads(
-            stripped.read_mono_behaviour_json_with_schemas(0, 7, schemas)
-        )
+        exact_read = stripped.read_mono_behaviour_json_with_schemas(0, 7, schemas)
+        assert exact_read.source == "schema"
+        exact_decoded = json.loads(exact_read.json)
         assert exact_decoded["m_Name"] == "Hero"
         assert exact_decoded["hit_points"] == 123
         assert "score" not in exact_decoded

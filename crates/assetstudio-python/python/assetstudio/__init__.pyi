@@ -474,6 +474,15 @@ class FbxCandidate:
     @property
     def name(self) -> str: ...
 
+class MonoBehaviourJson:
+    @property
+    def json(self) -> str: ...
+    @property
+    def source(self) -> str:
+        """``"embedded"`` when the file carried its own type tree, ``"schema"``
+        when the layout came from a supplied schema. A value read through a
+        schema is only as good as that schema."""
+
 class ExportReport:
     @property
     def exported(self) -> list[str]: ...
@@ -852,7 +861,7 @@ class AssetStudio:
         *,
         pretty: bool = False,
         maximum_bytes: int = 268_435_456,
-    ) -> str: ...
+    ) -> MonoBehaviourJson: ...
     def read_mono_behaviour_json_with_schemas(
         self,
         file_index: int,
@@ -861,7 +870,7 @@ class AssetStudio:
         *,
         pretty: bool = False,
         maximum_bytes: int = 268_435_456,
-    ) -> str: ...
+    ) -> MonoBehaviourJson: ...
     def read_texture(
         self,
         file_index: int,
