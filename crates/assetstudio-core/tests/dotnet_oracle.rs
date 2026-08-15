@@ -1043,7 +1043,7 @@ fn assert_container_fixtures(executable: &Path) {
             bytes: material_file.as_slice(),
         },
     ];
-    let uncompressed: [ContainerCase; 3] = [
+    let uncompressed: [ContainerCase; 4] = [
         (
             "oracle-bundle-v6-inline.unity3d",
             containers::unity_fs(&BundleLayout::v6(REVISION), &entries),
@@ -1065,6 +1065,22 @@ fn assert_container_fixtures(executable: &Path) {
             containers::unity_fs(
                 &BundleLayout {
                     version: 7,
+                    info: BlocksInfo::InlineAligned,
+                    ..BundleLayout::v6(REVISION)
+                },
+                &entries,
+            ),
+            &[],
+        ),
+        (
+            // The version current Unity writes. Its header and blocks info are
+            // v7's, which is why the managed reader branches on `>= 7` and
+            // never mentions 8 -- and why this one refusing it meant refusing
+            // every bundle a modern game ships.
+            "oracle-bundle-v8-aligned.unity3d",
+            containers::unity_fs(
+                &BundleLayout {
+                    version: 8,
                     info: BlocksInfo::InlineAligned,
                     ..BundleLayout::v6(REVISION)
                 },

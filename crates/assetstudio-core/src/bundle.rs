@@ -291,12 +291,19 @@ impl UnityFsBundle {
         let mut reader = EndianReader::new(region.cursor(), Endian::Big);
         let bundle_start = reader.position()?;
         let common = BundleHeader::read(&mut reader)?;
-        let is_unity_fs = common.signature == "UnityFS" && matches!(common.version, 6 | 7);
+        // 8 is the version modern Unity writes, and its header and blocks
+        // info are v7's -- the managed reader does not distinguish them at
+        // all, branching only on `>= 7`. Refusing it meant refusing every
+        // bundle a current game ships; four real ones read identically to
+        // UnityPy once it is accepted. Later versions stay refused rather
+        // than assumed compatible, because that is the difference between
+        // reading a file and guessing at it.
+        let is_unity_fs = common.signature == "UnityFS" && matches!(common.version, 6..=8);
         let is_legacy_v6 =
             matches!(common.signature.as_str(), "UnityWeb" | "UnityRaw") && common.version == 6;
         if !is_unity_fs && !is_legacy_v6 {
             return Err(Error::unsupported(format!(
-                "bundle signature {:?} format version {}; expected UnityFS v6/v7 or UnityWeb/UnityRaw v6",
+                "bundle signature {:?} format version {}; expected UnityFS v6/v7/v8 or UnityWeb/UnityRaw v6",
                 common.signature, common.version
             )));
         }
