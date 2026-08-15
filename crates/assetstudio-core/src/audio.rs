@@ -3824,6 +3824,7 @@ mod tests {
 
     #[test]
     fn decodes_interleaved_and_planar_fsb5_dsp() {
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
         for (channels, non_interleaved) in [(1_u16, false), (2, false), (6, false), (2, true)] {
             let fsb = Region::from_bytes(fsb5_dsp(channels, non_interleaved));
             let stream = parse_fsb5_dsp(&fsb).unwrap().unwrap();
@@ -3854,18 +3855,42 @@ mod tests {
             );
             assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16);
             let pcm = wave_data(&wav);
-            let expected_first = [1_i16, 3, 5, 7, -7, -5];
-            let expected_second = [3_i16, 7, 11, -1, -13, -9];
-            for channel in 0..usize::from(channels) {
-                let first =
-                    i16::from_le_bytes(pcm[channel * 2..channel * 2 + 2].try_into().unwrap());
-                let second_offset = usize::from(channels) * 2 + channel * 2;
-                let second =
-                    i16::from_le_bytes(pcm[second_offset..second_offset + 2].try_into().unwrap());
-                assert_eq!(first, expected_first[channel]);
-                assert_eq!(second, expected_second[channel]);
+            // What this test is for is the wiring: which bytes belong to which
+            // channel, and that the planar layout lands in the same place as
+            // the interleaved one. It used to pin exact sample values, which
+            // only worked because every frame header was zero -- predictor
+            // pair 0, scale shift 0 -- and fifteen of each channel's sixteen
+            // coefficients were zero too. The arithmetic those values pinned is
+            // what the vgmstream comparison checks, on inputs that vary.
+            let sample = |frame: usize, channel: usize| {
+                let offset = (frame * usize::from(channels) + channel) * 2;
+                i16::from_le_bytes(pcm[offset..offset + 2].try_into().unwrap())
+            };
+            let first: Vec<i16> = (0..usize::from(channels)).map(|c| sample(0, c)).collect();
+            // Each channel carries a different header, different nibbles and
+            // different coefficients, so no two may decode alike; equal
+            // channels would mean one channel's bytes were read twice.
+            for channel in 1..usize::from(channels) {
+                assert_ne!(
+                    first[channel], first[0],
+                    "channel {channel} decoded the same as channel 0 at {channels}ch",
+                );
             }
+            // And the stream advances rather than repeating one sample.
+            assert!(
+                (0..usize::from(channels)).any(|c| sample(1, c) != sample(0, c)),
+                "the second frame repeated the first at {channels}ch",
+            );
+            decoded.push(pcm.to_vec());
         }
+        // The planar case carries the same channel data as the interleaved one
+        // laid out differently, so it must decode to the same PCM. This is the
+        // property the layout code exists for, and no expected-value table can
+        // state it.
+        assert_eq!(
+            decoded[1], decoded[3],
+            "planar stereo decoded differently from interleaved stereo"
+        );
     }
 
     #[test]
@@ -4721,6 +4746,17 @@ mod tests {
         let mut block: Vec<u8> = (0..channels * 36)
             .map(|index| u8::try_from((index * 37 + 11) % 256).unwrap())
             .collect();
+        // The first decoded nibble of each channel stays zero, so the tests
+        // that check where the decoder starts reading -- the block header's
+        // history and step index, and the per-channel byte layout -- can still
+        // name the sample it must produce. Everything after it varies.
+        for channel in 0..channels {
+            let offset = usize::try_from(
+                super::ima_nibble_byte_offset(0, channels, channel, 1).expect("fixture offset"),
+            )
+            .expect("fixture offset fits usize");
+            block[offset] &= 0xf0;
+        }
         if channels <= 2 {
             for channel in 0..channels {
                 let offset = channel * 4;
