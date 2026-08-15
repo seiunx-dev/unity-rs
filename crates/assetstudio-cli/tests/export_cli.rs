@@ -26,7 +26,9 @@ fn exports_a_text_asset_from_the_native_cli() {
         "stderr: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(String::from_utf8_lossy(&result.stdout).contains("1 succeeded, 0 failed"));
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("1 succeeded, 0 unsupported, 0 failed")
+    );
     assert_eq!(
         fs::read(output.join("0000_fixture.assets").join("demo.lua")).unwrap(),
         b"payload"
@@ -137,7 +139,13 @@ fn exports_switch_mip_chain_base_image_from_the_native_cli() {
 }
 
 #[test]
-fn exports_unity6_shader_from_the_native_cli() {
+fn reports_a_unity6_shader_as_unsupported_rather_than_failing() {
+    // This used to assert the CLI wrote Unity6Object.shader. Unity changed the
+    // serialized shader in 2021 and neither implementation reads the new
+    // layout, so what it actually wrote was a file parsed from a fixture no
+    // Unity produces. Declining is the honest outcome -- and it is not a
+    // failure: a 2022 game carries hundreds of these, and an export that
+    // exits non-zero because of them cannot be told from one that broke.
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -157,26 +165,19 @@ fn exports_unity6_shader_from_the_native_cli() {
 
     assert!(
         result.status.success(),
-        "stderr: {}",
+        "an unsupported object is not a failed export; stderr: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let shader = fs::read(
-        output
-            .join("0000_unity6-shader.assets")
-            .join("Unity6Object.shader"),
-    )
-    .unwrap();
-    let header = concat!(
-        "//////////////////////////////////////////\n",
-        "//\n",
-        "// NOTE: This is *not* a valid shader file\n",
-        "//\n",
-        "///////////////////////////////////////////\n",
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("unsupported ") && stdout.contains("2021"),
+        "the run should say which object it declined and why: {stdout}"
     );
-    let expected = format!("{header}Shader \"Parsed/Unity6\" {{\nProperties {{\n}}\n}}");
-    assert_eq!(shader, expected.as_bytes());
-
-    fs::remove_dir_all(root).unwrap();
+    assert!(
+        stdout.contains("0 succeeded, 1 unsupported, 0 failed"),
+        "summary should separate the three outcomes: {stdout}"
+    );
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

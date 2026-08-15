@@ -240,7 +240,35 @@ fn portable_file_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// The payload for one object, or a record that this reader declines the shape.
+///
+/// A declared `Unsupported` is not a failure to read: it is this reader saying
+/// which formats it does not implement, which the corpus gate needs to
+/// distinguish from a genuine parse error. Real files carry both -- a 2022
+/// game's shaders are all refused by design -- and a gate that cannot tell
+/// them apart either fails on every real corpus or hides real breakage.
 fn rust_payload(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    class_id: i32,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    match rust_payload_inner(studio, file_index, object_index, class_id, maximum_bytes) {
+        Err(error) => match error.downcast::<assetstudio_core::Error>() {
+            Ok(boxed) => match *boxed {
+                assetstudio_core::Error::Unsupported(message) => {
+                    Ok(json!({ "Unsupported": message }))
+                }
+                other => Err(Box::new(other) as Box<dyn std::error::Error>),
+            },
+            Err(other) => Err(other),
+        },
+        payload => payload,
+    }
+}
+
+fn rust_payload_inner(
     studio: &Studio,
     file_index: usize,
     object_index: usize,

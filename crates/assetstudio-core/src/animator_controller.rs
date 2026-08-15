@@ -326,6 +326,10 @@ pub fn read_animator_controller(
     let controller = reader.read_controller_constant()?;
     let tos = reader.read_tos()?;
     let animation_clips = reader.read_animation_clips()?;
+    reader.read_state_machine_behaviour_tail()?;
+
+    // Now this means something: everything the object carries has been
+    // accounted for, either read or checked and found empty.
     let trailing = reader.reader.remaining()?;
     if trailing != 0 {
         return Err(Error::invalid_data(format!(
@@ -755,6 +759,39 @@ impl ControllerReader {
             clips.push(self.read_pptr("AnimatorController animation clip")?);
         }
         Ok(clips)
+    }
+
+    /// Reads the state-machine-behaviour tail that follows the animation clips.
+    ///
+    /// The managed reader stops at the animation clips and never looks at what
+    /// follows, so this reader did too -- and then refused every real file,
+    /// because all 212 `AnimatorController` objects in a Unity 2022.3 game
+    /// carry exactly sixteen more bytes: two empty collections in
+    /// `m_StateMachineBehaviourVectorDescription`, an empty
+    /// `m_StateMachineBehaviours`, and `m_MultiThreadedStateMachine` with its
+    /// padding.
+    ///
+    /// Reading the counts rather than skipping sixteen bytes is what keeps the
+    /// trailing-byte check meaningful. Non-empty collections are reported as
+    /// unsupported and named, because no file available here has one: the
+    /// element layouts would be a guess, and a guess that parses is worse than
+    /// a refusal that explains itself.
+    fn read_state_machine_behaviour_tail(&mut self) -> Result<()> {
+        for field in [
+            "AnimatorController state machine behaviour ranges",
+            "AnimatorController state machine behaviour indices",
+            "AnimatorController state machine behaviours",
+        ] {
+            let count = self.reader.read_u32()?;
+            if count != 0 {
+                return Err(Error::unsupported(format!(
+                    "{field} has {count} entries, a shape this reader does not model"
+                )));
+            }
+        }
+        self.reader.read_u8()?;
+        self.align(4)?;
+        Ok(())
     }
 
     fn read_aligned_string(&mut self, field: &str) -> Result<String> {
@@ -1298,6 +1335,7 @@ mod tests {
         push_aligned_string(&mut out, endian, "Root/Body");
         endian.push_i32(&mut out, 1);
         push_pptr(&mut out, endian, 1, 77);
+        push_state_machine_behaviour_tail(&mut out, endian);
         out
     }
 
@@ -1323,6 +1361,7 @@ mod tests {
         endian.push_i32(&mut out, 0);
         endian.push_i32(&mut out, 1);
         push_pptr(&mut out, endian, 0, clip_path_id);
+        push_state_machine_behaviour_tail(&mut out, endian);
         out
     }
 
@@ -1363,6 +1402,21 @@ mod tests {
         for value in values {
             endian.push_u32(out, *value);
         }
+    }
+
+    /// The sixteen bytes every real `AnimatorController` ends with.
+    ///
+    /// These fixtures used to stop at the animation clips, because that is
+    /// where the managed reader stops. No Unity has ever written such a file:
+    /// all 212 controllers in a real 2022.3 game carry this tail, and the
+    /// reader's trailing-byte check is only worth anything if the fixtures
+    /// carry it too.
+    fn push_state_machine_behaviour_tail(out: &mut Vec<u8>, endian: TestEndian) {
+        endian.push_i32(out, 0);
+        endian.push_i32(out, 0);
+        endian.push_i32(out, 0);
+        out.push(1);
+        align(out, 4);
     }
 
     fn push_i32_array(out: &mut Vec<u8>, endian: TestEndian, values: &[i32]) {

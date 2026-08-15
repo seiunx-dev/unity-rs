@@ -4121,6 +4121,14 @@ mod tests {
         }
         push_i32(&mut output, 1);
         push_pptr(&mut output, (0, clip));
+        // The state-machine-behaviour tail every real controller carries.
+        push_i32(&mut output, 0);
+        push_i32(&mut output, 0);
+        push_i32(&mut output, 0);
+        output.push(1);
+        while output.len() % 4 != 0 {
+            output.push(0);
+        }
         output
     }
 
