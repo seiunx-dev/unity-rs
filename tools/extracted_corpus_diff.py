@@ -17,7 +17,19 @@ actually be held to:
   while this project reproduces the current managed writer's shortest
   round-trip form. Parsing both sides back to `f32` compares what the readers
   read rather than how two different tools chose to print it.
-* `.txt` -- TextAsset bytes, compared exactly. There is nothing to normalize.
+* `.txt` -- TextAsset bytes, compared exactly, with one attribution. On the
+  corpus this was written against, 571 of 577 differ, and none of them is a
+  disagreement: the extraction decoded each asset as text and wrote the decode
+  back, so every byte that is not valid UTF-8 became `?`. Most of these assets
+  are not text at all -- this project's copies begin `1f 8b 08` and unpack
+  through Python's `gzip`, while the extraction's copies are rejected as not
+  gzip and carry 1,044 `?` bytes against this project's 8. Reproducing that
+  transform exactly -- decode UTF-8, one `?` per undecodable byte, re-encode --
+  identifies those files as an oracle that destroyed its own payload rather
+  than as a difference of opinion. Nothing is loosened: a difference the
+  transform does not reproduce still fails. The blind spot is that a difference
+  confined to bytes which are themselves undecodable collapses to `?` on both
+  sides and cannot be seen.
 * `.png` -- compared as decoded pixels, since two PNG encoders agree about
   images and not about bytes, and compared by what a pixel contributes when it
   is drawn rather than by its raw channels. Sizes must match exactly, alpha
@@ -63,14 +75,24 @@ writer would only invite matching the weaker one.
 A file this project does not produce is counted and named rather than passed
 over, because "we exported nothing" would otherwise look like agreement.
 
-What is left over after all of that, on the corpus this was written against,
-is a handful of sprites disagreeing on their tight-mesh boundary: 4 pixels out
-of 1,143,000 in the worst one, going both ways -- one texel this project keeps
-and the extraction masks, three the other way round. That is a rasterizer edge
-rule, and this project's rasterizer is held to the managed one by an exact
-differential, so the disagreement is the extraction's. Those cases are
-reported rather than tolerated: widening the allowance until they pass would
-also hide a real masking defect.
+What is left over after all of that, across all 2,778 bundles, is sprites
+disagreeing on their tight-mesh boundary and nothing else. Every one is tiny
+and the counts say so: 214 of 2,609 images disagree at all, and among those
+reported the worst holds 62 bad pixels out of 4,161,596, with 578 bad pixels
+in 113,262,530 across the set -- five ten-thousandths of one percent. On one
+4,171,800-pixel sprite, 324,432 of the 373,063 pixels that differ have
+identical alpha and 48,603 differ by one; 21 exceed the allowance. That is a
+rasterizer edge rule, and this project's rasterizer is held to the managed one
+by an exact differential, so the disagreement is the extraction's. Those cases
+are reported rather than tolerated: widening the allowance until they pass
+would also hide a real masking defect.
+
+Counts matter as much as extremes here. Reporting only the worst pixel made a
+21-pixel edge case read as "alpha differs by 255" -- indistinguishable from a
+texture that decoded wrongly from end to end. For the same reason the problem
+list is capped per kind rather than globally: a single flat cap filled with
+image rows and hid 39 meshes this project exported nothing for, which were
+visible only in the totals.
 """
 
 from __future__ import annotations
@@ -234,7 +256,12 @@ def main() -> int:
         cases = cases[:limit]
 
     totals = collections.Counter()
-    problems: list[str] = []
+    # Keyed by file kind rather than one flat list. A single global cap fills
+    # with whichever kind is alphabetically first and noisiest -- the PNG rows,
+    # in practice -- so 39 meshes this project exported nothing for never
+    # appeared at all and were visible only in the totals. A category that has
+    # something to say should not be silenced by a category that has more.
+    problems: dict[str, list[str]] = collections.defaultdict(list)
     # Boxed so the comparison loop can raise the running maxima.
     worst_alpha = [0]
     worst_drawn = [0.0]
@@ -267,7 +294,7 @@ def main() -> int:
                 command += [str(staged), str(output)]
                 result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
                 if result.returncode not in (0, 3):
-                    problems.append(
+                    problems["export"].append(
                         f"{case.name}: export failed: {result.stderr.strip()[:160]}"
                     )
                     failed = True
@@ -297,8 +324,10 @@ def main() -> int:
                 ours = mine.get(theirs.name)
                 if ours is None:
                     totals[f"{theirs.suffix} not exported"] += 1
-                    if len(problems) < 40:
-                        problems.append(f"{case.name}/{theirs.name}: this project exported nothing")
+                    if len(problems[f"{theirs.suffix} missing"]) < 20:
+                        problems[f"{theirs.suffix} missing"].append(
+                            f"{case.name}/{theirs.name}: this project exported nothing"
+                        )
                     continue
                 if theirs.suffix == ".obj":
                     agree = obj_values(ours) == obj_values(theirs)
@@ -325,12 +354,12 @@ def main() -> int:
                     try:
                         comparison = image_difference(ours, theirs)
                     except Exception as error:  # noqa: BLE001 -- corpus data
-                        problems.append(f"{case.name}/{theirs.name}: {error}")
+                        problems[".png unreadable"].append(f"{case.name}/{theirs.name}: {error}")
                         continue
                     if not comparison.agrees:
                         totals[".png differing"] += 1
-                        if len(problems) < 40:
-                            problems.append(
+                        if len(problems[".png"]) < 20:
+                            problems[".png"].append(
                                 f"{case.name}/{theirs.name}: {comparison.reason}, "
                                 "more than two correct decoders can"
                             )
@@ -346,8 +375,8 @@ def main() -> int:
                     totals[f"{theirs.suffix} identical"] += 1
                 else:
                     totals[f"{theirs.suffix} differing"] += 1
-                    if len(problems) < 40:
-                        problems.append(f"{case.name}/{theirs.name}: differs")
+                    if len(problems[theirs.suffix]) < 20:
+                        problems[theirs.suffix].append(f"{case.name}/{theirs.name}: differs")
 
             subprocess.run(["rm", "-rf", str(root)], check=True)
             root.mkdir()
@@ -362,9 +391,13 @@ def main() -> int:
             f"worst drawn difference {worst_drawn[0]:.2f}"
         )
     if problems:
-        print(f"\n{len(problems)} problem(s):", file=sys.stderr)
-        for line in problems:
-            print(f"  {line}", file=sys.stderr)
+        total = sum(len(lines) for lines in problems.values())
+        print(f"\n{total} problem(s) in {len(problems)} categor(y/ies):", file=sys.stderr)
+        for category in sorted(problems):
+            lines = problems[category]
+            print(f"  {category}: {len(lines)} shown", file=sys.stderr)
+            for line in lines:
+                print(f"    {line}", file=sys.stderr)
         return 1
     if not any(key.endswith("compared") for key in totals):
         print("nothing was compared, so nothing was checked", file=sys.stderr)
