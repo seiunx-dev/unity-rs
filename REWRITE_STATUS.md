@@ -285,7 +285,10 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 4. **README 把纹理差分说大了**。原文写「所有列出的格式都与托管解码器逐字节一致」，但 DXT1/DXT5 是**刻意**偏离（同一段前面三十个字就写着），DXT3 托管侧根本没有解码器。两处出现这句话的地方都已改成如实表述。
 5. **2021+ shader 的容错过宽**。实现 2021+ 之后，`Err(_)` 把 2022+ 上的**任何**错误都吞掉并在导出文本里一律归因于「2022 布局变了」——预算超限、记录损坏、未知 GPU program type、未知记录版本全被说成同一件事，而后两者是本项目有意声明的拒绝。现在只吞解析失配（含读到记录末尾之外，那是同一件事从读取端看的样子，且记录是内存切片、不可能是文件系统故障），声明性的拒绝仍然让整个 shader 失败，导出文本里写的是它**实际**失败的原因。
 
-剩下的 material 条目（Node 面缺 unity version override/UnityCN key/失败容忍策略、Live2D 包的 physics/pose/display_info 在 Node 侧被丢掉、三个交付面的模型导出互不等价、`extraction.rs` 的重名分配是 O(N²)、SpriteAtlas/Texture2DArray/场景与 FBX/UnityCN/容器元数据缺差分）尚未处理，清单在本次审计的输出里。
+这份 material 清单已在同日晚些时候逐条处理（见上文「本轮进展」）：Node 的加载选项、Live2D 三份文档与 diagnostics、三个交付面的模型导出、两处线性搜索、SpriteAtlas 与 Texture2DArray 的托管差分均已完成。剩下两条，各有各的原因：
+
+- **场景与 FBX 缺差分**。托管侧的 FBX 导出走的是 `AssetStudio.FBXNative`（一个原生库），oracle 项目引不进来；场景层则由 `scene_hierarchy`/`model_ir` 的单测和真实语料覆盖。要补这条需要先决定拿什么当 oracle。
+- **UnityCN 缺差分，而且短期内补不了**。托管 AssetStudio 只检测不解密（`BundleFile.cs` 直接抛 `NotSupportedException`），本机这份 UnityPy 也没有 UnityCN，两份语料都不是 UnityCN 加密的——也就是说没有第二个实现可比。当前证据分两层：AES-128 本身由 FIPS-197 向量验证，这是真正的外部 oracle；它上面的 token/counter/掩码层只有往返测试，而那个测试里的"加密"是测试自己写的，与解密器共享同一份理解——两边一起错就一起过。这一层现在只能算"结构上被检查过"，不能算"被验证过"，要真的验证需要一个 UnityCN 加密的真实 bundle 和它的密钥。
 
 **真实 AssetBundle 也接上了，并抓到一个更大的缺口（2026-08-15）**：上面那份是播放器目录（`.assets`），不是 AssetBundle；`~/Downloads` 里有四个真实的 PJSK bundle，一跑就发现 **UnityFS v8 被整个拒掉了**——本项目只认 v6/v7，而 v8 正是当代 Unity 写出来的版本，也就是说现在任何一款新游戏的 bundle 都打不开。查下来 v8 根本不是新格式：它的 header 与 blocks info 就是 v7 的，托管侧压根不区分（只判 `>= 7`），本项目在闸门以下也早就是同样的写法；拿真实 v8 header 按 v7 布局解，declared size 与文件大小逐字节吻合。现已接受 v8（更高版本仍然拒绝而不是假定兼容），并且用两个 oracle 分别验证：四个真实 bundle 的对象数与 class 分布与 UnityPy 完全一致（101/23/4/26，逐类相同），容器差分也加了一条 v8 用例交给托管侧比对。另外两个 bundle 的 header 版本被抹成 `5.x.x`，需要 `--unity-version`——corpus manifest 因此加了 `unity_version` 字段（CLI 一直有这个选项，只是清单没法表达）。四个 bundle 现在都能完整导出（101/23/4/26 全部成功、0 失败），其中的贴图是真实的 ASTC_RGB_6x6，导出的 PNG 用独立解码器逐个验过。`extract` 那条路径也在真实 bundle 上跑通并做了闭环：解出 CAB 与同名 `.resS` 之后，直接读解出来的 CAB 得到的 22 张 PNG 与直接读 bundle 得到的逐字节相同——这同时也验证了「单文件输入要连带加载同名伴随文件」那个修复。顺带拿到一条对上游缺陷的实证：那张 600×576 的 ASTC_RGB_6x6 贴图，本项目解出来的 1,382,400 字节与托管原生解码器逐字节一致（FNV `c6687283ffa9acde`），而绑定未修补 crate 的 UnityPy 与两者都不同；二十张 sprite 的差异全部是 R/G/B 恰好差 1、alpha 一字节不差——正是「该四舍五入的地方做了截断」的形状，已写进 `docs/upstream-defects.md`。
 
