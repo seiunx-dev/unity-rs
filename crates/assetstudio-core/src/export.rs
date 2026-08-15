@@ -171,22 +171,52 @@ pub fn export_collection(
     output_root: &Path,
     options: ExportOptions,
 ) -> Result<ExportReport> {
-    export_collection_with_schemas(collection, output_root, options, None)
+    export_collection_with_plan(collection, output_root, options, ExportPlan::default())
 }
 
-/// The same export, with schemas for `MonoBehaviour` objects whose own type
-/// tree was stripped from the build.
+/// What to export and what extra knowledge to export it with.
 ///
-/// Without them a stripped behaviour is declined, and in a modern game that is
-/// most of the file: exporting one Unity 2022.3 title reports 172,192 objects
-/// unsupported for this reason alone. The provider supplies the layout as
-/// data; nothing here opens or executes the managed assembly it came from.
-pub fn export_collection_with_schemas(
+/// Separate from [`ExportOptions`] because these borrow, and options are
+/// copied through the whole selection chain.
+#[derive(Clone, Copy, Default)]
+pub struct ExportPlan<'a> {
+    /// Schemas for `MonoBehaviour` objects whose own type tree was stripped
+    /// from the build.
+    ///
+    /// Without them a stripped behaviour is declined, and in a modern game
+    /// that is most of the file: exporting one Unity 2022.3 title reports
+    /// 172,192 objects unsupported for this reason alone. The provider
+    /// supplies the layout as data; nothing here opens or executes the managed
+    /// assembly it came from.
+    pub mono_schemas: Option<&'a dyn MonoBehaviourSchemaProvider>,
+    /// The class IDs to export. `None` exports every class.
+    ///
+    /// Worth having because the cost of an export is dominated by whatever is
+    /// largest: dumping one game's `Live2D` bundles as type-tree JSON writes
+    /// gigabytes of mesh, and a caller after its script data pays all of it.
+    pub classes: Option<&'a [i32]>,
+}
+
+impl std::fmt::Debug for ExportPlan<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExportPlan")
+            // A provider is caller code with no useful rendering, so it is
+            // reported as present or absent rather than described.
+            .field("mono_schemas", &self.mono_schemas.is_some())
+            .field("classes", &self.classes)
+            .finish()
+    }
+}
+
+/// The same export, narrowed and informed by a plan.
+pub fn export_collection_with_plan(
     collection: &AssetCollection,
     output_root: &Path,
     options: ExportOptions,
-    schemas: Option<&dyn MonoBehaviourSchemaProvider>,
+    plan: ExportPlan<'_>,
 ) -> Result<ExportReport> {
+    let schemas = plan.mono_schemas;
     let object_count = collection
         .serialized_files
         .iter()
@@ -215,6 +245,11 @@ pub fn export_collection_with_schemas(
         ensure_secure_export_directory(&group_path)?;
 
         for (object_index, object) in loaded.file.objects.iter().enumerate() {
+            if let Some(classes) = plan.classes
+                && !classes.contains(&object.class_id)
+            {
+                continue;
+            }
             let remaining_output_bytes = options
                 .maximum_total_output_bytes
                 .checked_sub(total_output_bytes)

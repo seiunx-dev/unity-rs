@@ -15,7 +15,8 @@ use assetstudio_core::compression::{
 use assetstudio_core::cubism_moc::{CubismMoc, CubismMocReadLimits, try_read_cubism_moc};
 use assetstudio_core::endian::{Endian, EndianReader};
 use assetstudio_core::export::{
-    AudioExportFormat, ExportMode, ExportOptions, FilenameFormat, export_collection_with_schemas,
+    AudioExportFormat, ExportMode, ExportOptions, ExportPlan, FilenameFormat,
+    export_collection_with_plan,
 };
 use assetstudio_core::extraction::{ExtractionOptions, extract_path};
 use assetstudio_core::fbx_ascii::{
@@ -163,6 +164,7 @@ fn run_with_arguments(arguments: &[OsString], output: &mut impl Write) -> CliRes
             &command.input,
             &command.output,
             command.options,
+            &command.classes,
             &load,
             output,
         ),
@@ -489,6 +491,9 @@ fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliComman
                 input,
                 output,
                 options,
+                // The legacy spellings never took a class filter, and adding
+                // one to them would be inventing a command that never existed.
+                classes: Vec::new(),
             }))
         }
         _ => Err(CliError::Usage(format!(
@@ -607,6 +612,8 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          --image-format <jpg|jpeg|png|bmp|tga|webp|raw-rgba>\n  \
          --jpeg-quality <1-100>\n  --no-restore-text-extension\n  \
          --audio-format <auto|raw|wav>\n  \
+         --class <ID>                  Export only this class, repeatable. IDs are the\n  \
+         numbers list and export print, for example 114 for MonoBehaviour.\n  \
          --compact-json\n\n\
          Extract options:\n  --overwrite\n\n\
          Live2D export:\n  Exports only MonoBehaviours whose resolved MonoScript class is CubismMoc.\n  \
@@ -629,6 +636,8 @@ struct ExportCommand {
     input: PathBuf,
     output: PathBuf,
     options: ExportOptions,
+    /// Class IDs to export, in the order given. Empty exports every class.
+    classes: Vec<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -936,6 +945,7 @@ fn parse_extract_arguments(arguments: &[OsString]) -> Result<ExtractCommand> {
 
 fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
     let mut options = ExportOptions::default();
+    let mut classes = Vec::new();
     let mut positional = Vec::new();
     let mut parse_options = true;
     let mut index = 0;
@@ -984,6 +994,12 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
                 .get(index)
                 .ok_or_else(|| Error::invalid_data("--audio-format requires a value"))?;
             options.audio_format = parse_audio_format(value)?;
+        } else if parse_options && argument == "--class" {
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| Error::invalid_data("--class requires a class ID"))?;
+            classes.push(parse_class_id(value)?);
         } else if parse_options
             && argument
                 .to_str()
@@ -1009,7 +1025,25 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
         input: positional.remove(0),
         output: positional.remove(0),
         options,
+        classes,
     })
+}
+
+/// Reads a class ID as the `list` and `export` output prints it.
+///
+/// Numbers rather than names: this reader has no class-name table, and one
+/// invented here would be wrong for exactly the classes a caller most needs to
+/// name -- the ones a new Unity version added.
+fn parse_class_id(value: &OsString) -> Result<i32> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "invalid class ID: {} (expected a number, as `list` prints)",
+                value.to_string_lossy()
+            ))
+        })
 }
 
 fn parse_export_mode(value: &OsString) -> Result<ExportMode> {
@@ -1085,18 +1119,22 @@ fn export_path(
     input: &Path,
     output_directory: &Path,
     options: ExportOptions,
+    classes: &[i32],
     load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
     let collection = load_asset_collection(input, load, output)?;
     let schemas = load.mono_schema_registry()?;
-    let report = export_collection_with_schemas(
+    let report = export_collection_with_plan(
         &collection,
         output_directory,
         options,
-        schemas
-            .as_ref()
-            .map(|registry| registry as &dyn MonoBehaviourSchemaProvider),
+        ExportPlan {
+            mono_schemas: schemas
+                .as_ref()
+                .map(|registry| registry as &dyn MonoBehaviourSchemaProvider),
+            classes: (!classes.is_empty()).then_some(classes),
+        },
     )?;
 
     for record in &report.exported {
