@@ -212,7 +212,7 @@ impl CompressedMesh {
             let flat = self.vertices.unpack(3, 0, None)?;
             let vertex_count = flat.len() / 3;
             if vertex_count == 0 {
-                return Err(Error::invalid_data("compressed Mesh has no vertices"));
+                return Err(Error::unsupported("compressed Mesh has no vertices"));
             }
             if vertex_count > limits.maximum_vertices {
                 return Err(Error::invalid_data(format!(
@@ -446,11 +446,14 @@ fn read_mesh_inner(
     let supported = if is_tuanjie {
         version.0 == 2022 && version.1 == 3 && version.2 >= 2
     } else {
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 1)
+        // 6000.2 appends a `MeshLodInfo` tail; everything before it is
+        // unchanged, and the tail's shape comes from the type tree a 6000.3
+        // build writes rather than from a guess.
+        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || version.0 == 6000
     };
     if !supported {
         return Err(Error::unsupported(format!(
-            "resident Mesh layout for Unity {}; implemented ranges are standard Unity 2017.3-2023 and 6000.0-6000.1 plus Tuanjie 2022.3.x (6000.2 adds an unverified MeshLodInfo tail)",
+            "resident Mesh layout for Unity {}; implemented ranges are standard Unity 2017.3-2023 and 6000.x plus Tuanjie 2022.3.x",
             file.unity_version
         )));
     }
@@ -633,6 +636,9 @@ fn read_mesh_inner(
     } else {
         false
     };
+    if !is_tuanjie && version >= (6000, 2, 0) {
+        reader.read_mesh_lod_info()?;
+    }
     reader.finish()?;
 
     if has_virtual_geometry {
@@ -672,7 +678,11 @@ fn read_mesh_inner(
         compressed.overlay(&mut decoded, limits)?;
     }
     if decoded.vertices.is_empty() {
-        return Err(Error::invalid_data("Mesh has no vertices"));
+        // Unity writes empty meshes -- a placeholder renderer, a mesh whose
+        // geometry lives only in a LOD level. The managed exporter skips them
+        // too. Declining says that about the asset; failing would say the
+        // bytes were broken, and they were not.
+        return Err(Error::unsupported("Mesh has no vertices"));
     }
     let decoded = decoded;
     let vertex_count = decoded.vertices.len();
@@ -870,7 +880,7 @@ fn write_mesh_obj_inner<W: Write>(mesh: &Mesh, output: &mut W) -> io::Result<()>
 
 fn validate_mesh_for_obj(mesh: &Mesh) -> Result<()> {
     if mesh.vertices.is_empty() {
-        return Err(Error::invalid_data("Mesh has no vertices"));
+        return Err(Error::unsupported("Mesh has no vertices"));
     }
     if let Some(normals) = &mesh.normals
         && normals.len() != mesh.vertices.len()
@@ -1007,7 +1017,7 @@ impl VertexData {
         version: (u32, u32, u32),
     ) -> Result<DecodedVertexData> {
         if self.vertex_count == 0 {
-            return Err(Error::invalid_data("Mesh has no vertices"));
+            return Err(Error::unsupported("Mesh has no vertices"));
         }
         for (index, channel) in self.channels.iter().copied().enumerate() {
             if channel.dimension == 0 {
@@ -1845,6 +1855,31 @@ impl MeshObjectReader {
             return Ok(());
         }
         self.skip(alignment - remainder, "Mesh alignment")
+    }
+
+    /// Reads the `MeshLodInfo` tail Unity 6000.2 appends.
+    ///
+    /// Taken from the type tree a Unity 6000.3 build writes for `Mesh` rather
+    /// than from a guess: a selection curve, a level count, and per-submesh
+    /// index ranges. Nothing here is kept -- this reader exports mip zero of a
+    /// mesh, not its LOD chain -- but the bytes have to be walked, because
+    /// `finish` refuses a mesh whose layout did not account for the object.
+    fn read_mesh_lod_info(&mut self) -> Result<()> {
+        self.align(4)?;
+        self.skip(4, "Mesh LOD selection slope")?;
+        self.skip(4, "Mesh LOD selection bias")?;
+        self.align(4)?;
+        self.skip(4, "Mesh LOD level count")?;
+        self.align(4)?;
+        let submeshes =
+            self.read_record_count(self.limits.maximum_array_elements, 4, "Mesh LOD sub-mesh")?;
+        for _ in 0..submeshes {
+            // Each range is two u32s; the vector aligns after its elements.
+            self.skip_counted_auxiliary_records(8, "Mesh LOD index range")?;
+            self.align(4)?;
+        }
+        self.align(4)?;
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
