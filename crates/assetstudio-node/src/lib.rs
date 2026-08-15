@@ -9,10 +9,11 @@ use assetstudio_core::avatar::AvatarReadLimits;
 use assetstudio_core::export::ExportOptions;
 use assetstudio_core::extraction::ExtractionOptions;
 use assetstudio_core::image_export::ImageFormat;
+use assetstudio_core::live2d_clip_motion::CubismClipMotionReadLimits;
 use assetstudio_core::live2d_motion::{CubismFadeMotionReadLimits, CubismMotionTargetNames};
 use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMaterializeLimits};
 use assetstudio_core::live2d_physics::CubismPhysicsReadLimits;
-use assetstudio_core::live2d_schema::CubismExpressionReadLimits;
+use assetstudio_core::live2d_schema::{CubismAuxiliaryReadLimits, CubismExpressionReadLimits};
 use assetstudio_core::loader::{AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy};
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
@@ -105,6 +106,45 @@ pub struct CubismDocument {
     /// Sub-rigs for physics, parameters for an expression, curves for a
     /// motion. Zero for a document that has no such notion.
     pub entry_count: u32,
+}
+
+/// One embedded-schema `CubismPosePart` component.
+#[napi(object)]
+pub struct CubismPosePart {
+    pub path_id: BigInt,
+    pub group_index: i32,
+    pub links: Vec<String>,
+}
+
+/// One embedded-schema Cubism display-info component.
+#[napi(object)]
+pub struct CubismDisplayInfo {
+    pub path_id: BigInt,
+    pub name: String,
+    pub display_name: Option<String>,
+    /// `displayName` when it is non-empty, otherwise `name`.
+    pub effective_name: String,
+}
+
+/// Parameter and part identifiers used to resolve `AnimationClip` bindings.
+#[napi(object)]
+pub struct CubismMotionTargets {
+    pub parameters: Option<Vec<String>>,
+    pub parts: Option<Vec<String>>,
+}
+
+/// One real Unity `AnimationClip` projected to Cubism motion3 JSON.
+#[napi(object)]
+pub struct CubismClipMotion {
+    pub file_index: u32,
+    pub path_id: BigInt,
+    pub name: String,
+    pub duration: f64,
+    pub fps: f64,
+    pub curve_count: u32,
+    pub keyframe_count: u32,
+    pub event_count: u32,
+    pub json: Buffer,
 }
 
 /// One `GameObject` branch that can be exported as its own FBX.
@@ -486,6 +526,25 @@ pub struct OpenOptions {
     pub maximum_directory_entries: Option<u32>,
 }
 
+/// Caller-configurable collection-wide scene assembly budgets.
+#[napi(object)]
+pub struct SceneLimits {
+    pub maximum_game_objects: Option<u32>,
+    pub maximum_total_components: Option<u32>,
+    pub maximum_total_transform_child_references: Option<u32>,
+    pub maximum_total_material_references: Option<u32>,
+    pub maximum_total_bone_references: Option<u32>,
+    pub maximum_hierarchy_edges: Option<u32>,
+}
+
+/// Caller-configurable budgets for textures returned beside a model.
+#[napi(object)]
+pub struct ModelTextureLimits {
+    pub maximum_textures: Option<u32>,
+    pub maximum_total_encoded_bytes: Option<i64>,
+    pub maximum_single_texture_bytes: Option<i64>,
+}
+
 fn load_options(
     options: Option<OpenOptions>,
     oodle: Option<Arc<dyn assetstudio_core::bundle::OodleDecoder>>,
@@ -548,6 +607,66 @@ fn count_limit(value: Option<u32>, default: usize) -> usize {
     value.map_or(default, |value| value as usize)
 }
 
+fn scene_limits(options: Option<SceneLimits>) -> SceneHierarchyLimits {
+    let defaults = SceneHierarchyLimits::default();
+    let Some(options) = options else {
+        return defaults;
+    };
+    SceneHierarchyLimits {
+        maximum_game_objects: count_limit(
+            options.maximum_game_objects,
+            defaults.maximum_game_objects,
+        ),
+        maximum_total_components: count_limit(
+            options.maximum_total_components,
+            defaults.maximum_total_components,
+        ),
+        maximum_total_transform_child_references: count_limit(
+            options.maximum_total_transform_child_references,
+            defaults.maximum_total_transform_child_references,
+        ),
+        maximum_total_material_references: count_limit(
+            options.maximum_total_material_references,
+            defaults.maximum_total_material_references,
+        ),
+        maximum_total_bone_references: count_limit(
+            options.maximum_total_bone_references,
+            defaults.maximum_total_bone_references,
+        ),
+        maximum_hierarchy_edges: count_limit(
+            options.maximum_hierarchy_edges,
+            defaults.maximum_hierarchy_edges,
+        ),
+        ..defaults
+    }
+}
+
+fn model_texture_limits(options: Option<ModelTextureLimits>) -> Result<SceneTextureLimits> {
+    let defaults = SceneTextureLimits::default();
+    let Some(options) = options else {
+        return Ok(defaults);
+    };
+    let maximum_single_texture_bytes = non_negative_limit(
+        options.maximum_single_texture_bytes,
+        defaults.texture.maximum_output_bytes,
+        "maximumSingleTextureBytes",
+    )?;
+    Ok(SceneTextureLimits {
+        maximum_textures: count_limit(options.maximum_textures, defaults.maximum_textures),
+        maximum_total_encoded_bytes: non_negative_limit(
+            options.maximum_total_encoded_bytes,
+            defaults.maximum_total_encoded_bytes,
+            "maximumTotalEncodedBytes",
+        )?,
+        texture: TextureReadLimits {
+            maximum_payload_bytes: maximum_single_texture_bytes,
+            maximum_output_bytes: maximum_single_texture_bytes,
+            maximum_decoder_working_bytes: maximum_single_texture_bytes,
+            ..defaults.texture
+        },
+    })
+}
+
 /// One opened collection. All format work is delegated to `assetstudio-core`.
 #[napi]
 pub struct AssetStudio {
@@ -603,7 +722,7 @@ impl AssetStudio {
     #[napi(ts_return_type = "Promise<Buffer>")]
     pub fn read_fbx_with_acl_decoder(
         &self,
-        decoder: AclCallback,
+        #[napi(ts_arg_type = "(request: AclDecodeRequest) => AclDecodedClip")] decoder: AclCallback,
         maximum_bytes: Option<i64>,
     ) -> Result<AsyncTask<FbxWithAclTask>> {
         Ok(AsyncTask::new(FbxWithAclTask {
@@ -639,6 +758,7 @@ impl AssetStudio {
     #[napi(ts_return_type = "Promise<AssetStudio>")]
     pub fn open_with_oodle(
         path: String,
+        #[napi(ts_arg_type = "(input: Buffer, expectedLength: number) => Buffer")]
         decoder: OodleCallback,
         options: Option<OpenOptions>,
     ) -> AsyncTask<OpenWithOodleTask> {
@@ -1270,24 +1390,16 @@ impl AssetStudio {
         if let Some(maximum) = maximum_game_objects {
             limits.maximum_game_objects = usize::try_from(maximum).expect("u32 fits usize");
         }
-        let hierarchy = self.studio.scene_hierarchy(limits).map_err(core_error)?;
-        let mut nodes = Vec::with_capacity(hierarchy.nodes.len());
-        for node in &hierarchy.nodes {
-            nodes.push(SceneNode {
-                file_index: u32::try_from(node.object.file_index)
-                    .map_err(|_| invalid_arg("file index does not fit u32"))?,
-                path_id: BigInt::from(node.object.path_id),
-                name: node.name.clone(),
-                parent_path_id: node.parent.map(|parent| BigInt::from(parent.path_id)),
-                child_count: u32::try_from(node.children.len())
-                    .map_err(|_| invalid_arg("child count does not fit u32"))?,
-                has_transform: node.transform.is_some(),
-                has_mesh_renderer: node.mesh_renderer.is_some(),
-                has_skinned_mesh_renderer: node.skinned_mesh_renderer.is_some(),
-                has_animator: node.animator.is_some(),
-            });
-        }
-        Ok(nodes)
+        build_scene(&self.studio, limits)
+    }
+
+    /// Assembles the same hierarchy with all collection-wide budgets exposed.
+    ///
+    /// `scene(maximumGameObjects)` remains available for compatibility; this
+    /// method adds component, child, material, bone, and hierarchy-edge limits.
+    #[napi]
+    pub fn scene_with_limits(&self, limits: Option<SceneLimits>) -> Result<Vec<SceneNode>> {
+        build_scene(&self.studio, scene_limits(limits))
     }
 
     /// Writes the whole collection as static ASCII FBX 7.4.
@@ -1398,6 +1510,95 @@ impl AssetStudio {
             json: json.into(),
             entry_count: u32::try_from(motion.curves.len()).unwrap_or(u32::MAX),
         })
+    }
+
+    /// Reads one embedded-schema `CubismPosePart` component.
+    #[napi]
+    pub fn read_cubism_pose_part(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<CubismPosePart> {
+        let limits = cubism_auxiliary_limits(byte_limit(maximum_bytes)?)?;
+        let pose = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_cubism_pose_part(limits)
+            .map_err(core_error)?;
+        Ok(CubismPosePart {
+            path_id: pose.path_id.into(),
+            group_index: pose.group_index,
+            links: pose.links,
+        })
+    }
+
+    /// Reads one embedded-schema Cubism display-info component.
+    #[napi]
+    pub fn read_cubism_display_info(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<CubismDisplayInfo> {
+        let limits = cubism_auxiliary_limits(byte_limit(maximum_bytes)?)?;
+        let info = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_cubism_display_info(limits)
+            .map_err(core_error)?;
+        let effective_name = copy_string(info.effective_name(), "Cubism effective display name")?;
+        Ok(CubismDisplayInfo {
+            path_id: info.path_id.into(),
+            name: info.name,
+            display_name: info.display_name,
+            effective_name,
+        })
+    }
+
+    /// Projects one real Unity `AnimationClip` to Cubism motion3 JSON.
+    #[napi]
+    pub fn read_cubism_clip_motion(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        targets: Option<CubismMotionTargets>,
+        force_bezier: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<CubismClipMotion> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let target_names = cubism_motion_targets(targets);
+        let motion = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_cubism_clip_motion(&target_names, cubism_clip_motion_limits(maximum)?)
+            .map_err(core_error)?;
+        build_cubism_clip_motion(motion, force_bezier.unwrap_or(false), maximum)
+            .map(CubismClipMotionOutput::into_js)
+    }
+
+    /// Projects one ACL-backed Tuanjie `AnimationClip` on a worker.
+    ///
+    /// The JavaScript decoder receives only Core-validated, owned ACL input.
+    /// Core then validates every returned time, binding index and value before
+    /// the motion3 document is built. The worker is required so the callback
+    /// can execute on the JavaScript event loop without deadlocking it.
+    #[napi(ts_return_type = "Promise<CubismClipMotion>")]
+    pub fn read_cubism_clip_motion_with_acl_decoder(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        #[napi(ts_arg_type = "(request: AclDecodeRequest) => AclDecodedClip")] decoder: AclCallback,
+        targets: Option<CubismMotionTargets>,
+        force_bezier: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<CubismClipMotionWithAclTask>> {
+        Ok(AsyncTask::new(CubismClipMotionWithAclTask {
+            studio: Arc::clone(&self.studio),
+            file_index: usize::try_from(file_index).expect("u32 fits usize"),
+            path_id: bigint_i64(path_id, "pathId")?,
+            targets: cubism_motion_targets(targets),
+            force_bezier: force_bezier.unwrap_or(false),
+            maximum: byte_limit(maximum_bytes)?,
+            decoder: Arc::new(JsAclDecoder { callback: decoder }),
+        }))
     }
 
     /// Enumerates the `GameObject` branches a split-objects export would write.
@@ -1769,22 +1970,25 @@ impl AssetStudio {
     ///
     /// `materialLibraryName` is what the OBJ's `mtllib` line will say, so it
     /// has to be the name the library is actually written under.
+    /// `textureFormat` defaults to PNG and accepts the same format names as
+    /// the Core and Python surfaces. `textureLimits` independently bounds the
+    /// texture count, total encoded bytes and each texture's payload, decoded
+    /// output and decoder workspace.
     #[napi]
     pub fn read_model_obj(
         &self,
         material_library_name: Option<String>,
         maximum_bytes: Option<i64>,
+        texture_format: Option<String>,
+        texture_limits: Option<ModelTextureLimits>,
     ) -> Result<ModelObj> {
         let maximum = byte_limit(maximum_bytes)?;
+        let texture_format = parse_image_format(texture_format)?;
+        let texture_limits = model_texture_limits(texture_limits)?;
         let name = material_library_name.unwrap_or_else(|| "model.mtl".to_owned());
         let model = self
             .studio
-            .read_model_obj(
-                &name,
-                maximum,
-                ImageFormat::Png,
-                SceneTextureLimits::default(),
-            )
+            .read_model_obj(&name, maximum, texture_format, texture_limits)
             .map_err(core_error)?;
         Ok(ModelObj {
             obj: model.obj.into(),
@@ -1793,16 +1997,16 @@ impl AssetStudio {
             textures: model
                 .textures
                 .textures
-                .iter()
+                .into_iter()
                 .map(|texture| Live2dFile {
-                    file_name: texture.file_name.clone(),
-                    data: texture.encoded.clone().into(),
+                    file_name: texture.file_name,
+                    data: texture.encoded.into(),
                 })
                 .collect(),
             skipped: model
                 .textures
                 .skipped
-                .iter()
+                .into_iter()
                 .map(|skip| format!("{}: {}", skip.property, skip.reason))
                 .collect(),
         })
@@ -1814,33 +2018,37 @@ impl AssetStudio {
     /// The FBX names each texture by file name, so the returned files have to
     /// be written beside it for those references to resolve. They come back
     /// rather than being written because this call has no directory of its own
-    /// and where they land is the caller's decision.
+    /// and where they land is the caller's decision. `textureFormat` defaults
+    /// to PNG and accepts the same format names as the Core and Python surfaces.
+    /// `textureLimits` has the same meaning as on `readModelObj`.
     #[napi]
-    pub fn read_fbx_with_textures(&self, maximum_bytes: Option<i64>) -> Result<TexturedFbx> {
+    pub fn read_fbx_with_textures(
+        &self,
+        maximum_bytes: Option<i64>,
+        texture_format: Option<String>,
+        texture_limits: Option<ModelTextureLimits>,
+    ) -> Result<TexturedFbx> {
         let maximum = byte_limit(maximum_bytes)?;
+        let texture_format = parse_image_format(texture_format)?;
+        let texture_limits = model_texture_limits(texture_limits)?;
         let mut fbx = Vec::new();
         let (_, textures) = self
             .studio
-            .write_fbx_with_textures(
-                &mut fbx,
-                maximum,
-                ImageFormat::Png,
-                SceneTextureLimits::default(),
-            )
+            .write_fbx_with_textures(&mut fbx, maximum, texture_format, texture_limits)
             .map_err(core_error)?;
         Ok(TexturedFbx {
             fbx: fbx.into(),
             textures: textures
                 .textures
-                .iter()
+                .into_iter()
                 .map(|texture| Live2dFile {
-                    file_name: texture.file_name.clone(),
-                    data: texture.encoded.clone().into(),
+                    file_name: texture.file_name,
+                    data: texture.encoded.into(),
                 })
                 .collect(),
             skipped: textures
                 .skipped
-                .iter()
+                .into_iter()
                 .map(|skip| format!("{}: {}", skip.property, skip.reason))
                 .collect(),
         })
@@ -2119,6 +2327,35 @@ impl Task for FbxWithAclTask {
     }
 }
 
+/// Builds one ACL-backed Cubism motion on a worker while its decoder callback
+/// is serviced by the JavaScript event loop.
+pub struct CubismClipMotionWithAclTask {
+    studio: Arc<Studio>,
+    file_index: usize,
+    path_id: i64,
+    targets: CubismMotionTargetNames,
+    force_bezier: bool,
+    maximum: u64,
+    decoder: Arc<JsAclDecoder>,
+}
+
+impl Task for CubismClipMotionWithAclTask {
+    type Output = CubismClipMotionOutput;
+    type JsValue = CubismClipMotion;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let limits = cubism_clip_motion_limits(self.maximum)?;
+        let motion = studio_object(&self.studio, self.file_index, self.path_id)?
+            .read_cubism_clip_motion_with_acl_decoder(&self.targets, limits, self.decoder.as_ref())
+            .map_err(core_error)?;
+        build_cubism_clip_motion(motion, self.force_bezier, self.maximum)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output.into_js())
+    }
+}
+
 pub struct OpenWithOodleTask {
     path: String,
     decoder: Arc<JsOodleDecoder>,
@@ -2316,6 +2553,27 @@ fn studio_object(studio: &Studio, file_index: usize, path_id: i64) -> Result<Stu
     })
 }
 
+fn build_scene(studio: &Studio, limits: SceneHierarchyLimits) -> Result<Vec<SceneNode>> {
+    let hierarchy = studio.scene_hierarchy(limits).map_err(core_error)?;
+    let mut nodes = reserve(hierarchy.nodes.len(), "scene nodes")?;
+    for node in &hierarchy.nodes {
+        nodes.push(SceneNode {
+            file_index: u32::try_from(node.object.file_index)
+                .map_err(|_| invalid_arg("file index does not fit u32"))?,
+            path_id: BigInt::from(node.object.path_id),
+            name: copy_string(&node.name, "scene node name")?,
+            parent_path_id: node.parent.map(|parent| BigInt::from(parent.path_id)),
+            child_count: u32::try_from(node.children.len())
+                .map_err(|_| invalid_arg("child count does not fit u32"))?,
+            has_transform: node.transform.is_some(),
+            has_mesh_renderer: node.mesh_renderer.is_some(),
+            has_skinned_mesh_renderer: node.skinned_mesh_renderer.is_some(),
+            has_animator: node.animator.is_some(),
+        });
+    }
+    Ok(nodes)
+}
+
 /// Converts caller-supplied schema descriptions into a lookup registry.
 ///
 /// Bounded on both node count and total string bytes, because these arrive
@@ -2384,6 +2642,109 @@ fn settings_limits(maximum: u64) -> ProjectSettingsReadLimits {
         maximum_object_bytes: maximum,
         ..ProjectSettingsReadLimits::default()
     }
+}
+
+fn cubism_auxiliary_limits(maximum: u64) -> Result<CubismAuxiliaryReadLimits> {
+    let maximum_usize = usize::try_from(maximum)
+        .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?;
+    let defaults = CubismAuxiliaryReadLimits::default();
+    Ok(CubismAuxiliaryReadLimits {
+        maximum_object_bytes: defaults.maximum_object_bytes.min(maximum),
+        maximum_string_bytes: defaults.maximum_string_bytes.min(maximum_usize),
+        maximum_total_string_bytes: defaults.maximum_total_string_bytes.min(maximum_usize),
+        ..defaults
+    })
+}
+
+fn cubism_motion_targets(targets: Option<CubismMotionTargets>) -> CubismMotionTargetNames {
+    let targets = targets.unwrap_or(CubismMotionTargets {
+        parameters: None,
+        parts: None,
+    });
+    CubismMotionTargetNames {
+        parameters: targets.parameters.unwrap_or_default(),
+        parts: targets.parts.unwrap_or_default(),
+    }
+}
+
+fn cubism_clip_motion_limits(maximum: u64) -> Result<CubismClipMotionReadLimits> {
+    let maximum_usize = usize::try_from(maximum)
+        .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?;
+    let defaults = CubismClipMotionReadLimits::default();
+    Ok(CubismClipMotionReadLimits {
+        maximum_string_bytes: defaults.maximum_string_bytes.min(maximum_usize),
+        maximum_total_string_bytes: defaults.maximum_total_string_bytes.min(maximum_usize),
+        maximum_output_bytes: maximum,
+        clip: AnimationClipReadLimits {
+            maximum_object_bytes: defaults.clip.maximum_object_bytes.min(maximum),
+            maximum_string_bytes: defaults.clip.maximum_string_bytes.min(maximum_usize),
+            maximum_total_string_bytes: defaults.clip.maximum_total_string_bytes.min(maximum_usize),
+            maximum_total_allocation_bytes: defaults
+                .clip
+                .maximum_total_allocation_bytes
+                .min(maximum),
+            ..defaults.clip
+        },
+        ..defaults
+    })
+}
+
+pub struct CubismClipMotionOutput {
+    file_index: u32,
+    path_id: i64,
+    name: String,
+    duration: f64,
+    fps: f64,
+    curve_count: u32,
+    keyframe_count: u32,
+    event_count: u32,
+    json: Vec<u8>,
+}
+
+impl CubismClipMotionOutput {
+    fn into_js(self) -> CubismClipMotion {
+        CubismClipMotion {
+            file_index: self.file_index,
+            path_id: self.path_id.into(),
+            name: self.name,
+            duration: self.duration,
+            fps: self.fps,
+            curve_count: self.curve_count,
+            keyframe_count: self.keyframe_count,
+            event_count: self.event_count,
+            json: self.json.into(),
+        }
+    }
+}
+
+fn build_cubism_clip_motion(
+    motion: assetstudio_core::live2d_clip_motion::CubismClipMotion,
+    force_bezier: bool,
+    maximum: u64,
+) -> Result<CubismClipMotionOutput> {
+    let keyframe_count = motion.curves.iter().try_fold(0_usize, |total, curve| {
+        total.checked_add(curve.keyframes.len())
+    });
+    let keyframe_count = keyframe_count
+        .ok_or_else(|| invalid_arg("Cubism clip-motion keyframe count overflowed"))?;
+    let mut json = reserve(
+        usize::try_from(maximum.min(64 * 1024)).expect("64 KiB fits usize"),
+        "Cubism clip-motion JSON",
+    )?;
+    motion
+        .write_motion3_json(force_bezier, &mut json, maximum)
+        .map_err(core_error)?;
+    Ok(CubismClipMotionOutput {
+        file_index: count_u32(motion.object.file_index, "Cubism clip-motion file index")?,
+        path_id: motion.object.path_id,
+        name: motion.name,
+        duration: f64::from(motion.duration),
+        fps: f64::from(motion.fps),
+        curve_count: count_u32(motion.curves.len(), "Cubism clip-motion curve count")?,
+        keyframe_count: count_u32(keyframe_count, "Cubism clip-motion keyframe count")?,
+        event_count: count_u32(motion.events.len(), "Cubism clip-motion event count")?,
+        json,
+    })
 }
 
 /// The names of one material property sheet, in serialized order.
@@ -2484,13 +2845,30 @@ fn page(offset: Option<u32>, limit: Option<u32>) -> Result<(usize, usize)> {
 }
 
 fn byte_limit(value: Option<i64>) -> Result<u64> {
+    non_negative_limit(value, DEFAULT_PAYLOAD_LIMIT, "maximumBytes")
+}
+
+fn non_negative_limit(value: Option<i64>, default: u64, field: &str) -> Result<u64> {
     match value {
-        None => Ok(DEFAULT_PAYLOAD_LIMIT),
+        None => Ok(default),
         Some(value) if value >= 0 => u64::try_from(value)
-            .map_err(|_| invalid_arg("maximumBytes does not fit an unsigned 64-bit integer")),
+            .map_err(|_| invalid_arg(format!("{field} does not fit an unsigned 64-bit integer"))),
         Some(value) => Err(invalid_arg(format!(
-            "maximumBytes must be non-negative, received {value}"
+            "{field} must be non-negative, received {value}"
         ))),
+    }
+}
+
+fn parse_image_format(value: Option<String>) -> Result<ImageFormat> {
+    let value = value.unwrap_or_else(|| "png".to_owned());
+    match value.trim().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Ok(ImageFormat::Jpeg),
+        "png" => Ok(ImageFormat::Png),
+        "bmp" => Ok(ImageFormat::Bmp),
+        "tga" => Ok(ImageFormat::Tga),
+        "webp" => Ok(ImageFormat::Webp),
+        "raw_rgba" | "raw-rgba" | "rgba" => Ok(ImageFormat::RawRgba),
+        _ => Err(invalid_arg(format!("unsupported image format {value:?}"))),
     }
 }
 
