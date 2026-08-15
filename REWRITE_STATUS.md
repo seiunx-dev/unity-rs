@@ -244,11 +244,13 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 |---|---|
 | Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足；C ABI crate 已排除在 workspace 外，只作历史参考 |
 | 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷；另需注意 2021+ 的 shader 现已明确拒绝（见下），差分覆盖的是 5.2/5.3 |
-| 代表性真实 corpus 稳定通过 | **部分满足（2026-08-15 首次实跑）**；本机 `~/Desktop/pjsksc/extract` 是一份完整的 Unity 2022.3.62f2 播放器目录（387 MB），corpus 门已在其上跑通：21 个文件、570,445 个对象、177,384 个有解析载荷，零错误。这一条从「没有语料」变成「有一份、且已通过」；仍缺的是多引擎版本/多平台的覆盖面（Tuanjie、Switch、旧版本），以及带托管快照的取值比对 |
+| 代表性真实 corpus 稳定通过 | **部分满足（2026-08-15 首次实跑）**；本机 `~/Desktop/pjsksc/extract` 是一份完整的 Unity 2022.3.62f2 播放器目录（387 MB），corpus 门已在其上跑通：21 个文件、570,445 个对象、177,384 个有解析载荷，零错误。另有四个真实 UnityFS v8 bundle（PJSK，含 ASTC 贴图/Sprite/MonoBehaviour/视频）也已纳入同一道闸门，对象数与 class 分布与 UnityPy 逐一相符。这一条从「没有语料」变成「播放器目录 + AssetBundle 两种形态各有一份、且都已通过」；仍缺的是多引擎版本/多平台的覆盖面（Tuanjie、Switch、旧版本），以及带托管快照的取值比对 |
 | 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
 | 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux 的 x86-64 与 arm64 两个架构上，core+CLI 测试、Python wheel 构建与两套测试、Node addon 构建与测试均已在容器里实跑通过；Windows 侧验证了编译。缺的是 Windows 上的真实运行——本机查过 wine（未安装）、Windows 容器（macOS 上不支持）与 Parallels（只有一个无效的 Debian 虚拟机），都不具备条件，装 wine 属于往你机器上装东西，没有自作主张——以及 CI 自己的发布产物流程 |
 | 导出/解包有界、拒绝穿越与符号链接、原子发布 | 满足 |
 | C# 仅作历史参考或可选 oracle | 满足 |
+
+**真实 AssetBundle 也接上了，并抓到一个更大的缺口（2026-08-15）**：上面那份是播放器目录（`.assets`），不是 AssetBundle；`~/Downloads` 里有四个真实的 PJSK bundle，一跑就发现 **UnityFS v8 被整个拒掉了**——本项目只认 v6/v7，而 v8 正是当代 Unity 写出来的版本，也就是说现在任何一款新游戏的 bundle 都打不开。查下来 v8 根本不是新格式：它的 header 与 blocks info 就是 v7 的，托管侧压根不区分（只判 `>= 7`），本项目在闸门以下也早就是同样的写法；拿真实 v8 header 按 v7 布局解，declared size 与文件大小逐字节吻合。现已接受 v8（更高版本仍然拒绝而不是假定兼容），并且用两个 oracle 分别验证：四个真实 bundle 的对象数与 class 分布与 UnityPy 完全一致（101/23/4/26，逐类相同），容器差分也加了一条 v8 用例交给托管侧比对。另外两个 bundle 的 header 版本被抹成 `5.x.x`，需要 `--unity-version`——corpus manifest 因此加了 `unity_version` 字段（CLI 一直有这个选项，只是清单没法表达）。四个 bundle 现在都能完整导出（101/23/4/26 全部成功、0 失败），其中的贴图是真实的 ASTC_RGB_6x6，导出的 PNG 用独立解码器逐个验过。
 
 **首次跑真实 corpus 抓到的四个缺陷（2026-08-15）**：这道门一直没跑过——每次的结论都是「没有游戏文件」，而本机 Desktop 上一直躺着一份完整的 2022.3 播放器目录。指上去之后，一个接一个地挡住了后面所有文件：
 
