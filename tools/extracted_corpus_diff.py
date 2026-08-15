@@ -116,6 +116,30 @@ def obj_values(path: Path) -> list[list[object]]:
     return rows
 
 
+def lossy_utf8_reencode(raw: bytes) -> bytes:
+    """What a UTF-8 decode with a one-character `?` fallback would produce.
+
+    Valid sequences pass through; every undecodable byte becomes one `?`, which
+    is why the length is preserved.
+    """
+    out = bytearray()
+    index = 0
+    while index < len(raw):
+        for width in (1, 2, 3, 4):
+            chunk = raw[index : index + width]
+            try:
+                chunk.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            out += chunk
+            index += width
+            break
+        else:
+            out += b"?"
+            index += 1
+    return bytes(out)
+
+
 def image_pixels(path: Path):
     from PIL import Image  # noqa: PLC0415 -- optional, and only needed here
 
@@ -141,13 +165,23 @@ class ImageComparison(NamedTuple):
 
 
 def image_difference(ours: Path, theirs: Path) -> ImageComparison:
-    """Compares two images by what they draw, not by their raw channels."""
+    """Compares two images by what they draw, not by their raw channels.
+
+    The reason string carries how many pixels exceeded the allowance, not only
+    the worst one. Without the count a sprite whose tight-mesh edge disagrees
+    on twenty-one pixels out of four million reads exactly like a texture that
+    decoded wrongly from end to end -- both say "alpha differs by 255" -- and
+    the first is a known rasterization edge rule while the second would be a
+    defect. Reporting only the extreme made them indistinguishable.
+    """
     mine, my_size = image_pixels(ours)
     yours, your_size = image_pixels(theirs)
     if my_size != your_size:
         return ImageComparison(False, 0, 0.0, False, f"{my_size} against {your_size}")
     worst_alpha = 0
     worst_composited = 0.0
+    over_allowance = 0
+    total_pixels = len(mine) // 4
     identical = True
     for offset in range(0, len(mine), 4):
         left = mine[offset : offset + 4]
@@ -155,20 +189,26 @@ def image_difference(ours: Path, theirs: Path) -> ImageComparison:
         if left == right:
             continue
         identical = False
-        worst_alpha = max(worst_alpha, abs(left[3] - right[3]))
+        pixel_alpha = abs(left[3] - right[3])
+        pixel_composited = 0.0
         for channel in range(3):
             contribution = abs(left[channel] * left[3] - right[channel] * right[3]) / 255
-            worst_composited = max(worst_composited, contribution)
-    agrees = (
-        worst_alpha <= MAXIMUM_ALPHA_DIFFERENCE
-        and worst_composited <= MAXIMUM_COMPOSITED_DIFFERENCE
-    )
+            pixel_composited = max(pixel_composited, contribution)
+        worst_alpha = max(worst_alpha, pixel_alpha)
+        worst_composited = max(worst_composited, pixel_composited)
+        if (
+            pixel_alpha > MAXIMUM_ALPHA_DIFFERENCE
+            or pixel_composited > MAXIMUM_COMPOSITED_DIFFERENCE
+        ):
+            over_allowance += 1
+    agrees = over_allowance == 0
     return ImageComparison(
         agrees,
         worst_alpha,
         worst_composited,
         identical,
-        f"alpha differs by {worst_alpha}, drawn value by {worst_composited:.2f}",
+        f"{over_allowance} of {total_pixels} pixel(s) over the allowance; "
+        f"worst alpha differs by {worst_alpha}, drawn value by {worst_composited:.2f}",
     )
 
 
@@ -263,7 +303,24 @@ def main() -> int:
                 if theirs.suffix == ".obj":
                     agree = obj_values(ours) == obj_values(theirs)
                 elif theirs.suffix == ".txt":
-                    agree = ours.read_bytes() == theirs.read_bytes()
+                    my_bytes = ours.read_bytes()
+                    their_bytes = theirs.read_bytes()
+                    agree = my_bytes == their_bytes
+                    if not agree and lossy_utf8_reencode(my_bytes) == their_bytes:
+                        # Not a disagreement: the extraction decoded the asset
+                        # as text and wrote the decode back, so every byte that
+                        # is not valid UTF-8 became `?`. A `TextAsset` is
+                        # frequently not text -- most of these are gzip streams,
+                        # and the extraction's copies do not decompress -- so
+                        # the oracle has destroyed the payload rather than
+                        # disagreeing about it. Attributing this exactly, by
+                        # reproducing the transform, keeps the row honest: any
+                        # other difference still fails. What it cannot see is a
+                        # difference confined to bytes that are themselves
+                        # undecodable, since those collapse to `?` on both
+                        # sides.
+                        totals[".txt oracle re-encoded"] += 1
+                        continue
                 else:
                     try:
                         comparison = image_difference(ours, theirs)
