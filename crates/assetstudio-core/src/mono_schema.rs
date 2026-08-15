@@ -229,9 +229,30 @@ pub fn read_mono_behaviour_json_with_provider(
         .map_err(|error| Error::invalid_data(format!("MonoBehaviour JSON is not UTF-8: {error}")))
 }
 
+/// Compares assembly names the way the two sides actually spell them.
+///
+/// A `MonoScript` names its assembly without a suffix -- `Fwk`, `App.Runtime`
+/// -- while a generator walking a directory names the file, `Fwk.dll`. Both
+/// spellings mean the same assembly, so the suffix is trimmed from either side
+/// before comparing; without this every schema misses and the whole document
+/// silently does nothing.
 fn assembly_names_equal(left: &str, right: &str) -> bool {
-    portable_file_name(left).eq_ignore_ascii_case(portable_file_name(right))
+    trim_assembly_extension(portable_file_name(left))
+        .eq_ignore_ascii_case(trim_assembly_extension(portable_file_name(right)))
 }
+
+fn trim_assembly_extension(value: &str) -> &str {
+    let Some(cut) = value.len().checked_sub(4) else {
+        return value;
+    };
+    // `get` rather than indexing: a name is caller data, and slicing four
+    // bytes back can land inside a multi-byte character.
+    match value.get(cut..) {
+        Some(suffix) if suffix.eq_ignore_ascii_case(".dll") => &value[..cut],
+        _ => value,
+    }
+}
+
 
 fn portable_file_name(value: &str) -> &str {
     value.rsplit(['/', '\\']).next().unwrap_or(value)
