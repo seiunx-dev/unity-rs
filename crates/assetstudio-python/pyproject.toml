@@ -27,3 +27,8 @@ module-name = "assetstudio._native"
 python-source = "python"
 strip = true
 exclude = ["dist/**"]
+
+[tool.mypy]
+mypy_path = "python"
+python_version = "3.9"
+strict = true

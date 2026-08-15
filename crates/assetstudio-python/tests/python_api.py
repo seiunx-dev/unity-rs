@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import struct
 import tempfile
@@ -27,15 +29,16 @@ from assetstudio import (
     FbxCandidate,
     Live2dPackage,
     Material,
+    ModelTextureLimits,
     MonoBehaviourSchema,
     MonoBehaviourSchemas,
     MonoScript,
     PlayerSettings,
     ResourceInfo,
     ResourceIterator,
+    SceneLimits,
     extract,
 )
-
 
 def push_i32(output: bytearray, value: int) -> None:
     output.extend(struct.pack("<i", value))
@@ -856,6 +859,10 @@ def synthetic_external_video_clip() -> bytes:
 
 
 def synthetic_material() -> bytes:
+    return finish_v22_asset(21, material_payload())
+
+
+def material_payload(texture_path_id: int = 9) -> bytearray:
     payload = bytearray()
     push_aligned_string(payload, "python-material")
     push_i32(payload, 1)
@@ -878,7 +885,7 @@ def synthetic_material() -> bytes:
     push_aligned_string(payload, "ShadowCaster")
     push_i32(payload, 1)
     push_aligned_string(payload, "_MainTex")
-    push_pptr(payload, 9)
+    push_pptr(payload, texture_path_id)
     push_f32s(payload, (2.0, 3.0, 0.25, 0.5))
     push_i32(payload, 2)
     for value in (1, 2):
@@ -891,7 +898,7 @@ def synthetic_material() -> bytes:
     push_aligned_string(payload, "_Color")
     push_f32s(payload, (1.0, 0.5, 0.25, 1.0))
     push_i32(payload, 0)
-    return finish_v22_asset(21, payload)
+    return payload
 
 
 def synthetic_game_object() -> bytes:
@@ -1440,6 +1447,26 @@ def synthetic_static_model(*, tuanjie: bool = False) -> bytes:
     )
 
 
+def synthetic_textured_model() -> bytes:
+    return finish_v22_objects(
+        (
+            (1, 1, model_game_object()),
+            (4, 11, model_transform()),
+            (33, 21, model_mesh_filter()),
+            (23, 31, model_renderer(material_path_id=41)),
+            (21, 41, material_payload(61)),
+            (43, 51, model_mesh()),
+            (
+                28,
+                61,
+                texture2d_payload(
+                    "python model texture", 1, 1, bytes((9, 8, 7, 255))
+                ),
+            ),
+        )
+    )
+
+
 def push_pptr(output: bytearray, path_id: int) -> None:
     push_i32(output, 0)
     output.extend(struct.pack("<q", path_id))
@@ -1476,7 +1503,7 @@ def model_mesh_filter() -> bytearray:
     return output
 
 
-def model_renderer(*, tuanjie: bool = False) -> bytearray:
+def model_renderer(*, tuanjie: bool = False, material_path_id: int = 0) -> bytearray:
     output = bytearray()
     push_pptr(output, 1)
     output.extend((1, 2, 1, 0, 0, 0, 0, 0, 0, 0))
@@ -1488,7 +1515,9 @@ def model_renderer(*, tuanjie: bool = False) -> bytearray:
     push_u32(output, 0xFFFFFFFF)
     push_i32(output, 0)
     output.extend(bytes(36))
-    push_i32(output, 0)
+    push_i32(output, int(material_path_id != 0))
+    if material_path_id != 0:
+        push_pptr(output, material_path_id)
     output.extend(bytes(4))
     for _ in range(3):
         push_pptr(output, 0)
@@ -1866,6 +1895,7 @@ def main() -> None:
     assert MonoScript.__name__ == "MonoScript"
     assert ResourceInfo.__name__ == "ResourceInfo"
     assert ResourceIterator.__name__ == "ResourceIterator"
+    assert SceneLimits.__name__ == "SceneLimits"
     assert FbxCandidate.__name__ == "FbxCandidate"
     assert hasattr(Live2dPackage, "eye_blink_parameters")
     assert hasattr(Live2dPackage, "lip_sync_parameters")
@@ -1874,6 +1904,15 @@ def main() -> None:
     assert targets.parts == ["PartBody"]
     with tempfile.TemporaryDirectory(prefix="assetstudio-python-") as directory:
         path = Path(directory) / "fixture.assets"
+        missing_path = Path(directory) / "missing.assets"
+        try:
+            AssetStudio(missing_path)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError(
+                "a missing input path should preserve FileNotFoundError"
+            )
         path.write_bytes(synthetic_text_asset())
 
         studio = AssetStudio(path)
@@ -2638,7 +2677,11 @@ def main() -> None:
 
         scene_path = Path(directory) / "scene.assets"
         scene_path.write_bytes(synthetic_game_object())
-        scene = AssetStudio(scene_path).scene()
+        scene_limits = SceneLimits(maximum_game_objects=1)
+        assert scene_limits.maximum_game_objects == 1
+        assert scene_limits.maximum_total_components == 10_000_000
+        scene_studio = AssetStudio(scene_path)
+        scene = scene_studio.scene(limits=scene_limits)
         assert len(scene) == 1
         assert scene[0].file_index == 0
         assert scene[0].path_id == 7
@@ -2652,6 +2695,12 @@ def main() -> None:
         assert scene[0].materials == []
         assert scene[0].bones == []
         assert scene[0].animator is None
+        try:
+            scene_studio.scene(limits=SceneLimits(maximum_game_objects=0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("scene GameObject limit should be enforced")
 
         model_path = Path(directory) / "model.assets"
         model_path.write_bytes(synthetic_static_model())
@@ -2716,6 +2765,68 @@ def main() -> None:
         )
         assert textured.fbx.startswith(b"; FBX 7.4.0 project file\n")
         assert textured.textures == []
+
+        # Core and the CLI already accept every image encoding for model
+        # textures. The Python model APIs must pass that choice through rather
+        # than silently forcing PNG.
+        textured_model_path = Path(directory) / "textured-model.assets"
+        textured_model_path.write_bytes(synthetic_textured_model())
+        raw_model = AssetStudio(textured_model_path).read_model_obj(
+            texture_format="raw-rgba", maximum_bytes=128 * 1024
+        )
+        assert len(raw_model.textures) == 1
+        assert raw_model.textures[0].file_name.endswith(".rgba")
+        assert raw_model.textures[0].data.startswith(b"HARUKI_RGBAIR_V1")
+        default_texture_limits = ModelTextureLimits()
+        assert default_texture_limits.maximum_textures == 4_096
+        assert default_texture_limits.maximum_total_encoded_bytes == 2_147_483_648
+        assert default_texture_limits.maximum_single_texture_bytes == 536_870_912
+        try:
+            AssetStudio(textured_model_path).read_model_obj(
+                texture_format="raw-rgba",
+                maximum_bytes=128 * 1024,
+                texture_limits=ModelTextureLimits(maximum_textures=0),
+            )
+        except ValueError as error:
+            assert "more than 0 textures" in str(error)
+        else:
+            raise AssertionError("the model texture-count budget must be enforced")
+        try:
+            AssetStudio(textured_model_path).read_fbx_with_textures(
+                texture_format="raw-rgba",
+                maximum_bytes=128 * 1024,
+                texture_limits=ModelTextureLimits(
+                    maximum_total_encoded_bytes=len(raw_model.textures[0].data) - 1
+                ),
+            )
+        except ValueError as error:
+            assert "byte budget" in str(error)
+        else:
+            raise AssertionError("the aggregate model texture budget must be enforced")
+        limited_model = AssetStudio(textured_model_path).read_model_obj(
+            texture_format="raw-rgba",
+            maximum_bytes=128 * 1024,
+            texture_limits=ModelTextureLimits(
+                maximum_single_texture_bytes=len(raw_model.textures[0].data) - 1
+            ),
+        )
+        assert limited_model.textures == []
+        assert len(limited_model.skipped) == 1
+        assert "limit" in limited_model.skipped[0].lower()
+        tga_model = AssetStudio(textured_model_path).read_fbx_with_textures(
+            texture_format="tga", maximum_bytes=128 * 1024
+        )
+        assert len(tga_model.textures) == 1
+        assert tga_model.textures[0].file_name.endswith(".tga")
+        assert tga_model.textures[0].file_name.encode() in tga_model.fbx
+        try:
+            AssetStudio(textured_model_path).read_model_obj(
+                texture_format="not-an-image-format"
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unknown model texture formats must be rejected")
 
         animated_fbx = AssetStudio(model_path).read_fbx(maximum_bytes=128 * 1024)
         animated_binary = AssetStudio(model_path).read_fbx_binary(

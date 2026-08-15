@@ -1,5 +1,7 @@
 //! Python bindings for the high-level Rust [`assetstudio_core::studio::Studio`] API.
 
+use std::fmt::Write as _;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,7 +38,7 @@ use assetstudio_core::mono_schema::{
 use assetstudio_core::monobehaviour::{MonoBehaviourReadLimits, MonoScript};
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::{SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey};
-use assetstudio_core::scene_textures::{SceneTextureLimits, SceneTextureSet};
+use assetstudio_core::scene_textures::{SceneTexture, SceneTextureLimits, SceneTextureSkip};
 use assetstudio_core::serialized::{TypeTree, TypeTreeNode};
 use assetstudio_core::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
@@ -50,23 +52,16 @@ use assetstudio_core::texture_array::TextureArrayReadLimits;
 use assetstudio_core::unity_cn::UnityCnKey;
 use assetstudio_core::unity_version::UnityVersion;
 use pyo3::exceptions::{
-    PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError,
+    PyKeyError, PyMemoryError, PyNotImplementedError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-const DEFAULT_RAW_LIMIT: u64 = 512 * 1024 * 1024;
-const DEFAULT_INPUT_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_MEMORY_FILE_LIMIT: u64 = 512 * 1024 * 1024;
-const DEFAULT_MEMORY_FILE_COUNT: usize = 100_000;
 const MAXIMUM_MEMORY_FILE_NAME_BYTES: usize = 1024 * 1024;
 const MAXIMUM_TOTAL_MEMORY_FILE_NAME_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_JSON_LIMIT: usize = 256 * 1024 * 1024;
-const DEFAULT_DUMP_LIMIT: u64 = 256 * 1024 * 1024;
 const MAXIMUM_SCHEMA_NODES: usize = 1_000_000;
 const MAXIMUM_SCHEMA_STRING_BYTES: usize = 256 * 1024 * 1024;
 const MAXIMUM_METADATA_PAGE_ITEMS: usize = 1_000_000;
-const DEFAULT_METADATA_PAGE_ITEMS: usize = 4096;
 
 struct PythonOodleDecoder {
     callback: Py<PyAny>,
@@ -79,13 +74,19 @@ struct PythonAclDecoder {
 impl AclDecoder for PythonAclDecoder {
     fn decode(&self, request: &AclDecodeRequest<'_>) -> assetstudio_core::Result<AclDecodedClip> {
         Python::attach(|py| {
+            let compressed_tracks = python_callback_bytes(py, &request.input.compressed_tracks)?;
+            let mut decoder_map = Vec::new();
+            decoder_map
+                .try_reserve_exact(request.input.decoder_map.len())
+                .map_err(|error| python_allocation_error("ACL decoder map", error))?;
+            decoder_map.extend_from_slice(&request.input.decoder_map);
             let result = self
                 .callback
                 .call1(
                     py,
                     (
-                        PyBytes::new(py, &request.input.compressed_tracks),
-                        request.input.decoder_map.clone(),
+                        compressed_tracks,
+                        decoder_map,
                         request.frame_count,
                         request.bone_count,
                         request.sample_rate(),
@@ -116,9 +117,10 @@ impl AclDecoder for PythonAclDecoder {
 impl OodleDecoder for PythonOodleDecoder {
     fn decompress(&self, input: &[u8], output: &mut [u8]) -> assetstudio_core::Result<usize> {
         Python::attach(|py| {
+            let input = python_callback_bytes(py, input)?;
             let result = self
                 .callback
-                .call1(py, (PyBytes::new(py, input), output.len()))
+                .call1(py, (input, output.len()))
                 .map_err(|error| {
                     Error::invalid_data(format!("Python Oodle decoder raised an error: {error}"))
                 })?;
@@ -424,10 +426,13 @@ impl PyMonoBehaviourSchema {
         let mut registry = MonoBehaviourSchemaRegistry::new();
         registry
             .push(MonoBehaviourSchemaEntry {
-                assembly_name: assembly_name.clone(),
-                namespace: namespace.clone(),
-                class_name: class_name.clone(),
-                unity_version: unity_version.clone(),
+                assembly_name: try_copy_string(&assembly_name, "schema assembly name")?,
+                namespace: try_copy_string(&namespace, "schema namespace")?,
+                class_name: try_copy_string(&class_name, "schema class name")?,
+                unity_version: try_copy_optional_string(
+                    unity_version.as_deref(),
+                    "schema Unity version",
+                )?,
                 tree: TypeTree {
                     nodes: tree_nodes,
                     string_buffer: Vec::new(),
@@ -525,7 +530,10 @@ impl PyMonoBehaviourSchemas {
         for schema in schemas {
             let schema = schema.borrow(py);
             entries.push(PythonSchemaProviderEntry {
-                unity_version: schema.unity_version.clone(),
+                unity_version: try_copy_optional_string(
+                    schema.unity_version.as_deref(),
+                    "schema collection Unity version",
+                )?,
                 registry: Arc::clone(&schema.registry),
             });
         }
@@ -651,8 +659,8 @@ impl PyCubismPhysics {
     }
 
     #[getter]
-    fn json<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.json)
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.json)
     }
 }
 
@@ -705,8 +713,8 @@ impl PyCubismFadeMotion {
         self.keyframe_count
     }
     #[getter]
-    fn json<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.json)
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.json)
     }
 }
 
@@ -778,8 +786,8 @@ impl PyCubismClipMotion {
         self.event_count
     }
     #[getter]
-    fn json<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.json)
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.json)
     }
 }
 
@@ -827,8 +835,8 @@ impl PyCubismExpression {
     }
 
     #[getter]
-    fn json<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.json)
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.json)
     }
 }
 
@@ -847,6 +855,155 @@ struct PySceneNode {
     materials: Vec<Option<(usize, i64)>>,
     bones: Vec<Option<(usize, i64)>>,
     animator: Option<(usize, i64)>,
+}
+
+/// Caller-configurable collection-wide scene assembly budgets.
+#[pyclass(name = "SceneLimits", frozen, skip_from_py_object)]
+#[derive(Debug, Clone, Copy)]
+struct PySceneLimits {
+    game_objects: usize,
+    total_components: usize,
+    total_transform_child_references: usize,
+    total_material_references: usize,
+    total_bone_references: usize,
+    hierarchy_edges: usize,
+}
+
+#[pymethods]
+impl PySceneLimits {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        maximum_game_objects=1_000_000,
+        maximum_total_components=10_000_000,
+        maximum_total_transform_child_references=10_000_000,
+        maximum_total_material_references=10_000_000,
+        maximum_total_bone_references=10_000_000,
+        maximum_hierarchy_edges=1_000_000
+    ))]
+    const fn new(
+        maximum_game_objects: usize,
+        maximum_total_components: usize,
+        maximum_total_transform_child_references: usize,
+        maximum_total_material_references: usize,
+        maximum_total_bone_references: usize,
+        maximum_hierarchy_edges: usize,
+    ) -> Self {
+        Self {
+            game_objects: maximum_game_objects,
+            total_components: maximum_total_components,
+            total_transform_child_references: maximum_total_transform_child_references,
+            total_material_references: maximum_total_material_references,
+            total_bone_references: maximum_total_bone_references,
+            hierarchy_edges: maximum_hierarchy_edges,
+        }
+    }
+
+    #[getter]
+    const fn maximum_game_objects(&self) -> usize {
+        self.game_objects
+    }
+
+    #[getter]
+    const fn maximum_total_components(&self) -> usize {
+        self.total_components
+    }
+
+    #[getter]
+    const fn maximum_total_transform_child_references(&self) -> usize {
+        self.total_transform_child_references
+    }
+
+    #[getter]
+    const fn maximum_total_material_references(&self) -> usize {
+        self.total_material_references
+    }
+
+    #[getter]
+    const fn maximum_total_bone_references(&self) -> usize {
+        self.total_bone_references
+    }
+
+    #[getter]
+    const fn maximum_hierarchy_edges(&self) -> usize {
+        self.hierarchy_edges
+    }
+}
+
+impl From<PySceneLimits> for SceneHierarchyLimits {
+    fn from(value: PySceneLimits) -> Self {
+        Self {
+            maximum_game_objects: value.game_objects,
+            maximum_total_components: value.total_components,
+            maximum_total_transform_child_references: value.total_transform_child_references,
+            maximum_total_material_references: value.total_material_references,
+            maximum_total_bone_references: value.total_bone_references,
+            maximum_hierarchy_edges: value.hierarchy_edges,
+            ..Self::default()
+        }
+    }
+}
+
+/// Caller-configurable budgets for textures returned beside a model.
+#[pyclass(name = "ModelTextureLimits", frozen, skip_from_py_object)]
+#[derive(Debug, Clone, Copy)]
+struct PyModelTextureLimits {
+    textures: usize,
+    total_encoded_bytes: u64,
+    single_texture_bytes: u64,
+}
+
+#[pymethods]
+impl PyModelTextureLimits {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        maximum_textures=4_096,
+        maximum_total_encoded_bytes=2_147_483_648,
+        maximum_single_texture_bytes=536_870_912
+    ))]
+    const fn new(
+        maximum_textures: usize,
+        maximum_total_encoded_bytes: u64,
+        maximum_single_texture_bytes: u64,
+    ) -> Self {
+        Self {
+            textures: maximum_textures,
+            total_encoded_bytes: maximum_total_encoded_bytes,
+            single_texture_bytes: maximum_single_texture_bytes,
+        }
+    }
+
+    #[getter]
+    const fn maximum_textures(&self) -> usize {
+        self.textures
+    }
+
+    #[getter]
+    const fn maximum_total_encoded_bytes(&self) -> u64 {
+        self.total_encoded_bytes
+    }
+
+    #[getter]
+    const fn maximum_single_texture_bytes(&self) -> u64 {
+        self.single_texture_bytes
+    }
+}
+
+impl From<PyModelTextureLimits> for SceneTextureLimits {
+    fn from(value: PyModelTextureLimits) -> Self {
+        let texture = TextureReadLimits {
+            maximum_payload_bytes: value.single_texture_bytes,
+            maximum_output_bytes: value.single_texture_bytes,
+            maximum_decoder_working_bytes: value.single_texture_bytes,
+            ..TextureReadLimits::default()
+        };
+        Self {
+            maximum_textures: value.textures,
+            maximum_total_encoded_bytes: value.total_encoded_bytes,
+            texture,
+        }
+    }
 }
 
 #[pyclass(name = "FbxCandidate", frozen, get_all, skip_from_py_object)]
@@ -941,8 +1098,8 @@ impl PyBinaryAsset {
     }
 
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.bytes)
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.bytes)
     }
 
     fn __repr__(&self) -> String {
@@ -974,8 +1131,8 @@ impl PyAudioClip {
     }
 
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.bytes)
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.bytes)
     }
 
     fn __repr__(&self) -> String {
@@ -1001,8 +1158,8 @@ impl PyRgbaImage {
     }
 
     #[getter]
-    fn rgba<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.pixels)
+    fn rgba<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.pixels)
     }
 
     fn __repr__(&self) -> String {
@@ -1205,11 +1362,24 @@ struct PyExportLimits {
 }
 
 /// One file a model export names by file name.
-#[pyclass(name = "ModelFile", frozen, get_all)]
+#[pyclass(name = "ModelFile", frozen)]
 #[derive(Debug)]
 struct PyModelFile {
     file_name: String,
     data: Vec<u8>,
+}
+
+#[pymethods]
+impl PyModelFile {
+    #[getter]
+    fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    #[getter]
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.data)
+    }
 }
 
 /// A scene written as Wavefront OBJ, with the files it names.
@@ -1219,7 +1389,7 @@ struct PyModelFile {
 /// OBJ's own directory. They come back rather than being written because this
 /// call has no directory of its own, and splitting them across directories
 /// breaks the references.
-#[pyclass(name = "ModelObj", frozen, get_all)]
+#[pyclass(name = "ModelObj", frozen)]
 #[derive(Debug)]
 struct PyModelObj {
     obj: Vec<u8>,
@@ -1232,13 +1402,59 @@ struct PyModelObj {
     skipped: Vec<String>,
 }
 
+#[pymethods]
+impl PyModelObj {
+    #[getter]
+    fn obj<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.obj)
+    }
+
+    #[getter]
+    fn material_library_name(&self) -> &str {
+        &self.material_library_name
+    }
+
+    #[getter]
+    fn material_library<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.material_library)
+    }
+
+    #[getter]
+    fn textures(&self, py: Python<'_>) -> PyResult<Vec<Py<PyModelFile>>> {
+        clone_python_references(py, &self.textures, "model texture files")
+    }
+
+    #[getter]
+    fn skipped(&self) -> PyResult<Vec<String>> {
+        copy_strings(&self.skipped, "skipped model textures")
+    }
+}
+
 /// An FBX and the texture files it references by name.
-#[pyclass(name = "TexturedFbx", frozen, get_all)]
+#[pyclass(name = "TexturedFbx", frozen)]
 #[derive(Debug)]
 struct PyTexturedFbx {
     fbx: Vec<u8>,
     textures: Vec<Py<PyModelFile>>,
     skipped: Vec<String>,
+}
+
+#[pymethods]
+impl PyTexturedFbx {
+    #[getter]
+    fn fbx<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.fbx)
+    }
+
+    #[getter]
+    fn textures(&self, py: Python<'_>) -> PyResult<Vec<Py<PyModelFile>>> {
+        clone_python_references(py, &self.textures, "FBX texture files")
+    }
+
+    #[getter]
+    fn skipped(&self) -> PyResult<Vec<String>> {
+        copy_strings(&self.skipped, "skipped FBX textures")
+    }
 }
 
 #[pyclass(name = "Live2dTexture", frozen)]
@@ -1255,8 +1471,8 @@ impl PyLive2dTexture {
     }
 
     #[getter]
-    fn png<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.png)
+    fn png<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.png)
     }
 }
 
@@ -1287,8 +1503,8 @@ impl PyLive2dMotionFile {
     }
 
     #[getter]
-    fn json<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.json)
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.json)
     }
 }
 
@@ -1305,8 +1521,8 @@ impl PyLive2dExpressionFile {
     }
 
     #[getter]
-    fn json<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.json)
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.json)
     }
 }
 
@@ -1324,8 +1540,8 @@ impl PyLive2dJsonFile {
     }
 
     #[getter]
-    fn json<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.json)
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.json)
     }
 }
 
@@ -1377,8 +1593,8 @@ impl PyLive2dPackage {
     }
 
     #[getter]
-    fn moc<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.moc)
+    fn moc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.moc)
     }
 
     #[getter]
@@ -1387,8 +1603,8 @@ impl PyLive2dPackage {
     }
 
     #[getter]
-    fn manifest<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.manifest)
+    fn manifest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.manifest)
     }
 
     #[getter]
@@ -1644,7 +1860,7 @@ impl PyAssetStudio {
         *,
         name="memory.assets",
         unity_version=None,
-        maximum_bytes=DEFAULT_INPUT_LIMIT,
+        maximum_bytes=4_294_967_296,
         oodle_decoder=None
     ))]
     fn from_bytes(
@@ -1675,9 +1891,9 @@ impl PyAssetStudio {
         files,
         *,
         unity_version=None,
-        maximum_files=DEFAULT_MEMORY_FILE_COUNT,
-        maximum_file_bytes=DEFAULT_MEMORY_FILE_LIMIT,
-        maximum_total_bytes=DEFAULT_INPUT_LIMIT,
+        maximum_files=100_000,
+        maximum_file_bytes=536_870_912,
+        maximum_total_bytes=4_294_967_296,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
         unity_cn_key=None
@@ -1797,7 +2013,7 @@ impl PyAssetStudio {
     }
 
     /// Returns a bounded page of collection file metadata.
-    #[pyo3(signature = (*, offset=0, limit=DEFAULT_METADATA_PAGE_ITEMS))]
+    #[pyo3(signature = (*, offset=0, limit=4_096))]
     fn file_page(&self, offset: usize, limit: usize) -> PyResult<Vec<PyFileInfo>> {
         check_metadata_page_limit(limit)?;
         let available = self.studio.file_count().saturating_sub(offset);
@@ -1810,7 +2026,7 @@ impl PyAssetStudio {
     }
 
     /// Returns a bounded page within one serialized file's object table.
-    #[pyo3(signature = (file_index, *, offset=0, limit=DEFAULT_METADATA_PAGE_ITEMS))]
+    #[pyo3(signature = (file_index, *, offset=0, limit=4_096))]
     fn object_page(
         &self,
         file_index: usize,
@@ -1838,7 +2054,7 @@ impl PyAssetStudio {
     }
 
     /// Returns a bounded page of external resource metadata.
-    #[pyo3(signature = (*, offset=0, limit=DEFAULT_METADATA_PAGE_ITEMS))]
+    #[pyo3(signature = (*, offset=0, limit=4_096))]
     fn resource_page(&self, offset: usize, limit: usize) -> PyResult<Vec<PyResourceInfo>> {
         check_metadata_page_limit(limit)?;
         let available = self.studio.resource_count().saturating_sub(offset);
@@ -1851,7 +2067,7 @@ impl PyAssetStudio {
     }
 
     /// Reads one external resource by stable collection index.
-    #[pyo3(signature = (resource_index, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (resource_index, *, maximum_bytes=536_870_912))]
     fn read_resource<'py>(
         &self,
         py: Python<'py>,
@@ -1864,11 +2080,11 @@ impl PyAssetStudio {
         let bytes = py
             .detach(|| resource.read(maximum_bytes))
             .map_err(core_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Reads one checked byte range from an external resource.
-    #[pyo3(signature = (resource_index, offset, length, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (resource_index, offset, length, *, maximum_bytes=536_870_912))]
     fn read_resource_range<'py>(
         &self,
         py: Python<'py>,
@@ -1883,11 +2099,11 @@ impl PyAssetStudio {
         let bytes = py
             .detach(|| resource.read_range(offset, length, maximum_bytes))
             .map_err(core_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Reads the first resource matching a portable, ASCII-insensitive path.
-    #[pyo3(signature = (path, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (path, *, maximum_bytes=536_870_912))]
     fn read_resource_by_path<'py>(
         &self,
         py: Python<'py>,
@@ -1900,19 +2116,31 @@ impl PyAssetStudio {
         let bytes = py
             .detach(|| resource.read(maximum_bytes))
             .map_err(core_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Builds the bounded, collection-wide `GameObject` hierarchy.
-    fn scene(&self, py: Python<'_>) -> PyResult<Vec<PySceneNode>> {
+    #[pyo3(signature = (*, limits=None))]
+    fn scene(
+        &self,
+        py: Python<'_>,
+        limits: Option<PyRef<'_, PySceneLimits>>,
+    ) -> PyResult<Vec<PySceneNode>> {
+        let limits = limits.map_or_else(SceneHierarchyLimits::default, |limits| {
+            SceneHierarchyLimits::from(*limits)
+        });
         let hierarchy = py
-            .detach(|| self.studio.scene_hierarchy(SceneHierarchyLimits::default()))
+            .detach(|| self.studio.scene_hierarchy(limits))
             .map_err(core_error)?;
-        Ok(hierarchy.nodes.into_iter().map(PySceneNode::from).collect())
+        let mut nodes = reserve_metadata(hierarchy.nodes.len(), "Python scene nodes")?;
+        for node in hierarchy.nodes {
+            nodes.push(python_scene_node(node)?);
+        }
+        Ok(nodes)
     }
 
     /// Builds general static ASCII FBX 7.4, including direct-bone skin clusters.
-    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (*, maximum_bytes=536_870_912))]
     fn read_static_fbx<'py>(
         &self,
         py: Python<'py>,
@@ -1921,14 +2149,14 @@ impl PyAssetStudio {
         let bytes = py
             .detach(|| self.studio.read_static_fbx(maximum_bytes))
             .map_err(core_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// The same static scene in FBX 7.4's binary encoding.
     ///
     /// Some importers accept only the binary form, and it is smaller and faster
     /// to parse; the scene itself is identical to `read_static_fbx`.
-    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (*, maximum_bytes=536_870_912))]
     fn read_static_fbx_binary<'py>(
         &self,
         py: Python<'py>,
@@ -1937,11 +2165,11 @@ impl PyAssetStudio {
         let bytes = py
             .detach(|| self.studio.read_static_fbx_binary(maximum_bytes))
             .map_err(core_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// The same animated scene in FBX 7.4's binary encoding.
-    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT, acl_decoder=None))]
+    #[pyo3(signature = (*, maximum_bytes=536_870_912, acl_decoder=None))]
     fn read_fbx_binary<'py>(
         &self,
         py: Python<'py>,
@@ -1963,12 +2191,12 @@ impl PyAssetStudio {
                 )
                 .map_err(core_error)
         })?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Builds ASCII FBX 7.4 with supported bound animations and an optional
     /// caller-supplied Tuanjie ACL decoder.
-    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT, acl_decoder=None))]
+    #[pyo3(signature = (*, maximum_bytes=536_870_912, acl_decoder=None))]
     fn read_fbx<'py>(
         &self,
         py: Python<'py>,
@@ -1990,7 +2218,7 @@ impl PyAssetStudio {
                 )
                 .map_err(core_error)
         })?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Enumerates managed-compatible `SplitObjects` FBX roots.
@@ -2001,7 +2229,7 @@ impl PyAssetStudio {
                     .split_object_fbx_candidates(ModelExportPlanLimits::default())
             })
             .map_err(core_error)?;
-        Ok(candidates.into_iter().map(PyFbxCandidate::from).collect())
+        python_fbx_candidates(candidates, "SplitObjects FBX candidates")
     }
 
     /// Enumerates Animator-owned FBX roots.
@@ -2012,7 +2240,7 @@ impl PyAssetStudio {
                     .animator_fbx_candidates(ModelExportPlanLimits::default())
             })
             .map_err(core_error)?;
-        Ok(candidates.into_iter().map(PyFbxCandidate::from).collect())
+        python_fbx_candidates(candidates, "Animator FBX candidates")
     }
 
     /// Materializes one selected `GameObject` FBX branch.
@@ -2021,7 +2249,7 @@ impl PyAssetStudio {
         path_id,
         *,
         include_animations=true,
-        maximum_bytes=DEFAULT_RAW_LIMIT,
+        maximum_bytes=536_870_912,
         acl_decoder=None
     ))]
     fn read_game_object_fbx<'py>(
@@ -2053,10 +2281,10 @@ impl PyAssetStudio {
                 )
             })
             .map_err(core_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_raw<'py>(
         &self,
         py: Python<'py>,
@@ -2069,10 +2297,10 @@ impl PyAssetStudio {
                 .read_raw(maximum_bytes)
                 .map_err(core_error)
         })?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_text<'py>(
         &self,
         py: Python<'py>,
@@ -2087,11 +2315,11 @@ impl PyAssetStudio {
                 .read_text_bytes(maximum_bytes)
                 .map_err(core_error)
         })?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Converts one Unity `Shader` to AssetStudio's bounded text payload.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_shader<'py>(
         &self,
         py: Python<'py>,
@@ -2104,7 +2332,7 @@ impl PyAssetStudio {
                 .read_shader_text(maximum_bytes)
                 .map_err(core_error)
         })?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Writes the whole scene as one Wavefront OBJ, with the material library
@@ -2119,30 +2347,40 @@ impl PyAssetStudio {
     #[pyo3(signature = (
         *,
         material_library_name="model.mtl",
-        maximum_bytes=DEFAULT_RAW_LIMIT
+        texture_format="png",
+        maximum_bytes=536_870_912,
+        texture_limits=None
     ))]
     fn read_model_obj(
         &self,
         py: Python<'_>,
         material_library_name: &str,
+        texture_format: &str,
         maximum_bytes: u64,
+        texture_limits: Option<PyRef<'_, PyModelTextureLimits>>,
     ) -> PyResult<PyModelObj> {
+        let texture_format = parse_image_format(texture_format)?;
+        let texture_limits = texture_limits.map_or_else(SceneTextureLimits::default, |limits| {
+            SceneTextureLimits::from(*limits)
+        });
         let model = py
             .detach(|| {
                 self.studio.read_model_obj(
                     material_library_name,
                     maximum_bytes,
-                    ImageFormat::Png,
-                    SceneTextureLimits::default(),
+                    texture_format,
+                    texture_limits,
                 )
             })
             .map_err(core_error)?;
+        let textures = model_files(py, model.textures.textures)?;
+        let skipped = skipped_textures(model.textures.skipped)?;
         Ok(PyModelObj {
             obj: model.obj,
             material_library_name: model.material_library_name,
             material_library: model.material_library,
-            textures: model_files(py, &model.textures)?,
-            skipped: skipped_textures(&model.textures),
+            textures,
+            skipped,
         })
     }
 
@@ -2152,12 +2390,23 @@ impl PyAssetStudio {
     /// The FBX names each texture by file name, so they have to be written
     /// beside it for those references to resolve. They come back rather than
     /// being written because this call has no directory of its own.
-    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (
+        *,
+        texture_format="png",
+        maximum_bytes=536_870_912,
+        texture_limits=None
+    ))]
     fn read_fbx_with_textures(
         &self,
         py: Python<'_>,
+        texture_format: &str,
         maximum_bytes: u64,
+        texture_limits: Option<PyRef<'_, PyModelTextureLimits>>,
     ) -> PyResult<PyTexturedFbx> {
+        let texture_format = parse_image_format(texture_format)?;
+        let texture_limits = texture_limits.map_or_else(SceneTextureLimits::default, |limits| {
+            SceneTextureLimits::from(*limits)
+        });
         let (fbx, textures) = py
             .detach(|| {
                 let mut fbx = Vec::new();
@@ -2165,22 +2414,24 @@ impl PyAssetStudio {
                     .write_fbx_with_textures(
                         &mut fbx,
                         maximum_bytes,
-                        ImageFormat::Png,
-                        SceneTextureLimits::default(),
+                        texture_format,
+                        texture_limits,
                     )
                     .map(|(_, textures)| (fbx, textures))
             })
             .map_err(core_error)?;
+        let texture_files = model_files(py, textures.textures)?;
+        let skipped = skipped_textures(textures.skipped)?;
         Ok(PyTexturedFbx {
             fbx,
-            textures: model_files(py, &textures)?,
-            skipped: skipped_textures(&textures),
+            textures: texture_files,
+            skipped,
         })
     }
 
     /// Reads one supported resident or externally streamed Unity `Mesh` as
     /// managed-compatible OBJ.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_mesh_obj<'py>(
         &self,
         py: Python<'py>,
@@ -2204,12 +2455,12 @@ impl PyAssetStudio {
                 .read_mesh_obj(limits)
                 .map_err(core_error)
         })?;
-        Ok(PyBytes::new(py, &bytes))
+        python_bytes(py, &bytes)
     }
 
     /// Parses bounded curve, muscle, ACL, and streaming metadata from one
     /// Unity or Tuanjie `AnimationClip`.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_animation_clip(
         &self,
         py: Python<'_>,
@@ -2238,6 +2489,9 @@ impl PyAssetStudio {
             | (u8::from(clip.use_high_quality_curve) << 2)
             | (u8::from(muscle.is_some()) << 3)
             | (u8::from(acl.is_some()) << 4);
+        let streaming_path = streaming
+            .map(|value| try_copy_string(&value.path, "AnimationClip streaming path"))
+            .transpose()?;
         Ok(PyAnimationClip {
             path_id: clip.path_id,
             name: clip.name,
@@ -2263,7 +2517,7 @@ impl PyAssetStudio {
             acl_use_fast_sample_mode: acl.and_then(|value| value.use_fast_sample_mode),
             streaming_offset: streaming.map(|value| value.offset),
             streaming_size: streaming.map(|value| value.size),
-            streaming_path: streaming.map(|value| value.path.clone()),
+            streaming_path,
         })
     }
 
@@ -2273,8 +2527,8 @@ impl PyAssetStudio {
         file_index,
         path_id,
         *,
-        maximum_bytes=DEFAULT_RAW_LIMIT,
-        maximum_decompressed_values=128 * 1024 * 1024
+        maximum_bytes=536_870_912,
+        maximum_decompressed_values=134_217_728
     ))]
     fn inspect_acl_tracks(
         &self,
@@ -2334,9 +2588,9 @@ impl PyAssetStudio {
         file_index,
         path_id,
         *,
-        maximum_bytes=DEFAULT_RAW_LIMIT,
+        maximum_bytes=536_870_912,
         maximum_decoder_map_entries=2_000_000,
-        maximum_materialized_bytes=DEFAULT_RAW_LIMIT
+        maximum_materialized_bytes=536_870_912
     ))]
     fn read_acl_decoder_input<'py>(
         &self,
@@ -2378,7 +2632,7 @@ impl PyAssetStudio {
             .map_err(core_error)
         })?;
         Ok((
-            PyBytes::new(py, &input.compressed_tracks),
+            python_bytes(py, &input.compressed_tracks)?,
             input.decoder_map,
         ))
     }
@@ -2395,8 +2649,8 @@ impl PyAssetStudio {
         path_id,
         decoder,
         *,
-        maximum_bytes=DEFAULT_RAW_LIMIT,
-        maximum_values=128 * 1024 * 1024
+        maximum_bytes=536_870_912,
+        maximum_values=134_217_728
     ))]
     fn decode_acl_tracks(
         &self,
@@ -2457,7 +2711,7 @@ impl PyAssetStudio {
 
     /// Parses one complete Unity or Tuanjie `AnimatorController` and returns
     /// its stable controller, TOS, and clip-reference metadata.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_animator_controller(
         &self,
         py: Python<'_>,
@@ -2511,7 +2765,7 @@ impl PyAssetStudio {
 
     /// Parses one complete Unity or Tuanjie `Avatar` and returns its stable
     /// skeleton, TOS, and human-description metadata.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_avatar(
         &self,
         py: Python<'_>,
@@ -2565,7 +2819,7 @@ impl PyAssetStudio {
         })
     }
 
-    #[pyo3(signature = (file_index, path_id, *, pretty=false, maximum_bytes=DEFAULT_JSON_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, pretty=false, maximum_bytes=268_435_456))]
     fn read_type_tree_json(
         &self,
         py: Python<'_>,
@@ -2584,7 +2838,7 @@ impl PyAssetStudio {
     }
 
     /// Reads the managed-compatible, tab-indented CRLF `TypeTree` dump.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_DUMP_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=268_435_456))]
     fn read_type_tree_dump(
         &self,
         py: Python<'_>,
@@ -2608,7 +2862,7 @@ impl PyAssetStudio {
         schema,
         *,
         pretty=false,
-        maximum_bytes=DEFAULT_JSON_LIMIT
+        maximum_bytes=268_435_456
     ))]
     fn read_mono_behaviour_json(
         &self,
@@ -2643,7 +2897,7 @@ impl PyAssetStudio {
         schemas,
         *,
         pretty=false,
-        maximum_bytes=DEFAULT_JSON_LIMIT
+        maximum_bytes=268_435_456
     ))]
     fn read_mono_behaviour_json_with_schemas(
         &self,
@@ -2671,7 +2925,7 @@ impl PyAssetStudio {
         })
     }
 
-    #[pyo3(signature = (file_index, path_id, *, mip_level=0, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, mip_level=0, maximum_bytes=536_870_912))]
     fn read_texture(
         &self,
         py: Python<'_>,
@@ -2699,7 +2953,7 @@ impl PyAssetStudio {
         })
     }
 
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_texture_array(
         &self,
         py: Python<'_>,
@@ -2719,20 +2973,19 @@ impl PyAssetStudio {
                 .decode_texture_array_mip0(limits)
                 .map_err(core_error)
         })?;
-        images
-            .into_iter()
-            .map(|mut image| {
-                flip_rgba_rows(&mut image)?;
-                Ok(PyRgbaImage {
-                    width: image.width,
-                    height: image.height,
-                    pixels: image.pixels,
-                })
-            })
-            .collect()
+        let mut output = reserve_metadata(images.len(), "Python Texture2DArray images")?;
+        for mut image in images {
+            flip_rgba_rows(&mut image)?;
+            output.push(PyRgbaImage {
+                width: image.width,
+                height: image.height,
+                pixels: image.pixels,
+            });
+        }
+        Ok(output)
     }
 
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_sprite(
         &self,
         py: Python<'_>,
@@ -2765,7 +3018,7 @@ impl PyAssetStudio {
         })
     }
 
-    #[pyo3(signature = (file_index, path_id, *, format="auto", maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, format="auto", maximum_bytes=536_870_912))]
     fn read_audio_clip(
         &self,
         py: Python<'_>,
@@ -2788,7 +3041,7 @@ impl PyAssetStudio {
     }
 
     /// Reads the embedded font program rather than the serialized `Font` wrapper.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_font(
         &self,
         py: Python<'_>,
@@ -2806,7 +3059,7 @@ impl PyAssetStudio {
     }
 
     /// Reads the resident Ogg payload from a legacy `MovieTexture`.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_movie_texture(
         &self,
         py: Python<'_>,
@@ -2824,7 +3077,7 @@ impl PyAssetStudio {
     }
 
     /// Reads one inline or externally streamed `VideoClip` payload.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_video_clip(
         &self,
         py: Python<'_>,
@@ -2963,7 +3216,7 @@ impl PyAssetStudio {
         *,
         maximum_parameters=1_000_000,
         maximum_string_bytes=16_777_216,
-        maximum_output_bytes=DEFAULT_JSON_LIMIT
+        maximum_output_bytes=268_435_456
     ))]
     fn read_cubism_expression(
         &self,
@@ -3093,7 +3346,7 @@ impl PyAssetStudio {
         *,
         motion_fps=0.0,
         maximum_elements=1_000_000,
-        maximum_output_bytes=DEFAULT_JSON_LIMIT
+        maximum_output_bytes=268_435_456
     ))]
     fn read_cubism_physics(
         &self,
@@ -3163,7 +3416,7 @@ impl PyAssetStudio {
         *,
         force_bezier=false,
         maximum_curves=1_000_000,
-        maximum_output_bytes=DEFAULT_JSON_LIMIT
+        maximum_output_bytes=268_435_456
     ))]
     fn read_cubism_fade_motion(
         &self,
@@ -3222,7 +3475,7 @@ impl PyAssetStudio {
         *,
         targets=None,
         force_bezier=false,
-        maximum_output_bytes=DEFAULT_JSON_LIMIT
+        maximum_output_bytes=268_435_456
     ))]
     fn read_cubism_clip_motion(
         &self,
@@ -3259,7 +3512,7 @@ impl PyAssetStudio {
         decoder,
         *,
         targets=None,
-        maximum_output_bytes=DEFAULT_JSON_LIMIT
+        maximum_output_bytes=268_435_456
     ))]
     fn read_cubism_acl_clip_motion(
         &self,
@@ -3343,19 +3596,15 @@ impl PyAssetStudio {
         };
         let report = Python::attach(|py| py.detach(move || self.studio.export(output, options)))
             .map_err(core_error)?;
-        let exported = report
-            .exported
-            .into_iter()
-            .map(|record| record.output_path.to_string_lossy().into_owned())
-            .collect();
-        let describe = |failure: assetstudio_core::export::ExportFailure| {
-            format!(
-                "{}::{} (class {}): {}",
-                failure.source, failure.path_id, failure.class_id, failure.error
-            )
-        };
-        let failures = report.failures.into_iter().map(describe).collect();
-        let unsupported = report.unsupported.into_iter().map(describe).collect();
+        let mut exported = reserve_metadata(report.exported.len(), "Python exported paths")?;
+        for record in report.exported {
+            exported.push(try_path_string(
+                &record.output_path,
+                "exported output path",
+            )?);
+        }
+        let failures = python_export_failures(report.failures, "Python export failures")?;
+        let unsupported = python_export_failures(report.unsupported, "Python unsupported exports")?;
         Ok(PyExportReport {
             exported,
             failures,
@@ -3503,31 +3752,47 @@ fn python_resource_info(resource: StudioResource<'_>) -> PyResult<PyResourceInfo
 ///
 /// The package never ships or derives keys; obtaining one for a title is the
 /// caller's responsibility.
-fn model_files(py: Python<'_>, textures: &SceneTextureSet) -> PyResult<Vec<Py<PyModelFile>>> {
+fn model_files(py: Python<'_>, textures: Vec<SceneTexture>) -> PyResult<Vec<Py<PyModelFile>>> {
     let mut files = Vec::new();
-    files
-        .try_reserve(textures.textures.len())
-        .map_err(|error| {
-            PyValueError::new_err(format!("cannot allocate model texture files: {error}"))
-        })?;
-    for texture in &textures.textures {
+    files.try_reserve(textures.len()).map_err(|error| {
+        PyValueError::new_err(format!("cannot allocate model texture files: {error}"))
+    })?;
+    for texture in textures {
         files.push(Py::new(
             py,
             PyModelFile {
-                file_name: texture.file_name.clone(),
-                data: texture.encoded.clone(),
+                file_name: texture.file_name,
+                data: texture.encoded,
             },
         )?);
     }
     Ok(files)
 }
 
-fn skipped_textures(textures: &SceneTextureSet) -> Vec<String> {
-    textures
-        .skipped
-        .iter()
-        .map(|skip| format!("{}: {}", skip.property, skip.reason))
-        .collect()
+fn skipped_textures(texture_skips: Vec<SceneTextureSkip>) -> PyResult<Vec<String>> {
+    let mut skipped = Vec::new();
+    skipped.try_reserve(texture_skips.len()).map_err(|error| {
+        PyMemoryError::new_err(format!("cannot allocate skipped model textures: {error}"))
+    })?;
+    for skip in texture_skips {
+        let length = skip
+            .property
+            .len()
+            .checked_add(2)
+            .and_then(|length| length.checked_add(skip.reason.len()))
+            .ok_or_else(|| PyValueError::new_err("skipped model texture text overflowed"))?;
+        let mut description = String::new();
+        description.try_reserve_exact(length).map_err(|error| {
+            PyMemoryError::new_err(format!(
+                "cannot allocate skipped model texture text: {error}"
+            ))
+        })?;
+        description.push_str(&skip.property);
+        description.push_str(": ");
+        description.push_str(&skip.reason);
+        skipped.push(description);
+    }
+    Ok(skipped)
 }
 
 fn parse_unity_cn_key(py: Python<'_>, value: Option<Py<PyAny>>) -> PyResult<Option<UnityCnKey>> {
@@ -3817,10 +4082,38 @@ fn try_path_string(path: &std::path::Path, field: &'static str) -> PyResult<Stri
 
 fn core_error(error: Error) -> PyErr {
     match error {
-        Error::Io(error) => PyOSError::new_err(error.to_string()),
+        // Let PyO3 retain Rust's io::ErrorKind classification. Converting the
+        // error to a string first collapses FileNotFoundError,
+        // PermissionError, FileExistsError, and the other standard OSError
+        // subclasses into a generic OSError.
+        Error::Io(error) => error.into(),
         Error::InvalidData(message) => PyValueError::new_err(message),
         Error::Unsupported(message) => PyNotImplementedError::new_err(message),
     }
+}
+
+/// Copies bounded Rust output into a Python `bytes` object without turning a
+/// Python allocation failure into a Rust panic.
+fn python_bytes<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, bytes.len(), |output| {
+        output.copy_from_slice(bytes);
+        Ok(())
+    })
+}
+
+fn python_allocation_error(field: &str, error: impl std::fmt::Display) -> assetstudio_core::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!("cannot allocate Python {field}: {error}"),
+    )
+    .into()
+}
+
+fn python_callback_bytes<'py>(
+    py: Python<'py>,
+    bytes: &[u8],
+) -> assetstudio_core::Result<Bound<'py, PyBytes>> {
+    python_bytes(py, bytes).map_err(|error| python_allocation_error("callback bytes", error))
 }
 
 fn checked_schema_string_bytes<'a>(values: impl Iterator<Item = &'a str>) -> PyResult<usize> {
@@ -3987,71 +4280,91 @@ fn convert_live2d_json(
     )
 }
 
-impl From<SceneHierarchyNode> for PySceneNode {
-    fn from(node: SceneHierarchyNode) -> Self {
-        let (local_position, local_rotation, local_scale) =
-            node.transform
+fn python_scene_node(node: SceneHierarchyNode) -> PyResult<PySceneNode> {
+    let (local_position, local_rotation, local_scale) =
+        node.transform
+            .as_ref()
+            .map_or((None, None, None), |transform| {
+                (
+                    Some((
+                        transform.local_position.x,
+                        transform.local_position.y,
+                        transform.local_position.z,
+                    )),
+                    Some((
+                        transform.local_rotation.x,
+                        transform.local_rotation.y,
+                        transform.local_rotation.z,
+                        transform.local_rotation.w,
+                    )),
+                    Some((
+                        transform.local_scale.x,
+                        transform.local_scale.y,
+                        transform.local_scale.z,
+                    )),
+                )
+            });
+    let mesh = node
+        .skinned_mesh_renderer
+        .as_ref()
+        .and_then(|renderer| renderer.mesh)
+        .or_else(|| node.mesh_filter.as_ref().and_then(|filter| filter.mesh));
+    let materials = node
+        .skinned_mesh_renderer
+        .as_ref()
+        .map(|renderer| renderer.materials.as_slice())
+        .or_else(|| {
+            node.mesh_renderer
                 .as_ref()
-                .map_or((None, None, None), |transform| {
-                    (
-                        Some((
-                            transform.local_position.x,
-                            transform.local_position.y,
-                            transform.local_position.z,
-                        )),
-                        Some((
-                            transform.local_rotation.x,
-                            transform.local_rotation.y,
-                            transform.local_rotation.z,
-                            transform.local_rotation.w,
-                        )),
-                        Some((
-                            transform.local_scale.x,
-                            transform.local_scale.y,
-                            transform.local_scale.z,
-                        )),
-                    )
-                });
-        let mesh = node
-            .skinned_mesh_renderer
-            .as_ref()
-            .and_then(|renderer| renderer.mesh)
-            .or_else(|| node.mesh_filter.as_ref().and_then(|filter| filter.mesh));
-        let materials = node.skinned_mesh_renderer.as_ref().map_or_else(
-            || {
-                node.mesh_renderer
-                    .as_ref()
-                    .map_or_else(Vec::new, |renderer| renderer.materials.clone())
-            },
-            |renderer| renderer.materials.clone(),
-        );
-        let bones = node
-            .skinned_mesh_renderer
-            .as_ref()
-            .map_or_else(Vec::new, |renderer| renderer.bones.clone());
-        Self {
-            file_index: node.object.file_index,
-            path_id: node.object.path_id,
-            name: node.name,
-            parent: node.parent.map(object_key_tuple),
-            children: node.children.into_iter().map(object_key_tuple).collect(),
-            local_position,
-            local_rotation,
-            local_scale,
-            mesh: mesh.map(object_key_tuple),
-            materials: materials
-                .into_iter()
-                .map(|material| material.map(object_key_tuple))
-                .collect(),
-            bones: bones
-                .into_iter()
-                .map(|bone| bone.map(object_key_tuple))
-                .collect(),
-            animator: node
-                .animator
-                .map(|animator| object_key_tuple(animator.component)),
-        }
-    }
+                .map(|renderer| renderer.materials.as_slice())
+        })
+        .unwrap_or_default();
+    let bones = node
+        .skinned_mesh_renderer
+        .as_ref()
+        .map_or(&[][..], |renderer| renderer.bones.as_slice());
+    Ok(PySceneNode {
+        file_index: node.object.file_index,
+        path_id: node.object.path_id,
+        name: node.name,
+        parent: node.parent.map(object_key_tuple),
+        children: copy_scene_keys(&node.children, "scene child references")?,
+        local_position,
+        local_rotation,
+        local_scale,
+        mesh: mesh.map(object_key_tuple),
+        materials: copy_optional_scene_keys(materials, "scene material references")?,
+        bones: copy_optional_scene_keys(bones, "scene bone references")?,
+        animator: node
+            .animator
+            .map(|animator| object_key_tuple(animator.component)),
+    })
+}
+
+fn copy_scene_keys(source: &[SceneObjectKey], field: &str) -> PyResult<Vec<(usize, i64)>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(source.len())
+        .map_err(|error| PyMemoryError::new_err(format!("cannot allocate {field}: {error}")))?;
+    output.extend(source.iter().copied().map(object_key_tuple));
+    Ok(output)
+}
+
+fn copy_optional_scene_keys(
+    source: &[Option<SceneObjectKey>],
+    field: &str,
+) -> PyResult<Vec<Option<(usize, i64)>>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(source.len())
+        .map_err(|error| PyMemoryError::new_err(format!("cannot allocate {field}: {error}")))?;
+    output.extend(
+        source
+            .iter()
+            .copied()
+            .map(|value| value.map(object_key_tuple)),
+    );
+    Ok(output)
 }
 
 impl From<ModelExportCandidate> for PyFbxCandidate {
@@ -4065,6 +4378,42 @@ impl From<ModelExportCandidate> for PyFbxCandidate {
             name: candidate.name,
         }
     }
+}
+
+fn python_fbx_candidates(
+    candidates: Vec<ModelExportCandidate>,
+    field: &'static str,
+) -> PyResult<Vec<PyFbxCandidate>> {
+    let mut output = reserve_metadata(candidates.len(), field)?;
+    output.extend(candidates.into_iter().map(PyFbxCandidate::from));
+    Ok(output)
+}
+
+fn python_export_failures(
+    failures: Vec<assetstudio_core::export::ExportFailure>,
+    field: &'static str,
+) -> PyResult<Vec<String>> {
+    let mut output = reserve_metadata(failures.len(), field)?;
+    for failure in failures {
+        let capacity = failure
+            .source
+            .len()
+            .checked_add(failure.error.len())
+            .and_then(|length| length.checked_add(96))
+            .ok_or_else(|| PyValueError::new_err("export failure text length overflowed"))?;
+        let mut description = String::new();
+        description.try_reserve_exact(capacity).map_err(|error| {
+            PyMemoryError::new_err(format!("cannot allocate export failure text: {error}"))
+        })?;
+        write!(
+            description,
+            "{}::{} (class {}): {}",
+            failure.source, failure.path_id, failure.class_id, failure.error
+        )
+        .map_err(|error| PyValueError::new_err(format!("cannot format export failure: {error}")))?;
+        output.push(description);
+    }
+    Ok(output)
 }
 
 const fn object_key_tuple(key: SceneObjectKey) -> (usize, i64) {
@@ -4358,6 +4707,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCubismClipMotion>()?;
     module.add_class::<PyCubismMotionTargets>()?;
     module.add_class::<PySceneNode>()?;
+    module.add_class::<PySceneLimits>()?;
+    module.add_class::<PyModelTextureLimits>()?;
     module.add_class::<PyFbxCandidate>()?;
     module.add_class::<PyRgbaImage>()?;
     module.add_class::<PyBinaryAsset>()?;
