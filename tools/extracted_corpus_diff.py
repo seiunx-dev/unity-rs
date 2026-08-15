@@ -302,6 +302,14 @@ def main() -> int:
             staged.mkdir()
             stage(bundle, staged / bundle.name)
             mine: dict[str, Path] = {}
+            # A name that more than one asset claims cannot be compared. This
+            # bundle holds sixty-odd textures all called `item_icon`; the export
+            # keeps them apart with path IDs, which are stripped here, and the
+            # extraction numbers its own copies in an order that is not ours.
+            # Comparing them anyway pairs two unrelated icons and reports a
+            # handful of channels differing by three to five -- small enough to
+            # read as a decoder disagreement, which is what it looked like.
+            ambiguous: set[str] = set()
             failed = False
             # Bare-named classes first -- Texture2D, Mesh, TextAsset -- then
             # sprites, whose extraction names carry a suffix.
@@ -328,7 +336,10 @@ def main() -> int:
                     if not path.is_file():
                         continue
                     stem = PATH_ID_SUFFIX.sub("", path.stem) + suffix
-                    mine.setdefault(stem + path.suffix, path)
+                    primary = stem + path.suffix
+                    if primary in mine and mine[primary] != path:
+                        ambiguous.add(primary)
+                    mine.setdefault(primary, path)
                     # A sprite atlas texture is named `sactx-0-1024x512-ASTC
                     # 4x4-...` by Unity, spaces and all. This project keeps the
                     # asset's own name; the extraction replaces the spaces.
@@ -363,6 +374,9 @@ def main() -> int:
                 if theirs.suffix == ".png" and not have_pillow:
                     continue
                 totals[f"{theirs.suffix} compared"] += 1
+                if theirs.name in ambiguous:
+                    totals[f"{theirs.suffix} ambiguous name"] += 1
+                    continue
                 ours = mine.get(theirs.name)
                 if ours is None:
                     totals[f"{theirs.suffix} not exported"] += 1
