@@ -43,7 +43,15 @@ fn one_subset_block(endpoints: [[u16; 3]; 2], indices: [u8; 16]) -> [u8; 16] {
     for index in &indices[1..] {
         push(u32::from(*index), 4, &mut block);
     }
-    debug_assert_eq!(cursor, 128, "a BC6H block is exactly 128 bits");
+    // Not `debug_assert_eq!`. Release profiles drop those, and the committed
+    // payload beside these fixtures is produced by this function, so at the
+    // moment it is regenerated this is the only check that the packing fills a
+    // block exactly -- a short block would be written to the file and then
+    // compared against itself forever. Over-filling is caught by the array
+    // bounds above; under-filling is caught only here, which is verified: a
+    // ten-bit endpoint written as nine fails with 125 against 128 under
+    // `--release`, where a `debug_assert` reported nothing.
+    assert_eq!(cursor, 128, "a BC6H block is exactly 128 bits");
     block
 }
 
