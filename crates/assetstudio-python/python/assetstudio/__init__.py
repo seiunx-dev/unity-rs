@@ -37,6 +37,8 @@ from ._native import (
     Live2dPackageSet,
     Live2dTexture,
     Material,
+    ModelFile,
+    ModelObj,
     MonoBehaviourJson,
     MonoBehaviourSchema,
     MonoBehaviourSchemas,
@@ -48,6 +50,7 @@ from ._native import (
     ResourceInfo,
     ResourceIterator,
     SceneNode,
+    TexturedFbx,
     extract,
 )
 
@@ -88,6 +91,8 @@ __all__ = [
     "Live2dPackageSet",
     "Live2dTexture",
     "Material",
+    "ModelFile",
+    "ModelObj",
     "MonoBehaviourJson",
     "MonoBehaviourSchema",
     "MonoBehaviourSchemas",
@@ -99,5 +104,6 @@ __all__ = [
     "ResourceInfo",
     "ResourceIterator",
     "SceneNode",
+    "TexturedFbx",
     "extract",
 ]

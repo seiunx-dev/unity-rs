@@ -64,6 +64,19 @@ use crate::sprite::{SpriteReadLimits, decode_sprite_rgba8, read_sprite};
 use crate::texture::{RgbaImage, TextureReadLimits, read_texture2d};
 use crate::texture_array::{TextureArrayReadLimits, read_texture2d_array};
 
+/// A scene written as Wavefront OBJ, with the files it names.
+///
+/// The `mtllib` line names `material_library_name` and the library's `map_*`
+/// lines name the textures, all resolved by file name against the OBJ's own
+/// directory. Writing any of them somewhere else breaks those references.
+#[derive(Debug)]
+pub struct ModelObj {
+    pub obj: Vec<u8>,
+    pub material_library_name: String,
+    pub material_library: Vec<u8>,
+    pub textures: crate::scene_textures::SceneTextureSet,
+}
+
 /// An opened collection of Unity serialized files and external resources.
 #[derive(Debug)]
 pub struct Studio {
@@ -461,6 +474,56 @@ impl Studio {
             maximum_output_bytes,
         )?;
         Ok((written, textures))
+    }
+
+    /// Materializes the whole scene as one Wavefront OBJ, with the material
+    /// library it names and the textures that library references.
+    ///
+    /// Distinct from [`Studio::read_mesh_obj`], which writes one mesh the way
+    /// the managed exporter does. This is the scene: every renderer placed in
+    /// world space, and face references naming only the channels a mesh has.
+    /// It existed only inside the CLI, so a library caller could reach the FBX
+    /// scene but not the OBJ one.
+    ///
+    /// The three parts come back rather than being written: the `mtllib` and
+    /// `map_*` lines resolve by file name against the OBJ's own directory, and
+    /// this call has no directory to make that true in. The caller places
+    /// them, and `SceneTextureSet::write_to_directory` writes the textures.
+    pub fn read_model_obj(
+        &self,
+        material_library_name: &str,
+        maximum_output_bytes: u64,
+        format: crate::image_export::ImageFormat,
+        texture_limits: crate::scene_textures::SceneTextureLimits,
+    ) -> Result<ModelObj> {
+        let hierarchy = self.scene_hierarchy(SceneHierarchyLimits::default())?;
+        let model = build_model_ir(&self.collection, &hierarchy, ModelIrLimits::default())?;
+        let textures = crate::scene_textures::SceneTextureSet::from_model(
+            &self.collection,
+            &model,
+            format,
+            texture_limits,
+        )?;
+        let mut obj = Vec::new();
+        crate::obj_scene::write_model_ir_obj(
+            &model,
+            Some(material_library_name),
+            &mut obj,
+            maximum_output_bytes,
+        )?;
+        let mut material_library = Vec::new();
+        crate::obj_scene::write_model_ir_mtl(
+            &model,
+            &textures,
+            &mut material_library,
+            maximum_output_bytes,
+        )?;
+        Ok(ModelObj {
+            obj,
+            material_library_name: material_library_name.to_owned(),
+            material_library,
+            textures,
+        })
     }
 
     /// Materializes bounded ASCII FBX 7.4 with supported animation tracks.

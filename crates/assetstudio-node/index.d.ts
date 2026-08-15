@@ -208,6 +208,17 @@ export declare class AssetStudio {
    */
   readLive2DPackages(maximumBytes?: number | undefined | null): Live2DPackageSet
   /**
+   * Writes the whole scene as one Wavefront OBJ, with the material library
+   * it names and that library's textures.
+   *
+   * Distinct from `readMeshObj`, which writes one mesh the way the managed
+   * exporter does. This is the scene: every renderer placed in world space.
+   *
+   * `materialLibraryName` is what the OBJ's `mtllib` line will say, so it
+   * has to be the name the library is actually written under.
+   */
+  readModelObj(materialLibraryName?: string | undefined | null, maximumBytes?: number | undefined | null): ModelObj
+  /**
    * Writes the collection as ASCII FBX with its animations and returns the
    * material textures it references.
    *
@@ -503,6 +514,27 @@ export interface Material {
 export interface MemoryInput {
   name: string
   data: Buffer
+}
+
+/**
+ * A scene written as Wavefront OBJ, with the files it names.
+ *
+ * The OBJ's `mtllib` line names the material library and the library's
+ * `map_*` lines name the textures, all resolved by file name against the
+ * OBJ's own directory. They come back rather than being written because this
+ * call has no directory of its own, and splitting them across directories
+ * breaks the references.
+ */
+export interface ModelObj {
+  obj: Buffer
+  materialLibraryName: string
+  materialLibrary: Buffer
+  textures: Array<Live2DFile>
+  /**
+   * Texture references this reader could not resolve or decode, with the
+   * reason.
+   */
+  skipped: Array<string>
 }
 
 /** A `MonoBehaviour` read as JSON, and which tree it was read through. */
