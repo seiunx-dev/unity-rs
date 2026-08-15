@@ -1014,6 +1014,10 @@ impl PyRgbaImage {
 struct PyExportReport {
     exported: Vec<String>,
     failures: Vec<String>,
+    /// Objects declined by design rather than broken. A modern build carries
+    /// hundreds of them, and folding them into `failures` would make every
+    /// such export look like it went wrong.
+    unsupported: Vec<String>,
 }
 
 #[pyclass(name = "ExtractionLimits", frozen, skip_from_py_object)]
@@ -3208,17 +3212,19 @@ impl PyAssetStudio {
             .into_iter()
             .map(|record| record.output_path.to_string_lossy().into_owned())
             .collect();
-        let failures = report
-            .failures
-            .into_iter()
-            .map(|failure| {
-                format!(
-                    "{}::{} (class {}): {}",
-                    failure.source, failure.path_id, failure.class_id, failure.error
-                )
-            })
-            .collect();
-        Ok(PyExportReport { exported, failures })
+        let describe = |failure: assetstudio_core::export::ExportFailure| {
+            format!(
+                "{}::{} (class {}): {}",
+                failure.source, failure.path_id, failure.class_id, failure.error
+            )
+        };
+        let failures = report.failures.into_iter().map(describe).collect();
+        let unsupported = report.unsupported.into_iter().map(describe).collect();
+        Ok(PyExportReport {
+            exported,
+            failures,
+            unsupported,
+        })
     }
 
     /// Materializes the verified Live2D package slice in memory.

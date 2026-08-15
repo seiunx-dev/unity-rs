@@ -232,6 +232,10 @@ pub struct ExportFailure {
 pub struct ExportReport {
     pub exported: Vec<ExportRecord>,
     pub failures: Vec<ExportFailure>,
+    /// Objects declined by design rather than broken, kept separate so a
+    /// caller can tell "this build carries shaders we do not read" from "the
+    /// export went wrong".
+    pub unsupported: Vec<ExportFailure>,
 }
 
 /// What an extraction run produced.
@@ -1354,6 +1358,16 @@ impl AssetStudio {
                     path_id: BigInt::from(failure.path_id),
                     class_id: failure.class_id,
                     error: failure.error,
+                })
+                .collect(),
+            unsupported: report
+                .unsupported
+                .into_iter()
+                .map(|declined| ExportFailure {
+                    source: declined.source,
+                    path_id: BigInt::from(declined.path_id),
+                    class_id: declined.class_id,
+                    error: declined.error,
                 })
                 .collect(),
         })

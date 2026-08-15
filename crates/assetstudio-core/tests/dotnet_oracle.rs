@@ -2393,6 +2393,17 @@ fn animator_controller() -> Vec<u8> {
     push_i32(&mut output, 1);
     push_i32(&mut output, 0);
     output.extend_from_slice(&92_i64.to_le_bytes());
+    // The state-machine-behaviour tail every real controller ends with: two
+    // empty collections, an empty behaviour vector, and the threading flag.
+    // The managed reader stops before it, which is why these fixtures used to
+    // as well -- and why they described a file Unity does not write.
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    output.push(1);
+    while output.len() % 4 != 0 {
+        output.push(0);
+    }
     output
 }
 
@@ -2409,6 +2420,17 @@ fn tuanjie_animator_controller() -> Vec<u8> {
     push_i32(&mut output, 1);
     push_i32(&mut output, 0);
     output.extend_from_slice(&92_i64.to_le_bytes());
+    // The state-machine-behaviour tail every real controller ends with: two
+    // empty collections, an empty behaviour vector, and the threading flag.
+    // The managed reader stops before it, which is why these fixtures used to
+    // as well -- and why they described a file Unity does not write.
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    output.push(1);
+    while output.len() % 4 != 0 {
+        output.push(0);
+    }
     output
 }
 

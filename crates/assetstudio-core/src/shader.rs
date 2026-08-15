@@ -262,14 +262,39 @@ fn header_length() -> Result<u64> {
         .map_err(|_| Error::invalid_data("Shader text header length does not fit in u64"))
 }
 
+/// Accepts the versions whose `Shader` layout this reader actually implements.
+///
+/// Unity changed the serialized shader in 2021 and the managed implementation
+/// never followed: its object table skips class 48 entirely for `version >=
+/// 2021`, which is why an `AssetStudio` dump of a 2022 game lists no shaders
+/// at all rather than listing broken ones. This reader accepted them anyway
+/// and parsed them with the pre-2021 layout.
+///
+/// The result was not an error in the useful sense. Every one of the 372
+/// shaders in a real Unity 2022.3 game -- `unity_builtin_extra`,
+/// `globalgamemanagers.assets` and `resources.assets` -- drifted off its
+/// structure within the first few fields and then reported whatever the
+/// following bytes happened to say, which is how a count of 1869762655 comes
+/// out of a 9888-byte object: it is four bytes of shader source read as a
+/// length. A reader that mis-parses is worse than one that declines, because
+/// only one of the two can be told apart from a corrupt file.
+///
+/// So this declines, and says why. Implementing the 2021+ layout is a separate
+/// piece of work: the files carry no `TypeTree`, so it has to come from
+/// somewhere other than the asset itself.
 fn validate_unity_shader_version(version: &UnityVersion) -> Result<()> {
-    if version.major <= 5 || (2017..=2023).contains(&version.major) || version.major == 6000 {
-        Ok(())
-    } else {
-        Err(Error::unsupported(format!(
-            "Unity {version} Shader serialization version"
-        )))
+    if version.major <= 5 || (2017..=2020).contains(&version.major) {
+        return Ok(());
     }
+    if version.major >= 2021 {
+        return Err(Error::unsupported(format!(
+            "Unity {version} Shader serialization: the layout changed in 2021 \
+             and neither this reader nor the managed one implements it"
+        )));
+    }
+    Err(Error::unsupported(format!(
+        "Unity {version} Shader serialization version"
+    )))
 }
 
 #[derive(Debug, Default)]
@@ -2745,16 +2770,18 @@ mod tests {
     }
 
     #[test]
-    fn reads_unity_2022_segmented_compressed_programs() {
+    fn reads_segmented_compressed_programs() {
+        // 2020.3 rather than 2022: the segmented blob arrived in 2019.3, so
+        // this still covers it, and shaders from 2021 on are refused outright.
         let record = shader_sub_program_record(202_012_090, 1, &["MODERN"], &[], b"modern source");
         let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);
         let object = serialized_shader_object(
-            "2022.3.62f1",
+            "2020.3.48f1",
             "ModernObject",
             "Parsed/Segmented",
             &[first, record],
         );
-        let file = parse_asset("2022.3.62f1", 13, &object, Endian::Little);
+        let file = parse_asset("2020.3.48f1", 13, &object, Endian::Little);
 
         let shader = read_shader(&file, 0, ShaderReadLimits::default()).unwrap();
 
@@ -2764,23 +2791,29 @@ mod tests {
     }
 
     #[test]
-    fn reads_unity_6000_with_the_managed_2022_plus_layout() {
-        let record = shader_sub_program_record(202_012_090, 1, &["UNITY6"], &[], b"unity6 source");
-        let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);
-        let object = serialized_shader_object(
-            "6000.2.0f1",
-            "Unity6Object",
-            "Parsed/Unity6",
-            &[first, record],
-        );
-        let file = parse_asset("6000.2.0f1", 13, &object, Endian::Little);
+    fn refuses_shaders_from_unity_2021_and_later() {
+        // This used to assert that a 6000 shader read back as
+        // `Shader "Parsed/Unity6" { Properties { } }`, from a fixture built to
+        // the same layout the reader assumed. Unity's 2021+ SerializedProgram
+        // carries two fields that layout has never had -- m_PlayerSubPrograms
+        // and m_ParameterBlobIndices -- so the fixture described a file no
+        // Unity has written, and every one of the 372 shaders in a real 2022.3
+        // game drifted off its structure instead of parsing.
+        //
+        // The managed implementation reaches the same conclusion by a shorter
+        // route: its object table skips class 48 entirely for version >= 2021.
+        for revision in ["2021.1.0f1", "2022.3.62f1", "6000.2.0f1"] {
+            let record = shader_sub_program_record(202_012_090, 1, &[], &[], b"source");
+            let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);
+            let object = serialized_shader_object(revision, "Object", "Parsed", &[first, record]);
+            let file = parse_asset(revision, 13, &object, Endian::Little);
 
-        let shader = read_shader(&file, 0, ShaderReadLimits::default()).unwrap();
-
-        let mut expected = SHADER_TEXT_HEADER.as_bytes().to_vec();
-        expected.extend_from_slice(b"Shader \"Parsed/Unity6\" {\nProperties {\n}\n}");
-        assert_eq!(shader.name, "Unity6Object");
-        assert_eq!(shader.read_to_vec(4096).unwrap(), expected);
+            let error = read_shader(&file, 0, ShaderReadLimits::default()).unwrap_err();
+            assert!(
+                matches!(&error, Error::Unsupported(message) if message.contains("2021")),
+                "{revision} gave {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -2886,8 +2919,8 @@ mod tests {
 
         let record = shader_sub_program_record(202_012_090, 99, &[], &[], b"bad");
         let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);
-        let object = serialized_shader_object("2022.3.0f1", "BadType", "BadType", &[first, record]);
-        let file = parse_asset("2022.3.0f1", 13, &object, Endian::Little);
+        let object = serialized_shader_object("2020.3.0f1", "BadType", "BadType", &[first, record]);
+        let file = parse_asset("2020.3.0f1", 13, &object, Endian::Little);
         let error = read_shader(&file, 0, ShaderReadLimits::default()).unwrap_err();
         assert!(matches!(error, Error::Unsupported(message) if message.contains("type 99")));
 
@@ -2950,8 +2983,8 @@ mod tests {
         let record = shader_sub_program_record(123_456_789, 1, &[], &[], b"bad");
         let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);
         let object =
-            serialized_shader_object("2022.3.0f1", "BadVersion", "BadVersion", &[first, record]);
-        let file = parse_asset("2022.3.0f1", 13, &object, Endian::Little);
+            serialized_shader_object("2020.3.0f1", "BadVersion", "BadVersion", &[first, record]);
+        let file = parse_asset("2020.3.0f1", 13, &object, Endian::Little);
         let error = read_shader(&file, 0, ShaderReadLimits::default()).unwrap_err();
         assert!(matches!(error, Error::Unsupported(message) if message.contains("123456789")));
     }

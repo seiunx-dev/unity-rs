@@ -720,7 +720,9 @@ static object UInt32Values(IEnumerable<uint> values)
     };
 }
 
-static object Bytes(byte[] value) => new
+// A null array is not an empty one, and real files carry both: a Font whose
+// data never loaded reaches here as null and used to take the whole run down.
+static object? Bytes(byte[]? value) => value == null ? null : new
 {
     Size = value.LongLength,
     Fnv64 = Fnv1a64(value).ToString("x16"),

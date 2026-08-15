@@ -820,8 +820,13 @@ fn read_texture_shape(
     file: &SerializedFile,
     limits: &TextureReadLimits,
 ) -> Result<TextureShape> {
-    let width = reader.read_positive_dimension("Texture2D width")?;
-    let height = reader.read_positive_dimension("Texture2D height")?;
+    // Zero is a real value here, not a corrupt one. Unity builds dynamic font
+    // atlases as 0x0 textures and fills them at runtime -- a 2022.3 game
+    // carries twelve of them among 810 textures -- so refusing the dimension
+    // while reading refuses the asset. Decoding still requires positive
+    // dimensions, which is where the refusal belongs.
+    let width = reader.read_non_negative_i32("Texture2D width")?;
+    let height = reader.read_non_negative_i32("Texture2D height")?;
     validate_dimensions(width, height, limits)?;
     let complete_image_size = reader.reader.read_u32()?;
     let mips_stripped = if file.unity_version.major >= 2020 {
@@ -929,7 +934,7 @@ fn read_texture_tail(
     limits: &TextureReadLimits,
 ) -> Result<TextureTail> {
     let image_count =
-        reader.read_positive_count("Texture2D image count", limits.maximum_image_count)?;
+        reader.read_bounded_count("Texture2D image count", limits.maximum_image_count)?;
     let dimension = reader.reader.read_i32()?;
     if file.unity_version.major >= 2017 {
         reader.skip(24, "Texture2D GL texture settings")?;
@@ -1109,10 +1114,18 @@ impl TextureObjectReader {
             .map_err(|_| Error::invalid_data(format!("{field} cannot be negative: {value}")))
     }
 
-    fn read_positive_dimension(&mut self, field: &str) -> Result<u32> {
+    /// Reads a count that may legitimately be zero, still bounded above.
+    ///
+    /// Separate from [`Self::read_positive_count`] because zero means "this
+    /// asset carries none of these", which is a real state -- an empty dynamic
+    /// font atlas has no images -- while the shapes this reader implements are
+    /// checked where they are used, in `decode_mip_rgba8`.
+    fn read_bounded_count(&mut self, field: &str, maximum: u32) -> Result<u32> {
         let value = self.read_non_negative_i32(field)?;
-        if value == 0 {
-            return Err(Error::invalid_data(format!("{field} must be positive")));
+        if value > maximum {
+            return Err(Error::invalid_data(format!(
+                "{field} {value} exceeds limit {maximum}"
+            )));
         }
         Ok(value)
     }

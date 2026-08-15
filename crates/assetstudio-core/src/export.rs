@@ -142,6 +142,15 @@ pub struct ExportFailure {
 pub struct ExportReport {
     pub exported: Vec<ExportRecord>,
     pub failures: Vec<ExportFailure>,
+    /// Objects this implementation declines by design, kept apart from the
+    /// ones that went wrong.
+    ///
+    /// A real game makes the distinction matter rather than academic: a Unity
+    /// 2022 build carries hundreds of shaders whose serialized layout no
+    /// implementation here reads, so folding them in with genuine failures
+    /// means every export of a modern game reports failure and exits non-zero,
+    /// and a caller cannot tell that from an export that actually broke.
+    pub unsupported: Vec<ExportFailure>,
 }
 
 struct ObjectExportContext<'a> {
@@ -214,12 +223,18 @@ pub fn export_collection(
                     report.exported.push(record);
                 }
                 Err(error) => {
-                    report.failures.try_reserve(1).map_err(|reserve_error| {
+                    let declined = matches!(error, Error::Unsupported(_));
+                    let bucket = if declined {
+                        &mut report.unsupported
+                    } else {
+                        &mut report.failures
+                    };
+                    bucket.try_reserve(1).map_err(|reserve_error| {
                         Error::invalid_data(format!(
-                            "cannot grow export failures while recording {error}: {reserve_error}"
+                            "cannot grow export records while recording {error}: {reserve_error}"
                         ))
                     })?;
-                    report.failures.push(ExportFailure {
+                    bucket.push(ExportFailure {
                         source: loaded.path.clone(),
                         path_id: object.path_id,
                         class_id: object.class_id,
@@ -1776,10 +1791,14 @@ mod tests {
         let report = export_collection(&collection, &output, ExportOptions::default()).unwrap();
 
         assert!(report.exported.is_empty());
-        assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].class_id, 114);
-        assert!(report.failures[0].error.contains("managed assembly"));
-        assert!(report.failures[0].error.contains("dummy-DLL schema"));
+        // Declined, not broken: the schema lives in a managed assembly this
+        // implementation does not load, which is a statement about the reader
+        // rather than about the file.
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].class_id, 114);
+        assert!(report.unsupported[0].error.contains("managed assembly"));
+        assert!(report.unsupported[0].error.contains("dummy-DLL schema"));
         let group = output.join("0000_stripped.assets");
         assert_eq!(fs::read_dir(group).unwrap().count(), 0);
 

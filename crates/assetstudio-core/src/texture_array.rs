@@ -206,8 +206,13 @@ pub fn read_texture2d_array(
     let color_space = reader.reader.read_i32()?;
     let graphics_format = reader.reader.read_i32()?;
     let texture_format = graphics_format_to_texture_format(graphics_format)?;
-    let width = reader.read_positive_dimension("Texture2DArray width")?;
-    let height = reader.read_positive_dimension("Texture2DArray height")?;
+    // Zero is a real value here, not a corrupt one. Unity builds dynamic font
+    // atlases as 0x0 textures and fills them at runtime -- a 2022.3 game
+    // carries twelve of them among 810 textures -- so refusing the dimension
+    // while reading refuses the asset. Decoding still requires positive
+    // dimensions, which is where the refusal belongs.
+    let width = reader.read_non_negative_i32("Texture2DArray width")?;
+    let height = reader.read_non_negative_i32("Texture2DArray height")?;
     validate_dimensions(width, height, &limits)?;
     let depth = reader.read_positive_count("Texture2DArray depth", limits.maximum_depth)?;
     let mip_count =
@@ -599,14 +604,6 @@ impl TextureArrayObjectReader {
         let value = self.reader.read_i64()?;
         u64::try_from(value)
             .map_err(|_| Error::invalid_data(format!("{field} cannot be negative: {value}")))
-    }
-
-    fn read_positive_dimension(&mut self, field: &str) -> Result<u32> {
-        let value = self.read_non_negative_i32(field)?;
-        if value == 0 {
-            return Err(Error::invalid_data(format!("{field} must be positive")));
-        }
-        Ok(value)
     }
 
     fn read_positive_count(&mut self, field: &str, maximum: u32) -> Result<u32> {

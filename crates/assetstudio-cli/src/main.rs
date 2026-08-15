@@ -1021,10 +1021,23 @@ fn export_path(
             failure.error
         )?;
     }
+    // Listed rather than counted: an unsupported object is a statement about
+    // this implementation, and the caller cannot act on a number alone.
+    for declined in &report.unsupported {
+        writeln!(
+            output,
+            "unsupported {}::{} (class {}): {}",
+            escape_text(&declined.source),
+            declined.path_id,
+            declined.class_id,
+            declined.error
+        )?;
+    }
     writeln!(
         output,
-        "export summary: {} succeeded, {} failed",
+        "export summary: {} succeeded, {} unsupported, {} failed",
         report.exported.len(),
+        report.unsupported.len(),
         report.failures.len()
     )?;
 
