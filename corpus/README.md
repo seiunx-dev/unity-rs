@@ -67,6 +67,9 @@ older snapshot will differ from a current run for that reason rather than
 because anything is wrong.
 
 `maximum_object_bytes` is a per-object materialization ceiling for the trusted
-gate, and also bounds the Live2D section's file and total sizes. Raise it
+gate, and also bounds the Live2D section's file size and the total across
+**every package in the case** -- not per package. A case covering thousands of
+bundles therefore needs a budget in the gigabytes, and under-declaring it fails
+partway through a texture rather than at the object that was too big. Raise it
 explicitly for a known large sample instead of disabling bounds globally. A manifest must have at least one enabled case when the ignored test
 is executed.
