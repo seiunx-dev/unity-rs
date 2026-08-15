@@ -72,7 +72,15 @@ impl Default for TypeTreeReadLimits {
             maximum_array_elements: 32_000_000,
             maximum_string_bytes: 16 * 1024 * 1024,
             maximum_typeless_bytes: 256 * 1024 * 1024,
-            maximum_materialized_bytes: 256 * 1024 * 1024,
+            // Set from a measurement, like the two above. A Live2D
+            // MonoBehaviour in a shipping Unity 6000.3 build materializes to
+            // between 384 and 512 MiB of value tree -- the same content whose
+            // package materialization was measured at 439 MB -- and at 256 MiB
+            // an otherwise clean 11,639-object export failed on two of them.
+            // This is the bound that actually decides peak heap for one
+            // object, so raising it raises that peak: 512 MiB covers what has
+            // been measured here, and is not a proof that nothing needs more.
+            maximum_materialized_bytes: 512 * 1024 * 1024,
         }
     }
 }
