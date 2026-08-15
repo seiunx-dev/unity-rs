@@ -226,9 +226,16 @@ def main() -> int:
                     failed = True
                     break
                 for path in output.rglob("*"):
-                    if path.is_file():
-                        stem = PATH_ID_SUFFIX.sub("", path.stem) + suffix
-                        mine.setdefault(stem + path.suffix, path)
+                    if not path.is_file():
+                        continue
+                    stem = PATH_ID_SUFFIX.sub("", path.stem) + suffix
+                    mine.setdefault(stem + path.suffix, path)
+                    # A sprite atlas texture is named `sactx-0-1024x512-ASTC
+                    # 4x4-...` by Unity, spaces and all. This project keeps the
+                    # asset's own name; the extraction replaces the spaces.
+                    # Without this the file reads as one this project never
+                    # produced, which is a much more alarming thing to report.
+                    mine.setdefault(stem.replace(" ", "_") + path.suffix, path)
             if failed:
                 subprocess.run(["rm", "-rf", str(root)], check=True)
                 root.mkdir()
