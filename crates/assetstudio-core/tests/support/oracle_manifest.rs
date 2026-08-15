@@ -1,3 +1,7 @@
+// Each test binary includes this module separately, so an entry point only one
+// of them calls is dead code in the others.
+#![allow(dead_code)]
+
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -42,7 +46,20 @@ pub fn rust_manifest(
     path: &Path,
     maximum_object_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let value = rust_manifest_inner(path, maximum_object_bytes);
+    rust_manifest_with_version(path, maximum_object_bytes, None)
+}
+
+/// The same manifest, read under an explicit Unity version.
+///
+/// A shipping bundle often carries a stripped header version, and every
+/// version-dependent reader then declines it. The caller supplies what the
+/// file does not.
+pub fn rust_manifest_with_version(
+    path: &Path,
+    maximum_object_bytes: u64,
+    unity_version: Option<&str>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let value = rust_manifest_inner(path, maximum_object_bytes, unity_version);
     if let (Ok(directory), Ok(value)) = (std::env::var("ORACLE_DUMP_DIR"), value.as_ref()) {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let _ = std::fs::write(
@@ -56,8 +73,18 @@ pub fn rust_manifest(
 fn rust_manifest_inner(
     path: &Path,
     maximum_object_bytes: u64,
+    unity_version: Option<&str>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let studio = Studio::open(path)?;
+    let studio = match unity_version {
+        Some(version) => Studio::open_with_options(
+            path,
+            assetstudio_core::loader::AssetLoadOptions {
+                unity_version_override: Some(version.parse()?),
+                ..assetstudio_core::loader::AssetLoadOptions::default()
+            },
+        )?,
+        None => Studio::open(path)?,
+    };
     let mut files = Vec::new();
     for file in studio.files() {
         let mut objects = Vec::new();

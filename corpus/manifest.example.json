@@ -13,6 +13,13 @@
       "input": "private/another_game_Data",
       "maximum_object_bytes": 536870912,
       "enabled": false
+    },
+    {
+      "name": "bundle-whose-header-carries-no-version",
+      "input": "private/downloaded-bundle",
+      "unity_version": "2022.3.62f2",
+      "maximum_object_bytes": 536870912,
+      "enabled": false
     }
   ]
 }

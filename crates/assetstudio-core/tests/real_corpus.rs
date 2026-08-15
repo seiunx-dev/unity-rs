@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 #[path = "support/oracle_manifest.rs"]
 mod oracle_manifest;
 
-use oracle_manifest::rust_manifest;
+use oracle_manifest::rust_manifest_with_version;
 
 const CORPUS_MANIFEST_ENV: &str = "ASSETSTUDIO_CORPUS_MANIFEST";
 const DEFAULT_MAXIMUM_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
@@ -29,6 +29,13 @@ struct CorpusCase {
     /// right, only that nothing broke.
     expected: Option<PathBuf>,
     maximum_object_bytes: u64,
+    /// The version to read the input under when it does not carry its own.
+    ///
+    /// Shipping bundles often have the header version stripped -- two of the
+    /// four real ones checked here say `5.x.x` -- and without this a case
+    /// pointed at one fails on the first version-dependent object rather than
+    /// on anything about the reader.
+    unity_version: Option<String>,
     enabled: bool,
 }
 
@@ -36,12 +43,16 @@ struct CorpusCase {
 fn example_corpus_manifest_is_valid() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/manifest.example.json");
     let cases = read_cases(&path).unwrap();
-    assert_eq!(cases.len(), 2);
+    assert_eq!(cases.len(), 3);
     assert!(cases.iter().all(|case| !case.enabled));
     // One case of each shape, so the example shows that the snapshot is
     // optional rather than leaving it to the prose.
     assert!(cases[0].expected.is_some());
     assert!(cases[1].expected.is_none());
+    // And that a stripped-header bundle is pointed at a version rather than
+    // being unusable, which is the shape a downloaded bundle actually has.
+    assert!(cases[0].unity_version.is_none());
+    assert_eq!(cases[2].unity_version.as_deref(), Some("2022.3.62f2"));
 }
 
 #[test]
@@ -56,10 +67,12 @@ fn private_real_corpus_matches_managed_snapshots() {
     for case in cases.iter().filter(|case| case.enabled) {
         // Reading is the same work either way, and an error here fails the case
         // whether or not a snapshot exists.
-        let actual =
-            rust_manifest(&case.input, case.maximum_object_bytes).unwrap_or_else(|error| {
-                panic!("corpus case {:?} could not be read: {error}", case.name)
-            });
+        let actual = rust_manifest_with_version(
+            &case.input,
+            case.maximum_object_bytes,
+            case.unity_version.as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("corpus case {:?} could not be read: {error}", case.name));
         if let Some(expected) = &case.expected {
             let expected: Value = serde_json::from_slice(&fs::read(expected).unwrap()).unwrap();
             assert_eq!(actual, expected, "private corpus case {:?}", case.name);
@@ -144,11 +157,21 @@ fn read_cases(path: &Path) -> Result<Vec<CorpusCase>, Box<dyn std::error::Error>
             })
             .transpose()?
             .unwrap_or(true);
+        let unity_version = entry
+            .get("unity_version")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("corpus case {index} unity_version is not a string"))
+            })
+            .transpose()?;
         cases.push(CorpusCase {
             name,
             input,
             expected,
             maximum_object_bytes,
+            unity_version,
             enabled,
         });
     }
