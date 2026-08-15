@@ -36,6 +36,7 @@ use assetstudio_core::mono_schema::{
 use assetstudio_core::monobehaviour::{MonoBehaviourReadLimits, MonoScript};
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::{SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey};
+use assetstudio_core::scene_textures::{SceneTextureLimits, SceneTextureSet};
 use assetstudio_core::serialized::{TypeTree, TypeTreeNode};
 use assetstudio_core::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
@@ -1203,6 +1204,43 @@ struct PyExportLimits {
     maximum_total_output_bytes: u64,
 }
 
+/// One file a model export names by file name.
+#[pyclass(name = "ModelFile", frozen, get_all)]
+#[derive(Debug)]
+struct PyModelFile {
+    file_name: String,
+    data: Vec<u8>,
+}
+
+/// A scene written as Wavefront OBJ, with the files it names.
+///
+/// The OBJ's `mtllib` line names the material library and the library's
+/// `map_*` lines name the textures, all resolved by file name against the
+/// OBJ's own directory. They come back rather than being written because this
+/// call has no directory of its own, and splitting them across directories
+/// breaks the references.
+#[pyclass(name = "ModelObj", frozen, get_all)]
+#[derive(Debug)]
+struct PyModelObj {
+    obj: Vec<u8>,
+    material_library_name: String,
+    material_library: Vec<u8>,
+    textures: Vec<Py<PyModelFile>>,
+    /// Texture references this reader could not resolve or decode, with the
+    /// reason. Reported rather than raised so one bad texture does not cost
+    /// the model.
+    skipped: Vec<String>,
+}
+
+/// An FBX and the texture files it references by name.
+#[pyclass(name = "TexturedFbx", frozen, get_all)]
+#[derive(Debug)]
+struct PyTexturedFbx {
+    fbx: Vec<u8>,
+    textures: Vec<Py<PyModelFile>>,
+    skipped: Vec<String>,
+}
+
 #[pyclass(name = "Live2dTexture", frozen)]
 struct PyLive2dTexture {
     file_name: String,
@@ -2067,6 +2105,77 @@ impl PyAssetStudio {
                 .map_err(core_error)
         })?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Writes the whole scene as one Wavefront OBJ, with the material library
+    /// it names and that library's textures.
+    ///
+    /// Distinct from `read_mesh_obj`, which writes one mesh the way the
+    /// managed exporter does. This is the scene: every renderer placed in
+    /// world space, and face references naming only the channels a mesh has.
+    ///
+    /// `material_library_name` is what the OBJ's `mtllib` line will say, so it
+    /// has to be the name the library is actually written under.
+    #[pyo3(signature = (
+        *,
+        material_library_name="model.mtl",
+        maximum_bytes=DEFAULT_RAW_LIMIT
+    ))]
+    fn read_model_obj(
+        &self,
+        py: Python<'_>,
+        material_library_name: &str,
+        maximum_bytes: u64,
+    ) -> PyResult<PyModelObj> {
+        let model = py
+            .detach(|| {
+                self.studio.read_model_obj(
+                    material_library_name,
+                    maximum_bytes,
+                    ImageFormat::Png,
+                    SceneTextureLimits::default(),
+                )
+            })
+            .map_err(core_error)?;
+        Ok(PyModelObj {
+            obj: model.obj,
+            material_library_name: model.material_library_name,
+            material_library: model.material_library,
+            textures: model_files(py, &model.textures)?,
+            skipped: skipped_textures(&model.textures),
+        })
+    }
+
+    /// Writes the scene as ASCII FBX with its animations, and returns the
+    /// material textures it references.
+    ///
+    /// The FBX names each texture by file name, so they have to be written
+    /// beside it for those references to resolve. They come back rather than
+    /// being written because this call has no directory of its own.
+    #[pyo3(signature = (*, maximum_bytes=DEFAULT_RAW_LIMIT))]
+    fn read_fbx_with_textures(
+        &self,
+        py: Python<'_>,
+        maximum_bytes: u64,
+    ) -> PyResult<PyTexturedFbx> {
+        let (fbx, textures) = py
+            .detach(|| {
+                let mut fbx = Vec::new();
+                self.studio
+                    .write_fbx_with_textures(
+                        &mut fbx,
+                        maximum_bytes,
+                        ImageFormat::Png,
+                        SceneTextureLimits::default(),
+                    )
+                    .map(|(_, textures)| (fbx, textures))
+            })
+            .map_err(core_error)?;
+        Ok(PyTexturedFbx {
+            fbx,
+            textures: model_files(py, &textures)?,
+            skipped: skipped_textures(&textures),
+        })
     }
 
     /// Reads one supported resident or externally streamed Unity `Mesh` as
@@ -3394,6 +3503,33 @@ fn python_resource_info(resource: StudioResource<'_>) -> PyResult<PyResourceInfo
 ///
 /// The package never ships or derives keys; obtaining one for a title is the
 /// caller's responsibility.
+fn model_files(py: Python<'_>, textures: &SceneTextureSet) -> PyResult<Vec<Py<PyModelFile>>> {
+    let mut files = Vec::new();
+    files
+        .try_reserve(textures.textures.len())
+        .map_err(|error| {
+            PyValueError::new_err(format!("cannot allocate model texture files: {error}"))
+        })?;
+    for texture in &textures.textures {
+        files.push(Py::new(
+            py,
+            PyModelFile {
+                file_name: texture.file_name.clone(),
+                data: texture.encoded.clone(),
+            },
+        )?);
+    }
+    Ok(files)
+}
+
+fn skipped_textures(textures: &SceneTextureSet) -> Vec<String> {
+    textures
+        .skipped
+        .iter()
+        .map(|skip| format!("{}: {}", skip.property, skip.reason))
+        .collect()
+}
+
 fn parse_unity_cn_key(py: Python<'_>, value: Option<Py<PyAny>>) -> PyResult<Option<UnityCnKey>> {
     let Some(value) = value else {
         return Ok(None);
@@ -4230,6 +4366,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMonoScript>()?;
     module.add_class::<PyExportReport>()?;
     module.add_class::<PyMonoBehaviourJson>()?;
+    module.add_class::<PyModelFile>()?;
+    module.add_class::<PyModelObj>()?;
+    module.add_class::<PyTexturedFbx>()?;
     module.add_class::<PyExportLimits>()?;
     module.add_class::<PyExtractionLimits>()?;
     module.add_class::<PyExtractionRecord>()?;

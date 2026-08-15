@@ -474,6 +474,35 @@ class FbxCandidate:
     @property
     def name(self) -> str: ...
 
+class ModelFile:
+    @property
+    def file_name(self) -> str: ...
+    @property
+    def data(self) -> bytes: ...
+
+class ModelObj:
+    @property
+    def obj(self) -> bytes: ...
+    @property
+    def material_library_name(self) -> str: ...
+    @property
+    def material_library(self) -> bytes: ...
+    @property
+    def textures(self) -> list[ModelFile]: ...
+    @property
+    def skipped(self) -> list[str]:
+        """Texture references that could not be resolved or decoded, with the
+        reason. Reported rather than raised so one bad texture does not cost
+        the model."""
+
+class TexturedFbx:
+    @property
+    def fbx(self) -> bytes: ...
+    @property
+    def textures(self) -> list[ModelFile]: ...
+    @property
+    def skipped(self) -> list[str]: ...
+
 class MonoBehaviourJson:
     @property
     def json(self) -> str: ...
@@ -784,6 +813,17 @@ class AssetStudio:
         *,
         maximum_bytes: int = 536_870_912,
     ) -> bytes: ...
+    def read_model_obj(
+        self,
+        *,
+        material_library_name: str = "model.mtl",
+        maximum_bytes: int = 1_073_741_824,
+    ) -> ModelObj: ...
+    def read_fbx_with_textures(
+        self,
+        *,
+        maximum_bytes: int = 1_073_741_824,
+    ) -> TexturedFbx: ...
     def read_mesh_obj(
         self,
         file_index: int,

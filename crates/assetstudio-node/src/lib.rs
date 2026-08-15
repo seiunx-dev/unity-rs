@@ -346,6 +346,24 @@ pub struct TexturedFbx {
     pub skipped: Vec<String>,
 }
 
+/// A scene written as Wavefront OBJ, with the files it names.
+///
+/// The OBJ's `mtllib` line names the material library and the library's
+/// `map_*` lines name the textures, all resolved by file name against the
+/// OBJ's own directory. They come back rather than being written because this
+/// call has no directory of its own, and splitting them across directories
+/// breaks the references.
+#[napi(object)]
+pub struct ModelObj {
+    pub obj: Buffer,
+    pub material_library_name: String,
+    pub material_library: Buffer,
+    pub textures: Vec<Live2dFile>,
+    /// Texture references this reader could not resolve or decode, with the
+    /// reason.
+    pub skipped: Vec<String>,
+}
+
 /// The header of one ACL compressed-track blob.
 ///
 /// Enough to decide whether a caller's decoder can handle it, without
@@ -1740,6 +1758,53 @@ impl AssetStudio {
         Ok(Live2dPackageSet {
             packages,
             diagnostics,
+        })
+    }
+
+    /// Writes the whole scene as one Wavefront OBJ, with the material library
+    /// it names and that library's textures.
+    ///
+    /// Distinct from `readMeshObj`, which writes one mesh the way the managed
+    /// exporter does. This is the scene: every renderer placed in world space.
+    ///
+    /// `materialLibraryName` is what the OBJ's `mtllib` line will say, so it
+    /// has to be the name the library is actually written under.
+    #[napi]
+    pub fn read_model_obj(
+        &self,
+        material_library_name: Option<String>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<ModelObj> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let name = material_library_name.unwrap_or_else(|| "model.mtl".to_owned());
+        let model = self
+            .studio
+            .read_model_obj(
+                &name,
+                maximum,
+                ImageFormat::Png,
+                SceneTextureLimits::default(),
+            )
+            .map_err(core_error)?;
+        Ok(ModelObj {
+            obj: model.obj.into(),
+            material_library_name: model.material_library_name,
+            material_library: model.material_library.into(),
+            textures: model
+                .textures
+                .textures
+                .iter()
+                .map(|texture| Live2dFile {
+                    file_name: texture.file_name.clone(),
+                    data: texture.encoded.clone().into(),
+                })
+                .collect(),
+            skipped: model
+                .textures
+                .skipped
+                .iter()
+                .map(|skip| format!("{}: {}", skip.property, skip.reason))
+                .collect(),
         })
     }
 

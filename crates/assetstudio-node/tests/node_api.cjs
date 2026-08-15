@@ -826,6 +826,9 @@ console.log('node api: animated fbx and live2d materialization ok')
     { name: 'text.assets', data: syntheticTextAsset() },
   ])
   assert.throws(() => barren.readFbxWithTextures())
+  // The scene OBJ, which existed only inside the CLI. No renderable geometry
+  // is refused rather than written as an empty scene, same as the FBX.
+  assert.throws(() => barren.readModelObj())
   // A TextAsset is not an AnimationClip, so asking for its ACL blob is
   // refused rather than answered with zeroes.
   const objects = barren.objectPage(0)

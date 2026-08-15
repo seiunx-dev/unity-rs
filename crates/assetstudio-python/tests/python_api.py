@@ -2691,6 +2691,29 @@ def main() -> None:
         assert b'P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,-45' in fbx
         assert b'P: "Lcl Scaling", "Lcl Scaling", "", "A",2,3,4' in fbx
         assert b"a: 2,1,-1" in fbx
+        # The scene as OBJ, which existed only inside the CLI: a library
+        # caller could reach the FBX scene but not this one. The `mtllib` line
+        # has to name the library the caller is told to write, or the material
+        # reference resolves to nothing.
+        model_obj = AssetStudio(model_path).read_model_obj(
+            material_library_name="python-model.mtl", maximum_bytes=128 * 1024
+        )
+        assert model_obj.material_library_name == "python-model.mtl"
+        assert b"mtllib python-model.mtl" in model_obj.obj
+        assert b"v " in model_obj.obj and b"f " in model_obj.obj
+        assert model_obj.material_library.startswith(b"#")
+        # This fixture has no material textures, which is an empty list rather
+        # than an error, and nothing was skipped for a reason worth reporting.
+        assert model_obj.textures == []
+        assert model_obj.skipped == []
+        # The same scene as FBX plus its textures, which Python could not
+        # reach either.
+        textured = AssetStudio(model_path).read_fbx_with_textures(
+            maximum_bytes=128 * 1024
+        )
+        assert textured.fbx.startswith(b"; FBX 7.4.0 project file\n")
+        assert textured.textures == []
+
         animated_fbx = AssetStudio(model_path).read_fbx(maximum_bytes=128 * 1024)
         animated_binary = AssetStudio(model_path).read_fbx_binary(
             maximum_bytes=128 * 1024
