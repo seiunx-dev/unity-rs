@@ -199,6 +199,14 @@ struct Extractor {
     output_root: PathBuf,
     options: ExtractionOptions,
     budget: ExtractionBudget,
+    /// Output paths already handed out, keyed by [`portable_key`] rather than
+    /// by the path itself.
+    ///
+    /// Two names that differ only in case are the same file on the platforms
+    /// this has to be safe on, so a claim has to be found by that comparison.
+    /// Doing it by scanning every key made allocation quadratic in the number
+    /// of entries, and an archive with tens of thousands of them in one
+    /// directory spent all its time there.
     claims: BTreeMap<PathBuf, ClaimKind>,
     temporary_sequence: u64,
     report: ExtractionReport,
@@ -673,7 +681,7 @@ impl Extractor {
                 ExistingKind::Missing => true,
             };
             if usable {
-                self.claims.insert(candidate.clone(), kind);
+                self.claims.insert(portable_key(&candidate), kind);
                 return Ok(candidate);
             }
         }
@@ -681,9 +689,7 @@ impl Extractor {
     }
 
     fn path_is_claimed(&self, candidate: &Path) -> bool {
-        self.claims
-            .keys()
-            .any(|claimed| paths_equal_portably(claimed, candidate))
+        self.claims.contains_key(&portable_key(candidate))
     }
 
     fn resolve_parent_collisions(&self, desired: &Path) -> Result<PathBuf> {
@@ -732,9 +738,7 @@ impl Extractor {
     }
 
     fn claim_kind(&self, path: &Path) -> Option<ClaimKind> {
-        self.claims
-            .iter()
-            .find_map(|(claimed, kind)| paths_equal_portably(claimed, path).then_some(*kind))
+        self.claims.get(&portable_key(path)).copied()
     }
 
     fn charge_entry(&mut self, length: u64) -> Result<()> {
@@ -1304,12 +1308,16 @@ fn nested_label(parent: &str, child: &str) -> String {
     format!("{parent}::{}", child.replace('\\', "/"))
 }
 
-fn paths_equal_portably(left: &Path, right: &Path) -> bool {
-    left.components()
+/// The form two paths share when they name the same file on a
+/// case-insensitive filesystem.
+///
+/// Components rather than the whole string: a component can never contain a
+/// separator, so joining the lowercased components back up cannot make two
+/// different paths collide.
+fn portable_key(path: &Path) -> PathBuf {
+    path.components()
         .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-        .eq(right
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy().to_lowercase()))
+        .collect()
 }
 
 fn lexical_absolute(path: &Path) -> Result<PathBuf> {

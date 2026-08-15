@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flate2::read::MultiGzDecoder;
 
@@ -52,11 +52,28 @@ pub struct ZipEntry {
     pub size: u64,
 }
 
-#[derive(Debug, Clone)]
 pub struct ZipContainer {
-    bytes: Arc<[u8]>,
+    /// The parsed central directory, kept rather than re-parsed.
+    ///
+    /// Reading an entry needs `&mut` on the archive while the container itself
+    /// is shared, so it sits behind a lock. It used to be reopened per entry,
+    /// which re-parsed the whole central directory every time and made
+    /// extraction quadratic in the entry count: a 20,000-entry archive spent
+    /// 29 seconds of CPU doing nothing else.
+    archive: Mutex<zip::ZipArchive<Cursor<Arc<[u8]>>>>,
     pub entries: Vec<ZipEntry>,
     maximum_entry_bytes: u64,
+}
+
+impl std::fmt::Debug for ZipContainer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The archive is a cursor over bytes with nothing readable to say.
+        formatter
+            .debug_struct("ZipContainer")
+            .field("entries", &self.entries)
+            .field("maximum_entry_bytes", &self.maximum_entry_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ZipContainer {
@@ -156,7 +173,7 @@ impl ZipContainer {
         }
 
         Ok(Self {
-            bytes,
+            archive: Mutex::new(archive),
             entries,
             maximum_entry_bytes: limits.maximum_zip_entry_bytes,
         })
@@ -166,12 +183,14 @@ impl ZipContainer {
         let entry = self.entries.get(index).ok_or_else(|| {
             Error::invalid_data(format!("ZIP entry index {index} is out of range"))
         })?;
-        let mut archive = zip::ZipArchive::new(Cursor::new(Arc::clone(&self.bytes)))
-            .map_err(|error| invalid_zip("cannot reopen ZIP central directory", &error))?;
+        let mut archive = self.archive.lock().map_err(|_| {
+            Error::invalid_data("ZIP archive lock was poisoned by an earlier panic")
+        })?;
         let file = archive
             .by_index(entry.archive_index)
             .map_err(|error| invalid_zip("cannot read ZIP entry", &error))?;
         let output = read_bounded(file, self.maximum_entry_bytes, "ZIP entry output")?;
+        drop(archive);
         if u64::try_from(output.len()).ok() != Some(entry.size) {
             return Err(Error::invalid_data(format!(
                 "ZIP entry {:?} decoded to {} bytes; expected {}",
