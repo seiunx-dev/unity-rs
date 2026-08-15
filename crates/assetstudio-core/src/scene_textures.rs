@@ -12,7 +12,10 @@
 //! cannot escape the directory the caller chose.
 
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
 use crate::loader::AssetCollection;
@@ -21,6 +24,9 @@ use crate::scene::resolve_object_reference;
 use crate::scene_hierarchy::SceneObjectKey;
 use crate::texture::{TEXTURE_2D_CLASS_ID, TextureReadLimits, read_texture2d};
 use crate::{Error, Result};
+
+const MAXIMUM_TEXTURE_TEMPORARY_ATTEMPTS: u64 = 1_024;
+static TEXTURE_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The material channel a texture is bound to.
 ///
@@ -145,8 +151,10 @@ impl SceneTextureSet {
     /// A reference that resolves to a class other than `Texture2D`, or that
     /// fails to decode, is recorded in [`Self::skipped`] rather than failing
     /// the export: one unreadable texture should not cost the whole model.
-    /// Exceeding a limit is still an error, because that is a bound the caller
-    /// chose.
+    /// Exceeding the set-wide count or encoded-byte limit is still an error,
+    /// because those bounds apply to the operation as a whole. A per-texture
+    /// decode limit is reported in [`Self::skipped`] like any other failure of
+    /// that texture, so the remaining material images can still be returned.
     pub fn from_model(
         collection: &AssetCollection,
         model: &ModelIr,
@@ -196,36 +204,47 @@ impl SceneTextureSet {
                     Ok(Some(resolved)) => resolved,
                     Ok(None) => continue,
                     Err(error) => {
-                        set.skipped.push(SceneTextureSkip {
-                            material: material.object,
-                            property: property.name.clone(),
-                            reason: error.to_string(),
-                        });
+                        record_texture_skip(&mut set, material.object, &property.name, error);
                         continue;
                     }
                 };
                 if resolved.object.class_id != TEXTURE_2D_CLASS_ID {
-                    set.skipped.push(SceneTextureSkip {
-                        material: material.object,
-                        property: property.name.clone(),
-                        reason: format!("class ID {} is not Texture2D", resolved.object.class_id),
-                    });
+                    record_texture_skip(
+                        &mut set,
+                        material.object,
+                        &property.name,
+                        format!("class ID {} is not Texture2D", resolved.object.class_id),
+                    );
                     continue;
                 }
                 let key = SceneObjectKey {
                     file_index: resolved.file_index,
                     path_id: resolved.object.path_id,
                 };
-                let texture = match by_object.get(&key) {
-                    Some(index) => *index,
-                    None => match encode_texture(collection, key, format, limits) {
+                let texture = if let Some(index) = by_object.get(&key) {
+                    *index
+                } else {
+                    // Charge the reference before decoding it. Otherwise a
+                    // caller choosing zero (or an already exhausted count)
+                    // could still make us read, decode and encode one more
+                    // potentially large texture before the limit fired.
+                    if set.textures.len() == limits.maximum_textures {
+                        return Err(Error::invalid_data(format!(
+                            "model references more than {} textures",
+                            limits.maximum_textures
+                        )));
+                    }
+                    let remaining_encoded = limits
+                        .maximum_total_encoded_bytes
+                        .checked_sub(total_encoded)
+                        .ok_or_else(|| {
+                            Error::invalid_data("model texture byte accounting underflowed")
+                        })?;
+                    if remaining_encoded == 0 {
+                        return Err(total_texture_budget_error(limits));
+                    }
+                    match encode_texture(collection, key, format, limits, remaining_encoded) {
                         Ok((name, encoded)) => {
-                            if set.textures.len() == limits.maximum_textures {
-                                return Err(Error::invalid_data(format!(
-                                    "model references more than {} textures",
-                                    limits.maximum_textures
-                                )));
-                            }
                             total_encoded =
                                 total_encoded.checked_add(encoded.len() as u64).ok_or_else(
                                     || Error::invalid_data("encoded texture size overflowed"),
@@ -246,15 +265,14 @@ impl SceneTextureSet {
                             by_object.insert(key, index);
                             index
                         }
-                        Err(error) => {
-                            set.skipped.push(SceneTextureSkip {
-                                material: material.object,
-                                property: property.name.clone(),
-                                reason: error.to_string(),
-                            });
+                        Err(TextureEncodeFailure::TotalBudgetExceeded) => {
+                            return Err(total_texture_budget_error(limits));
+                        }
+                        Err(TextureEncodeFailure::Recoverable(error)) => {
+                            record_texture_skip(&mut set, material.object, &property.name, error);
                             continue;
                         }
-                    },
+                    }
                 };
                 bindings.push(SceneTextureBinding {
                     property: property.name.clone(),
@@ -314,27 +332,100 @@ impl SceneTextureSet {
     /// Existing files are left alone rather than overwritten, so exporting two
     /// models that share a texture into the same directory does not rewrite it
     /// and cannot clobber an unrelated file that happens to share the name.
+    /// Each new file is completely written and synced under a temporary name
+    /// in the same directory before an atomic no-clobber publish; a failed
+    /// write therefore cannot leave a truncated final texture behind.
     pub fn write_to_directory(&self, directory: &Path) -> Result<Vec<PathBuf>> {
         let mut written = Vec::new();
         for texture in &self.textures {
             let path = directory.join(&texture.file_name);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    file.write_all(&texture.encoded)?;
-                    file.flush()?;
-                    written.push(path);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+            let mut temporary = TextureTemporaryFile::create(directory)?;
+            temporary.file_mut().write_all(&texture.encoded)?;
+            temporary.file_mut().flush()?;
+            temporary.file_mut().sync_all()?;
+            temporary.close()?;
+            if temporary.persist_no_clobber(&path)? {
+                written.push(path);
             }
         }
         Ok(written)
     }
+}
+
+struct TextureTemporaryFile {
+    path: PathBuf,
+    file: Option<File>,
+    persisted: bool,
+}
+
+impl TextureTemporaryFile {
+    fn create(directory: &Path) -> Result<Self> {
+        for _ in 0..MAXIMUM_TEXTURE_TEMPORARY_ATTEMPTS {
+            let sequence = TEXTURE_TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(
+                ".assetstudio-texture-{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        persisted: false,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(Error::invalid_data(format!(
+            "cannot allocate a texture temporary file after {MAXIMUM_TEXTURE_TEMPORARY_ATTEMPTS} attempts"
+        )))
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("texture temporary file is open")
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.file
+            .take()
+            .ok_or_else(|| Error::invalid_data("texture temporary file was already closed"))?;
+        Ok(())
+    }
+
+    fn persist_no_clobber(&mut self, destination: &Path) -> Result<bool> {
+        match fs::hard_link(&self.path, destination) {
+            Ok(()) => {
+                fs::remove_file(&self.path)?;
+                self.persisted = true;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for TextureTemporaryFile {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn record_texture_skip(
+    set: &mut SceneTextureSet,
+    material: SceneObjectKey,
+    property: &str,
+    reason: impl std::fmt::Display,
+) {
+    set.skipped.push(SceneTextureSkip {
+        material,
+        property: property.to_owned(),
+        reason: reason.to_string(),
+    });
 }
 
 fn encode_texture(
@@ -342,28 +433,97 @@ fn encode_texture(
     key: SceneObjectKey,
     format: ImageFormat,
     limits: SceneTextureLimits,
-) -> Result<(String, Vec<u8>)> {
+    remaining_encoded_bytes: u64,
+) -> std::result::Result<(String, Vec<u8>), TextureEncodeFailure> {
     let loaded = collection
         .serialized_files
         .get(key.file_index)
-        .ok_or_else(|| Error::invalid_data("texture file index is outside the collection"))?;
+        .ok_or_else(|| Error::invalid_data("texture file index is outside the collection"))
+        .map_err(TextureEncodeFailure::Recoverable)?;
     let object_index = loaded
         .file
         .objects
         .iter()
         .position(|object| object.path_id == key.path_id)
-        .ok_or_else(|| Error::invalid_data("texture path ID is absent from its file"))?;
-    let texture = read_texture2d(collection, &loaded.file, object_index, limits.texture)?;
-    let image = texture.decode_mip_rgba8(0, limits.texture)?;
-    let mut encoded = Vec::new();
-    write_rgba_image(
+        .ok_or_else(|| Error::invalid_data("texture path ID is absent from its file"))
+        .map_err(TextureEncodeFailure::Recoverable)?;
+    let texture = read_texture2d(collection, &loaded.file, object_index, limits.texture)
+        .map_err(TextureEncodeFailure::Recoverable)?;
+    let image = texture
+        .decode_mip_rgba8(0, limits.texture)
+        .map_err(TextureEncodeFailure::Recoverable)?;
+    let maximum_buffer_bytes = limits
+        .texture
+        .maximum_output_bytes
+        .min(remaining_encoded_bytes);
+    let maximum_buffer_bytes = usize::try_from(maximum_buffer_bytes).unwrap_or(usize::MAX);
+    let mut encoded = FallibleEncodedTexture::new(maximum_buffer_bytes);
+    let write_result = write_rgba_image(
         &image,
         format,
         ImageRowOrder::UnityDecoded,
         limits.texture.maximum_output_bytes,
         &mut encoded,
-    )?;
-    Ok((texture.name, encoded))
+    );
+    if encoded.limit_exceeded && remaining_encoded_bytes < limits.texture.maximum_output_bytes {
+        return Err(TextureEncodeFailure::TotalBudgetExceeded);
+    }
+    write_result.map_err(TextureEncodeFailure::Recoverable)?;
+    Ok((texture.name, encoded.bytes))
+}
+
+fn total_texture_budget_error(limits: SceneTextureLimits) -> Error {
+    Error::invalid_data(format!(
+        "model textures exceed the {} byte budget",
+        limits.maximum_total_encoded_bytes
+    ))
+}
+
+enum TextureEncodeFailure {
+    Recoverable(Error),
+    TotalBudgetExceeded,
+}
+
+struct FallibleEncodedTexture {
+    bytes: Vec<u8>,
+    maximum: usize,
+    limit_exceeded: bool,
+}
+
+impl FallibleEncodedTexture {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for FallibleEncodedTexture {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(input.len())
+            .ok_or_else(|| io::Error::other("encoded model texture length overflowed"))?;
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(io::Error::other(format!(
+                "encoded model texture exceeds {} bytes",
+                self.maximum
+            )));
+        }
+        self.bytes.try_reserve(input.len()).map_err(|error| {
+            io::Error::other(format!("cannot allocate encoded model texture: {error}"))
+        })?;
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Assigns each texture object one stable file name.
@@ -444,8 +604,10 @@ fn sanitize_file_stem(name: &str) -> String {
 mod tests {
     use super::{
         AssetCollection, ImageFormat, ModelIr, SceneObjectKey, SceneTextureLimits,
-        SceneTextureNames, SceneTextureSet, TEXTURE_2D_CLASS_ID, TextureSlot, sanitize_file_stem,
+        SceneTextureNames, SceneTextureSet, TEXTURE_2D_CLASS_ID, TextureSlot, TextureTemporaryFile,
+        sanitize_file_stem,
     };
+    use std::io::Write as _;
 
     const fn object(path_id: i64) -> SceneObjectKey {
         SceneObjectKey {
@@ -578,6 +740,47 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_exhausted_texture_count_before_decoding() {
+        let mut collection = texture_collection("Body");
+        // If the count were charged after decoding, this deliberately corrupt
+        // object would be recorded as a skipped texture and the call would
+        // incorrectly succeed even though the caller allowed zero textures.
+        collection.serialized_files[0].file.objects[0].byte_size = 1;
+        let model = model_with_texture_property("_MainTex", 81);
+        let error = SceneTextureSet::from_model(
+            &collection,
+            &model,
+            ImageFormat::Png,
+            SceneTextureLimits {
+                maximum_textures: 0,
+                ..SceneTextureLimits::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("more than 0 textures"));
+    }
+
+    #[test]
+    fn rejects_an_exhausted_total_budget_before_decoding() {
+        let mut collection = texture_collection("Body");
+        collection.serialized_files[0].file.objects[0].byte_size = 1;
+        let model = model_with_texture_property("_MainTex", 81);
+        let error = SceneTextureSet::from_model(
+            &collection,
+            &model,
+            ImageFormat::Png,
+            SceneTextureLimits {
+                maximum_total_encoded_bytes: 0,
+                ..SceneTextureLimits::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("0 byte budget"));
+    }
+
+    #[test]
     fn writes_files_without_clobbering_what_is_already_there() {
         let collection = texture_collection("Body");
         let model = model_with_texture_property("_MainTex", 81);
@@ -599,7 +802,33 @@ mod tests {
 
         // A second export into the same directory leaves the file alone.
         assert!(set.write_to_directory(&directory).unwrap().is_empty());
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".assetstudio-texture-")
+        }));
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn removes_an_abandoned_texture_temporary_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "assetstudio-scene-texture-abort-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let temporary_path;
+        {
+            let mut temporary = TextureTemporaryFile::create(&directory).unwrap();
+            temporary.file_mut().write_all(b"incomplete").unwrap();
+            temporary_path = temporary.path.clone();
+            assert!(temporary_path.exists());
+        }
+        assert!(!temporary_path.exists());
+        std::fs::remove_dir(&directory).unwrap();
     }
 
     /// A 1x1 RGBA32 `Texture2D` with inline pixel data.
