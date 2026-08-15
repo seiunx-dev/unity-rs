@@ -188,15 +188,19 @@ def wheel_tree(studio: Any, obj: Any) -> Any:
     return narrow_floats(json.loads(document))
 
 
-def assert_double_precision(path: Path) -> None:
+def assert_double_precision(path: Path) -> int:
     """Checks the one field `narrow_floats` would have hidden a loss in.
 
     Read straight from the file rather than from the compared manifest, whose
     floats have deliberately been narrowed. The fixture stores -0.1 in a
     `double`, which no float holds exactly, so a reader that widened from a
     float would produce -0.10000000149011612 -- and this asserts it does not.
+
+    Returns how many fields were really compared. Most fixtures carry none, so
+    the requirement that some fixture does is run-wide and lives in `main`.
     """
     studio = AssetStudio(path)
+    compared = 0
     for obj in studio.objects():
         try:
             document = json.loads(
@@ -206,6 +210,8 @@ def assert_double_precision(path: Path) -> None:
             continue
         if isinstance(document, dict) and "Double" in document:
             assert document["Double"] == -0.1, document["Double"]
+            compared += 1
+    return compared
 
 
 def cases() -> list[tuple[str, bytes]]:
@@ -249,7 +255,7 @@ def drop_undetermined_names(expected: dict[str, Any], actual: dict[str, Any]) ->
     return skipped
 
 
-def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, int]:
+def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, int, int]:
     if len(data) < UNITYPY_MINIMUM_SNIFF_BYTES:
         return (
             [
@@ -259,13 +265,14 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, in
             ],
             0,
             0,
+            0,
         )
     path = directory / name
     path.write_bytes(data)
 
     expected = unitypy_manifest(path)
     actual = wheel_manifest(path)
-    assert_double_precision(path)
+    compared_doubles = assert_double_precision(path)
     # A tree row that is None on both sides compares equal while proving
     # nothing, so the run reports how many were really compared and main()
     # requires at least one.
@@ -277,8 +284,13 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, in
     )
     skipped = drop_undetermined_names(expected, actual)
     if expected == actual:
-        return ([], skipped, compared_trees)
-    return ([f"{name}:\n  UnityPy: {expected}\n  wheel:   {actual}"], skipped, compared_trees)
+        return ([], skipped, compared_trees, compared_doubles)
+    return (
+        [f"{name}:\n  UnityPy: {expected}\n  wheel:   {actual}"],
+        skipped,
+        compared_trees,
+        compared_doubles,
+    )
 
 
 def main() -> None:
@@ -286,12 +298,16 @@ def main() -> None:
     checked = 0
     skipped_names = 0
     compared_trees = 0
+    compared_doubles = 0
     with tempfile.TemporaryDirectory(prefix="assetstudio-unitypy-oracle-") as directory:
         for name, data in cases():
-            case_failures, case_skipped, case_trees = compare(name, data, Path(directory))
+            case_failures, case_skipped, case_trees, case_doubles = compare(
+                name, data, Path(directory)
+            )
             failures.extend(case_failures)
             skipped_names += case_skipped
             compared_trees += case_trees
+            compared_doubles += case_doubles
             checked += 1
 
     if failures:
@@ -307,9 +323,19 @@ def main() -> None:
             "UnityPy differential: no TypeTree was compared, so the tree rows "
             "proved nothing; a fixture with an embedded tree is required"
         )
+    # The same shape one level down: `assert_double_precision` walks every
+    # fixture but only one carries the field, so a fixture change that dropped
+    # it would leave the loop comparing nothing and still passing.
+    if compared_doubles == 0:
+        raise SystemExit(
+            "UnityPy differential: no double field was compared, so the "
+            "narrowing check proved nothing; a fixture carrying a non-float "
+            "double is required"
+        )
     summary = (
         f"UnityPy differential: {checked} fixtures agree"
-        f" ({compared_trees} TypeTree object(s) compared)"
+        f" ({compared_trees} TypeTree object(s) compared,"
+        f" {compared_doubles} double field(s) compared)"
     )
     if skipped_names:
         summary += (
