@@ -509,6 +509,11 @@ struct ShaderProgram {
     entries: Vec<ShaderProgramEntry>,
     entries_by_segment: Vec<usize>,
     sub_programs: Vec<Option<ShaderSubProgram>>,
+    /// Why an entry has no decoded program, when that was tolerated.
+    ///
+    /// Kept so the exported text can report the mismatch it actually hit
+    /// rather than a guess at the cause.
+    undecoded: Vec<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -647,10 +652,18 @@ impl ShaderProgram {
             })?;
         entries_by_segment.extend(0..count);
         entries_by_segment.sort_unstable_by_key(|&index| (entries[index].segment, index));
+        let mut undecoded = Vec::new();
+        undecoded.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate {count} Shader undecoded-entry slots: {error}"
+            ))
+        })?;
+        undecoded.resize_with(count, || None);
         Ok(Self {
             entries,
             entries_by_segment,
             sub_programs,
+            undecoded,
         })
     }
 
@@ -694,9 +707,24 @@ impl ShaderProgram {
                 // shader would throw away the properties, sub-shaders, passes
                 // and render state, all of which parsed correctly; guessing at
                 // the record would put invented programs in the output. So the
-                // entry stays undecoded and the exported text says so where
-                // the listing would have been.
-                Err(_) if undecodable_programs_expected => {}
+                // entry stays undecoded and the exported text says so.
+                //
+                // Only a parse mismatch is absorbed, and the message it failed
+                // with is carried into that text rather than replaced by an
+                // assumption about the cause. A declared refusal -- an unknown
+                // record version, an unknown GPU program type -- still fails
+                // the shader, because that says something about the input this
+                // reader must not paper over.
+                //
+                // Running off the end counts as a mismatch here. The record is
+                // a slice of memory this function was handed, so the only I/O
+                // it can perform is reading past that slice, which is what a
+                // wrong layout does; no filesystem failure can reach this arm.
+                Err(error @ (Error::InvalidData(_) | Error::Io(_)))
+                    if undecodable_programs_expected =>
+                {
+                    self.undecoded[index] = Some(error.to_string());
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1595,30 +1623,31 @@ fn convert_serialized_sub_programs(
                     .get(platform_index)
                     .and_then(|program| program.sub_programs.get(blob_index))
                     .and_then(Option::as_ref);
-                match decoded {
-                    Some(decoded) => {
-                        if decoded.program_type != i32::from(sub_program.gpu_program_type) {
-                            return Err(Error::invalid_data(format!(
-                                "Shader blob index {} metadata type {} disagrees with decoded type {}",
-                                sub_program.blob_index,
-                                sub_program.gpu_program_type,
-                                decoded.program_type
-                            )));
-                        }
-                        export_shader_sub_program(decoded, output)?;
+                if let Some(decoded) = decoded {
+                    if decoded.program_type != i32::from(sub_program.gpu_program_type) {
+                        return Err(Error::invalid_data(format!(
+                            "Shader blob index {} metadata type {} disagrees with decoded type {}",
+                            sub_program.blob_index,
+                            sub_program.gpu_program_type,
+                            decoded.program_type
+                        )));
                     }
+                    export_shader_sub_program(decoded, output)?;
+                } else {
                     // Said rather than left out. The reader knows this record
                     // exists and where it is; what it does not know is the
                     // shape Unity 2022 gave it. A listing silently missing from
                     // an otherwise complete shader would read as a shader that
                     // has no program.
-                    None => {
-                        output.push_fmt(format_args!(
-                            "// blob index {} was not decoded: the compiled-program record\n\
-                             // layout changed in Unity 2022 and is not implemented\n",
-                            sub_program.blob_index
-                        ))?;
-                    }
+                    let reason = programs
+                        .get(platform_index)
+                        .and_then(|program| program.undecoded.get(blob_index))
+                        .and_then(Option::as_deref)
+                        .unwrap_or("no program was supplied for this entry");
+                    output.push_fmt(format_args!(
+                        "// blob index {} was not decoded: {reason}\n",
+                        sub_program.blob_index
+                    ))?;
                 }
                 output.push_str("\n}\n")?;
             }
@@ -2993,6 +3022,7 @@ mod tests {
                 local_keywords: Vec::new(),
                 program_code: b"void main() {}".to_vec(),
             })],
+            undecoded: vec![None],
         }];
 
         let limits = ShaderReadLimits {
