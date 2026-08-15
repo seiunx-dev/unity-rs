@@ -29,7 +29,10 @@ The directory is anything holding the game's managed assemblies: a Mono build's
 version decides the engine prefix — `m_PathID` is 32-bit before Unity 5 — so it
 has to match the build. `--assembly <name>` narrows the walk, repeatable;
 without it every assembly is converted, which for a large game is tens of
-megabytes of JSON.
+megabytes of JSON. Every generated entry is restricted to that exact Unity
+version by default. `--unversioned` deliberately emits a cross-version fallback
+document and should only be used after the same layout has been verified on
+every version that will consume it.
 
 Then hand the document to any command that opens a collection:
 
@@ -56,6 +59,7 @@ it came from.
       "assembly": "Assembly-CSharp",
       "namespace": "Game",
       "class": "Stats",
+      "unity_version": "6000.3.0f1",
       "nodes": [
         { "level": 0, "type": "MonoBehaviour", "name": "Base" },
         { "level": 1, "type": "UInt8", "name": "m_Enabled", "meta_flags": 16384 },
@@ -70,10 +74,16 @@ Anything that can name a class and lay out its serialized fields can write
 this; the generator is one producer, not the format's owner. `assembly` matches
 with or without a `.dll` suffix, because a `MonoScript` in a shipped file
 spells it `Fwk` while a generator walking a directory spells it `Fwk.dll`.
-`unity_version` is optional and an entry without one applies to every version;
-`generated_for` is informational and the reader ignores it. A node needs
+`unity_version` is optional in the document format and an entry without one
+applies to every version. The generator writes it by default because the Unity
+version changes both the engine prefix and user-field layout; accepting that
+tree for another release would be a silent corruption risk. `--unversioned`
+is the explicit opt-out for a verified shared layout. `generated_for` remains
+an informational summary and the reader ignores it for matching. A node needs
 `level`, `type` and `name`, and `meta_flags` carries Unity's align bit
-(`0x4000`).
+(`0x4000`). A present `unity_version` must itself be a valid Unity version;
+malformed or non-string values are rejected rather than becoming an accidental
+global fallback.
 
 ## How a schema is checked
 
