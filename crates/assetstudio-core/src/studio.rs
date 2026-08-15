@@ -479,7 +479,7 @@ impl Studio {
     /// Materializes the whole scene as one Wavefront OBJ, with the material
     /// library it names and the textures that library references.
     ///
-    /// Distinct from [`Studio::read_mesh_obj`], which writes one mesh the way
+    /// Distinct from [`StudioObject::read_mesh_obj`], which writes one mesh the way
     /// the managed exporter does. This is the scene: every renderer placed in
     /// world space, and face references naming only the channels a mesh has.
     /// It existed only inside the CLI, so a library caller could reach the FBX
