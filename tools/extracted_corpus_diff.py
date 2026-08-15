@@ -337,6 +337,15 @@ def main() -> int:
                     # exported when all 34 were written and correct -- the alarm
                     # this arm exists to prevent, raised by the arm itself.
                     mine.setdefault(sanitized_name(stem) + path.suffix, path)
+                    # A `TextAsset` whose name already carries an extension is
+                    # written under that name here -- a Spine atlas stays
+                    # `x.atlas` -- while the extraction appends `.txt` to every
+                    # text asset regardless, giving `x.atlas.txt`. Only the
+                    # extensions this comparison does not otherwise handle are
+                    # offered, so an image is never matched to `<image>.txt`.
+                    if path.suffix not in (".obj", ".png", ".txt"):
+                        for spelling in (stem, sanitized_name(stem)):
+                            mine.setdefault(spelling + path.suffix + ".txt", path)
             if failed:
                 subprocess.run(["rm", "-rf", str(root)], check=True)
                 root.mkdir()
