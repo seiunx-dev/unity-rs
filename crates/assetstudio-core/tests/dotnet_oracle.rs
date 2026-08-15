@@ -388,6 +388,19 @@ fn mesh_fixtures() -> Vec<TemporaryFixture> {
             &synthetic_single_v22(43, 43, "2022.3.62f1", &compressed_only_mesh()),
         )
         .unwrap(),
+        // 6000.2 appends MeshLodInfo. The 6000.1 fixture above pins the low
+        // side of that gate: it carries no tail, and reading one there would
+        // run past the object.
+        TemporaryFixture::new(
+            "oracle-mesh-6000.3.assets",
+            &synthetic_single_v22(
+                43,
+                43,
+                "6000.3.12f1",
+                &mesh_payload_with_lod(None, None, false, true),
+            ),
+        )
+        .unwrap(),
     ]
 }
 
@@ -3091,6 +3104,35 @@ fn mesh_payload(
     tuanjie_revision: Option<u8>,
     compressed: bool,
 ) -> Vec<u8> {
+    mesh_payload_with_lod(stream, tuanjie_revision, compressed, false)
+}
+
+/// The `MeshLodInfo` tail Unity 6000.2 appends, spelled as the type tree a
+/// 6000.3 build writes for `Mesh` spells it.
+///
+/// The managed reader has this read commented out and does not require an
+/// object to be fully consumed, so it stops before the tail and still reports
+/// the same geometry. That is what makes it usable as the oracle here: if this
+/// reader walked the tail wrongly it would refuse the mesh, and the two would
+/// disagree.
+fn push_mesh_lod_info(output: &mut Vec<u8>) {
+    push_f32(output, 0.0); // m_LodSlope
+    push_f32(output, 0.0); // m_LodBias
+    push_i32(output, 1); // m_NumLevels
+    push_i32(output, 2); // one entry per sub-mesh
+    for start in [0_u32, 3] {
+        push_i32(output, 1); // one level
+        push_u32(output, start); // m_IndexStart
+        push_u32(output, 3); // m_IndexCount
+    }
+}
+
+fn mesh_payload_with_lod(
+    stream: Option<(u64, u32, &str)>,
+    tuanjie_revision: Option<u8>,
+    compressed: bool,
+    lod: bool,
+) -> Vec<u8> {
     let mut output = Vec::new();
     push_string(&mut output, "oracle-mesh");
     push_i32(&mut output, 1);
@@ -3198,6 +3240,9 @@ fn mesh_payload(
     push_string(&mut output, stream_path);
     if tuanjie_revision.is_some() {
         output.extend_from_slice(&[1, 0]);
+    }
+    if lod {
+        push_mesh_lod_info(&mut output);
     }
     output
 }
