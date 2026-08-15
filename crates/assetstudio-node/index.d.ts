@@ -23,7 +23,7 @@ export declare class AssetStudio {
    * Asynchronous for the same reason as the Oodle entry point: the callback
    * runs on the event loop while a worker waits for it.
    */
-  readFbxWithAclDecoder(decoder: AclCallback, maximumBytes?: number | undefined | null): Promise<Buffer>
+  readFbxWithAclDecoder(decoder: (request: AclDecodeRequest) => AclDecodedClip, maximumBytes?: number | undefined | null): Promise<Buffer>
   /**
    * Opens a path with any combination of the load options.
    *
@@ -42,7 +42,7 @@ export declare class AssetStudio {
    * The callback receives the compressed bytes and the exact expected output
    * length, and must return precisely that many bytes.
    */
-  static openWithOodle(path: string, decoder: OodleCallback, options?: OpenOptions | undefined | null): Promise<AssetStudio>
+  static openWithOodle(path: string, decoder: (input: Buffer, expectedLength: number) => Buffer, options?: OpenOptions | undefined | null): Promise<AssetStudio>
   /**
    * Opens a path on a libuv worker so container discovery does not block
    * the JavaScript event loop.
@@ -118,6 +118,13 @@ export declare class AssetStudio {
   /** Assembles the `GameObject` hierarchy across every loaded file. */
   scene(maximumGameObjects?: number | undefined | null): Array<SceneNode>
   /**
+   * Assembles the same hierarchy with all collection-wide budgets exposed.
+   *
+   * `scene(maximumGameObjects)` remains available for compatibility; this
+   * method adds component, child, material, bone, and hierarchy-edge limits.
+   */
+  sceneWithLimits(limits?: SceneLimits | undefined | null): Array<SceneNode>
+  /**
    * Writes the whole collection as static ASCII FBX 7.4.
    *
    * Ordinary and skinned renderer geometry, direct and hash-recovered bones
@@ -143,6 +150,21 @@ export declare class AssetStudio {
   readCubismExpression(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismDocument
   /** Reads a `CubismFadeMotionData` and writes its motion3.json. */
   readCubismFadeMotion(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismDocument
+  /** Reads one embedded-schema `CubismPosePart` component. */
+  readCubismPosePart(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismPosePart
+  /** Reads one embedded-schema Cubism display-info component. */
+  readCubismDisplayInfo(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismDisplayInfo
+  /** Projects one real Unity `AnimationClip` to Cubism motion3 JSON. */
+  readCubismClipMotion(fileIndex: number, pathId: bigint, targets?: CubismMotionTargets | undefined | null, forceBezier?: boolean | undefined | null, maximumBytes?: number | undefined | null): CubismClipMotion
+  /**
+   * Projects one ACL-backed Tuanjie `AnimationClip` on a worker.
+   *
+   * The JavaScript decoder receives only Core-validated, owned ACL input.
+   * Core then validates every returned time, binding index and value before
+   * the motion3 document is built. The worker is required so the callback
+   * can execute on the JavaScript event loop without deadlocking it.
+   */
+  readCubismClipMotionWithAclDecoder(fileIndex: number, pathId: bigint, decoder: (request: AclDecodeRequest) => AclDecodedClip, targets?: CubismMotionTargets | undefined | null, forceBezier?: boolean | undefined | null, maximumBytes?: number | undefined | null): Promise<CubismClipMotion>
   /**
    * Enumerates the `GameObject` branches a split-objects export would write.
    *
@@ -216,8 +238,12 @@ export declare class AssetStudio {
    *
    * `materialLibraryName` is what the OBJ's `mtllib` line will say, so it
    * has to be the name the library is actually written under.
+   * `textureFormat` defaults to PNG and accepts the same format names as
+   * the Core and Python surfaces. `textureLimits` independently bounds the
+   * texture count, total encoded bytes and each texture's payload, decoded
+   * output and decoder workspace.
    */
-  readModelObj(materialLibraryName?: string | undefined | null, maximumBytes?: number | undefined | null): ModelObj
+  readModelObj(materialLibraryName?: string | undefined | null, maximumBytes?: number | undefined | null, textureFormat?: string | undefined | null, textureLimits?: ModelTextureLimits | undefined | null): ModelObj
   /**
    * Writes the collection as ASCII FBX with its animations and returns the
    * material textures it references.
@@ -225,9 +251,11 @@ export declare class AssetStudio {
    * The FBX names each texture by file name, so the returned files have to
    * be written beside it for those references to resolve. They come back
    * rather than being written because this call has no directory of its own
-   * and where they land is the caller's decision.
+   * and where they land is the caller's decision. `textureFormat` defaults
+   * to PNG and accepts the same format names as the Core and Python surfaces.
+   * `textureLimits` has the same meaning as on `readModelObj`.
    */
-  readFbxWithTextures(maximumBytes?: number | undefined | null): TexturedFbx
+  readFbxWithTextures(maximumBytes?: number | undefined | null, textureFormat?: string | undefined | null, textureLimits?: ModelTextureLimits | undefined | null): TexturedFbx
   /**
    * Inspects an `AnimationClip`'s ACL blob without decompressing it.
    *
@@ -377,6 +405,28 @@ export interface BuildSettings {
   scenes?: Array<string>
 }
 
+/** One real Unity `AnimationClip` projected to Cubism motion3 JSON. */
+export interface CubismClipMotion {
+  fileIndex: number
+  pathId: bigint
+  name: string
+  duration: number
+  fps: number
+  curveCount: number
+  keyframeCount: number
+  eventCount: number
+  json: Buffer
+}
+
+/** One embedded-schema Cubism display-info component. */
+export interface CubismDisplayInfo {
+  pathId: bigint
+  name: string
+  displayName?: string
+  /** `displayName` when it is non-empty, otherwise `name`. */
+  effectiveName: string
+}
+
 /**
  * One Cubism document produced from a single behaviour.
  *
@@ -392,6 +442,19 @@ export interface CubismDocument {
    * motion. Zero for a document that has no such notion.
    */
   entryCount: number
+}
+
+/** Parameter and part identifiers used to resolve `AnimationClip` bindings. */
+export interface CubismMotionTargets {
+  parameters?: Array<string>
+  parts?: Array<string>
+}
+
+/** One embedded-schema `CubismPosePart` component. */
+export interface CubismPosePart {
+  pathId: bigint
+  groupIndex: number
+  links: Array<string>
 }
 
 /** One object the exporter could not write, and why. */
@@ -537,6 +600,13 @@ export interface ModelObj {
   skipped: Array<string>
 }
 
+/** Caller-configurable budgets for textures returned beside a model. */
+export interface ModelTextureLimits {
+  maximumTextures?: number
+  maximumTotalEncodedBytes?: number
+  maximumSingleTextureBytes?: number
+}
+
 /** A `MonoBehaviour` read as JSON, and which tree it was read through. */
 export interface MonoBehaviourJson {
   json: Buffer
@@ -640,6 +710,16 @@ export interface RgbaImage {
    * been flipped.
    */
   pixels: Buffer
+}
+
+/** Caller-configurable collection-wide scene assembly budgets. */
+export interface SceneLimits {
+  maximumGameObjects?: number
+  maximumTotalComponents?: number
+  maximumTotalTransformChildReferences?: number
+  maximumTotalMaterialReferences?: number
+  maximumTotalBoneReferences?: number
+  maximumHierarchyEdges?: number
 }
 
 /**

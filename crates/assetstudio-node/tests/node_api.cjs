@@ -24,6 +24,12 @@ function i64(value) {
   return output
 }
 
+function f32(value) {
+  const output = Buffer.alloc(4)
+  output.writeFloatLE(value)
+  return output
+}
+
 function align(buffer, alignment) {
   const padding = (alignment - (buffer.length % alignment)) % alignment
   return padding === 0 ? buffer : Buffer.concat([buffer, Buffer.alloc(padding)])
@@ -80,6 +86,13 @@ function syntheticTextAsset() {
     Buffer.from('hello node'),
   ])
   return finishV22Asset(49, payload)
+}
+
+function syntheticGameObject() {
+  return finishV22Asset(
+    1,
+    Buffer.concat([i32(0), i32(0), alignedString('Node Root')]),
+  )
 }
 
 // A 2x2 RGBA32 Texture2D. Rows are stored bottom-up, so the first pixel in the
@@ -150,6 +163,274 @@ function syntheticTexture2d() {
   pad4()
   push(i32(TEXTURE_PIXELS.length), TEXTURE_PIXELS)
   return finishV22Asset(28, payload)
+}
+
+function pptr(pathId) {
+  return Buffer.concat([i32(0), i64(pathId)])
+}
+
+function f32s(values) {
+  return Buffer.concat(values.map(f32))
+}
+
+function texture2dPayload(name, width, height, pixels) {
+  let payload = Buffer.concat([
+    alignedString(name),
+    i32(0),
+    Buffer.from([0, 0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    i32(width),
+    i32(height),
+    u32(pixels.length),
+    i32(0),
+    i32(4), // RGBA32
+    i32(1), // one mip
+    Buffer.from([0, 0, 0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    alignedString(''),
+    Buffer.from([0]),
+  ])
+  payload = align(payload, 4)
+  return Buffer.concat([
+    payload,
+    i32(0),
+    i32(1),
+    i32(2),
+    Buffer.alloc(24),
+    i32(0),
+    i32(0),
+    i32(0), // empty platform blob
+    i32(pixels.length),
+    pixels,
+  ])
+}
+
+function materialPayload(texturePathId) {
+  return Buffer.concat([
+    alignedString('node-material'),
+    i32(1),
+    i64(42),
+    i32(2),
+    alignedString('FOO'),
+    alignedString('BAR'),
+    i32(1),
+    alignedString('OLD'),
+    u32(3),
+    Buffer.from([1, 0, 0, 0]),
+    i32(2450),
+    i32(2),
+    alignedString('RenderType'),
+    alignedString('Opaque'),
+    alignedString('RenderType'),
+    alignedString('Cutout'),
+    i32(1),
+    alignedString('ShadowCaster'),
+    i32(1),
+    alignedString('_MainTex'),
+    pptr(texturePathId),
+    f32s([2, 3, 0.25, 0.5]),
+    i32(2),
+    alignedString('_Mode'),
+    i32(1),
+    alignedString('_Mode'),
+    i32(2),
+    i32(1),
+    alignedString('_Glossiness'),
+    f32(0.75),
+    i32(1),
+    alignedString('_Color'),
+    f32s([1, 0.5, 0.25, 1]),
+    i32(0),
+  ])
+}
+
+function modelGameObject() {
+  return Buffer.concat([
+    i32(3),
+    pptr(11),
+    pptr(21),
+    pptr(31),
+    i32(0),
+    alignedString('node model'),
+  ])
+}
+
+function modelTransform() {
+  return Buffer.concat([
+    pptr(1),
+    f32s([0, 0, 0.38268343, 0.9238795]),
+    f32s([2, 3, 4]),
+    f32s([2, 3, 4]),
+    i32(0),
+    pptr(0),
+  ])
+}
+
+function modelRenderer() {
+  let payload = Buffer.concat([
+    pptr(1),
+    Buffer.from([1, 2, 1, 0, 0, 0, 0, 0, 0, 0]),
+  ])
+  payload = align(payload, 4)
+  return align(Buffer.concat([
+    payload,
+    u32(0xffffffff),
+    i32(0), // renderer priority
+    Buffer.alloc(36), // lightmap indexes and two tiling/offset vectors
+    i32(1),
+    pptr(41),
+    Buffer.alloc(4), // static batch info
+    pptr(0),
+    pptr(0),
+    pptr(0),
+    Buffer.alloc(8), // sorting layer/id/order
+  ]), 4)
+}
+
+function emptyPackedFloat() {
+  return Buffer.concat([u32(0), f32(0), f32(0), i32(0), Buffer.alloc(4)])
+}
+
+function emptyPackedInt() {
+  return Buffer.concat([u32(0), i32(0), Buffer.alloc(4)])
+}
+
+function modelMesh() {
+  let payload = Buffer.concat([
+    alignedString('node triangle'),
+    i32(1),
+    ...[0, 3, 0, 0, 0, 3].map(u32),
+    Buffer.alloc(24),
+    i32(0),
+    i32(0),
+    i32(0),
+    u32(0),
+    i32(0),
+    i32(0),
+    i32(0),
+    i32(0),
+    i32(0),
+    Buffer.from([0, 1, 0, 0]),
+    i32(0),
+    i32(6),
+    Buffer.from([0, 0, 1, 0, 2, 0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    u32(3),
+    i32(5),
+    Buffer.from([0, 0, 0, 3]),
+    Buffer.alloc(16),
+    i32(36),
+  ])
+  for (const vertex of [[0, 0, 0], [1, 0, 0], [0, 1, 0]]) {
+    payload = Buffer.concat([payload, f32s(vertex)])
+  }
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    ...Array.from({ length: 4 }, emptyPackedFloat),
+    ...Array.from({ length: 3 }, emptyPackedInt),
+    emptyPackedFloat(),
+    ...Array.from({ length: 2 }, emptyPackedInt),
+    u32(0),
+    Buffer.alloc(24),
+    i32(0),
+    i32(0),
+    i32(0),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([payload, i32(0)])
+  payload = align(payload, 4)
+  payload = Buffer.concat([payload, Buffer.alloc(8)])
+  payload = align(payload, 4)
+  return Buffer.concat([payload, i64(0), u32(0), alignedString('')])
+}
+
+function finishV22Objects(objects, version = '2022.3.62f1') {
+  const classes = [...new Set(objects.map(({ classId }) => classId))]
+    .sort((left, right) => left - right)
+  let metadata = Buffer.concat([
+    Buffer.from(`${version}\0`, 'ascii'),
+    i32(13),
+    Buffer.from([0]),
+    i32(classes.length),
+    ...classes.flatMap((classId) => [
+      i32(classId),
+      Buffer.from([0, 0xff, 0xff]),
+      Buffer.alloc(16),
+    ]),
+  ])
+  let data = Buffer.alloc(0)
+  const records = []
+  for (const object of objects) {
+    data = align(data, 4)
+    records.push({
+      pathId: object.pathId,
+      offset: data.length,
+      size: object.payload.length,
+      typeIndex: classes.indexOf(object.classId),
+    })
+    data = Buffer.concat([data, object.payload])
+  }
+  metadata = Buffer.concat([metadata, i32(records.length)])
+  for (const record of records) {
+    metadata = align(Buffer.concat([Buffer.alloc(48), metadata]), 4).subarray(48)
+    metadata = Buffer.concat([
+      metadata,
+      i64(record.pathId),
+      i64(record.offset),
+      u32(record.size),
+      i32(record.typeIndex),
+    ])
+  }
+  metadata = Buffer.concat([
+    metadata,
+    i32(0),
+    i32(0),
+    i32(0),
+    Buffer.from([0]),
+  ])
+  const dataOffset = Math.ceil((48 + metadata.length) / 16) * 16
+  const header = Buffer.alloc(48)
+  header.writeUInt32BE(22, 8)
+  header.writeUInt32BE(metadata.length, 20)
+  header.writeBigInt64BE(BigInt(dataOffset + data.length), 24)
+  header.writeBigInt64BE(BigInt(dataOffset), 32)
+  return Buffer.concat([
+    header,
+    metadata,
+    Buffer.alloc(dataOffset - 48 - metadata.length),
+    data,
+  ])
+}
+
+function syntheticTexturedModel() {
+  return finishV22Objects([
+    { classId: 1, pathId: 1, payload: modelGameObject() },
+    { classId: 4, pathId: 11, payload: modelTransform() },
+    { classId: 33, pathId: 21, payload: Buffer.concat([pptr(1), pptr(51)]) },
+    { classId: 23, pathId: 31, payload: modelRenderer() },
+    { classId: 21, pathId: 41, payload: materialPayload(61) },
+    { classId: 43, pathId: 51, payload: modelMesh() },
+    {
+      classId: 28,
+      pathId: 61,
+      payload: texture2dPayload(
+        'node model texture',
+        1,
+        1,
+        Buffer.from([9, 8, 7, 255]),
+      ),
+    },
+  ])
 }
 
 function syntheticMonoScript() {
@@ -384,6 +665,208 @@ function syntheticCubismExpression() {
   return typeTreeAsset(114, nodes, payload)
 }
 
+function cubismStringNodes(name, level) {
+  return [
+    { type: 'string', name, level, align: true },
+    { type: 'Array', name: 'Array', level: level + 1, array: true, align: true },
+    { type: 'int', name: 'size', size: 4, level: level + 2 },
+    { type: 'char', name: 'data', size: 1, level: level + 2 },
+  ]
+}
+
+function cubismPptrNodes(name, target, level) {
+  return [
+    { type: `PPtr<${target}>`, name, size: 12, level },
+    { type: 'int', name: 'm_FileID', size: 4, level: level + 1 },
+    { type: 'SInt64', name: 'm_PathID', size: 8, level: level + 1 },
+  ]
+}
+
+function cubismMonoBehaviourNodes() {
+  return [
+    { type: 'MonoBehaviour', name: 'Base', level: 0 },
+    ...cubismPptrNodes('m_GameObject', 'GameObject', 1),
+    { type: 'UInt8', name: 'm_Enabled', size: 1, level: 1, align: true },
+    ...cubismPptrNodes('m_Script', 'MonoScript', 1),
+    ...cubismStringNodes('m_Name', 1),
+  ]
+}
+
+function cubismMonoBehaviourPayload(name) {
+  return Buffer.concat([
+    Buffer.alloc(12),
+    Buffer.from([1, 0, 0, 0]),
+    Buffer.alloc(12),
+    alignedString(name),
+  ])
+}
+
+function syntheticCubismPosePart() {
+  const nodes = [
+    ...cubismMonoBehaviourNodes(),
+    { type: 'int', name: 'GroupIndex', size: 4, level: 1 },
+    { type: 'vector', name: 'Link', level: 1 },
+    { type: 'Array', name: 'Array', level: 2, array: true, align: true },
+    { type: 'int', name: 'size', size: 4, level: 3 },
+    ...cubismStringNodes('data', 3),
+  ]
+  const payload = Buffer.concat([
+    cubismMonoBehaviourPayload('pose-part'),
+    i32(3),
+    i32(2),
+    alignedString('PartArmL'),
+    alignedString('PartArmR'),
+  ])
+  return typeTreeAsset(114, nodes, payload)
+}
+
+function syntheticCubismDisplayInfo() {
+  const nodes = [
+    ...cubismMonoBehaviourNodes(),
+    ...cubismStringNodes('Name', 1),
+    ...cubismStringNodes('DisplayName', 1),
+  ]
+  const payload = Buffer.concat([
+    cubismMonoBehaviourPayload('display-info'),
+    alignedString('ParamAngleX'),
+    alignedString('Head angle'),
+  ])
+  return typeTreeAsset(114, nodes, payload)
+}
+
+function emptyCubismHumanPose() {
+  const zeroXform = () => Buffer.alloc(10 * 4)
+  const emptyF32Array = () => i32(0)
+  const handPose = () => Buffer.concat([
+    zeroXform(),
+    emptyF32Array(),
+    Buffer.alloc(4 * 4),
+  ])
+  return Buffer.concat([
+    zeroXform(),
+    Buffer.alloc(7 * 4),
+    i32(0),
+    handPose(),
+    handPose(),
+    emptyF32Array(),
+    i32(0),
+  ])
+}
+
+function emptyCubismMuscle(acl = Buffer.alloc(0)) {
+  const zeroXform = () => Buffer.alloc(10 * 4)
+  const emptyF32Array = () => i32(0)
+  return align(Buffer.concat([
+    emptyCubismHumanPose(),
+    zeroXform(),
+    zeroXform(),
+    zeroXform(),
+    zeroXform(),
+    Buffer.alloc(3 * 4),
+    i32(0), // streamed words
+    u32(0), // streamed curve count
+    i32(0), // dense frame count
+    u32(0), // dense curve count
+    f32(30),
+    f32(0),
+    emptyF32Array(), // dense samples
+    emptyF32Array(), // constant samples
+    acl,
+    f32(0), // start time
+    f32(1), // stop time
+    Buffer.alloc(4 * 4), // orientation, level, cycle, angular speed
+    i32(0), // indexes
+    i32(0), // value deltas
+    emptyF32Array(), // reference pose
+    Buffer.alloc(11), // muscle flags
+  ]), 4)
+}
+
+// A standard Unity 2022.2 AnimationClip with a muscle clip but no curves.
+// It is intentionally empty at the binding layer: the Node call still has to
+// parse the complete object and produce a valid motion3 document.
+function syntheticCubismAnimationClip() {
+  const payload = align(Buffer.concat([
+    alignedString('node-motion'),
+    Buffer.from([0, 1, 1]),
+    Buffer.alloc(1),
+    Buffer.alloc(7 * 4), // all seven ordinary curve lists are empty
+    f32(60),
+    i32(2),
+    Buffer.alloc(6 * 4), // AABB
+    u32(0), // muscle clip size is advisory on the standard Unity path
+    emptyCubismMuscle(),
+    i32(0), // generic bindings
+    i32(0), // PPtr curve mapping
+    Buffer.from([1, 0, 0, 0]), // 2018.3+ root/motion flags, aligned
+    i32(0), // events
+  ]), 4)
+  return finishV22Asset(74, payload, '2022.2.0f1')
+}
+
+function fnv1a32(bytes) {
+  let hash = 2_166_136_261
+  for (const byte of bytes) {
+    hash = Math.imul((hash ^ byte) >>> 0, 16_777_619) >>> 0
+  }
+  return hash
+}
+
+// A structurally valid, empty ACL 2.x `compressed_tracks` container. The
+// decoder payload is irrelevant to this bridge test; Core validates the size,
+// tag, version, algorithm, track shape and hash before JavaScript sees it.
+function syntheticAclTracks() {
+  const tracks = Buffer.alloc(32)
+  tracks.writeUInt32LE(tracks.length, 0)
+  tracks.writeUInt32LE(0xac11ac11, 8)
+  tracks.writeUInt16LE(10, 12)
+  tracks.writeUInt8(0, 14) // uniformly sampled algorithm
+  tracks.writeUInt8(0, 15) // float1f tracks
+  tracks.writeUInt32LE(0, 16)
+  tracks.writeUInt32LE(0, 20)
+  tracks.writeFloatLE(30, 24)
+  tracks.writeUInt32LE(0, 28)
+  tracks.writeUInt32LE(fnv1a32(tracks.subarray(8)), 4)
+  return tracks
+}
+
+// Tuanjie 2022.3.55t4 stores the muscle block in little-endian m_AnimData and
+// adds ACL tracks, a declared curve count, and the fast-sample flag.
+function syntheticCubismAclAnimationClip() {
+  const tracks = syntheticAclTracks()
+  const acl = Buffer.concat([
+    u32(0), // frame count
+    u32(0), // bone count
+    f32(30),
+    u32(0), // declared curve count
+    i32(tracks.length),
+    tracks,
+    i32(0), // decoder map
+    Buffer.from([1]), // fast sample mode, not aligned before 2022.3.61
+  ])
+  const embedded = emptyCubismMuscle(acl)
+  const payload = align(Buffer.concat([
+    alignedString('node-acl-motion'),
+    Buffer.from([0, 1, 1]),
+    Buffer.alloc(1),
+    Buffer.alloc(4 * 4), // rotation, compressed, float and PPtr curve lists
+    f32(60),
+    i32(2),
+    Buffer.alloc(6 * 4),
+    u32(embedded.length),
+    i32(embedded.length),
+    embedded,
+    i64(0),
+    u32(0),
+    alignedString(''), // StreamingInfo
+    i32(0), // generic bindings
+    i32(0), // PPtr curve mapping
+    Buffer.from([1, 0, 0, 0]),
+    i32(0), // events
+  ]), 4)
+  return finishV22Asset(74, payload, '2022.3.55t4')
+}
+
 function syntheticTypeTreeIntAsset() {
   const payload = i32(42)
   const strings = Buffer.from('int\0value\0', 'ascii')
@@ -485,6 +968,85 @@ const decodedTexture = textureStudio.readTexture(0, 7n)
 assert.equal(decodedTexture.width, 2)
 assert.equal(decodedTexture.height, 2)
 assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
+
+// Model texture encoding is a public Node option, not a PNG-only wrapper over
+// Core. This fixture has a real Renderer -> Material -> Texture2D chain so the
+// assertion cannot pass merely because the method accepted another argument.
+{
+  const modelInput = syntheticTexturedModel()
+  const modelStudio = addon.AssetStudio.fromBuffer(
+    modelInput,
+    'textured-model.assets',
+    modelInput.length,
+  )
+  const modelScene = modelStudio.scene()
+  assert.equal(modelScene.length, 1)
+  assert.equal(modelScene[0].hasMeshRenderer, true)
+  assert.match(modelStudio.readMeshObj(0, 51n).toString('utf8'), /^g node triangle/m)
+  const rawModel = modelStudio.readModelObj(undefined, 128 * 1024, 'raw-rgba')
+  assert.equal(rawModel.textures.length, 1)
+  assert.match(rawModel.textures[0].fileName, /\.rgba$/)
+  assert.equal(
+    Buffer.from(rawModel.textures[0].data).subarray(0, 16).toString('ascii'),
+    'HARUKI_RGBAIR_V1',
+  )
+  assert.throws(
+    () => modelStudio.readModelObj(
+      undefined,
+      128 * 1024,
+      'raw-rgba',
+      { maximumTextures: 0 },
+    ),
+    /more than 0 textures/i,
+  )
+  assert.throws(
+    () => modelStudio.readFbxWithTextures(
+      128 * 1024,
+      'raw-rgba',
+      { maximumTotalEncodedBytes: rawModel.textures[0].data.length - 1 },
+    ),
+    /byte budget/i,
+  )
+  const limitedModel = modelStudio.readModelObj(
+    undefined,
+    128 * 1024,
+    'raw-rgba',
+    { maximumSingleTextureBytes: rawModel.textures[0].data.length - 1 },
+  )
+  assert.equal(limitedModel.textures.length, 0)
+  assert.equal(limitedModel.skipped.length, 1)
+  assert.match(limitedModel.skipped[0], /limit/i)
+  assert.throws(
+    () => modelStudio.readModelObj(
+      undefined,
+      128 * 1024,
+      'png',
+      { maximumTotalEncodedBytes: -1 },
+    ),
+    /maximumTotalEncodedBytes must be non-negative/i,
+  )
+
+  const texturedFbx = modelStudio.readFbxWithTextures(128 * 1024, 'TGA')
+  assert.equal(texturedFbx.textures.length, 1)
+  assert.match(texturedFbx.textures[0].fileName, /\.tga$/)
+  const tga = Buffer.from(texturedFbx.textures[0].data)
+  assert.equal(tga[2], 2)
+  assert.equal(tga.readUInt16LE(12), 1)
+  assert.equal(tga.readUInt16LE(14), 1)
+  assert.equal(tga[16], 32)
+  assert.ok(
+    Buffer.from(texturedFbx.fbx).includes(
+      Buffer.from(texturedFbx.textures[0].fileName),
+    ),
+  )
+
+  const defaultModel = modelStudio.readModelObj(undefined, 128 * 1024)
+  assert.match(defaultModel.textures[0].fileName, /\.png$/)
+  assert.deepEqual(
+    Buffer.from(defaultModel.textures[0].data).subarray(0, 8),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  )
+}
 
 async function testAsyncWorkers() {
   const asyncStudio = await addon.AssetStudio.fromBufferAsync(
@@ -619,6 +1181,53 @@ testAsyncWorkers().catch((error) => {
   assert.throws(() => cubismStudio.readCubismFadeMotion(0, 11n))
 }
 
+// The remaining direct Cubism readers. Whole-package materialization already
+// carried pose/display documents, but without these methods Node callers could
+// not inspect one component, and clip motion had no Node entry point at all.
+{
+  const cubismStudio = addon.AssetStudio.fromBuffers([
+    { name: 'pose.assets', data: syntheticCubismPosePart() },
+    { name: 'display.assets', data: syntheticCubismDisplayInfo() },
+    { name: 'motion.assets', data: syntheticCubismAnimationClip() },
+  ])
+
+  const pose = cubismStudio.readCubismPosePart(0, 11n)
+  assert.strictEqual(pose.pathId, 11n)
+  assert.strictEqual(pose.groupIndex, 3)
+  assert.deepStrictEqual(pose.links, ['PartArmL', 'PartArmR'])
+
+  const display = cubismStudio.readCubismDisplayInfo(1, 11n)
+  assert.strictEqual(display.pathId, 11n)
+  assert.strictEqual(display.name, 'ParamAngleX')
+  assert.strictEqual(display.displayName, 'Head angle')
+  assert.strictEqual(display.effectiveName, 'Head angle')
+
+  const motion = cubismStudio.readCubismClipMotion(
+    2,
+    7n,
+    { parameters: [], parts: [] },
+    false,
+  )
+  assert.strictEqual(motion.fileIndex, 2)
+  assert.strictEqual(motion.pathId, 7n)
+  assert.strictEqual(motion.name, 'node-motion')
+  assert.strictEqual(motion.duration, 1)
+  assert.strictEqual(motion.fps, 60)
+  assert.strictEqual(motion.curveCount, 0)
+  assert.strictEqual(motion.keyframeCount, 0)
+  assert.strictEqual(motion.eventCount, 0)
+  const motionDocument = JSON.parse(motion.json.toString('utf8'))
+  assert.strictEqual(motionDocument.Version, 3)
+  assert.strictEqual(motionDocument.Meta.Duration, 1)
+  assert.strictEqual(motionDocument.Meta.Fps, 60)
+  assert.deepStrictEqual(motionDocument.Curves, [])
+
+  assert.throws(() => cubismStudio.readCubismPosePart(1, 11n))
+  assert.throws(() => cubismStudio.readCubismDisplayInfo(0, 11n))
+  assert.throws(() => cubismStudio.readCubismClipMotion(0, 11n))
+  assert.throws(() => cubismStudio.readCubismClipMotion(2, 7n, undefined, false, 1))
+}
+
 console.log('node api: additional readers ok')
 
 // PlayerSettings identity and the Unity version override.
@@ -685,6 +1294,26 @@ console.log('node api: settings and version override ok')
     { name: 'text.assets', data: syntheticTextAsset() },
   ])
   assert.deepEqual(studioForScene.scene(), [])
+
+  const populatedScene = addon.AssetStudio.fromBuffers([
+    { name: 'scene.assets', data: syntheticGameObject() },
+  ])
+  const legacyNodes = populatedScene.scene(1)
+  const limitedNodes = populatedScene.sceneWithLimits({
+    maximumGameObjects: 1,
+    maximumTotalComponents: 0,
+    maximumTotalTransformChildReferences: 0,
+    maximumTotalMaterialReferences: 0,
+    maximumTotalBoneReferences: 0,
+    maximumHierarchyEdges: 0,
+  })
+  assert.deepEqual(limitedNodes, legacyNodes)
+  assert.equal(limitedNodes.length, 1)
+  assert.equal(limitedNodes[0].name, 'Node Root')
+  assert.throws(
+    () => populatedScene.sceneWithLimits({ maximumGameObjects: 0 }),
+    /GameObject|limit/i,
+  )
 }
 
 console.log('node api: multi-buffer, resource range and scene ok')
@@ -826,9 +1455,17 @@ console.log('node api: animated fbx and live2d materialization ok')
     { name: 'text.assets', data: syntheticTextAsset() },
   ])
   assert.throws(() => barren.readFbxWithTextures())
+  assert.throws(
+    () => barren.readFbxWithTextures(undefined, 'not-an-image-format'),
+    /image format/i,
+  )
   // The scene OBJ, which existed only inside the CLI. No renderable geometry
   // is refused rather than written as an empty scene, same as the FBX.
   assert.throws(() => barren.readModelObj())
+  assert.throws(
+    () => barren.readModelObj(undefined, undefined, 'not-an-image-format'),
+    /image format/i,
+  )
   // A TextAsset is not an AnimationClip, so asking for its ACL blob is
   // refused rather than answered with zeroes.
   const objects = barren.objectPage(0)
@@ -928,6 +1565,54 @@ testOodleInjection().catch((error) => {
 // ACL decoder injection. Core ships no ACL decoder, so a caller supplies one
 // and Core validates whatever it returns.
 async function testAclInjection() {
+  const aclInput = syntheticCubismAclAnimationClip()
+  const aclStudio = addon.AssetStudio.fromBuffer(
+    aclInput,
+    'tuanjie-acl.assets',
+    aclInput.length,
+  )
+  let motionCalls = 0
+  const motion = await aclStudio.readCubismClipMotionWithAclDecoder(
+    0,
+    7n,
+    (request) => {
+      motionCalls += 1
+      assert.strictEqual(request.frameCount, 0)
+      assert.strictEqual(request.boneCount, 0)
+      assert.strictEqual(request.sampleRate, 30)
+      assert.strictEqual(request.declaredCurveCount, 0)
+      assert.strictEqual(request.useFastSampleMode, true)
+      assert.strictEqual(request.compressedTracks.length, 32)
+      assert.strictEqual(request.compressedTracks.readUInt32LE(8), 0xac11ac11)
+      assert.deepStrictEqual(request.decoderMap, [])
+      return {
+        times: [],
+        bindingIndices: [],
+        values: [],
+        followingCurveOffset: 0,
+      }
+    },
+    { parameters: [], parts: [] },
+    false,
+  )
+  assert.strictEqual(motionCalls, 1)
+  assert.strictEqual(motion.name, 'node-acl-motion')
+  assert.strictEqual(motion.duration, 1)
+  assert.strictEqual(motion.curveCount, 0)
+  assert.strictEqual(JSON.parse(motion.json.toString('utf8')).Meta.Fps, 60)
+
+  // The bridge does not trust the callback: one time for a zero-frame clip is
+  // structurally wrong and Core must reject it before it reaches the writer.
+  await assert.rejects(
+    aclStudio.readCubismClipMotionWithAclDecoder(0, 7n, () => ({
+      times: [0],
+      bindingIndices: [],
+      values: [],
+      followingCurveOffset: 0,
+    })),
+    /returned 1 times|0 declared frames/i,
+  )
+
   const barren = addon.AssetStudio.fromBuffers([
     { name: 'text.assets', data: syntheticTextAsset() },
   ])
