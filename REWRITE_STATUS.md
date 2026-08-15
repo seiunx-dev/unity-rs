@@ -29,7 +29,7 @@
 | Rust Core | Beta，主流程可用 | 主要容器、SerializedFile、常见资产、场景、动画和导出链路已实现；长尾格式继续补齐 |
 | Python | Beta，主要目标接口 | 直接绑定 Core，覆盖加载、枚举、资源读取、主要资产读取、FBX、Live2D、导出和解包 |
 | CLI | Beta | inspect/info/list/scene、export/extract、FBX、Animator/SplitObjects、Live2D 已接入 |
-| Node.js | 可选 Preview/Beta 子集 | 同步与 Promise worker API 已覆盖加载、枚举及主要读取路径；专用资产接口仍少于 Python |
+| Node.js | 可选 Preview/Beta 子集 | 同步与 Promise worker API 已覆盖加载、枚举及主要读取路径；加载选项（Unity 版本、UnityCN 密钥、失败容忍策略、输入上限）可组合传入，Live2D 包连同 physics/pose/display-info 与 diagnostics 一起返回，模型导出（场景 OBJ 与带贴图的 FBX）与 Python 等价 |
 | .NET 运行时退役 | 尚未完成 | 公开 Rust/Python/Node 不依赖 .NET；C# 仍用于差分 oracle 和格式核验 |
 
 这些状态是风险分级，不是按代码行数计算的完成百分比。
