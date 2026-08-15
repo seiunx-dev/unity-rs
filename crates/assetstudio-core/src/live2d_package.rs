@@ -514,6 +514,34 @@ fn build_live2d_packages_inner<'a>(
 }
 
 /// Materializes planned MOC, manifest, and mip-zero PNG files under cumulative limits.
+/// Decodes one package texture, saying which budget ran out when one does.
+///
+/// The ceiling handed to the decoder is usually what is left of the whole
+/// set's budget rather than a statement about textures, so a bare decode error
+/// reports an arbitrary-looking number the caller never chose: what they need
+/// to know is that the total ran out, not that this one texture was too big.
+fn decode_package_texture(
+    texture: &Live2dPackageTexture,
+    texture_limits: TextureReadLimits,
+    remaining: u64,
+    limits: Live2dPackageMaterializeLimits,
+) -> Result<crate::texture::RgbaImage> {
+    texture
+        .texture
+        .decode_mip_rgba8(0, texture_limits)
+        .map_err(|error| {
+            if remaining < limits.texture.maximum_output_bytes {
+                Error::invalid_data(format!(
+                    "materializing Live2D textures exhausted the {} byte total budget with \
+                     {remaining} bytes left: {error}",
+                    limits.maximum_total_bytes
+                ))
+            } else {
+                error
+            }
+        })
+}
+
 pub fn materialize_live2d_packages(
     set: Live2dPackageSet,
     limits: Live2dPackageMaterializeLimits,
@@ -552,7 +580,7 @@ pub fn materialize_live2d_packages(
                 maximum_output_bytes: limits.texture.maximum_output_bytes.min(remaining),
                 ..limits.texture
             };
-            let decoded = texture.texture.decode_mip_rgba8(0, texture_limits)?;
+            let decoded = decode_package_texture(&texture, texture_limits, remaining, limits)?;
             let png =
                 materialize_package_file(&mut total, limits, "Live2D texture PNG", |output| {
                     write_rgba_image(
@@ -3719,6 +3747,28 @@ mod tests {
             materialize_live2d_packages(set, limits),
             Err(crate::Error::InvalidData(_))
         ));
+
+        // A total budget that runs out mid-texture has to say so. The ceiling
+        // the decoder is handed is whatever is left of the set's budget, so
+        // the bare decode error names a number the caller never chose and
+        // cannot act on -- which is exactly how a corpus run was misread as a
+        // texture problem when the case had simply under-declared its budget.
+        // Past the MOC and manifest, short of the decoded texture: computed
+        // from what this package actually wrote, so the case stays on the
+        // texture step if the manifest's wording ever changes length.
+        let budget = u64::try_from(package.moc.len() + package.manifest.len() + 1).unwrap();
+        let set = build_live2d_packages(&collection, Live2dPackageLimits::default()).unwrap();
+        let limits = Live2dPackageMaterializeLimits {
+            maximum_total_bytes: budget,
+            ..Live2dPackageMaterializeLimits::default()
+        };
+        let error = materialize_live2d_packages(set, limits).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("exhausted the {budget} byte total budget")),
+            "{error}"
+        );
     }
 
     #[test]
