@@ -737,9 +737,18 @@ fn materialize_package_file(
     let mut output = FallibleBuffer::new(maximum, field);
     let write_result = write(&mut output);
     if output.limit_exceeded {
-        return Err(Error::invalid_data(format!(
-            "{field} exceeds {maximum} bytes"
-        )));
+        // This buffer only trips ahead of the writer's own ceiling when the
+        // set's total is what bound, since the writer is handed the file
+        // ceiling and checks it first. Saying which budget ran out is the
+        // difference between "raise this file's limit" and "raise the set's".
+        return Err(if remaining < limits.maximum_file_bytes {
+            Error::invalid_data(format!(
+                "{field} exhausted the {} byte total budget with {remaining} bytes left",
+                limits.maximum_total_bytes
+            ))
+        } else {
+            Error::invalid_data(format!("{field} exceeds {maximum} bytes"))
+        });
     }
     let written = write_result?;
     let actual = u64::try_from(output.bytes.len())
@@ -3728,25 +3737,34 @@ mod tests {
         assert!(package.eye_blink_parameters.is_empty());
         assert!(package.lip_sync_parameters.is_empty());
 
+        // The two budgets fail differently on purpose: one says raise this
+        // file's ceiling, the other says raise the whole set's, and a caller
+        // cannot act on the difference unless the message carries it.
         let set = build_live2d_packages(&collection, Live2dPackageLimits::default()).unwrap();
         let limits = Live2dPackageMaterializeLimits {
             maximum_file_bytes: 4,
             ..Live2dPackageMaterializeLimits::default()
         };
-        assert!(matches!(
-            materialize_live2d_packages(set, limits),
-            Err(crate::Error::InvalidData(_))
-        ));
+        // This one stops at the MOC, whose writer takes the file ceiling
+        // directly and already names it.
+        let error = materialize_live2d_packages(set, limits).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeding output limit 4"),
+            "{error}"
+        );
 
         let set = build_live2d_packages(&collection, Live2dPackageLimits::default()).unwrap();
         let limits = Live2dPackageMaterializeLimits {
             maximum_total_bytes: 5,
             ..Live2dPackageMaterializeLimits::default()
         };
-        assert!(matches!(
-            materialize_live2d_packages(set, limits),
-            Err(crate::Error::InvalidData(_))
-        ));
+        let error = materialize_live2d_packages(set, limits).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exhausted the 5 byte total budget"),
+            "{error}"
+        );
 
         // A total budget that runs out mid-texture has to say so. The ceiling
         // the decoder is handed is whatever is left of the set's budget, so
