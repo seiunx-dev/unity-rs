@@ -36,6 +36,7 @@ use assetstudio_core::sprite_atlas::{
 };
 use assetstudio_core::studio::Studio;
 use assetstudio_core::texture::{TextureReadLimits, read_texture2d};
+use assetstudio_core::texture_array::{TextureArrayReadLimits, read_texture2d_array};
 use assetstudio_core::type_tree::TypeValue;
 use assetstudio_core::type_tree_dump::write_type_tree_dump;
 use serde_json::{Value, json};
@@ -318,6 +319,7 @@ fn rust_payload_inner(
         | 91
         | 128
         | 152
+        | 187
         | 213
         | 329
         | SPRITE_ATLAS_CLASS_ID => {
@@ -372,6 +374,7 @@ fn rust_binary_payload(
             read_movie_texture(loaded, object_index, simple_limits)?,
             maximum_bytes,
         )?,
+        187 => texture_array_manifest(studio, file_index, object_index, maximum_bytes)?,
         213 => sprite_manifest(studio, file_index, object_index, maximum_bytes)?,
         SPRITE_ATLAS_CLASS_ID => {
             sprite_atlas_manifest(studio, file_index, object_index, maximum_bytes)?
@@ -620,6 +623,42 @@ fn sprite_manifest(
         "Width": image.width,
         "Height": image.height,
         "Pixels": bytes_manifest(&image.pixels),
+    }))
+}
+
+/// The array compared as parsed metadata plus its payload.
+///
+/// The managed reader does not decode an array, so there is nothing to compare
+/// pixels against; what it does do is resolve the payload -- resident or
+/// streamed -- and read a header whose field order changed three times. The
+/// layer split this project does on top is only as good as those bytes and
+/// that header.
+fn texture_array_manifest(
+    studio: &Studio,
+    file_index: usize,
+    object_index: usize,
+    maximum_bytes: u64,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let loaded = &studio.collection().serialized_files[file_index].file;
+    let array = read_texture2d_array(
+        studio.collection(),
+        loaded,
+        object_index,
+        TextureArrayReadLimits {
+            maximum_payload_bytes: maximum_bytes,
+            ..TextureArrayReadLimits::default()
+        },
+    )?;
+    Ok(json!({
+        "Name": array.name,
+        "Width": array.width,
+        "Height": array.height,
+        "Depth": array.depth,
+        "Format": array.graphics_format,
+        "MipCount": array.mip_count,
+        "DataSize": array.data_size,
+        "ColorSpace": array.color_space,
+        "Data": bytes_manifest(&array.data.read_to_vec(maximum_bytes)?),
     }))
 }
 

@@ -141,6 +141,22 @@ static object OracleObject(AssetStudio.Object value)
         Mesh mesh => MeshPayload(mesh),
         Sprite sprite => SpritePayload(sprite),
         SpriteAtlas atlas => SpriteAtlasPayload(atlas),
+        Texture2DArray array => new
+        {
+            Name = array.m_Name,
+            Width = array.m_Width,
+            Height = array.m_Height,
+            Depth = array.m_Depth,
+            Format = (int)array.m_Format,
+            MipCount = array.m_MipCount,
+            DataSize = array.m_DataSize,
+            ColorSpace = array.m_ColorSpace,
+            // The payload, wherever it came from: the managed reader resolves
+            // a stream reference the same way it resolves a resident one, and
+            // the layer split this project does on top is only as good as the
+            // bytes underneath it.
+            Data = Bytes(array.image_data.GetData()),
+        },
         Shader shader => ShaderPayload(shader),
         TextAsset text => new
         {

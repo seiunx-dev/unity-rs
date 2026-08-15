@@ -110,6 +110,7 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
     let mut fixtures = mesh_fixtures();
     fixtures.extend(animation_fixtures());
     fixtures.extend(sprite_atlas_fixtures());
+    fixtures.extend(texture_array_fixtures());
     fixtures.extend(vec![
         TemporaryFixture::new("oracle-v13-big-endian.assets", &synthetic_v13_big_endian()).unwrap(),
         TemporaryFixture::new(
@@ -199,6 +200,128 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
         .unwrap(),
     ]);
     fixtures
+}
+
+const TEXTURE2D_ARRAY_CLASS: i32 = 187;
+
+/// One `Texture2DArray` per version gate, plus one whose payload is streamed.
+///
+/// The header changed three times -- `usageMode` at 2020.2, the stripped mip
+/// count at 2023.2, the mip-limit flag and group name after it -- and each
+/// change moves every field behind it, including where the payload starts.
+/// The streamed case is separate because the payload then comes from a
+/// resource file rather than from the object, which is a different resolution
+/// path on both sides.
+fn texture_array_fixtures() -> Vec<TemporaryFixture> {
+    let mut fixtures = [
+        ("2019.4.40f1", (2019, 4)),
+        ("2020.2.7f1", (2020, 2)),
+        // Exactly 2023.2: the stripped mip count is already there and the
+        // mip-limit fields are not yet. Without this the two gates are
+        // indistinguishable from one another.
+        ("2023.2.0f1", (2023, 2)),
+        ("2023.3.0f1", (2023, 3)),
+    ]
+    .into_iter()
+    .map(|(revision, version)| {
+        let (major, minor) = version;
+        TemporaryFixture::new(
+            &format!("oracle-texture-array-{major}.{minor}.assets"),
+            &synthetic_single_v22(
+                TEXTURE2D_ARRAY_CLASS,
+                TEXTURE2D_ARRAY_PATH_ID,
+                revision,
+                &texture2d_array(version, None),
+            ),
+        )
+        .unwrap()
+    })
+    .collect::<Vec<_>>();
+    fixtures.push(
+        TemporaryFixture::with_resource(
+            "oracle-texture-array-streamed.assets",
+            &synthetic_single_v22(
+                TEXTURE2D_ARRAY_CLASS,
+                TEXTURE2D_ARRAY_PATH_ID,
+                "2022.3.62f1",
+                &texture2d_array((2022, 3), Some((8, "oracle-array.resS"))),
+            ),
+            "oracle-array.resS",
+            &texture_array_resource(),
+        )
+        .unwrap(),
+    );
+    fixtures
+}
+
+const TEXTURE2D_ARRAY_PATH_ID: i64 = 187;
+/// Two 2x2 RGBA32 layers, every byte distinct so a wrong split shows.
+const TEXTURE2D_ARRAY_LAYER_BYTES: u32 = 2 * 2 * 4;
+const TEXTURE2D_ARRAY_DEPTH: u32 = 2;
+
+fn texture_array_payload() -> Vec<u8> {
+    (0..TEXTURE2D_ARRAY_LAYER_BYTES * TEXTURE2D_ARRAY_DEPTH)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect()
+}
+
+/// The payload preceded by padding, so a stream offset of zero would read the
+/// wrong bytes rather than accidentally the right ones.
+fn texture_array_resource() -> Vec<u8> {
+    let mut output = vec![0xEE; 8];
+    output.extend_from_slice(&texture_array_payload());
+    output
+}
+
+fn texture2d_array(version: (u32, u32), streamed: Option<(u64, &str)>) -> Vec<u8> {
+    let payload = texture_array_payload();
+    let mut output = Vec::new();
+    push_string(&mut output, "oracle-texture-array");
+    // The Texture base, whose own fields are version-gated: the fallback pair
+    // is gone at 2023.2 and the alpha-channel flag arrives at 2020.2.
+    if version < (2023, 2) {
+        push_i32(&mut output, 0); // m_ForcedFallbackFormat
+        output.push(0); // m_DownscaleFallback
+    }
+    if version >= (2020, 2) {
+        output.push(0); // m_IsAlphaChannelOptional
+    }
+    align(&mut output, 4);
+    push_i32(&mut output, 1); // m_ColorSpace
+    push_i32(&mut output, 4); // m_Format, GraphicsFormat.R8G8B8A8_UNorm
+    push_i32(&mut output, 2); // m_Width
+    push_i32(&mut output, 2); // m_Height
+    push_i32(&mut output, i32::try_from(TEXTURE2D_ARRAY_DEPTH).unwrap());
+    push_i32(&mut output, 1); // m_MipCount
+    if version >= (2023, 2) {
+        push_i32(&mut output, 0); // m_MipsStripped
+    }
+    push_u32(&mut output, u32::try_from(payload.len()).unwrap());
+    output.extend_from_slice(&[0; 24]); // m_TextureSettings
+    if version >= (2020, 2) {
+        push_i32(&mut output, 0); // m_UsageMode
+    }
+    output.push(1); // m_IsReadable
+    if version > (2023, 2) {
+        output.push(0); // m_IgnoreMipmapLimit
+        align(&mut output, 4);
+        push_string(&mut output, "");
+    } else {
+        align(&mut output, 4);
+    }
+    match streamed {
+        None => {
+            push_i32(&mut output, i32::try_from(payload.len()).unwrap());
+            output.extend_from_slice(&payload);
+        }
+        Some((offset, path)) => {
+            push_i32(&mut output, 0);
+            output.extend_from_slice(&offset.to_le_bytes());
+            push_u32(&mut output, u32::try_from(payload.len()).unwrap());
+            push_string(&mut output, path);
+        }
+    }
+    output
 }
 
 /// One `SpriteAtlas` per version gate.
