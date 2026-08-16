@@ -1255,27 +1255,38 @@ fn companion_resource_inputs(
     let mut companions = Vec::new();
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let candidate = entry.path();
-        let Some(candidate_name) = candidate.file_name().and_then(|name| name.to_str()) else {
+        // Every directory entry is inspected for every input, so this loop is
+        // quadratic in the size of the directory -- a game data folder is tens
+        // of thousands of files. Judge each entry from its own name first:
+        // building `entry.path()` here allocated a `PathBuf` and then re-parsed
+        // the whole path, parent components included, three times per entry,
+        // and `file_type` was asked before anything had shown the entry to be
+        // worth asking about.
+        let candidate_file_name = entry.file_name();
+        let Some(candidate_name) = candidate_file_name.to_str() else {
             continue;
         };
         if candidate_name == name {
             continue;
         }
-        let shares_stem = stem.is_some_and(|stem| {
-            candidate.file_stem().and_then(|value| value.to_str()) == Some(stem)
-        }) && candidate
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                STREAMED_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
-            });
-        if !candidate_name.starts_with(&prefix) && !shares_stem {
+        if !candidate_name.starts_with(&prefix) {
+            let candidate = Path::new(candidate_name);
+            let shares_stem = stem.is_some_and(|stem| {
+                candidate.file_stem().and_then(|value| value.to_str()) == Some(stem)
+            }) && candidate
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    STREAMED_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                });
+            if !shares_stem {
+                continue;
+            }
+        }
+        if !entry.file_type()?.is_file() {
             continue;
         }
+        let candidate = parent.join(candidate_name);
         if companions.len() >= limits.maximum_input_files {
             return Err(Error::invalid_data(format!(
                 "companion resource files for {name} exceed {} inputs",
