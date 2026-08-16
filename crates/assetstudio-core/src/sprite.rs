@@ -1129,11 +1129,21 @@ fn apply_tight_mesh_mask(
         return Ok(());
     }
     validate_rgba_image(image, "tight Sprite crop")?;
+    // Nearly every sprite is a two-triangle quad that covers its own crop, so
+    // the mask keeps every pixel and the rasterisation is pure cost: across one
+    // scenario, 6,657 of 6,680 masks were fully covered and 1.09 billion of
+    // 1.09 billion pixel tests answered "inside". Proving that case up front
+    // costs eight point-in-triangle tests instead of width*height of them.
+    if mesh_covers_every_pixel(sprite, triangles, texture_rect_offset, image) {
+        return Ok(());
+    }
     let pixel_count = u64::from(image.width)
         .checked_mul(u64::from(image.height))
         .ok_or_else(|| Error::invalid_data("tight Sprite mask size overflowed"))?;
     let mask_length = usize::try_from(pixel_count)
         .map_err(|_| Error::invalid_data("tight Sprite mask is too large for this platform"))?;
+    let mask_width = usize::try_from(image.width)
+        .map_err(|_| Error::invalid_data("tight Sprite width is too large for this platform"))?;
     let mut mask = Vec::new();
     mask.try_reserve_exact(mask_length).map_err(|error| {
         Error::invalid_data(format!("cannot allocate tight Sprite mask: {error}"))
@@ -1161,15 +1171,26 @@ fn apply_tight_mesh_mask(
                 limits.maximum_raster_operations
             )));
         }
+        // `tight_triangle_bounds` clamps the box to the image and `mask` holds
+        // width*height entries, so every index below is in range. Resolving the
+        // row offset once per scanline keeps a fallible conversion -- and the
+        // error path it carries -- out of the per-pixel loop.
+        let edges = TriangleEdges::new(&transformed);
         for y in top..bottom {
+            let row = usize::try_from(y)
+                .ok()
+                .and_then(|y| y.checked_mul(mask_width))
+                .ok_or_else(|| Error::invalid_data("tight Sprite mask row overflowed"))?;
+            let Some(scanline) = mask.get_mut(row..row + mask_width) else {
+                return Err(Error::invalid_data("tight Sprite mask row is out of range"));
+            };
+            let row_terms = edges.row(f64::from(y) + 0.5);
             for x in left..right {
-                if point_in_triangle(f64::from(x) + 0.5, f64::from(y) + 0.5, &transformed) {
-                    let index =
-                        usize::try_from(u64::from(y) * u64::from(image.width) + u64::from(x))
-                            .map_err(|_| {
-                                Error::invalid_data("tight Sprite mask index overflowed")
-                            })?;
-                    mask[index] = 1;
+                if edges.contains(f64::from(x) + 0.5, &row_terms) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        scanline[x as usize] = 1;
+                    }
                 }
             }
         }
@@ -1244,19 +1265,131 @@ fn tight_triangle_bounds(
     (left < right && top < bottom).then_some((left, top, right, bottom))
 }
 
-fn point_in_triangle(x: f64, y: f64, triangle: &[(f64, f64); 3]) -> bool {
-    let edge = |first: (f64, f64), second: (f64, f64)| {
-        (x - first.0) * (second.1 - first.1) - (y - first.1) * (second.0 - first.0)
+/// True when the mesh provably keeps every pixel, making the mask a no-op.
+///
+/// Sufficient, never necessary: it only proves the shape that dominates real
+/// sprites -- two triangles sharing a diagonal, forming a convex quadrilateral
+/// that contains the whole pixel grid. Anything else falls through to the
+/// rasteriser, so a `false` here can only cost time, never correctness.
+fn mesh_covers_every_pixel(
+    sprite: &Sprite,
+    triangles: &[[Vector2; 3]],
+    texture_rect_offset: Vector2,
+    image: &RgbaImage,
+) -> bool {
+    let [first, second] = triangles else {
+        return false;
     };
-    let first = edge(triangle[0], triangle[1]);
-    let second = edge(triangle[1], triangle[2]);
-    let third = edge(triangle[2], triangle[0]);
-    if first == 0.0 && second == 0.0 && third == 0.0 {
+    let (Some(first), Some(second)) = (
+        transform_sprite_triangle(sprite, *first, texture_rect_offset),
+        transform_sprite_triangle(sprite, *second, texture_rect_offset),
+    ) else {
+        return false;
+    };
+    let Some(quad) = shared_edge_quad(&first, &second) else {
+        return false;
+    };
+    if !is_convex_quad(&quad) {
         return false;
     }
-    let has_negative = first < 0.0 || second < 0.0 || third < 0.0;
-    let has_positive = first > 0.0 || second > 0.0 || third > 0.0;
-    !(has_negative && has_positive)
+    if image.width == 0 || image.height == 0 {
+        return false;
+    }
+    // The extreme pixel centres; a convex region containing all four contains
+    // every centre between them.
+    let right = f64::from(image.width) - 0.5;
+    let bottom = f64::from(image.height) - 0.5;
+    [(0.5, 0.5), (right, 0.5), (0.5, bottom), (right, bottom)]
+        .into_iter()
+        .all(|(x, y)| point_in_triangle(x, y, &first) || point_in_triangle(x, y, &second))
+}
+
+/// Orders two triangles that share exactly one edge into the quadrilateral they
+/// tile, as `shared, only-in-first, shared, only-in-second`.
+fn shared_edge_quad(first: &[(f64, f64); 3], second: &[(f64, f64); 3]) -> Option<[(f64, f64); 4]> {
+    let shared: Vec<(f64, f64)> = first
+        .iter()
+        .copied()
+        .filter(|vertex| second.contains(vertex))
+        .collect();
+    if shared.len() != 2 {
+        return None;
+    }
+    let unique_first = first.iter().copied().find(|v| !shared.contains(v))?;
+    let unique_second = second.iter().copied().find(|v| !shared.contains(v))?;
+    if unique_first == unique_second {
+        return None;
+    }
+    Some([shared[0], unique_first, shared[1], unique_second])
+}
+
+fn is_convex_quad(quad: &[(f64, f64); 4]) -> bool {
+    let mut negative = false;
+    let mut positive = false;
+    for index in 0..4 {
+        let a = quad[index];
+        let b = quad[(index + 1) % 4];
+        let c = quad[(index + 2) % 4];
+        let cross = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
+        if cross < 0.0 {
+            negative = true;
+        } else if cross > 0.0 {
+            positive = true;
+        } else {
+            // A straight or repeated vertex leaves the shape unproven.
+            return false;
+        }
+    }
+    negative != positive
+}
+
+fn point_in_triangle(x: f64, y: f64, triangle: &[(f64, f64); 3]) -> bool {
+    let edges = TriangleEdges::new(triangle);
+    edges.contains(x, &edges.row(y))
+}
+
+/// The three edge functions of a triangle, with everything that does not depend
+/// on the sample point lifted out.
+///
+/// `point_in_triangle` recomputed each edge from the raw vertices for every
+/// pixel of every triangle, so the vertex deltas and the whole `y` term were
+/// re-derived millions of times. Hoisting them leaves one subtract, one
+/// multiply and one subtract per edge per pixel. Every operation still has the
+/// same operands as before, only evaluated once per triangle or per scanline
+/// instead of per pixel, so the result is bit-for-bit what it was.
+struct TriangleEdges {
+    origin: [(f64, f64); 3],
+    delta: [(f64, f64); 3],
+}
+
+impl TriangleEdges {
+    fn new(triangle: &[(f64, f64); 3]) -> Self {
+        let mut origin = [(0.0, 0.0); 3];
+        let mut delta = [(0.0, 0.0); 3];
+        for (index, pair) in [(0, 1), (1, 2), (2, 0)].into_iter().enumerate() {
+            let (first, second) = (triangle[pair.0], triangle[pair.1]);
+            origin[index] = first;
+            delta[index] = (second.0 - first.0, second.1 - first.1);
+        }
+        Self { origin, delta }
+    }
+
+    /// The `y`-dependent term of each edge, constant along a scanline.
+    fn row(&self, y: f64) -> [f64; 3] {
+        [0, 1, 2].map(|index| (y - self.origin[index].1) * self.delta[index].0)
+    }
+
+    fn contains(&self, x: f64, row: &[f64; 3]) -> bool {
+        let first = (x - self.origin[0].0) * self.delta[0].1 - row[0];
+        let second = (x - self.origin[1].0) * self.delta[1].1 - row[1];
+        let third = (x - self.origin[2].0) * self.delta[2].1 - row[2];
+        if first == 0.0 && second == 0.0 && third == 0.0 {
+            return false;
+        }
+        let has_negative = first < 0.0 || second < 0.0 || third < 0.0;
+        let has_positive = first > 0.0 || second > 0.0 || third > 0.0;
+        !(has_negative && has_positive)
+    }
 }
 
 fn flip_horizontal(image: &mut RgbaImage) -> Result<()> {
@@ -2071,9 +2204,58 @@ mod tests {
     use crate::texture::{RgbaImage, TextureFormat, TextureReadLimits};
 
     use super::{
-        SPRITE_CLASS_ID, SpritePackingMode, SpriteReadLimits, decode_sprite_rgba8, read_sprite,
-        resize_bicubic_rgba8, sprite_resize_dimensions,
+        SPRITE_CLASS_ID, SpritePackingMode, SpriteReadLimits, decode_sprite_rgba8, is_convex_quad,
+        read_sprite, resize_bicubic_rgba8, shared_edge_quad, sprite_resize_dimensions,
     };
+
+    /// The coverage fast path may only skip masking for shapes it has proved
+    /// convex. A bowtie -- two triangles on the same side of their shared edge
+    /// -- must not qualify, or the mask it skips would have cut real pixels.
+    #[test]
+    fn only_a_convex_quad_can_skip_the_tight_mask() {
+        let unit_square = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        assert!(is_convex_quad(&unit_square));
+        assert!(is_convex_quad(&[
+            (0.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 0.0),
+            (0.0, 0.0)
+        ]));
+
+        // Self-intersecting: the diagonal's endpoints are not opposite corners.
+        assert!(!is_convex_quad(&[
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (1.0, 0.0),
+            (0.0, 1.0)
+        ]));
+        // Reflex vertex.
+        assert!(!is_convex_quad(&[
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (0.5, 0.5),
+            (0.0, 2.0)
+        ]));
+        // Collinear edge leaves the shape unproven rather than assumed convex.
+        assert!(!is_convex_quad(&[
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (2.0, 0.0),
+            (0.0, 1.0)
+        ]));
+
+        // Two triangles over the unit square's main diagonal.
+        let lower = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)];
+        let upper = [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let quad = shared_edge_quad(&lower, &upper).expect("triangles share an edge");
+        assert!(is_convex_quad(&quad));
+
+        // Triangles that share only one vertex are not a quad at all.
+        assert!(
+            shared_edge_quad(&lower, &[(0.0, 0.0), (-1.0, 0.0), (-1.0, -1.0)]).is_none(),
+            "one shared vertex is not a shared edge"
+        );
+    }
 
     #[test]
     fn parses_modern_metadata_crops_flips_and_applies_alpha_texture() {
