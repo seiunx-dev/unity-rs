@@ -1603,65 +1603,67 @@ fn select_partition(buf: &[u8], data: &mut BlockData) {
     }
 }
 
+/// Which colour endpoint modes decode a colour channel through the HDR path.
+/// This is the `FUNC_TABLE_C` of the C++ original, reduced to the one bit it
+/// actually carried: dispatching per texel through a function pointer cost four
+/// indirect calls per texel and blocked inlining of `select_color`, which is a
+/// handful of integer ops.
+const CEM_HDR_C: [bool; 16] = [
+    false, false, true, true, false, false, false, true, false, false, false, true, false, false,
+    true, true,
+];
+
+/// The same for the alpha channel. It differs from `CEM_HDR_C` at index 14.
+const CEM_HDR_A: [bool; 16] = [
+    false, false, true, true, false, false, false, true, false, false, false, true, false, false,
+    false, true,
+];
+
+#[inline(always)]
+fn select_c(cem: usize, v0: i32, v1: i32, weight: i32) -> u8 {
+    if CEM_HDR_C[cem] {
+        select_color_hdr(v0, v1, weight)
+    } else {
+        select_color(v0, v1, weight)
+    }
+}
+
+#[inline(always)]
+fn select_a(cem: usize, v0: i32, v1: i32, weight: i32) -> u8 {
+    if CEM_HDR_A[cem] {
+        select_color_hdr(v0, v1, weight)
+    } else {
+        select_color(v0, v1, weight)
+    }
+}
+
 fn applicate_color(data: &mut BlockData, outbuf: &mut [u32]) {
-    static FUNC_TABLE_C: [fn(i32, i32, i32) -> u8; 16] = [
-        select_color,
-        select_color,
-        select_color_hdr,
-        select_color_hdr,
-        select_color,
-        select_color,
-        select_color,
-        select_color_hdr,
-        select_color,
-        select_color,
-        select_color,
-        select_color_hdr,
-        select_color,
-        select_color,
-        select_color_hdr,
-        select_color_hdr,
-    ];
-    static FUNC_TABLE_A: [fn(i32, i32, i32) -> u8; 16] = [
-        select_color,
-        select_color,
-        select_color_hdr,
-        select_color_hdr,
-        select_color,
-        select_color,
-        select_color,
-        select_color_hdr,
-        select_color,
-        select_color,
-        select_color,
-        select_color_hdr,
-        select_color,
-        select_color,
-        select_color,
-        select_color_hdr,
-    ];
     if data.dual_plane {
         let mut ps: [usize; 4] = [0; 4];
         ps[data.plane_selector] = 1;
         if data.part_num > 1 {
             (0..(data.bw * data.bh)).for_each(|i| {
                 let p = data.partition[i];
-                let r: u8 = FUNC_TABLE_C[data.cem[p]](
+                let r: u8 = select_c(
+                    data.cem[p],
                     data.endpoints[p][0],
                     data.endpoints[p][4],
                     data.weights[i][ps[0]],
                 );
-                let g: u8 = FUNC_TABLE_C[data.cem[p]](
+                let g: u8 = select_c(
+                    data.cem[p],
                     data.endpoints[p][1],
                     data.endpoints[p][5],
                     data.weights[i][ps[1]],
                 );
-                let b: u8 = FUNC_TABLE_C[data.cem[p]](
+                let b: u8 = select_c(
+                    data.cem[p],
                     data.endpoints[p][2],
                     data.endpoints[p][6],
                     data.weights[i][ps[2]],
                 );
-                let a: u8 = FUNC_TABLE_A[data.cem[p]](
+                let a: u8 = select_a(
+                    data.cem[p],
                     data.endpoints[p][3],
                     data.endpoints[p][7],
                     data.weights[i][ps[3]],
@@ -1670,22 +1672,26 @@ fn applicate_color(data: &mut BlockData, outbuf: &mut [u32]) {
             });
         } else {
             (0..(data.bw * data.bh)).for_each(|i| {
-                let r: u8 = FUNC_TABLE_C[data.cem[0]](
+                let r: u8 = select_c(
+                    data.cem[0],
                     data.endpoints[0][0],
                     data.endpoints[0][4],
                     data.weights[i][ps[0]],
                 );
-                let g: u8 = FUNC_TABLE_C[data.cem[0]](
+                let g: u8 = select_c(
+                    data.cem[0],
                     data.endpoints[0][1],
                     data.endpoints[0][5],
                     data.weights[i][ps[1]],
                 );
-                let b: u8 = FUNC_TABLE_C[data.cem[0]](
+                let b: u8 = select_c(
+                    data.cem[0],
                     data.endpoints[0][2],
                     data.endpoints[0][6],
                     data.weights[i][ps[2]],
                 );
-                let a: u8 = FUNC_TABLE_A[data.cem[0]](
+                let a: u8 = select_a(
+                    data.cem[0],
                     data.endpoints[0][3],
                     data.endpoints[0][7],
                     data.weights[i][ps[3]],
@@ -1696,22 +1702,26 @@ fn applicate_color(data: &mut BlockData, outbuf: &mut [u32]) {
     } else if data.part_num > 1 {
         (0..(data.bw * data.bh)).for_each(|i| {
             let p = data.partition[i];
-            let r: u8 = FUNC_TABLE_C[data.cem[p]](
+            let r: u8 = select_c(
+                data.cem[p],
                 data.endpoints[p][0],
                 data.endpoints[p][4],
                 data.weights[i][0],
             );
-            let g: u8 = FUNC_TABLE_C[data.cem[p]](
+            let g: u8 = select_c(
+                data.cem[p],
                 data.endpoints[p][1],
                 data.endpoints[p][5],
                 data.weights[i][0],
             );
-            let b: u8 = FUNC_TABLE_C[data.cem[p]](
+            let b: u8 = select_c(
+                data.cem[p],
                 data.endpoints[p][2],
                 data.endpoints[p][6],
                 data.weights[i][0],
             );
-            let a: u8 = FUNC_TABLE_A[data.cem[p]](
+            let a: u8 = select_a(
+                data.cem[p],
                 data.endpoints[p][3],
                 data.endpoints[p][7],
                 data.weights[i][0],
@@ -1720,22 +1730,26 @@ fn applicate_color(data: &mut BlockData, outbuf: &mut [u32]) {
         });
     } else {
         (0..(data.bw * data.bh)).for_each(|i| {
-            let r: u8 = FUNC_TABLE_C[data.cem[0]](
+            let r: u8 = select_c(
+                data.cem[0],
                 data.endpoints[0][0],
                 data.endpoints[0][4],
                 data.weights[i][0],
             );
-            let g: u8 = FUNC_TABLE_C[data.cem[0]](
+            let g: u8 = select_c(
+                data.cem[0],
                 data.endpoints[0][1],
                 data.endpoints[0][5],
                 data.weights[i][0],
             );
-            let b: u8 = FUNC_TABLE_C[data.cem[0]](
+            let b: u8 = select_c(
+                data.cem[0],
                 data.endpoints[0][2],
                 data.endpoints[0][6],
                 data.weights[i][0],
             );
-            let a: u8 = FUNC_TABLE_A[data.cem[0]](
+            let a: u8 = select_a(
+                data.cem[0],
                 data.endpoints[0][3],
                 data.endpoints[0][7],
                 data.weights[i][0],
