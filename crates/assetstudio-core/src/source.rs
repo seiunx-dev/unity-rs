@@ -2,7 +2,9 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(unix))]
+use std::sync::Mutex;
 
 use crate::{Error, Result};
 
@@ -261,15 +263,58 @@ impl Seek for RegionCursor {
     }
 }
 
-struct FileSource {
+/// A file read by absolute offset.
+///
+/// Parsing a serialized file is thousands of small reads, and pairing a seek
+/// with each one costs a second syscall every time and forces the shared file
+/// position under a lock. Unix `pread` takes the offset directly and leaves the
+/// position alone, so neither is needed there. Platforms without it keep the
+/// seek, and keep the lock that the shared position then requires.
+struct PositionalFile {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
     file: Mutex<File>,
+}
+
+impl PositionalFile {
+    #[cfg(unix)]
+    const fn new(file: File) -> Self {
+        Self { file }
+    }
+
+    #[cfg(not(unix))]
+    const fn new(file: File) -> Self {
+        Self {
+            file: Mutex::new(file),
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(&self.file, output, offset)
+    }
+
+    #[cfg(not(unix))]
+    fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("source file lock was poisoned"))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(output)
+    }
+}
+
+struct FileSource {
+    file: PositionalFile,
     length: u64,
 }
 
 impl FileSource {
     const fn new(file: File, length: u64) -> Self {
         Self {
-            file: Mutex::new(file),
+            file: PositionalFile::new(file),
             length,
         }
     }
@@ -281,12 +326,7 @@ impl Source for FileSource {
     }
 
     fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("source file lock was poisoned"))?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(output)
+        self.file.read_exact_at(offset, output)
     }
 }
 
