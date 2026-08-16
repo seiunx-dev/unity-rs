@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use crate::managed_number::ManagedNumber;
 use crate::serialized::{TypeTree, TypeTreeNode};
-use crate::type_tree::{TypeField, TypeMapEntry, TypeValue};
+use crate::type_tree::{TypeField, TypeMapEntry, TypeValue, is_array_parent};
 use crate::{Error, Result};
 
 /// Writes the legacy `TypeTreeHelper.ReadTypeString` representation.
@@ -77,8 +77,24 @@ impl<W: Write> DumpFormatter<'_, W> {
                 self.write_map(index, node, entries)
             }
             TypeValue::Object(fields) => {
-                if is_primitive_type(&node.type_name)
-                    || matches!(node.type_name.as_str(), "string" | "map" | "TypelessData")
+                // `string` is the one reserved name that can legitimately decode
+                // to an object: with no `Array` child it is a class name, not
+                // Unity's string. We print the declared type name here.
+                //
+                // The managed dump prints `string` the first time it meets such
+                // a node and `CustomType` every time after, because both its
+                // reader and its dumper overwrite `m_Node.m_Type` in place
+                // (`TypeTreeHelper.cs:322` and `:172`) while the label was
+                // captured beforehand (`:55`). The switch happens mid-dump for
+                // the second element of an array of these, and a value read
+                // beforehand poisons even the first dump. That output is a
+                // function of how often the shared tree has been walked, so we
+                // deliberately do not reproduce it.
+                let string_class =
+                    node.type_name == "string" && !is_array_parent(self.nodes, index);
+                if !string_class
+                    && (is_primitive_type(&node.type_name)
+                        || matches!(node.type_name.as_str(), "string" | "map" | "TypelessData"))
                 {
                     return Err(value_mismatch(node, "object"));
                 }
@@ -609,6 +625,104 @@ mod tests {
 \tfloat positive = 1.25\r\n\
 \tdouble infinite = Infinity\r\n"
         );
+    }
+
+    /// A `string` node with no `Array` child is a class named `string`, so it
+    /// dumps as a container rather than a quoted value. The managed dump prints
+    /// the declared type here too -- it captures the label before its class
+    /// branch renames the node to `CustomType`.
+    #[test]
+    fn writes_a_string_named_class_as_a_container() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0),
+                node("string", "exposedName", 1),
+                node("string", "id", 2),
+                node("Array", "Array", 3),
+                node("int", "size", 4),
+                node("char", "data", 4),
+                node("int", "m_Trailing", 1),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let value = TypeValue::Object(vec![
+            field(
+                "exposedName",
+                TypeValue::Object(vec![field("id", TypeValue::String("259".to_owned()))]),
+            ),
+            field("m_Trailing", TypeValue::Signed(9)),
+        ]);
+        let mut output = Vec::new();
+        write_type_tree_dump(&tree, &value, &mut output, 4096).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Root Base\r\n\
+\tstring exposedName\r\n\
+\t\tstring id = \"259\"\r\n\
+\tint m_Trailing = 9\r\n"
+        );
+    }
+
+    /// Repeated occurrences keep the declared name. This is the shape where the
+    /// managed dump contradicts itself -- it prints `string` for the first
+    /// element and `CustomType` for every one after, because reading the first
+    /// rewrote the shared node.
+    #[test]
+    fn keeps_the_declared_name_for_every_element_of_a_string_class_array() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0),
+                node("vector", "items", 1),
+                node("Array", "Array", 2),
+                node("int", "size", 3),
+                node("string", "data", 3),
+                node("string", "id", 4),
+                node("Array", "Array", 5),
+                node("int", "size", 6),
+                node("char", "data", 6),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let element =
+            |id: &str| TypeValue::Object(vec![field("id", TypeValue::String(id.to_owned()))]);
+        let value = TypeValue::Object(vec![field(
+            "items",
+            TypeValue::Array(vec![element("a"), element("b")]),
+        )]);
+        let mut output = Vec::new();
+        write_type_tree_dump(&tree, &value, &mut output, 4096).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Root Base\r\n\
+\tvector items\r\n\
+\t\tArray Array\r\n\
+\t\tint size = 2\r\n\
+\t\t\t[0]\r\n\
+\t\t\tstring data\r\n\
+\t\t\t\tstring id = \"a\"\r\n\
+\t\t\t[1]\r\n\
+\t\t\tstring data\r\n\
+\t\t\t\tstring id = \"b\"\r\n"
+        );
+    }
+
+    /// The relaxation is scoped: a node that really is Unity's string still
+    /// refuses an object, so a value decoded against the wrong tree is caught.
+    #[test]
+    fn still_rejects_an_object_against_a_real_string_node() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("string", "value", 0),
+                node("Array", "Array", 1),
+                node("int", "size", 2),
+                node("char", "data", 2),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let error =
+            write_type_tree_dump(&tree, &TypeValue::Object(Vec::new()), &mut Vec::new(), 1024)
+                .unwrap_err();
+        assert!(error.to_string().contains("object"), "{error}");
     }
 
     #[test]
