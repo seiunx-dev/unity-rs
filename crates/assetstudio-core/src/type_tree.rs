@@ -329,11 +329,22 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
             ValueKind::Float32 => (TypeValue::Float32(self.reader.read_f32()?), index + 1),
             ValueKind::Float64 => (TypeValue::Float(self.reader.read_f64()?), index + 1),
             ValueKind::Boolean => (TypeValue::Boolean(self.reader.read_bool()?), index + 1),
-            ValueKind::String => {
+            ValueKind::String if is_array_parent(self.nodes, index) => {
                 validate_array_shape(self.nodes, index)?;
                 let value = self.read_aligned_string()?;
                 (TypeValue::String(value), subtree_end)
             }
+            // A node named `string` is only Unity's string when an `Array` child
+            // carries its bytes. Unity also emits `string` as an ordinary class
+            // name -- `PropertyName`, the payload of `ExposedReference<T>`, is
+            // one, and every Timeline asset that points at a scene object has
+            // one. Both managed readers guard on it -- `TypeTreeHelper.cs:280`
+            // and, in the JSON writer this payload is compared against,
+            // `AssetStudioSession.cs:1013`
+            // (`when i + 1 < nodes.Count && nodes[i + 1].m_Type == "Array"`) --
+            // and let the rest fall through to their class branch. Treating them
+            // all as strings rejected objects the reference reads.
+            ValueKind::String => (self.read_class(index, depth)?, subtree_end),
             ValueKind::Map => {
                 let (value, array_align) = self.read_map(index, depth)?;
                 align |= array_align;
@@ -692,7 +703,13 @@ struct MapShape {
     align: bool,
 }
 
-fn is_array_parent(nodes: &[TypeTreeNode], index: usize) -> bool {
+/// True when `index` carries its elements in an `Array` child, which is what
+/// separates Unity's `string` from a class that merely happens to be named one.
+///
+/// The managed guards compare only the next node's type name; requiring it to
+/// sit one level deeper additionally rejects an `Array` that is a sibling rather
+/// than a child, a shape Unity does not emit.
+pub(crate) fn is_array_parent(nodes: &[TypeTreeNode], index: usize) -> bool {
     nodes.get(index + 1).is_some_and(|node| {
         node.type_name == "Array" && node.level == nodes[index].level.saturating_add(1)
     })
@@ -919,6 +936,134 @@ mod tests {
                 TypeField {
                     name: "m_Values".to_owned(),
                     value: TypeValue::Array(vec![TypeValue::Signed(-1), TypeValue::Signed(7),]),
+                },
+            ])
+        );
+    }
+
+    /// Unity names the payload of `ExposedReference<T>` `string`, but it is
+    /// `PropertyName` -- a class with a real string inside it, not a string.
+    /// Reading it as one rejected every Timeline object that points at a scene
+    /// object; the managed reader takes its class branch here.
+    #[test]
+    fn reads_a_string_named_class_as_a_class() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0, false),
+                node("string", "exposedName", 1, false),
+                node("string", "id", 2, false),
+                node("Array", "Array", 3, false),
+                node("int", "size", 4, false),
+                node("char", "data", 4, false),
+                node("int", "m_Trailing", 1, false),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3_i32.to_le_bytes());
+        bytes.extend_from_slice(b"259");
+        bytes.push(0);
+        bytes.extend_from_slice(&9_i32.to_le_bytes());
+
+        let value = read_type_tree_from_reader(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            TypeValue::Object(vec![
+                TypeField {
+                    name: "exposedName".to_owned(),
+                    value: TypeValue::Object(vec![TypeField {
+                        name: "id".to_owned(),
+                        value: TypeValue::String("259".to_owned()),
+                    }]),
+                },
+                TypeField {
+                    name: "m_Trailing".to_owned(),
+                    value: TypeValue::Signed(9),
+                },
+            ])
+        );
+    }
+
+    /// The same rule at its degenerate end: a `string` node with no children at
+    /// all is an empty class and consumes nothing, which is what the managed
+    /// class branch does when its node list holds only the node itself.
+    #[test]
+    fn reads_a_childless_string_node_as_an_empty_class() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0, false),
+                node("string", "m_Empty", 1, false),
+                node("int", "m_Trailing", 1, false),
+            ],
+            string_buffer: Vec::new(),
+        };
+
+        let value = read_type_tree_from_reader(
+            &tree,
+            EndianReader::new(Cursor::new(5_i32.to_le_bytes().to_vec()), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            TypeValue::Object(vec![
+                TypeField {
+                    name: "m_Empty".to_owned(),
+                    value: TypeValue::Object(Vec::new()),
+                },
+                TypeField {
+                    name: "m_Trailing".to_owned(),
+                    value: TypeValue::Signed(5),
+                },
+            ])
+        );
+    }
+
+    /// The one way the class branch can consume different bytes than the string
+    /// branch it replaced is the node's own align flag, which is captured before
+    /// the split and applied after it. Managed does the same, and neither side
+    /// takes an align flag from an array child that is not there.
+    #[test]
+    fn aligns_after_a_string_named_class_that_sets_the_align_flag() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0, false),
+                node("UInt8", "a", 1, false),
+                node("string", "exposedName", 1, true),
+                node("int", "b", 1, false),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let bytes = vec![0x01, 0xaa, 0xaa, 0xaa, 0x02, 0x00, 0x00, 0x00];
+
+        let value = read_type_tree_from_reader(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            TypeValue::Object(vec![
+                TypeField {
+                    name: "a".to_owned(),
+                    value: TypeValue::Unsigned(1),
+                },
+                TypeField {
+                    name: "exposedName".to_owned(),
+                    value: TypeValue::Object(Vec::new()),
+                },
+                TypeField {
+                    name: "b".to_owned(),
+                    value: TypeValue::Signed(2),
                 },
             ])
         );

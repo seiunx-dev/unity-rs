@@ -231,6 +231,37 @@ mod tests {
         );
     }
 
+    /// A node Unity names `string` but shapes as a class reaches JSON as an
+    /// ordinary nested object, not a quoted value. This is the surface the asset
+    /// exporter consumes, so pin it here rather than only at the `TypeValue`
+    /// layer: `ExposedReference<T>` is the shape that made it matter.
+    #[test]
+    fn writes_a_string_named_class_as_a_nested_object() {
+        let value = TypeValue::Object(vec![
+            TypeField {
+                name: "exposedName".to_owned(),
+                value: TypeValue::Object(vec![TypeField {
+                    name: "id".to_owned(),
+                    value: TypeValue::String("259224778".to_owned()),
+                }]),
+            },
+            TypeField {
+                name: "defaultValue".to_owned(),
+                value: TypeValue::Object(vec![TypeField {
+                    name: "m_PathID".to_owned(),
+                    value: TypeValue::Signed(0),
+                }]),
+            },
+        ]);
+        let mut output = Vec::new();
+        write_type_value_json(&value, &mut output, false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"exposedName\":{\"id\":\"259224778\"},\
+             \"defaultValue\":{\"m_PathID\":0}}"
+        );
+    }
+
     #[test]
     fn writes_ordered_objects_maps_and_special_floats() {
         let value = TypeValue::Object(vec![
