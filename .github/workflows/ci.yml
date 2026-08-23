@@ -33,8 +33,26 @@ jobs:
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
           rustup override set 1.88.0
+      - name: Install locked RustSec auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+      - name: Audit locked Rust dependencies
+        run: cargo audit --file Cargo.lock --deny unsound --deny yanked
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Test the local CI completion policy
+        run: python3 tools/test_local_ci.py
+      - name: Verify Python API surface coverage
+        run: python3 tools/check_python_api_surface.py
+      - name: Test the Python API surface audit
+        run: python3 tools/test_python_api_surface.py
+      - name: Verify Node API surface coverage
+        run: python3 tools/check_node_api_surface.py
+      - name: Test the Node API surface audit
+        run: python3 tools/test_node_api_surface.py
+      - name: Verify six-platform release matrices
+        run: python3 tools/check_ci_matrix.py
+      - name: Test the release-matrix audit
+        run: python3 tools/test_ci_matrix.py
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build warning-free Rust API documentation
@@ -47,6 +65,8 @@ jobs:
         run: python3 tools/generate_dependency_licenses.py --check
       - name: Verify headless delivery scope
         run: python3 tools/check_delivery_scope.py
+      - name: Test the headless delivery-scope audit
+        run: python3 tools/test_delivery_scope.py
       - name: Verify Core crate legal files
         run: python3 tools/check_core_package.py
       - name: Upload Rust core crate
@@ -305,27 +325,27 @@ jobs:
           - os: ubuntu-latest
             artifact: linux-x64
             binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            smoke: ./target/release/artifact/assetstudio --help
           - os: ubuntu-24.04-arm
             artifact: linux-arm64
             binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            smoke: ./target/release/artifact/assetstudio --help
           - os: windows-latest
             artifact: windows-x64
             binary: target/release/assetstudio.exe
-            smoke: .\target\release\assetstudio.exe --help
+            smoke: .\target\release\artifact\assetstudio.exe --help
           - os: windows-11-arm
             artifact: windows-arm64
             binary: target/release/assetstudio.exe
-            smoke: .\target\release\assetstudio.exe --help
+            smoke: .\target\release\artifact\assetstudio.exe --help
           - os: macos-15-intel
             artifact: macos-x64
             binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            smoke: ./target/release/artifact/assetstudio --help
           - os: macos-latest
             artifact: macos-arm64
             binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            smoke: ./target/release/artifact/assetstudio --help
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -337,10 +357,10 @@ jobs:
           python-version: "3.12"
       - name: Build release CLI
         run: cargo +1.88.0 build --release --locked -p assetstudio-cli
-      - name: Smoke-test the exact CLI artifact
-        run: ${{ matrix.smoke }}
       - name: Stage binary with license and notices
         run: python tools/stage_cli_artifact.py "${{ matrix.binary }}" target/release/artifact
+      - name: Smoke-test the staged CLI artifact
+        run: ${{ matrix.smoke }}
       - name: Upload native CLI
         uses: actions/upload-artifact@v4
         with:
