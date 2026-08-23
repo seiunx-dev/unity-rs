@@ -72,6 +72,26 @@ class CiMatrixAuditTests(unittest.TestCase):
         with self.assertRaises(check_ci_matrix.AuditError):
             check_ci_matrix.validate_workflow(altered)
 
+    def test_commented_stage_cannot_hide_wrong_active_order(self) -> None:
+        stage = (
+            "      - name: Stage binary with license and notices\n"
+            "        run: python tools/stage_cli_artifact.py \"${{ matrix.binary }}\" target/release/artifact\n"
+        )
+        smoke = (
+            "      - name: Smoke-test the staged CLI artifact\n"
+            "        run: ${{ matrix.smoke }}\n"
+        )
+        commented_stage = (
+            "      # - name: Disabled staging decoy\n"
+            "      #   run: python tools/stage_cli_artifact.py decoy artifact\n"
+        )
+        self.assertIn(stage + smoke, self.workflow)
+        altered = self.workflow.replace(
+            stage + smoke, commented_stage + smoke + stage, 1
+        )
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
     def test_missing_python_surface_audit_tests_are_rejected(self) -> None:
         altered = self.workflow.replace(
             "        run: python3 tools/test_python_api_surface.py\n",
@@ -127,6 +147,38 @@ class CiMatrixAuditTests(unittest.TestCase):
             "        run: cargo audit --file Cargo.lock --deny unsound --deny yanked\n",
             "        # run: cargo audit --file Cargo.lock --deny unsound --deny yanked\n",
             1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
+    def test_echoed_rustsec_audit_is_rejected(self) -> None:
+        command = "cargo audit --file Cargo.lock --deny unsound --deny yanked"
+        altered = self.workflow.replace(
+            f"        run: {command}\n",
+            f"        run: echo '{command}'\n",
+            1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
+    def test_environment_value_cannot_impersonate_rustsec_audit(self) -> None:
+        command = "cargo audit --file Cargo.lock --deny unsound --deny yanked"
+        altered = self.workflow.replace(
+            f"        run: {command}\n",
+            f"        env:\n          AUDIT_COMMAND: {command}\n"
+            '        run: echo "$AUDIT_COMMAND"\n',
+            1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
+    def test_echoed_multiline_python_test_is_rejected(self) -> None:
+        altered = self.workflow.replace(
+            "          python -I tests/python_api.py\n",
+            "          echo python -I tests/python_api.py\n",
         )
         self.assertNotEqual(altered, self.workflow)
         with self.assertRaises(check_ci_matrix.AuditError):
