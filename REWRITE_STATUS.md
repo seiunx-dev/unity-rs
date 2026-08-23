@@ -1,6 +1,6 @@
 # AssetStudio Rust 重写进度与缺口
 
-最后更新：2026-08-23
+最后更新：2026-08-24
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -750,6 +750,14 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - **Node 的 `AnimationClipInfo` 已从简略 shape 补到完整稳定元数据（2026-08-22）**：保留原方法名和旧字段，新增 PathID、high-quality 标志、PPtr 曲线、muscle size 与 streamed/dense/constant 计数、ACL frame/bone/rate/curve/track bytes/decoder/fast-sample 字段，以及外部 streaming offset/size/path。`maximumBytes` 现在同时收紧对象、字符串、packed/reference 与累计分配预算，两个 clip 入口共用同一限制构造。现有完整 Unity 2022.2 muscle fixture 验证无 ACL/streaming 时所有 optional 字段保持 `undefined`；Tuanjie 2022.3.55t4 fixture 验证 32-byte ACL 容器、decoder map、fast-sample 与空路径 StreamingInfo。生成声明中的 `bigint`/optional 字段由严格 TypeScript 消费端实际赋值，不再只做方法存在性 smoke。
 - **Node 的 `Avatar` 已从四字段摘要补到完整稳定元数据（2026-08-22）**：`readAvatar` 现在返回 PathID、声明大小、普通/人形骨架节点数、保序 TOS `(hash,path)`、HumanDescription 的人形骨/骨架骨计数和 root-motion bone name；旧 `declaredSize` 保留为 `declaredAvatarSize` 的兼容别名。`maximumBytes` 同时收紧对象、单/累计字符串、引用与累计分配预算。由 Python 已通过的 Tuanjie 2022.3.55t4 fixture 逐字节移植到 JavaScript，完整对象解析后逐字段核对 `0xfeedbeef -> Root/Hips` 与 `Hips` root motion，并证明一字节预算拒绝；生成声明的 `AvatarPathEntry[]` 与 `bigint` PathID 进入严格 TypeScript 消费。
 - **六平台发布配置有了自动结构门禁（2026-08-22）**：`tools/check_ci_matrix.py` 不把“workflow 里看起来有 matrix”当证据，而是逐 job 要求 Python wheel、CLI 和可选 Node 包各自恰好包含 Linux/Windows/macOS × x86-64/ARM64 六个 `(runner, artifact)` 对；Python 必须安装并跑 wheel API/mypy，CLI 必须执行精确 release 二进制的 `--help` 并带法律文件 staging，Node 必须测试 release addon、检查 npm 内容并真正 `npm pack`。门禁自身接入本地与 GitHub `quality`，八项回归锁定当前配置、缺一个 Windows ARM64 目标、矩阵项重复键、移除 CLI smoke、移除 local-CI 完成策略自测、移除 Python API 审计自测、移除 RustSec 执行步骤，以及把 RustSec `run:` 行注释掉。收口审查实际发现 GitHub `quality` 原先没有执行 `tools/test_local_ci.py`，所以 `--fail-on-skip` 的正反策略虽在本地跑、却可能在正式 CI 中退化；现已补上该步骤并由反向测试锁定。注释场景则暴露了另一处真实漏洞：旧检查只搜原始 YAML 字符串，注释中的命令也会被误认成可执行证据；现只在有效 YAML 行中计数。锁定的 `actionlint 1.7.12` 也在 2026-08-22 对最新 workflow 零告警通过，因此专用矩阵断言没有被冒充为通用 YAML/Actions 表达式检查。以上仍然**不替代 GitHub runner 的六路绿色记录**。外部状态也已按 API 核实：`81b02a5` 的 [run 31947620200](https://github.com/Team-Haruki/unity-rs/actions/runs/31947620200) 在 2026-08-16 启动后约六秒即失败，所有 16 个主 job 都是 `steps=[]` 且没有日志，两个依赖 job 被跳过，因此没有一条仓库命令实际执行；仓库级 Actions 当前为 enabled、允许全部 actions，默认 workflow 权限为 write，所以不是仓库禁用了 Actions。API 没有给出可进一步归因的错误文本；组织计费端点需要当前 token 没有的 `admin:org` 权限，不能越权把根因写成某一种计费状态，也不能把这次 run 写成代码失败或绿色证据。
+- **正式 PR 已建立，但 runner 被账单策略挡在执行前（2026-08-24）**：收口分支已推送到
+  [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)，head 为 `2c24e2f`；对应
+  [run 32656083818](https://github.com/Team-Haruki/unity-rs/actions/runs/32656083818)
+  的 16 个主 job 仍全部在两至四秒内失败，API 显示每项 `steps=[]`、`runner_id=0`、
+  runner 名称与组均为空。与旧 run 不同，这次 check annotation 已给出精确原因：近期账户付款
+  失败或 spending limit 需要提高，并要求检查 Billing & plans。仓库级 Actions 仍为 enabled、
+  `allowed_actions=all`；因此不能把这些红项算作代码失败，也不能反复重跑来冒充验证。修复账户
+  账单后必须重跑同一矩阵，只有实际分配 runner、出现步骤日志并六平台全绿才满足第 1 项。
 - **旧无头 WorkMode 的入口名已补齐（2026-08-22）**：逐项核对托管 `WorkMode` 与 CLI alias 后，原生 CLI 现接受 Extract、Export、ExportRaw、Dump、Info、Live2D（`l2d`/`live2d`）、SplitObjects 和 Animator 的旧式 `-m` 写法。新补的两个 Live2D alias 进入完整 `live2d-package` 路径，而不是只写散件 MOC；仍要求显式 `-o`，并拒绝 overwrite 与无关的 extension flag，以保持当前原子 no-clobber 契约而不恢复隐式 `ASExport` 副作用。解析单测同时覆盖两个 alias、缺输出和两个拒绝分支；进程级测试逐个核对 MOC、model3、PNG 和临时文件清理。完整 CLI 共 **72 项测试**通过，严格 CLI Clippy 通过；同一工作树随后执行严格 `quality rust typing`，共 12 项快速质量步骤、workspace build/test 和 Python 3.9 严格消费端全部通过、零跳过。
 - **锁定依赖图现有 RustSec 门禁（2026-08-22）**：`cargo-audit 0.22.2` 的 MSRV 正好是项目下限 Rust 1.88；当前数据库载入 1,225 条 advisory，扫描 `Cargo.lock` 的 103 个依赖后没有漏洞、unsound 或 yanked 包。唯一输出是 `paste 1.0.15` 的停止维护警告 RUSTSEC-2024-0436，它只经 `texture2ddecoder 0.1.2` 进入构建图；后者没有新版，而为去掉一个无已知漏洞的 proc-macro 完整 vendor 需要再维护约 8,685 行上游解码代码，因此现阶段明确允许 unmaintained 提示，但不忽略 advisory，也不放宽漏洞/unsound/yanked。GitHub `quality` 会安装锁定版本并执行该策略；本地 `security` 组不仅检查命令存在，还要求 `--version` 精确为同一个 `cargo-audit 0.22.2`，旧版或无法读取版本时按缺少前置条件处理，配合 `--fail-on-skip` 必然失败而不会产出较弱的假证据。对应正反测试与“注释掉 GitHub 执行行”的结构测试都已通过。
 - **SerializedFile v1-v4 保持验收边界而不猜实现（2026-08-22）**：托管枚举定义 1、2、3 后直接跳到 5，格式 4 没有公开定义；v1-v3 又早于当前 TPK/真实语料能提供的最早 TypeTree。Rust 内部已有 v2/v3 recursive-node 字段门只说明代码为未来样本留了位置，不能当作兼容证据。生产入口继续在完整 header/layout 校验后返回带具体版本号的 `Unsupported`，新增回归逐一锁定 1、2、3、4 不得退化成 `InvalidData`、误解析或 panic。只有拿到真实文件和可独立核验的树/对象载荷后才扩展差分矩阵；在此之前不从 v5 树反推更老格式。
@@ -960,15 +968,15 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送，2026-08-22 核对时本地 `main` 与 `origin/main`
-均指向 `81b02a5`。当前工作树包含严格跳过策略、对应回归测试、Python 主接口
-审计、六平台矩阵门禁、多文件模型导出的事务发布和本文同步这批尚未提交的收口改动；它们不阻塞读取现有
-远端代码，但正式发布矩阵应在这批改动审查并提交后再运行，避免可选门禁因
-环境缺失而静默跳过。
+整理出的主体提交已经推送；2026-08-24 核对时，本地与远端分支
+`codex/headless-rewrite-closure` 均指向 `2c24e2f`，工作树干净。收口改动已按 Core、CI、
+文档三个可独立审查的提交进入 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。
+正式发布矩阵已经触发，但 GitHub 在分配 runner 之前因账户付款失败或 spending limit
+不足拒绝了全部主 job；这不是仓库命令失败，也不能作为绿色发布证据。
 
 | 顺序 | 接下来要做的事 | 完成证据 |
 | --- | --- | --- |
-| 0 | **收口当前工作树**：逐模块审查现有 Core、Python、Node、CI、许可证和文档改动，确认所有新增文件都属于交付范围，再整理为可审查提交 | **主体已完成并同步远端（2026-08-22）**：本地 `main` 与 `origin/main` 同为 `81b02a5`；此前带源码的提交均在独立 worktree 里验证过能单独编译、不依赖后续提交。当前新增的 `--fail-on-skip`、回归测试、Python API/RustSec 审计、六平台矩阵门禁、多文件模型导出事务、旧 `l2d`/`live2d` CLI alias 和文档同步仍未提交。本轮已逐模块审查 Core/CLI、Python、Node、CI、许可证和文档；唯一确定遗漏是 GitHub `quality` 没有运行 local-CI 完成策略自测，现已修复并有删除该步骤即失败的回归。修复后重新执行严格 `quality rust security typing` 以及 `node python`：格式、十二项结构/反向审计、Clippy、rustdoc、Core 打包、许可证、无 GUI/旧 C ABI/context handle 交付范围、workspace build/test、RustSec、Python 3.9 typing、Node debug/release addon/JS/TS/npm tarball、Python release wheel/sdist/重建 wheel/安装后公开面与完整 API 全部通过，零组跳过；最新多文件事务切片又执行完整 `outputs quality rust python node typing security cross` 与 Linux amd64/arm64 原生门禁，同样零组跳过。`git diff --check` 已复核；剩余工作只是把当前改动整理为可审查提交并在 GitHub runner 上跑正式矩阵 |
+| 0 | **收口当前工作树**：逐模块审查现有 Core、Python、Node、CI、许可证和文档改动，确认所有新增文件都属于交付范围，再整理为可审查提交 | **已完成并同步远端（2026-08-24）**：`37e6ee0`、`ca0ea56`、`2c24e2f` 分别收口 Core/绑定、CI/交付范围和文档，均在独立 worktree 中验证可单独构建或通过对应严格门禁；分支 `codex/headless-rewrite-closure` 已推送并创建 PR #1。完整 `outputs quality rust python node typing security cross`、其余 `cli-package oracle audio python314 unitypy` 组，以及 Linux amd64/arm64 原生 Core/CLI、release CLI、Python wheel、Node addon/npm 均通过且零跳过；`git diff --check` 通过。CodeRabbit 的免费审查未报告可执行阻断问题 |
 | 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | 六路 job 全绿；每个 CLI 产物能运行 `--help`，每个 wheel 能安装并通过公开 API 测试，每个 Node tarball 只含目标平台 addon 并通过 JS/TypeScript smoke；产物包含一致的许可证和 notices |
 | 2 | **扩充代表性真实 corpus**：在现有 Unity 2022.3 与 6000.3 之外，优先加入 Tuanjie 2022.3.x、Nintendo Switch、旧 Unity 4/5/2017 和带完整托管快照的样本 | 私有 manifest 在 release 模式稳定通过；每类至少有对象顺序、PathID/class、名称/container、原始载荷 hash、主要解码结果或明确错误族的版本化快照；专有样本不提交到仓库 |
 | 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
