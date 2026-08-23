@@ -23,6 +23,7 @@ pub mod fbx_binary;
 pub mod fbx_binary_scene;
 mod fbx_scene_ascii;
 pub mod file_type;
+mod filesystem_text;
 mod fsb_vorbis;
 pub mod image_export;
 pub mod json;

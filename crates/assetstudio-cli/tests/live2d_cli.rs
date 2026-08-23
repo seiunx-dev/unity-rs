@@ -178,6 +178,41 @@ fn live2d_usage_and_runtime_errors_have_stable_exit_codes() {
     assert!(!output.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn live2d_rejects_a_symbolic_link_output_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::new("symlink");
+    let input = root.path().join("models.assets");
+    let real_output = root.path().join("real-output");
+    let linked_output = root.path().join("linked-output");
+    fs::create_dir_all(real_output.join("existing")).unwrap();
+    symlink(&real_output, &linked_output).unwrap();
+    fs::write(
+        &input,
+        synthetic_models_file(b"MOC3\x63first", b"MOC3\x63second", true),
+    )
+    .unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "live2d".into(),
+            input.as_os_str().into(),
+            linked_output.join("existing/output").into_os_string(),
+        ],
+    );
+
+    assert_eq!(result.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("symbolic-link"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!real_output.join("existing/output").exists());
+}
+
 fn cli<I>(current_directory: &Path, arguments: I) -> Output
 where
     I: IntoIterator<Item = std::ffi::OsString>,

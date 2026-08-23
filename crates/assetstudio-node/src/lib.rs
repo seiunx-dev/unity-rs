@@ -1,48 +1,73 @@
 //! Thin Node-API bindings over the safe high-level Rust API.
 
+use std::fmt::Write as _;
+use std::io::{self, Write};
 use std::sync::Arc;
 
-use assetstudio_core::acl::AclCompressedTracksLimits;
+use assetstudio_core::acl::{AclCompressedTracksLimits, AclDecodeLimits};
 use assetstudio_core::animation_clip::AnimationClipReadLimits;
+use assetstudio_core::animation_component::{AnimationClipOverride, AnimationComponentReadLimits};
 use assetstudio_core::animator_controller::AnimatorControllerReadLimits;
 use assetstudio_core::avatar::AvatarReadLimits;
-use assetstudio_core::export::ExportOptions;
+use assetstudio_core::export::{
+    AudioExportFormat, ExportMode, ExportOptions as CoreExportOptions,
+    ExportReport as CoreExportReport, FilenameFormat,
+};
 use assetstudio_core::extraction::ExtractionOptions;
 use assetstudio_core::image_export::ImageFormat;
 use assetstudio_core::live2d_clip_motion::CubismClipMotionReadLimits;
 use assetstudio_core::live2d_motion::{CubismFadeMotionReadLimits, CubismMotionTargetNames};
-use assetstudio_core::live2d_package::{Live2dPackageLimits, Live2dPackageMaterializeLimits};
+use assetstudio_core::live2d_package::{
+    Live2dPackageBytesSet as CoreLive2dPackageBytesSet, Live2dPackageLimits,
+    Live2dPackageMaterializeLimits,
+};
 use assetstudio_core::live2d_physics::CubismPhysicsReadLimits;
 use assetstudio_core::live2d_schema::{CubismAuxiliaryReadLimits, CubismExpressionReadLimits};
-use assetstudio_core::loader::{AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy};
+use assetstudio_core::loader::{
+    AssetLoadLimits, AssetLoadOptions, DEFAULT_MAXIMUM_LOAD_PATH_BYTES,
+    DEFAULT_MAXIMUM_TOTAL_LOAD_PATH_BYTES, LoadFailurePolicy,
+};
 use assetstudio_core::material::MaterialReadLimits;
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
 use assetstudio_core::mono_schema::{
-    MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry, MonoBehaviourSchemaSource,
+    MonoBehaviourSchemaEntry, MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry,
+    MonoBehaviourSchemaSource, ResolvedMonoBehaviourJson,
 };
 use assetstudio_core::monobehaviour::MonoBehaviourReadLimits;
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::SceneHierarchyLimits;
 use assetstudio_core::scene_hierarchy::SceneObjectKey;
 use assetstudio_core::scene_textures::SceneTextureLimits;
-use assetstudio_core::serialized::{TypeTree, TypeTreeNode};
-use assetstudio_core::simple_assets::{SimpleAssetReadLimits, SimpleBinaryAsset};
+use assetstudio_core::serialized::{ContainerMetadataReadLimits, TypeTree, TypeTreeNode};
+use assetstudio_core::simple_assets::{
+    AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
+    write_direct_wav,
+};
 use assetstudio_core::source::Region;
-use assetstudio_core::sprite::SpriteReadLimits;
+use assetstudio_core::sprite::{Sprite, SpriteMeshType, SpritePackingMode, SpriteReadLimits};
+use assetstudio_core::sprite_atlas::{SpriteAtlas, SpriteAtlasReadLimits};
 use assetstudio_core::studio::{Studio, StudioObject};
 use assetstudio_core::texture::TextureReadLimits;
 use assetstudio_core::texture_array::TextureArrayReadLimits;
 use assetstudio_core::unity_cn::UnityCnKey;
 use assetstudio_core::unity_version::UnityVersion;
-use napi::bindgen_prelude::{AsyncTask, BigInt, Buffer, FnArgs};
+use napi::bindgen_prelude::{Array, AsyncTask, BigInt, Buffer, FnArgs, Object};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Env, Error, Result, Status, Task};
+use napi::{Env, Error, JsString, JsValue, Result, Status, Task, Unknown, ValueType};
 use napi_derive::napi;
 
 const DEFAULT_PAYLOAD_LIMIT: u64 = 512 * 1024 * 1024;
+const DEFAULT_LIVE2D_TOTAL_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_PAGE_LIMIT: u32 = 4096;
 const MAXIMUM_PAGE_LIMIT: u32 = 1_000_000;
+const MAXIMUM_MEMORY_INPUT_NAME_BYTES: usize = DEFAULT_MAXIMUM_LOAD_PATH_BYTES;
+const MAXIMUM_TOTAL_MEMORY_INPUT_NAME_BYTES: usize = DEFAULT_MAXIMUM_TOTAL_LOAD_PATH_BYTES;
+const MAXIMUM_SCHEMA_ENTRIES: usize = 100_000;
+const MAXIMUM_SCHEMA_NODES_PER_ENTRY: usize = 100_000;
+const MAXIMUM_TOTAL_SCHEMA_NODES: usize = 1_000_000;
+const MAXIMUM_SCHEMA_STRING_BYTES: usize = 16 * 1024 * 1024;
+const MAXIMUM_OPTION_DIAGNOSTIC_BYTES: usize = 64;
 
 #[napi(object)]
 pub struct FileInfo {
@@ -71,6 +96,248 @@ pub struct ResourceInfo {
     pub byte_size: BigInt,
 }
 
+/// One Unity serialized-object pointer.
+#[napi(object)]
+pub struct ObjectReference {
+    pub file_id: i32,
+    pub path_id: BigInt,
+}
+
+/// Stable references from one legacy Unity `Animation` component.
+#[napi(object)]
+pub struct LegacyAnimationInfo {
+    pub path_id: BigInt,
+    pub game_object: ObjectReference,
+    pub enabled: u32,
+    pub default_clip: ObjectReference,
+    pub clips: Vec<ObjectReference>,
+    pub trailing_bytes: BigInt,
+}
+
+/// One original-to-replacement clip entry in an override controller.
+#[napi(object)]
+pub struct AnimationClipOverrideInfo {
+    pub original_clip: ObjectReference,
+    pub override_clip: ObjectReference,
+}
+
+/// Stable references from one Unity `AnimatorOverrideController`.
+#[napi(object)]
+pub struct AnimatorOverrideControllerInfo {
+    pub path_id: BigInt,
+    pub name: String,
+    pub controller: ObjectReference,
+    pub clip_overrides: Vec<AnimationClipOverrideInfo>,
+    pub trailing_bytes: BigInt,
+}
+
+/// One named entry in an `AssetBundle` container table.
+#[napi(object)]
+pub struct AssetBundleContainerEntry {
+    pub key: String,
+    pub preload_index: u32,
+    pub preload_size: u32,
+    pub asset: ObjectReference,
+}
+
+/// Bounded, ordered metadata from one Unity `AssetBundle`.
+#[napi(object)]
+pub struct AssetBundleInfo {
+    pub path_id: BigInt,
+    pub name: String,
+    pub object_name: String,
+    pub asset_bundle_name: Option<String>,
+    pub preload_table: Vec<ObjectReference>,
+    pub container: Vec<AssetBundleContainerEntry>,
+    pub dependencies: Vec<String>,
+    pub is_streamed_scene_asset_bundle: bool,
+}
+
+/// One named entry in a `ResourceManager` container table.
+#[napi(object)]
+pub struct ResourceManagerContainerEntry {
+    pub key: String,
+    pub asset: ObjectReference,
+}
+
+/// Bounded, ordered metadata from one Unity `ResourceManager`.
+#[napi(object)]
+pub struct ResourceManagerInfo {
+    pub path_id: BigInt,
+    pub container: Vec<ResourceManagerContainerEntry>,
+}
+
+/// Bounded, ordered metadata from one Unity `PreloadData`.
+#[napi(object)]
+pub struct PreloadDataInfo {
+    pub path_id: BigInt,
+    pub name: String,
+    pub assets: Vec<ObjectReference>,
+}
+
+/// Serialized composite key used by one `SpriteAtlas` render-data entry.
+#[napi(object)]
+pub struct SpriteAtlasRenderDataKey {
+    /// GUID bytes in Unity's original serialized order.
+    pub guid_bytes: Buffer,
+    pub value: BigInt,
+}
+
+#[napi(object)]
+pub struct SpriteAtlasVector2 {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[napi(object)]
+pub struct SpriteAtlasVector4 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub w: f64,
+}
+
+#[napi(object)]
+pub struct SpriteAtlasRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Raw and decoded `SpriteSettings` bits.
+#[napi(object)]
+pub struct SpriteAtlasSettings {
+    pub raw: u32,
+    pub packed: bool,
+    pub packing_mode: u32,
+    pub packing_rotation: u32,
+    pub mesh_type: u32,
+}
+
+#[napi(object)]
+pub struct SpriteAtlasSecondaryTexture {
+    pub texture: ObjectReference,
+    pub name: String,
+}
+
+/// Complete crop, texture and packing metadata for one atlas key.
+#[napi(object)]
+pub struct SpriteAtlasRenderData {
+    pub key: SpriteAtlasRenderDataKey,
+    pub texture: ObjectReference,
+    pub alpha_texture: ObjectReference,
+    pub texture_rect: SpriteAtlasRect,
+    pub texture_rect_offset: SpriteAtlasVector2,
+    pub atlas_rect_offset: SpriteAtlasVector2,
+    pub uv_transform: SpriteAtlasVector4,
+    pub downscale_multiplier: f64,
+    pub settings: SpriteAtlasSettings,
+    /// Absent before Unity 2020.2; present and possibly empty afterwards.
+    pub secondary_textures: Option<Vec<SpriteAtlasSecondaryTexture>>,
+}
+
+/// Complete, bounded metadata from one Unity `SpriteAtlas` object.
+#[napi(object)]
+pub struct SpriteAtlasInfo {
+    pub path_id: BigInt,
+    pub name: String,
+    pub packed_sprites: Vec<ObjectReference>,
+    pub packed_sprite_names: Vec<String>,
+    pub render_data_entries: Vec<SpriteAtlasRenderData>,
+    pub tag: String,
+    pub is_variant: bool,
+}
+
+/// Caller-configurable budgets for metadata-only `Sprite` parsing.
+#[napi(object)]
+pub struct SpriteMetadataLimits {
+    pub maximum_entries: Option<u32>,
+    pub maximum_string_bytes: Option<i64>,
+    pub maximum_total_string_bytes: Option<i64>,
+    pub maximum_mesh_bytes: Option<i64>,
+}
+
+#[napi(object)]
+pub struct SpriteVector2 {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[napi(object)]
+pub struct SpriteVector4 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub w: f64,
+}
+
+#[napi(object)]
+pub struct SpriteRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Raw and decoded `SpriteSettings` bits from resident render data.
+#[napi(object)]
+pub struct SpriteSettings {
+    pub raw: u32,
+    pub packed: bool,
+    pub packing_mode: String,
+    pub packing_rotation: u32,
+    pub mesh_type: String,
+}
+
+#[napi(object)]
+pub struct SpriteSecondaryTexture {
+    pub texture: ObjectReference,
+    pub name: String,
+}
+
+/// One validated local-space triangle used for tight-mesh masking.
+#[napi(object)]
+pub struct SpriteTriangle {
+    pub first: SpriteVector2,
+    pub second: SpriteVector2,
+    pub third: SpriteVector2,
+}
+
+/// Complete resident render metadata stored directly on one `Sprite`.
+#[napi(object)]
+pub struct SpriteRenderData {
+    pub texture: ObjectReference,
+    pub alpha_texture: ObjectReference,
+    pub secondary_textures: Vec<SpriteSecondaryTexture>,
+    pub texture_rect: SpriteRect,
+    pub texture_rect_offset: SpriteVector2,
+    pub atlas_rect_offset: SpriteVector2,
+    pub settings: SpriteSettings,
+    pub uv_transform: SpriteVector4,
+    pub downscale_multiplier: f64,
+    pub mesh_triangles: Vec<SpriteTriangle>,
+}
+
+/// Complete, bounded metadata from one Unity `Sprite` object.
+#[napi(object)]
+pub struct SpriteMetadata {
+    pub object_index: u32,
+    pub path_id: BigInt,
+    pub name: String,
+    pub rect: SpriteRect,
+    pub offset: SpriteVector2,
+    pub border: SpriteVector4,
+    pub pixels_to_units: f64,
+    pub pivot: SpriteVector2,
+    pub extrude: u32,
+    pub is_polygon: bool,
+    pub render_data_key: Option<SpriteAtlasRenderDataKey>,
+    pub atlas_tags: Vec<String>,
+    pub sprite_atlas: ObjectReference,
+    pub render_data: SpriteRenderData,
+}
+
 /// A decoded RGBA8 image.
 #[napi(object)]
 pub struct RgbaImage {
@@ -89,7 +356,10 @@ pub struct AudioClip {
     pub name: String,
     /// The extension the stored bytes carry, `.fsb` or `.wav` for example.
     pub extension: String,
-    /// True when the payload is already a playable RIFF/WAVE stream.
+    /// `audio_raw` for the serialized payload or `audio_wav` for a verified
+    /// decoder-free WAV materialization.
+    pub payload_kind: String,
+    /// True when Core can produce WAV bytes without an external decoder.
     pub is_direct_wav: bool,
     pub data: Buffer,
 }
@@ -210,16 +480,33 @@ pub struct PlayerSettings {
     pub product_name: String,
 }
 
-/// An `Avatar`'s skeleton summary.
+/// One ordered Avatar TOS path entry.
+#[napi(object)]
+pub struct AvatarPathEntry {
+    pub hash: u32,
+    pub path: String,
+}
+
+/// Complete stable skeleton, TOS, and human-description metadata from an
+/// `Avatar`.
 #[napi(object)]
 pub struct Avatar {
+    pub path_id: BigInt,
     pub name: String,
-    /// The size the object declares for its constant block.
+    /// Compatibility alias retained for callers of the original Node slice.
     pub declared_size: u32,
+    /// The size the object declares for its constant block.
+    pub declared_avatar_size: u32,
+    pub skeleton_node_count: u32,
+    pub human_skeleton_node_count: u32,
     /// Bone path entries, retained in order so duplicate hashes keep Unity's
     /// first-hit behaviour.
     pub path_count: u32,
+    pub paths: Vec<AvatarPathEntry>,
     pub has_human_description: bool,
+    pub human_bone_count: u32,
+    pub skeleton_bone_count: u32,
+    pub root_motion_bone_name: Option<String>,
 }
 
 /// One `GameObject` in the assembled hierarchy.
@@ -290,27 +577,47 @@ pub struct ExtractionReport {
     pub output_bytes: BigInt,
 }
 
-/// An `AnimationClip`'s shape, without materializing its keyframes.
+/// Complete bounded `AnimationClip` shape, muscle, ACL, and streaming metadata.
 ///
-/// Separate booleans rather than a bitfield: this is a JavaScript-facing shape
-/// and a bitfield would only move the decoding to the other side.
+/// Core still parses the complete object and validates ordinary keyframes;
+/// their arrays stay in Rust and are summarized by counts rather than copied
+/// into JavaScript. Separate booleans rather than a bitfield keep callers from
+/// having to reproduce Core's decoding.
 #[allow(clippy::struct_excessive_bools)]
 #[napi(object)]
 pub struct AnimationClipInfo {
+    pub path_id: BigInt,
     pub name: String,
     pub sample_rate: f64,
     pub wrap_mode: i32,
     pub legacy: bool,
     pub compressed: bool,
+    pub use_high_quality_curve: bool,
     pub rotation_curve_count: u32,
     pub position_curve_count: u32,
     pub scale_curve_count: u32,
     pub euler_curve_count: u32,
     pub float_curve_count: u32,
+    pub pptr_curve_count: u32,
+    pub muscle_clip_size: u32,
     /// Present when the clip carries muscle (humanoid) data.
     pub has_muscle_clip: bool,
+    pub streamed_curve_count: Option<u32>,
+    pub dense_curve_count: Option<u32>,
+    pub constant_value_count: Option<u32>,
+    pub has_acl: bool,
+    pub acl_frame_count: Option<u32>,
+    pub acl_bone_count: Option<u32>,
+    pub acl_sample_rate: Option<f64>,
+    pub acl_curve_count: Option<u32>,
+    pub acl_track_byte_count: Option<BigInt>,
+    pub acl_decoder_count: Option<u32>,
+    pub acl_use_fast_sample_mode: Option<bool>,
     /// Present when the clip's samples live in a sibling resource file.
     pub has_streaming_info: bool,
+    pub streaming_offset: Option<BigInt>,
+    pub streaming_size: Option<u32>,
+    pub streaming_path: Option<String>,
 }
 
 /// An `AnimatorController`'s identity and the clips it references.
@@ -524,6 +831,47 @@ pub struct OpenOptions {
     pub maximum_input_files: Option<u32>,
     pub maximum_input_directories: Option<u32>,
     pub maximum_directory_entries: Option<u32>,
+    /// Maximum UTF-8 bytes in one root label or fully qualified nested path.
+    pub maximum_path_bytes: Option<u32>,
+    /// Maximum cumulative UTF-8 bytes of paths discovered during one load.
+    pub maximum_total_path_bytes: Option<u32>,
+}
+
+/// Complete caller-configurable Core export policy.
+///
+/// Every field is optional and preserves Core's default when omitted. The
+/// older `export(outputRoot, overwrite?)` method remains available as the
+/// compact compatibility call.
+#[napi(object)]
+pub struct ExportConfiguration {
+    /// `auto`, `raw`, `typetree-json`, or `dump-text`.
+    pub mode: Option<String>,
+    /// `asset-name`, `asset-name-path-id`, or `path-id`.
+    pub filename_format: Option<String>,
+    /// `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`.
+    pub image_format: Option<String>,
+    pub jpeg_quality: Option<u32>,
+    /// `auto`, `raw`, or `wav`.
+    pub audio_format: Option<String>,
+    pub overwrite_existing: Option<bool>,
+    pub restore_text_asset_extension: Option<bool>,
+    pub pretty_json: Option<bool>,
+    pub maximum_objects: Option<u32>,
+    pub maximum_total_output_bytes: Option<i64>,
+    pub maximum_raw_object_bytes: Option<i64>,
+    pub maximum_type_tree_json_bytes: Option<i64>,
+    pub maximum_type_tree_dump_bytes: Option<i64>,
+    pub maximum_text_asset_bytes: Option<i64>,
+    pub maximum_simple_asset_bytes: Option<i64>,
+    pub maximum_audio_output_bytes: Option<i64>,
+    pub maximum_texture_output_bytes: Option<i64>,
+    pub maximum_texture_array_output_bytes: Option<i64>,
+    pub maximum_texture_array_bundle_bytes: Option<i64>,
+    pub maximum_sprite_output_bytes: Option<i64>,
+    pub maximum_shader_output_bytes: Option<i64>,
+    pub maximum_monobehaviour_json_bytes: Option<i64>,
+    pub maximum_mesh_object_bytes: Option<i64>,
+    pub maximum_mesh_output_bytes: Option<i64>,
 }
 
 /// Caller-configurable collection-wide scene assembly budgets.
@@ -590,6 +938,14 @@ fn load_options(
                 options.maximum_directory_entries,
                 defaults.maximum_directory_entries,
             ),
+            maximum_path_bytes: count_limit(
+                options.maximum_path_bytes,
+                defaults.maximum_path_bytes,
+            ),
+            maximum_total_path_bytes: count_limit(
+                options.maximum_total_path_bytes,
+                defaults.maximum_total_path_bytes,
+            ),
             ..defaults
         },
         unity_version_override,
@@ -605,6 +961,161 @@ fn load_options(
 
 fn count_limit(value: Option<u32>, default: usize) -> usize {
     value.map_or(default, |value| value as usize)
+}
+
+fn export_configuration(options: Option<ExportConfiguration>) -> Result<CoreExportOptions> {
+    let defaults = CoreExportOptions::default();
+    let Some(options) = options else {
+        return Ok(defaults);
+    };
+    let jpeg_quality = options
+        .jpeg_quality
+        .unwrap_or(u32::from(defaults.jpeg_quality));
+    if !(1..=100).contains(&jpeg_quality) {
+        return Err(invalid_arg(format!(
+            "jpegQuality {jpeg_quality} is outside the supported range 1 through 100"
+        )));
+    }
+    let jpeg_quality = u8::try_from(jpeg_quality)
+        .map_err(|_| invalid_arg("jpegQuality does not fit in one byte"))?;
+    let audio_format = match options.audio_format.as_deref() {
+        Some(value) => parse_audio_format(value)?,
+        None => defaults.audio_format,
+    };
+    let mut configured = defaults;
+    apply_export_limits(&options, &mut configured)?;
+    configured.mode = parse_export_mode(options.mode.as_deref())?;
+    configured.filename_format = parse_filename_format(options.filename_format.as_deref())?;
+    configured.image_format = parse_image_format(options.image_format)?;
+    configured.jpeg_quality = jpeg_quality;
+    configured.audio_format = audio_format;
+    configured.overwrite_existing = options
+        .overwrite_existing
+        .unwrap_or(defaults.overwrite_existing);
+    configured.restore_text_asset_extension = options
+        .restore_text_asset_extension
+        .unwrap_or(defaults.restore_text_asset_extension);
+    configured.pretty_json = options.pretty_json.unwrap_or(defaults.pretty_json);
+    Ok(configured)
+}
+
+fn apply_export_limits(
+    options: &ExportConfiguration,
+    configured: &mut CoreExportOptions,
+) -> Result<()> {
+    configured.maximum_objects = count_limit(options.maximum_objects, configured.maximum_objects);
+    configured.maximum_total_output_bytes = non_negative_limit(
+        options.maximum_total_output_bytes,
+        configured.maximum_total_output_bytes,
+        "maximumTotalOutputBytes",
+    )?;
+    configured.maximum_raw_object_bytes = non_negative_limit(
+        options.maximum_raw_object_bytes,
+        configured.maximum_raw_object_bytes,
+        "maximumRawObjectBytes",
+    )?;
+    configured.maximum_type_tree_json_bytes = non_negative_limit(
+        options.maximum_type_tree_json_bytes,
+        configured.maximum_type_tree_json_bytes,
+        "maximumTypeTreeJsonBytes",
+    )?;
+    configured.maximum_type_tree_dump_bytes = non_negative_limit(
+        options.maximum_type_tree_dump_bytes,
+        configured.maximum_type_tree_dump_bytes,
+        "maximumTypeTreeDumpBytes",
+    )?;
+    configured.maximum_text_asset_bytes = usize_non_negative_limit(
+        options.maximum_text_asset_bytes,
+        configured.maximum_text_asset_bytes,
+        "maximumTextAssetBytes",
+    )?;
+    configured.maximum_simple_asset_bytes = non_negative_limit(
+        options.maximum_simple_asset_bytes,
+        configured.maximum_simple_asset_bytes,
+        "maximumSimpleAssetBytes",
+    )?;
+    configured.maximum_audio_output_bytes = non_negative_limit(
+        options.maximum_audio_output_bytes,
+        configured.maximum_audio_output_bytes,
+        "maximumAudioOutputBytes",
+    )?;
+    configured.maximum_texture_output_bytes = non_negative_limit(
+        options.maximum_texture_output_bytes,
+        configured.maximum_texture_output_bytes,
+        "maximumTextureOutputBytes",
+    )?;
+    configured.maximum_texture_array_output_bytes = non_negative_limit(
+        options.maximum_texture_array_output_bytes,
+        configured.maximum_texture_array_output_bytes,
+        "maximumTextureArrayOutputBytes",
+    )?;
+    configured.maximum_texture_array_bundle_bytes = non_negative_limit(
+        options.maximum_texture_array_bundle_bytes,
+        configured.maximum_texture_array_bundle_bytes,
+        "maximumTextureArrayBundleBytes",
+    )?;
+    configured.maximum_sprite_output_bytes = non_negative_limit(
+        options.maximum_sprite_output_bytes,
+        configured.maximum_sprite_output_bytes,
+        "maximumSpriteOutputBytes",
+    )?;
+    configured.maximum_shader_output_bytes = non_negative_limit(
+        options.maximum_shader_output_bytes,
+        configured.maximum_shader_output_bytes,
+        "maximumShaderOutputBytes",
+    )?;
+    configured.maximum_monobehaviour_json_bytes = usize_non_negative_limit(
+        options.maximum_monobehaviour_json_bytes,
+        configured.maximum_monobehaviour_json_bytes,
+        "maximumMonobehaviourJsonBytes",
+    )?;
+    configured.maximum_mesh_object_bytes = non_negative_limit(
+        options.maximum_mesh_object_bytes,
+        configured.maximum_mesh_object_bytes,
+        "maximumMeshObjectBytes",
+    )?;
+    configured.maximum_mesh_output_bytes = non_negative_limit(
+        options.maximum_mesh_output_bytes,
+        configured.maximum_mesh_output_bytes,
+        "maximumMeshOutputBytes",
+    )?;
+    Ok(())
+}
+
+fn export_report(report: CoreExportReport) -> Result<ExportReport> {
+    let mut exported = reserve(report.exported.len(), "export records")?;
+    for record in report.exported {
+        exported.push(ExportRecord {
+            source: record.source,
+            path_id: BigInt::from(record.path_id),
+            class_id: record.class_id,
+            output_path: copy_path_string(&record.output_path, "exported output path")?,
+            payload_kind: record.payload_kind.to_owned(),
+        });
+    }
+    let mut failures = reserve(report.failures.len(), "export failures")?;
+    for failure in report.failures {
+        failures.push(ExportFailure {
+            source: failure.source,
+            path_id: BigInt::from(failure.path_id),
+            class_id: failure.class_id,
+            error: failure.error,
+        });
+    }
+    let mut unsupported = reserve(report.unsupported.len(), "unsupported exports")?;
+    for declined in report.unsupported {
+        unsupported.push(ExportFailure {
+            source: declined.source,
+            path_id: BigInt::from(declined.path_id),
+            class_id: declined.class_id,
+            error: declined.error,
+        });
+    }
+    Ok(ExportReport {
+        exported,
+        failures,
+        unsupported,
+    })
 }
 
 fn scene_limits(options: Option<SceneLimits>) -> SceneHierarchyLimits {
@@ -728,7 +1239,30 @@ impl AssetStudio {
         Ok(AsyncTask::new(FbxWithAclTask {
             studio: Arc::clone(&self.studio),
             maximum: byte_limit(maximum_bytes)?,
-            decoder: Arc::new(JsAclDecoder { callback: decoder }),
+            decoder: Arc::new(JsAclDecoder {
+                callback: decoder,
+                limits: AclDecodeLimits::default(),
+            }),
+            request: FbxWithAclRequest::SceneAscii,
+        }))
+    }
+
+    /// Writes the animated scene as binary FBX 7.4, decoding ACL tracks
+    /// through a caller-supplied decoder on a worker.
+    #[napi(ts_return_type = "Promise<Buffer>")]
+    pub fn read_fbx_binary_with_acl_decoder(
+        &self,
+        #[napi(ts_arg_type = "(request: AclDecodeRequest) => AclDecodedClip")] decoder: AclCallback,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<FbxWithAclTask>> {
+        Ok(AsyncTask::new(FbxWithAclTask {
+            studio: Arc::clone(&self.studio),
+            maximum: byte_limit(maximum_bytes)?,
+            decoder: Arc::new(JsAclDecoder {
+                callback: decoder,
+                limits: AclDecodeLimits::default(),
+            }),
+            request: FbxWithAclRequest::SceneBinary,
         }))
     }
 
@@ -770,20 +1304,26 @@ impl AssetStudio {
     }
 
     /// Opens a path on a libuv worker so container discovery does not block
-    /// the JavaScript event loop.
+    /// the JavaScript event loop. The optional settings are identical to
+    /// `openWith`; existing one-argument calls remain valid.
     #[must_use]
     #[napi(ts_return_type = "Promise<AssetStudio>")]
-    pub fn open_async(path: String) -> AsyncTask<OpenPathTask> {
-        AsyncTask::new(OpenPathTask { path })
+    pub fn open_async(path: String, options: Option<OpenOptions>) -> AsyncTask<OpenPathTask> {
+        AsyncTask::new(OpenPathTask { path, options })
     }
 
     /// Opens one in-memory asset, bundle, or resource after copying the Node
     /// buffer into Rust-owned immutable storage.
+    ///
+    /// The final options argument exposes the same version override, UnityCN
+    /// key, failure policy, and discovery budgets as `openWith`. It is last so
+    /// existing `(data, name, maximumBytes)` calls remain source-compatible.
     #[napi(factory)]
     pub fn from_buffer(
         data: &[u8],
         name: Option<String>,
         maximum_bytes: Option<i64>,
+        options: Option<OpenOptions>,
     ) -> Result<Self> {
         let maximum = byte_limit(maximum_bytes)?;
         let actual =
@@ -793,9 +1333,11 @@ impl AssetStudio {
                 "input buffer is {actual} bytes, exceeding limit {maximum}"
             )));
         }
-        Studio::open_region(
+        let bytes = copy_slice(data, "input buffer")?;
+        Studio::open_region_with_options(
             name.unwrap_or_else(|| "memory.assets".to_owned()),
-            Region::from_bytes(data.to_vec()),
+            Region::from_bytes(bytes),
+            load_options(options, None)?,
         )
         .map(|studio| Self {
             studio: Arc::new(studio),
@@ -803,12 +1345,14 @@ impl AssetStudio {
         .map_err(core_error)
     }
 
-    /// Copies a Node buffer once, then parses it on a libuv worker.
+    /// Copies a Node buffer once, then parses it on a libuv worker. The final
+    /// options argument matches the synchronous `fromBuffer` entry point.
     #[napi(ts_return_type = "Promise<AssetStudio>")]
     pub fn from_buffer_async(
         data: &[u8],
         name: Option<String>,
         maximum_bytes: Option<i64>,
+        options: Option<OpenOptions>,
     ) -> Result<AsyncTask<OpenBufferTask>> {
         let maximum = byte_limit(maximum_bytes)?;
         let actual =
@@ -818,14 +1362,11 @@ impl AssetStudio {
                 "input buffer is {actual} bytes, exceeding limit {maximum}"
             )));
         }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(data.len()).map_err(|error| {
-            Error::from_reason(format!("cannot allocate input buffer: {error}"))
-        })?;
-        bytes.extend_from_slice(data);
+        let bytes = copy_slice(data, "input buffer")?;
         Ok(AsyncTask::new(OpenBufferTask {
             bytes,
             name: name.unwrap_or_else(|| "memory.assets".to_owned()),
+            options,
         }))
     }
 
@@ -1147,6 +1688,43 @@ impl AssetStudio {
         }))
     }
 
+    /// Reads one complete, bounded Unity `SpriteAtlas` metadata table.
+    #[napi]
+    pub fn read_sprite_atlas(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_entries: Option<u32>,
+        maximum_string_bytes: Option<i64>,
+        maximum_total_string_bytes: Option<i64>,
+    ) -> Result<SpriteAtlasInfo> {
+        let atlas = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_sprite_atlas(sprite_atlas_limits(
+                maximum_entries,
+                maximum_string_bytes,
+                maximum_total_string_bytes,
+            )?)
+            .map_err(core_error)?;
+        convert_sprite_atlas(atlas)
+    }
+
+    /// Reads one complete, bounded Unity `Sprite` metadata object without
+    /// resolving or decoding its texture references.
+    #[napi]
+    pub fn read_sprite_metadata(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        limits: Option<SpriteMetadataLimits>,
+    ) -> Result<SpriteMetadata> {
+        let sprite = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_sprite(sprite_metadata_limits(limits)?)
+            .map_err(core_error)?;
+        convert_sprite_metadata(sprite)
+    }
+
     #[napi]
     pub fn read_sprite(
         &self,
@@ -1193,13 +1771,38 @@ impl AssetStudio {
                 ..SimpleAssetReadLimits::default()
             })
             .map_err(core_error)?;
-        let data = audio.payload.read_to_vec(maximum).map_err(core_error)?;
-        Ok(AudioClip {
-            name: audio.name,
-            extension: audio.raw_extension,
-            is_direct_wav: audio.direct_wav.is_some(),
-            data: data.into(),
-        })
+        materialize_audio_clip(audio, AudioExportFormat::Raw, maximum)
+    }
+
+    /// Reads an `AudioClip` using the same `auto`, `raw`, or `wav` policy as
+    /// Core, Python and the CLI exporter.
+    ///
+    /// `auto` writes a WAV only when Core has verified a decoder-free path;
+    /// otherwise it preserves the source container. `wav` requires such a
+    /// path and refuses compressed codecs rather than returning mislabeled
+    /// bytes. The older `readAudio` method remains a raw-only compatibility
+    /// alias.
+    #[napi]
+    pub fn read_audio_clip(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        format: Option<String>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AudioClip> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let format = match format {
+            Some(value) => parse_audio_format(&value)?,
+            None => AudioExportFormat::Auto,
+        };
+        let audio = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_audio_clip(SimpleAssetReadLimits {
+                maximum_payload_bytes: maximum,
+                ..SimpleAssetReadLimits::default()
+            })
+            .map_err(core_error)?;
+        materialize_audio_clip(audio, format, maximum)
     }
 
     /// Reads the identity of a `MonoScript`.
@@ -1251,9 +1854,9 @@ impl AssetStudio {
             name: material.name,
             shader_file_id: material.shader.file_id,
             shader_path_id: BigInt::from(material.shader.path_id),
-            texture_properties: property_names(&material.saved_properties.texture_environments),
-            float_properties: property_names(&material.saved_properties.floats),
-            color_properties: property_names(&material.saved_properties.colors),
+            texture_properties: property_names(&material.saved_properties.texture_environments)?,
+            float_properties: property_names(&material.saved_properties.floats)?,
+            color_properties: property_names(&material.saved_properties.colors)?,
         })
     }
 
@@ -1293,7 +1896,8 @@ impl AssetStudio {
         })
     }
 
-    /// Reads an `Avatar`'s skeleton summary.
+    /// Reads complete stable skeleton, TOS, and human-description metadata
+    /// from one bounded `Avatar`.
     #[napi]
     pub fn read_avatar(
         &self,
@@ -1304,18 +1908,9 @@ impl AssetStudio {
         let maximum = byte_limit(maximum_bytes)?;
         let avatar = self
             .object(file_index, bigint_i64(path_id, "pathId")?)?
-            .read_avatar(AvatarReadLimits {
-                maximum_object_bytes: maximum,
-                ..AvatarReadLimits::default()
-            })
+            .read_avatar(avatar_limits(maximum)?)
             .map_err(core_error)?;
-        Ok(Avatar {
-            name: avatar.name,
-            declared_size: avatar.declared_avatar_size,
-            path_count: u32::try_from(avatar.paths.len())
-                .map_err(|_| invalid_arg("avatar path count does not fit u32"))?,
-            has_human_description: avatar.human_description.is_some(),
-        })
+        convert_avatar(avatar)
     }
 
     /// Opens several in-memory inputs as one collection.
@@ -1323,14 +1918,49 @@ impl AssetStudio {
     /// A serialized file and the `.resS` its textures and audio stream from are
     /// separate files; opening them one at a time leaves every streamed payload
     /// unresolvable, so a caller holding both in memory needs to pass them
-    /// together.
+    /// together. The final options argument matches `openWith` and is placed
+    /// after the existing aggregate byte limit to preserve old calls.
     #[napi(factory)]
-    pub fn from_buffers(inputs: Vec<MemoryInput>, maximum_bytes: Option<i64>) -> Result<Self> {
+    pub fn from_buffers(
+        env: Env,
+        #[napi(ts_arg_type = "Array<MemoryInput>")] inputs: Array<'_>,
+        maximum_bytes: Option<i64>,
+        options: Option<OpenOptions>,
+    ) -> Result<Self> {
         let maximum = byte_limit(maximum_bytes)?;
+        let options = load_options(options, None)?;
+        let input_count = usize::try_from(inputs.len()).expect("u32 fits usize");
+        let maximum_files = options.limits.maximum_input_files;
+        if input_count > maximum_files {
+            return Err(invalid_arg(format!(
+                "memory input has {input_count} files, exceeding limit {maximum_files}"
+            )));
+        }
         let mut total = 0_u64;
-        let mut regions = Vec::new();
-        for input in inputs {
-            let length = u64::try_from(input.data.len())
+        let mut total_name_bytes = 0_usize;
+        let mut regions = reserve(input_count, "memory input regions")?;
+        for index in 0..inputs.len() {
+            let owner = format!("memory input {index}");
+            let input: Object<'_> = inputs
+                .get(index)?
+                .ok_or_else(|| invalid_arg(format!("{owner} is missing")))?;
+            let name: JsString<'_> = required_object_field(&input, "name", &owner)?;
+            let name_length = name.utf8_len()?;
+            if name_length > MAXIMUM_MEMORY_INPUT_NAME_BYTES {
+                return Err(invalid_arg(format!(
+                    "{owner} name has {name_length} bytes, exceeding limit {MAXIMUM_MEMORY_INPUT_NAME_BYTES}"
+                )));
+            }
+            total_name_bytes = total_name_bytes
+                .checked_add(name_length)
+                .ok_or_else(|| invalid_arg("memory input name byte count overflowed"))?;
+            if total_name_bytes > MAXIMUM_TOTAL_MEMORY_INPUT_NAME_BYTES {
+                return Err(invalid_arg(format!(
+                    "memory input names exceed {MAXIMUM_TOTAL_MEMORY_INPUT_NAME_BYTES} bytes"
+                )));
+            }
+            let data: Buffer = required_object_field(&input, "data", &owner)?;
+            let length = u64::try_from(data.len())
                 .map_err(|_| invalid_arg("buffer length does not fit u64"))?;
             total = total
                 .checked_add(length)
@@ -1340,9 +1970,11 @@ impl AssetStudio {
                     "input buffers total {total} bytes, exceeding limit {maximum}"
                 )));
             }
-            regions.push((input.name, Region::from_bytes(input.data.to_vec())));
+            let name = copy_js_string(env.raw(), name, name_length, "memory input name")?;
+            let bytes = copy_slice(data.as_ref(), "memory input buffer")?;
+            regions.push((name, Region::from_bytes(bytes)));
         }
-        Studio::open_regions(regions)
+        Studio::open_regions_with_options(regions, options)
             .map(|studio| Self {
                 studio: Arc::new(studio),
             })
@@ -1444,18 +2076,18 @@ impl AssetStudio {
             .object(file_index, bigint_i64(path_id, "pathId")?)?
             .read_cubism_physics(CubismPhysicsReadLimits::default())
             .map_err(core_error)?;
-        let mut json = Vec::new();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "physics3.json's fps field is a float"
         )]
         let fallback = motion_fps.unwrap_or(30.0) as f32;
-        rig.write_physics3_json(fallback, &mut json, maximum)
-            .map_err(core_error)?;
+        let json = materialize_core_bytes(maximum, "physics3 JSON", |output| {
+            rig.write_physics3_json(fallback, output, maximum)
+        })?;
         Ok(CubismDocument {
             name: String::new(),
             json: json.into(),
-            entry_count: u32::try_from(rig.sub_rigs.len()).unwrap_or(u32::MAX),
+            entry_count: count_u32(rig.sub_rigs.len(), "Cubism physics sub-rig count")?,
         })
     }
 
@@ -1472,14 +2104,17 @@ impl AssetStudio {
             .object(file_index, bigint_i64(path_id, "pathId")?)?
             .read_cubism_expression(CubismExpressionReadLimits::default())
             .map_err(core_error)?;
-        let mut json = Vec::new();
-        expression
-            .write_exp3_json(&mut json, maximum)
-            .map_err(core_error)?;
+        let json = materialize_core_bytes(maximum, "exp3 JSON", |output| {
+            expression.write_exp3_json(output, maximum)
+        })?;
+        let entry_count = count_u32(
+            expression.parameters.len(),
+            "Cubism expression parameter count",
+        )?;
         Ok(CubismDocument {
-            name: expression.source_name.clone(),
+            name: expression.source_name,
             json: json.into(),
-            entry_count: u32::try_from(expression.parameters.len()).unwrap_or(u32::MAX),
+            entry_count,
         })
     }
 
@@ -1496,19 +2131,14 @@ impl AssetStudio {
             .object(file_index, bigint_i64(path_id, "pathId")?)?
             .read_cubism_fade_motion(CubismFadeMotionReadLimits::default())
             .map_err(core_error)?;
-        let mut json = Vec::new();
-        motion
-            .write_motion3_json(
-                &CubismMotionTargetNames::default(),
-                false,
-                &mut json,
-                maximum,
-            )
-            .map_err(core_error)?;
+        let json = materialize_core_bytes(maximum, "motion3 JSON", |output| {
+            motion.write_motion3_json(&CubismMotionTargetNames::default(), false, output, maximum)
+        })?;
+        let entry_count = count_u32(motion.curves.len(), "Cubism fade-motion curve count")?;
         Ok(CubismDocument {
-            name: motion.source_name.clone(),
+            name: motion.source_name,
             json: json.into(),
-            entry_count: u32::try_from(motion.curves.len()).unwrap_or(u32::MAX),
+            entry_count,
         })
     }
 
@@ -1560,15 +2190,16 @@ impl AssetStudio {
         &self,
         file_index: u32,
         path_id: BigInt,
-        targets: Option<CubismMotionTargets>,
+        #[napi(ts_arg_type = "CubismMotionTargets | undefined | null")] targets: Option<Object<'_>>,
         force_bezier: Option<bool>,
         maximum_bytes: Option<i64>,
     ) -> Result<CubismClipMotion> {
         let maximum = byte_limit(maximum_bytes)?;
-        let target_names = cubism_motion_targets(targets);
+        let limits = cubism_clip_motion_limits(maximum)?;
+        let target_names = cubism_motion_targets(targets, limits)?;
         let motion = self
             .object(file_index, bigint_i64(path_id, "pathId")?)?
-            .read_cubism_clip_motion(&target_names, cubism_clip_motion_limits(maximum)?)
+            .read_cubism_clip_motion(&target_names, limits)
             .map_err(core_error)?;
         build_cubism_clip_motion(motion, force_bezier.unwrap_or(false), maximum)
             .map(CubismClipMotionOutput::into_js)
@@ -1586,18 +2217,23 @@ impl AssetStudio {
         file_index: u32,
         path_id: BigInt,
         #[napi(ts_arg_type = "(request: AclDecodeRequest) => AclDecodedClip")] decoder: AclCallback,
-        targets: Option<CubismMotionTargets>,
+        #[napi(ts_arg_type = "CubismMotionTargets | undefined | null")] targets: Option<Object<'_>>,
         force_bezier: Option<bool>,
         maximum_bytes: Option<i64>,
     ) -> Result<AsyncTask<CubismClipMotionWithAclTask>> {
+        let maximum = byte_limit(maximum_bytes)?;
+        let limits = cubism_clip_motion_limits(maximum)?;
         Ok(AsyncTask::new(CubismClipMotionWithAclTask {
             studio: Arc::clone(&self.studio),
             file_index: usize::try_from(file_index).expect("u32 fits usize"),
             path_id: bigint_i64(path_id, "pathId")?,
-            targets: cubism_motion_targets(targets),
+            targets: cubism_motion_targets(targets, limits)?,
             force_bezier: force_bezier.unwrap_or(false),
-            maximum: byte_limit(maximum_bytes)?,
-            decoder: Arc::new(JsAclDecoder { callback: decoder }),
+            maximum,
+            decoder: Arc::new(JsAclDecoder {
+                callback: decoder,
+                limits: AclDecodeLimits::default(),
+            }),
         }))
     }
 
@@ -1612,7 +2248,7 @@ impl AssetStudio {
             .studio
             .split_object_fbx_candidates(ModelExportPlanLimits::default())
             .map_err(core_error)?;
-        Ok(candidates.into_iter().map(into_candidate).collect())
+        convert_fbx_candidates(candidates, "split-object FBX candidates")
     }
 
     /// Enumerates the branches an Animator owns.
@@ -1622,7 +2258,7 @@ impl AssetStudio {
             .studio
             .animator_fbx_candidates(ModelExportPlanLimits::default())
             .map_err(core_error)?;
-        Ok(candidates.into_iter().map(into_candidate).collect())
+        convert_fbx_candidates(candidates, "Animator FBX candidates")
     }
 
     /// Writes one selected `GameObject` branch as FBX.
@@ -1647,6 +2283,34 @@ impl AssetStudio {
             )
             .map(Into::into)
             .map_err(core_error)
+    }
+
+    /// Writes one selected `GameObject` branch as animated ASCII FBX while a
+    /// worker delegates Tuanjie ACL decompression to JavaScript.
+    #[napi(ts_return_type = "Promise<Buffer>")]
+    pub fn read_game_object_fbx_with_acl_decoder(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        #[napi(ts_arg_type = "(request: AclDecodeRequest) => AclDecodedClip")] decoder: AclCallback,
+        include_animations: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<FbxWithAclTask>> {
+        Ok(AsyncTask::new(FbxWithAclTask {
+            studio: Arc::clone(&self.studio),
+            maximum: byte_limit(maximum_bytes)?,
+            decoder: Arc::new(JsAclDecoder {
+                callback: decoder,
+                limits: AclDecodeLimits::default(),
+            }),
+            request: FbxWithAclRequest::GameObject {
+                key: SceneObjectKey {
+                    file_index: usize::try_from(file_index).expect("u32 fits usize"),
+                    path_id: bigint_i64(path_id, "pathId")?,
+                },
+                include_animations: include_animations.unwrap_or(true),
+            },
+        }))
     }
 
     /// Reads a `Font`'s resident payload.
@@ -1697,47 +2361,36 @@ impl AssetStudio {
     #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn export(&self, output_root: String, overwrite: Option<bool>) -> Result<ExportReport> {
-        let options = ExportOptions {
+        let options = CoreExportOptions {
             overwrite_existing: overwrite.unwrap_or(false),
-            ..ExportOptions::default()
+            ..CoreExportOptions::default()
         };
         let report = self
             .studio
             .export(&output_root, options)
             .map_err(core_error)?;
-        Ok(ExportReport {
-            exported: report
-                .exported
-                .into_iter()
-                .map(|record| ExportRecord {
-                    source: record.source,
-                    path_id: BigInt::from(record.path_id),
-                    class_id: record.class_id,
-                    output_path: record.output_path.to_string_lossy().into_owned(),
-                    payload_kind: record.payload_kind.to_owned(),
-                })
-                .collect(),
-            failures: report
-                .failures
-                .into_iter()
-                .map(|failure| ExportFailure {
-                    source: failure.source,
-                    path_id: BigInt::from(failure.path_id),
-                    class_id: failure.class_id,
-                    error: failure.error,
-                })
-                .collect(),
-            unsupported: report
-                .unsupported
-                .into_iter()
-                .map(|declined| ExportFailure {
-                    source: declined.source,
-                    path_id: BigInt::from(declined.path_id),
-                    class_id: declined.class_id,
-                    error: declined.error,
-                })
-                .collect(),
-        })
+        export_report(report)
+    }
+
+    /// Exports every supported object with the complete Core policy surface.
+    ///
+    /// This is additive to `export`: existing callers keep the compact
+    /// overwrite flag, while callers that need deterministic names, raw/dump
+    /// modes, image/audio selection or aggregate budgets can express them
+    /// without dropping to the CLI.
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn export_with_options(
+        &self,
+        output_root: String,
+        options: Option<ExportConfiguration>,
+    ) -> Result<ExportReport> {
+        let options = export_configuration(options)?;
+        let report = self
+            .studio
+            .export(&output_root, options)
+            .map_err(core_error)?;
+        export_report(report)
     }
 
     /// Recursively extracts one file or directory tree without loading it.
@@ -1769,7 +2422,9 @@ impl AssetStudio {
         })
     }
 
-    /// Reads an `AnimationClip`'s shape without materializing its keyframes.
+    /// Reads complete bounded `AnimationClip` shape, muscle, ACL, and external
+    /// streaming metadata without copying parsed keyframe arrays into
+    /// JavaScript.
     #[napi]
     pub fn read_animation_clip_info(
         &self,
@@ -1780,25 +2435,174 @@ impl AssetStudio {
         let maximum = byte_limit(maximum_bytes)?;
         let clip = self
             .object(file_index, bigint_i64(path_id, "pathId")?)?
-            .read_animation_clip(AnimationClipReadLimits {
-                maximum_object_bytes: maximum,
-                ..AnimationClipReadLimits::default()
-            })
+            .read_animation_clip(animation_clip_limits(maximum)?)
             .map_err(core_error)?;
-        let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
-        Ok(AnimationClipInfo {
-            name: clip.name,
-            sample_rate: f64::from(clip.sample_rate),
-            wrap_mode: clip.wrap_mode,
-            legacy: clip.legacy,
-            compressed: clip.compressed,
-            rotation_curve_count: count(clip.rotation_curves.len()),
-            position_curve_count: count(clip.position_curves.len()),
-            scale_curve_count: count(clip.scale_curves.len()),
-            euler_curve_count: count(clip.euler_curves.len()),
-            float_curve_count: count(clip.float_curves.len()),
-            has_muscle_clip: clip.muscle_clip.is_some(),
-            has_streaming_info: clip.streaming_info.is_some(),
+        convert_animation_clip_info(clip)
+    }
+
+    /// Reads the stable references from one legacy Unity `Animation` component.
+    #[napi]
+    pub fn read_legacy_animation(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<LegacyAnimationInfo> {
+        let limits = animation_component_limits(maximum_bytes)?;
+        let animation = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_legacy_animation(limits)
+            .map_err(core_error)?;
+        let mut clips = reserve(animation.clips.len(), "legacy Animation clip references")?;
+        for reference in animation.clips {
+            clips.push(object_reference(reference));
+        }
+        Ok(LegacyAnimationInfo {
+            path_id: BigInt::from(animation.path_id),
+            game_object: object_reference(animation.behaviour.component.game_object),
+            enabled: u32::from(animation.behaviour.enabled),
+            default_clip: object_reference(animation.default_clip),
+            clips,
+            trailing_bytes: BigInt::from(animation.trailing_bytes),
+        })
+    }
+
+    /// Reads one bounded Unity `AnimatorOverrideController` substitution table.
+    #[napi]
+    pub fn read_animator_override_controller(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AnimatorOverrideControllerInfo> {
+        let limits = animation_component_limits(maximum_bytes)?;
+        let controller = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_animator_override_controller(limits)
+            .map_err(core_error)?;
+        let mut clip_overrides = reserve(
+            controller.clips.len(),
+            "AnimatorOverrideController clip overrides",
+        )?;
+        for pair in controller.clips {
+            clip_overrides.push(AnimationClipOverrideInfo {
+                original_clip: object_reference(pair.original_clip),
+                override_clip: object_reference(pair.override_clip),
+            });
+        }
+        Ok(AnimatorOverrideControllerInfo {
+            path_id: BigInt::from(controller.path_id),
+            name: controller.name,
+            controller: object_reference(controller.controller),
+            clip_overrides,
+            trailing_bytes: BigInt::from(controller.trailing_bytes),
+        })
+    }
+
+    /// Reads inherited/effective names, dependencies and ordered tables from
+    /// one bounded Unity `AssetBundle` object.
+    #[napi]
+    pub fn read_asset_bundle(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_entries: Option<u32>,
+        maximum_string_bytes: Option<i64>,
+        maximum_total_string_bytes: Option<i64>,
+    ) -> Result<AssetBundleInfo> {
+        let path_id = bigint_i64(path_id, "pathId")?;
+        let bundle = self
+            .object(file_index, path_id)?
+            .read_asset_bundle(container_metadata_limits(
+                maximum_entries,
+                maximum_string_bytes,
+                maximum_total_string_bytes,
+            )?)
+            .map_err(core_error)?;
+        let mut preload_table = reserve(bundle.preload_table.len(), "AssetBundle preload table")?;
+        for reference in bundle.preload_table {
+            preload_table.push(object_reference(reference));
+        }
+        let mut container = reserve(bundle.container.len(), "AssetBundle container")?;
+        for entry in bundle.container {
+            container.push(AssetBundleContainerEntry {
+                key: entry.key,
+                preload_index: count_u32(entry.preload_index, "preload index")?,
+                preload_size: count_u32(entry.preload_size, "preload size")?,
+                asset: object_reference(entry.asset),
+            });
+        }
+        Ok(AssetBundleInfo {
+            path_id: BigInt::from(path_id),
+            name: bundle.name,
+            object_name: bundle.object_name,
+            asset_bundle_name: bundle.asset_bundle_name,
+            preload_table,
+            container,
+            dependencies: bundle.dependencies,
+            is_streamed_scene_asset_bundle: bundle.is_streamed_scene_asset_bundle,
+        })
+    }
+
+    /// Reads one bounded Unity `ResourceManager` named-container table.
+    #[napi]
+    pub fn read_resource_manager(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_entries: Option<u32>,
+        maximum_string_bytes: Option<i64>,
+        maximum_total_string_bytes: Option<i64>,
+    ) -> Result<ResourceManagerInfo> {
+        let path_id = bigint_i64(path_id, "pathId")?;
+        let manager = self
+            .object(file_index, path_id)?
+            .read_resource_manager(container_metadata_limits(
+                maximum_entries,
+                maximum_string_bytes,
+                maximum_total_string_bytes,
+            )?)
+            .map_err(core_error)?;
+        let mut container = reserve(manager.container.len(), "ResourceManager container")?;
+        for entry in manager.container {
+            container.push(ResourceManagerContainerEntry {
+                key: entry.key,
+                asset: object_reference(entry.asset),
+            });
+        }
+        Ok(ResourceManagerInfo {
+            path_id: BigInt::from(path_id),
+            container,
+        })
+    }
+
+    /// Reads one bounded Unity `PreloadData` object-reference table.
+    #[napi]
+    pub fn read_preload_data(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_entries: Option<u32>,
+        maximum_string_bytes: Option<i64>,
+        maximum_total_string_bytes: Option<i64>,
+    ) -> Result<PreloadDataInfo> {
+        let path_id = bigint_i64(path_id, "pathId")?;
+        let preload = self
+            .object(file_index, path_id)?
+            .read_preload_data(container_metadata_limits(
+                maximum_entries,
+                maximum_string_bytes,
+                maximum_total_string_bytes,
+            )?)
+            .map_err(core_error)?;
+        let mut assets = reserve(preload.assets.len(), "PreloadData asset references")?;
+        for reference in preload.assets {
+            assets.push(object_reference(reference));
+        }
+        Ok(PreloadDataInfo {
+            path_id: BigInt::from(path_id),
+            name: preload.name,
+            assets,
         })
     }
 
@@ -1818,15 +2622,21 @@ impl AssetStudio {
                 ..AnimatorControllerReadLimits::default()
             })
             .map_err(core_error)?;
+        let mut animation_clip_path_ids = reserve(
+            controller.animation_clips.len(),
+            "AnimatorController clip path IDs",
+        )?;
+        animation_clip_path_ids.extend(
+            controller
+                .animation_clips
+                .iter()
+                .map(|reference| BigInt::from(reference.path_id)),
+        );
         Ok(AnimatorControllerInfo {
             name: controller.name,
             tos_entry_count: u32::try_from(controller.tos.len())
                 .map_err(|_| invalid_arg("TOS entry count does not fit u32"))?,
-            animation_clip_path_ids: controller
-                .animation_clips
-                .iter()
-                .map(|reference| BigInt::from(reference.path_id))
-                .collect(),
+            animation_clip_path_ids,
         })
     }
 
@@ -1841,22 +2651,21 @@ impl AssetStudio {
             .studio
             .live2d_packages(Live2dPackageLimits::default())
             .map_err(core_error)?;
-        let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
-        Ok(set
-            .packages
-            .into_iter()
-            .map(|package| Live2dPackageInfo {
+        let mut packages = reserve(set.packages.len(), "Live2D package metadata")?;
+        for package in set.packages {
+            packages.push(Live2dPackageInfo {
                 name: package.name,
                 directory_name: package.directory_name,
                 moc_file_name: package.moc_file_name,
-                texture_count: count(package.textures.len()),
-                expression_count: count(package.expressions.len()),
-                motion_count: count(package.motions.len()),
+                texture_count: count_u32(package.textures.len(), "Live2D texture count")?,
+                expression_count: count_u32(package.expressions.len(), "Live2D expression count")?,
+                motion_count: count_u32(package.motions.len(), "Live2D motion count")?,
                 has_physics: package.physics.is_some(),
                 has_pose: package.pose.is_some(),
                 has_display_info: package.display_info.is_some(),
-            })
-            .collect())
+            });
+        }
+        Ok(packages)
     }
 
     /// Writes the collection as ASCII FBX 7.4 including its animation tracks.
@@ -1888,78 +2697,74 @@ impl AssetStudio {
     /// files land and stays inside whatever budget it set.
     #[napi]
     pub fn read_live2d_packages(&self, maximum_bytes: Option<i64>) -> Result<Live2dPackageSet> {
-        let maximum = byte_limit(maximum_bytes)?;
+        let (planning_limits, materialize_limits) = live2d_package_limits(None, maximum_bytes)?;
         let set = self
             .studio
-            .read_live2d_packages(
-                Live2dPackageLimits::default(),
-                Live2dPackageMaterializeLimits {
-                    maximum_total_bytes: maximum,
-                    ..Live2dPackageMaterializeLimits::default()
-                },
+            .read_live2d_packages(planning_limits, materialize_limits)
+            .map_err(core_error)?;
+        convert_live2d_package_set(set)
+    }
+
+    /// Materializes every verified Live2D package using trusted external
+    /// MonoBehaviour schemas when a shipped build stripped its type trees.
+    ///
+    /// Schemas are inert data produced by an offline tool. Embedded type trees
+    /// retain priority, matching the Core and Python surfaces.
+    #[napi]
+    pub fn read_live2d_packages_with_schemas(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "Array<MonoBehaviourSchema>")] schemas: Array<'_>,
+        maximum_file_bytes: Option<i64>,
+        maximum_total_bytes: Option<i64>,
+    ) -> Result<Live2dPackageSet> {
+        let registry = build_schema_registry(env, schemas)?;
+        let (planning_limits, materialize_limits) =
+            live2d_package_limits(maximum_file_bytes, maximum_total_bytes)?;
+        let set = self
+            .studio
+            .read_live2d_packages_with_schema_provider(
+                planning_limits,
+                materialize_limits,
+                &registry,
             )
             .map_err(core_error)?;
-        let mut packages = Vec::with_capacity(set.packages.len());
-        for package in set.packages {
-            let mut files = Vec::new();
-            files.push(Live2dFile {
-                file_name: package.moc_file_name,
-                data: package.moc.into(),
-            });
-            files.push(Live2dFile {
-                file_name: package.manifest_file_name,
-                data: package.manifest.into(),
-            });
-            for texture in package.textures {
-                files.push(Live2dFile {
-                    file_name: texture.file_name,
-                    data: texture.png.into(),
-                });
-            }
-            for expression in package.expressions {
-                files.push(Live2dFile {
-                    file_name: expression.file_name,
-                    data: expression.json.into(),
-                });
-            }
-            for motion in package.motions {
-                files.push(Live2dFile {
-                    file_name: motion.file_name,
-                    data: motion.json.into(),
-                });
-            }
-            // The physics, pose and display-info documents are materialized
-            // with the rest and were being dropped here, so a package that had
-            // them arrived without them and nothing said so.
-            for auxiliary in [package.physics, package.pose, package.display_info]
-                .into_iter()
-                .flatten()
-            {
-                files.push(Live2dFile {
-                    file_name: auxiliary.file_name,
-                    data: auxiliary.bytes.into(),
-                });
-            }
-            packages.push(Live2dPackageFiles {
-                name: package.name,
-                directory_name: package.directory_name,
-                files,
-            });
-        }
-        let mut diagnostics = Vec::with_capacity(set.diagnostics.len());
-        for diagnostic in set.diagnostics {
-            diagnostics.push(Live2dDiagnostic {
-                file_index: u32::try_from(diagnostic.object.file_index)
-                    .map_err(|_| invalid_arg("serialized file index does not fit u32"))?,
-                path_id: BigInt::from(diagnostic.object.path_id),
-                kind: format!("{:?}", diagnostic.kind),
-                detail: diagnostic.message,
-            });
-        }
-        Ok(Live2dPackageSet {
-            packages,
-            diagnostics,
-        })
+        convert_live2d_package_set(set)
+    }
+
+    /// Materializes every verified Live2D package on a worker while a
+    /// JavaScript callback decodes Tuanjie ACL animation tracks.
+    ///
+    /// `schemas` is optional so the same call handles embedded trees, stripped
+    /// managed layouts, or both. Core validates all decoded curves and output
+    /// budgets before JavaScript receives the package bytes.
+    #[napi(ts_return_type = "Promise<Live2DPackageSet>")]
+    pub fn read_live2d_packages_with_acl_decoder(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "(request: AclDecodeRequest) => AclDecodedClip")] decoder: AclCallback,
+        #[napi(ts_arg_type = "Array<MonoBehaviourSchema> | undefined | null")] schemas: Option<
+            Array<'_>,
+        >,
+        maximum_file_bytes: Option<i64>,
+        maximum_total_bytes: Option<i64>,
+    ) -> Result<AsyncTask<Live2dPackagesWithAclTask>> {
+        let schemas = schemas
+            .map(|schemas| build_schema_registry(env, schemas))
+            .transpose()?
+            .map(Arc::new);
+        let (planning_limits, materialize_limits) =
+            live2d_package_limits(maximum_file_bytes, maximum_total_bytes)?;
+        Ok(AsyncTask::new(Live2dPackagesWithAclTask {
+            studio: Arc::clone(&self.studio),
+            planning_limits,
+            materialize_limits,
+            schemas,
+            decoder: Arc::new(JsAclDecoder {
+                callback: decoder,
+                limits: AclDecodeLimits::default(),
+            }),
+        }))
     }
 
     /// Writes the whole scene as one Wavefront OBJ, with the material library
@@ -1990,25 +2795,16 @@ impl AssetStudio {
             .studio
             .read_model_obj(&name, maximum, texture_format, texture_limits)
             .map_err(core_error)?;
+        let textures =
+            convert_scene_texture_files(model.textures.textures, "model OBJ texture files")?;
+        let skipped =
+            convert_scene_texture_skips(model.textures.skipped, "model OBJ skipped textures")?;
         Ok(ModelObj {
             obj: model.obj.into(),
             material_library_name: model.material_library_name,
             material_library: model.material_library.into(),
-            textures: model
-                .textures
-                .textures
-                .into_iter()
-                .map(|texture| Live2dFile {
-                    file_name: texture.file_name,
-                    data: texture.encoded.into(),
-                })
-                .collect(),
-            skipped: model
-                .textures
-                .skipped
-                .into_iter()
-                .map(|skip| format!("{}: {}", skip.property, skip.reason))
-                .collect(),
+            textures,
+            skipped,
         })
     }
 
@@ -2031,26 +2827,17 @@ impl AssetStudio {
         let maximum = byte_limit(maximum_bytes)?;
         let texture_format = parse_image_format(texture_format)?;
         let texture_limits = model_texture_limits(texture_limits)?;
-        let mut fbx = Vec::new();
-        let (_, textures) = self
-            .studio
-            .write_fbx_with_textures(&mut fbx, maximum, texture_format, texture_limits)
-            .map_err(core_error)?;
+        let (fbx, textures) =
+            materialize_core_output(maximum, "ASCII FBX with textures", |output| {
+                self.studio
+                    .write_fbx_with_textures(output, maximum, texture_format, texture_limits)
+            })?;
+        let texture_files = convert_scene_texture_files(textures.textures, "FBX texture files")?;
+        let skipped = convert_scene_texture_skips(textures.skipped, "FBX skipped textures")?;
         Ok(TexturedFbx {
             fbx: fbx.into(),
-            textures: textures
-                .textures
-                .into_iter()
-                .map(|texture| Live2dFile {
-                    file_name: texture.file_name,
-                    data: texture.encoded.into(),
-                })
-                .collect(),
-            skipped: textures
-                .skipped
-                .into_iter()
-                .map(|skip| format!("{}: {}", skip.property, skip.reason))
-                .collect(),
+            textures: texture_files,
+            skipped,
         })
     }
 
@@ -2068,10 +2855,7 @@ impl AssetStudio {
         let maximum = byte_limit(maximum_bytes)?;
         let clip = self
             .object(file_index, bigint_i64(path_id, "pathId")?)?
-            .read_animation_clip(AnimationClipReadLimits {
-                maximum_object_bytes: maximum,
-                ..AnimationClipReadLimits::default()
-            })
+            .read_animation_clip(animation_clip_limits(maximum)?)
             .map_err(core_error)?;
         let acl = clip
             .muscle_clip
@@ -2100,6 +2884,47 @@ impl AssetStudio {
         })
     }
 
+    /// Reads a `MonoBehaviour` as JSON through the type tree embedded in the
+    /// serialized file.
+    ///
+    /// A stripped build has no embedded managed layout and is refused rather
+    /// than guessed; use `readMonoBehaviourJsonWithSchemas` for that case.
+    #[napi]
+    pub fn read_mono_behaviour_json(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        pretty: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<MonoBehaviourJson> {
+        self.mono_behaviour_json(
+            file_index,
+            path_id,
+            &MonoBehaviourSchemaRegistry::new(),
+            pretty,
+            maximum_bytes,
+        )
+    }
+
+    /// Worker-backed form of `readMonoBehaviourJson` for large or untrusted
+    /// embedded type trees.
+    #[napi(ts_return_type = "Promise<MonoBehaviourJson>")]
+    pub fn read_mono_behaviour_json_async(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        pretty: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<ReadMonoBehaviourJsonTask>> {
+        self.mono_behaviour_json_task(
+            file_index,
+            path_id,
+            MonoBehaviourSchemaRegistry::new(),
+            pretty,
+            maximum_bytes,
+        )
+    }
+
     /// Reads a `MonoBehaviour` as JSON, resolving its stripped managed fields
     /// through caller-supplied schemas.
     ///
@@ -2110,30 +2935,84 @@ impl AssetStudio {
     #[napi]
     pub fn read_mono_behaviour_json_with_schemas(
         &self,
+        env: Env,
         file_index: u32,
         path_id: BigInt,
-        schemas: Vec<MonoBehaviourSchema>,
+        #[napi(ts_arg_type = "Array<MonoBehaviourSchema>")] schemas: Array<'_>,
+        pretty: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<MonoBehaviourJson> {
+        let registry = build_schema_registry(env, schemas)?;
+        self.mono_behaviour_json(file_index, path_id, &registry, pretty, maximum_bytes)
+    }
+
+    /// Worker-backed form of `readMonoBehaviourJsonWithSchemas`. Schema data
+    /// is validated and converted before the task is queued; parsing and JSON
+    /// materialization happen on the worker.
+    #[napi(ts_return_type = "Promise<MonoBehaviourJson>")]
+    pub fn read_mono_behaviour_json_with_schemas_async(
+        &self,
+        env: Env,
+        file_index: u32,
+        path_id: BigInt,
+        #[napi(ts_arg_type = "Array<MonoBehaviourSchema>")] schemas: Array<'_>,
+        pretty: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<ReadMonoBehaviourJsonTask>> {
+        self.mono_behaviour_json_task(
+            file_index,
+            path_id,
+            build_schema_registry(env, schemas)?,
+            pretty,
+            maximum_bytes,
+        )
+    }
+}
+
+impl AssetStudio {
+    /// Shared bounded body for embedded and externally supplied
+    /// `MonoBehaviour` type trees.
+    fn mono_behaviour_json(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        registry: &MonoBehaviourSchemaRegistry,
         pretty: Option<bool>,
         maximum_bytes: Option<i64>,
     ) -> Result<MonoBehaviourJson> {
         let maximum = byte_limit(maximum_bytes)?;
-        let registry = build_schema_registry(schemas)?;
         let limits = MonoBehaviourReadLimits {
             maximum_json_bytes: usize::try_from(maximum).unwrap_or(usize::MAX),
             ..MonoBehaviourReadLimits::default()
         };
         let resolved = self
             .object(file_index, bigint_i64(path_id, "pathId")?)?
-            .read_mono_behaviour_json(&registry, pretty.unwrap_or(false), limits)
+            .read_mono_behaviour_json(registry, pretty.unwrap_or(false), limits)
             .map_err(core_error)?;
         Ok(MonoBehaviourJson {
             json: resolved.json.into(),
             source: schema_source_name(resolved.source).to_owned(),
         })
     }
-}
 
-impl AssetStudio {
+    fn mono_behaviour_json_task(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        registry: MonoBehaviourSchemaRegistry,
+        pretty: Option<bool>,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<ReadMonoBehaviourJsonTask>> {
+        Ok(AsyncTask::new(ReadMonoBehaviourJsonTask {
+            studio: Arc::clone(&self.studio),
+            file_index: usize::try_from(file_index).expect("u32 fits usize"),
+            path_id: bigint_i64(path_id, "pathId")?,
+            registry,
+            pretty: pretty.unwrap_or(false),
+            maximum: byte_limit(maximum_bytes)?,
+        }))
+    }
+
     /// Shared body for the three binary-asset readers, which differ only in
     /// which Core method they call.
     fn binary_asset(
@@ -2189,7 +3068,7 @@ impl AssetStudio {
 
 /// The JavaScript ACL decoder callback.
 type AclCallback =
-    ThreadsafeFunction<AclDecodeRequest, AclDecodedClip, AclDecodeRequest, Status, false>;
+    ThreadsafeFunction<AclDecodeRequest, Unknown<'static>, AclDecodeRequest, Status, false>;
 
 /// Bridges a JavaScript ACL decoder into Core's synchronous animation build.
 ///
@@ -2198,6 +3077,14 @@ type AclCallback =
 /// asynchronous entry points.
 struct JsAclDecoder {
     callback: AclCallback,
+    limits: AclDecodeLimits,
+}
+
+#[derive(Clone, Copy)]
+struct JsAclOutputExpectation {
+    frame_count: u32,
+    declared_curve_count: Option<u32>,
+    limits: AclDecodeLimits,
 }
 
 impl assetstudio_core::acl::AclDecoder for JsAclDecoder {
@@ -2205,49 +3092,195 @@ impl assetstudio_core::acl::AclDecoder for JsAclDecoder {
         &self,
         request: &assetstudio_core::acl::AclDecodeRequest<'_>,
     ) -> assetstudio_core::Result<assetstudio_core::acl::AclDecodedClip> {
+        let compressed_tracks = copy_core_slice(
+            &request.input.compressed_tracks,
+            "ACL callback compressed tracks",
+        )?;
+        let decoder_map = copy_core_slice(&request.input.decoder_map, "ACL callback decoder map")?;
         let payload = AclDecodeRequest {
             frame_count: request.frame_count,
             bone_count: request.bone_count,
             sample_rate: f64::from(request.sample_rate()),
             declared_curve_count: request.declared_curve_count,
             use_fast_sample_mode: request.use_fast_sample_mode,
-            compressed_tracks: Buffer::from(request.input.compressed_tracks.clone()),
-            decoder_map: request.input.decoder_map.clone(),
+            compressed_tracks: Buffer::from(compressed_tracks),
+            decoder_map,
+        };
+        let expected = JsAclOutputExpectation {
+            frame_count: request.frame_count,
+            declared_curve_count: request.declared_curve_count,
+            limits: self.limits,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
         self.callback.call_with_return_value(
             payload,
             ThreadsafeFunctionCallMode::Blocking,
-            move |result: Result<AclDecodedClip>, _env| {
-                let _ = sender.send(result.map(|clip| {
-                    (
-                        clip.times,
-                        clip.binding_indices,
-                        clip.values,
-                        clip.following_curve_offset,
-                    )
-                }));
+            move |result: Result<Unknown<'static>>, _env| {
+                let _ = sender.send(result.and_then(|value| parse_js_acl_output(value, expected)));
                 Ok(())
             },
         );
-        let (times, binding_indices, values, following_curve_offset) = receiver
+        receiver
             .recv()
             .map_err(|_| {
                 assetstudio_core::Error::invalid_data("the ACL decoder callback never answered")
             })?
             .map_err(|error| {
                 assetstudio_core::Error::invalid_data(format!("the ACL decoder failed: {error}"))
-            })?;
-        // Core validates shape, ordering and budgets on what comes back; the
-        // narrowing here is only f64 to f32, which is what Unity stores.
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(assetstudio_core::acl::AclDecodedClip {
-            times: times.into_iter().map(|value| value as f32).collect(),
-            binding_indices,
-            values: values.into_iter().map(|value| value as f32).collect(),
-            following_curve_offset,
-        })
+            })
     }
+}
+
+fn parse_js_acl_output(
+    value: Unknown<'static>,
+    expected: JsAclOutputExpectation,
+) -> Result<assetstudio_core::acl::AclDecodedClip> {
+    if value.get_type()? != ValueType::Object {
+        return Err(invalid_arg("ACL decoder must return an object"));
+    }
+    // `get_type` above establishes the precondition for `Unknown::cast`.
+    let object = unsafe { value.cast::<Object<'static>>()? };
+    let times: Array<'_> = required_object_field(&object, "times", "ACL decoder output")?;
+    let binding_indices: Array<'_> =
+        required_object_field(&object, "bindingIndices", "ACL decoder output")?;
+    let values: Array<'_> = required_object_field(&object, "values", "ACL decoder output")?;
+    let following_curve_offset: u32 =
+        required_object_field(&object, "followingCurveOffset", "ACL decoder output")?;
+
+    let frame_count = usize::try_from(expected.frame_count).expect("u32 fits usize");
+    let returned_frames = usize::try_from(times.len()).expect("u32 fits usize");
+    if returned_frames != frame_count {
+        return Err(invalid_arg(format!(
+            "ACL decoder returned {returned_frames} times for {frame_count} declared frames"
+        )));
+    }
+    let curve_count = usize::try_from(binding_indices.len()).expect("u32 fits usize");
+    if curve_count > expected.limits.maximum_curves {
+        return Err(invalid_arg(format!(
+            "ACL decoder returned {curve_count} curves, exceeding limit {}",
+            expected.limits.maximum_curves
+        )));
+    }
+    if let Some(declared) = expected.declared_curve_count {
+        let declared = usize::try_from(declared).expect("u32 fits usize");
+        if curve_count != declared {
+            return Err(invalid_arg(format!(
+                "ACL decoder returned {curve_count} curves for {declared} declared curves"
+            )));
+        }
+    }
+    let expected_values = frame_count
+        .checked_mul(curve_count)
+        .ok_or_else(|| invalid_arg("ACL decoded value count overflowed"))?;
+    if expected_values > expected.limits.maximum_values {
+        return Err(invalid_arg(format!(
+            "ACL decoder output requires {expected_values} values, exceeding limit {}",
+            expected.limits.maximum_values
+        )));
+    }
+    let returned_values = usize::try_from(values.len()).expect("u32 fits usize");
+    if returned_values != expected_values {
+        return Err(invalid_arg(format!(
+            "ACL decoder returned {returned_values} values; {expected_values} are required"
+        )));
+    }
+
+    Ok(assetstudio_core::acl::AclDecodedClip {
+        times: copy_js_f32_array(&times, "ACL decoded times")?,
+        binding_indices: copy_js_u32_array(&binding_indices, "ACL decoded binding indices")?,
+        values: copy_js_f32_array(&values, "ACL decoded values")?,
+        following_curve_offset,
+    })
+}
+
+fn required_object_field<T: napi::bindgen_prelude::FromNapiValue>(
+    object: &Object<'_>,
+    field: &str,
+    owner: &str,
+) -> Result<T> {
+    object
+        .get(field)?
+        .ok_or_else(|| invalid_arg(format!("{owner} is missing {field}")))
+}
+
+fn optional_object_field<T: napi::bindgen_prelude::FromNapiValue>(
+    object: &Object<'_>,
+    field: &str,
+) -> Result<Option<T>> {
+    object.get::<Option<T>>(field).map(Option::flatten)
+}
+
+/// Copies one JavaScript string after its UTF-8 length has already passed the
+/// caller's budget. napi-rs' ordinary `String` conversion allocates with
+/// `vec![0; len]`; using the raw N-API copy here lets the binding reserve
+/// fallibly before setting the vector length.
+fn copy_js_string(
+    env: napi::sys::napi_env,
+    value: JsString<'_>,
+    length: usize,
+    field: &str,
+) -> Result<String> {
+    let capacity = length
+        .checked_add(1)
+        .ok_or_else(|| invalid_arg(format!("{field} length overflowed")))?;
+    let mut bytes: Vec<u8> = reserve(capacity, field)?;
+    bytes.resize(capacity, 0);
+    let mut written = 0_usize;
+    // SAFETY: `bytes` owns `capacity` initialized bytes, `value` and `env`
+    // belong to this active N-API callback, and N-API writes at most the
+    // supplied capacity including its trailing NUL.
+    napi::check_status!(
+        unsafe {
+            napi::sys::napi_get_value_string_utf8(
+                env,
+                value.raw(),
+                bytes.as_mut_ptr().cast(),
+                capacity,
+                &raw mut written,
+            )
+        },
+        "failed to copy {field}"
+    )?;
+    if written != length {
+        return Err(invalid_arg(format!(
+            "{field} changed length while being copied: expected {length}, wrote {written}"
+        )));
+    }
+    bytes.truncate(written);
+    String::from_utf8(bytes).map_err(|error| invalid_arg(format!("{field} is not UTF-8: {error}")))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "ACL samples are stored as f32 after JavaScript transports them as numbers"
+)]
+fn copy_js_f32_array(values: &Array<'_>, field: &'static str) -> Result<Vec<f32>> {
+    let mut copied = reserve(
+        usize::try_from(values.len()).expect("u32 fits usize"),
+        field,
+    )?;
+    for index in 0..values.len() {
+        let value = values
+            .get::<f64>(index)?
+            .ok_or_else(|| invalid_arg(format!("{field} is missing index {index}")))?;
+        copied.push(value as f32);
+    }
+    Ok(copied)
+}
+
+fn copy_js_u32_array(values: &Array<'_>, field: &'static str) -> Result<Vec<u32>> {
+    let mut copied = reserve(
+        usize::try_from(values.len()).expect("u32 fits usize"),
+        field,
+    )?;
+    for index in 0..values.len() {
+        copied.push(
+            values
+                .get::<u32>(index)?
+                .ok_or_else(|| invalid_arg(format!("{field} is missing index {index}")))?,
+        );
+    }
+    Ok(copied)
 }
 
 /// The JavaScript decoder callback: compressed bytes and the exact expected
@@ -2275,12 +3308,15 @@ impl assetstudio_core::bundle::OodleDecoder for JsOodleDecoder {
         let expected = u32::try_from(output.len()).map_err(|_| {
             assetstudio_core::Error::invalid_data("Oodle output length does not fit u32")
         })?;
+        let input = copy_core_slice(input, "Oodle callback input")?;
         let (sender, receiver) = std::sync::mpsc::channel();
         self.callback.call_with_return_value(
-            (Buffer::from(input.to_vec()), expected).into(),
+            (Buffer::from(input), expected).into(),
             ThreadsafeFunctionCallMode::Blocking,
             move |result: Result<Buffer>, _env| {
-                let _ = sender.send(result.map(|buffer| buffer.to_vec()));
+                let copied =
+                    result.and_then(|buffer| copy_slice(buffer.as_ref(), "Oodle decoder output"));
+                let _ = sender.send(copied);
                 Ok(())
             },
         );
@@ -2310,6 +3346,17 @@ pub struct FbxWithAclTask {
     studio: Arc<Studio>,
     maximum: u64,
     decoder: Arc<JsAclDecoder>,
+    request: FbxWithAclRequest,
+}
+
+#[derive(Clone, Copy)]
+enum FbxWithAclRequest {
+    SceneAscii,
+    SceneBinary,
+    GameObject {
+        key: SceneObjectKey,
+        include_animations: bool,
+    },
 }
 
 impl Task for FbxWithAclTask {
@@ -2317,9 +3364,24 @@ impl Task for FbxWithAclTask {
     type JsValue = Buffer;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        self.studio
-            .read_fbx_with_acl_decoder(self.maximum, Some(self.decoder.as_ref()))
-            .map_err(core_error)
+        match self.request {
+            FbxWithAclRequest::SceneAscii => self
+                .studio
+                .read_fbx_with_acl_decoder(self.maximum, Some(self.decoder.as_ref())),
+            FbxWithAclRequest::SceneBinary => self
+                .studio
+                .read_fbx_binary_with_acl_decoder(self.maximum, Some(self.decoder.as_ref())),
+            FbxWithAclRequest::GameObject {
+                key,
+                include_animations,
+            } => self.studio.read_game_object_fbx_with_acl_decoder(
+                key,
+                include_animations,
+                self.maximum,
+                Some(self.decoder.as_ref()),
+            ),
+        }
+        .map_err(core_error)
     }
 
     fn resolve(&mut self, _env: Env, bytes: Self::Output) -> Result<Self::JsValue> {
@@ -2356,6 +3418,40 @@ impl Task for CubismClipMotionWithAclTask {
     }
 }
 
+/// Builds complete `Live2D` packages on a worker while JavaScript services ACL
+/// decode callbacks on the event loop.
+pub struct Live2dPackagesWithAclTask {
+    studio: Arc<Studio>,
+    planning_limits: Live2dPackageLimits,
+    materialize_limits: Live2dPackageMaterializeLimits,
+    schemas: Option<Arc<MonoBehaviourSchemaRegistry>>,
+    decoder: Arc<JsAclDecoder>,
+}
+
+impl Task for Live2dPackagesWithAclTask {
+    type Output = CoreLive2dPackageBytesSet;
+    type JsValue = Live2dPackageSet;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let provider = self
+            .schemas
+            .as_deref()
+            .map(|value| value as &dyn MonoBehaviourSchemaProvider);
+        self.studio
+            .read_live2d_packages_with_adapters(
+                self.planning_limits,
+                self.materialize_limits,
+                provider,
+                Some(self.decoder.as_ref()),
+            )
+            .map_err(core_error)
+    }
+
+    fn resolve(&mut self, _env: Env, set: Self::Output) -> Result<Self::JsValue> {
+        convert_live2d_package_set(set)
+    }
+}
+
 pub struct OpenWithOodleTask {
     path: String,
     decoder: Arc<JsOodleDecoder>,
@@ -2381,6 +3477,7 @@ impl Task for OpenWithOodleTask {
 
 pub struct OpenPathTask {
     path: String,
+    options: Option<OpenOptions>,
 }
 
 impl Task for OpenPathTask {
@@ -2388,7 +3485,8 @@ impl Task for OpenPathTask {
     type JsValue = AssetStudio;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        Studio::open(&self.path).map_err(core_error)
+        Studio::open_with_options(&self.path, load_options(self.options.take(), None)?)
+            .map_err(core_error)
     }
 
     fn resolve(&mut self, _env: Env, studio: Self::Output) -> Result<Self::JsValue> {
@@ -2401,6 +3499,7 @@ impl Task for OpenPathTask {
 pub struct OpenBufferTask {
     bytes: Vec<u8>,
     name: String,
+    options: Option<OpenOptions>,
 }
 
 impl Task for OpenBufferTask {
@@ -2409,7 +3508,13 @@ impl Task for OpenBufferTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         let bytes = std::mem::take(&mut self.bytes);
-        Studio::open_region(self.name.clone(), Region::from_bytes(bytes)).map_err(core_error)
+        let name = std::mem::take(&mut self.name);
+        Studio::open_region_with_options(
+            name,
+            Region::from_bytes(bytes),
+            load_options(self.options.take(), None)?,
+        )
+        .map_err(core_error)
     }
 
     fn resolve(&mut self, _env: Env, studio: Self::Output) -> Result<Self::JsValue> {
@@ -2467,6 +3572,41 @@ impl Task for ReadBytesTask {
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
         Ok(output.into())
+    }
+}
+
+pub struct ReadMonoBehaviourJsonTask {
+    studio: Arc<Studio>,
+    file_index: usize,
+    path_id: i64,
+    registry: MonoBehaviourSchemaRegistry,
+    pretty: bool,
+    maximum: u64,
+}
+
+impl Task for ReadMonoBehaviourJsonTask {
+    type Output = ResolvedMonoBehaviourJson;
+    type JsValue = MonoBehaviourJson;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        studio_object(&self.studio, self.file_index, self.path_id)?
+            .read_mono_behaviour_json(
+                &self.registry,
+                self.pretty,
+                MonoBehaviourReadLimits {
+                    maximum_json_bytes: usize::try_from(self.maximum)
+                        .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?,
+                    ..MonoBehaviourReadLimits::default()
+                },
+            )
+            .map_err(core_error)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(MonoBehaviourJson {
+            json: output.json.into(),
+            source: schema_source_name(output.source).to_owned(),
+        })
     }
 }
 
@@ -2574,66 +3714,269 @@ fn build_scene(studio: &Studio, limits: SceneHierarchyLimits) -> Result<Vec<Scen
     Ok(nodes)
 }
 
-/// Converts caller-supplied schema descriptions into a lookup registry.
-///
-/// Bounded on both node count and total string bytes, because these arrive
-/// from JavaScript and nothing else checks them.
-fn build_schema_registry(schemas: Vec<MonoBehaviourSchema>) -> Result<MonoBehaviourSchemaRegistry> {
-    const MAXIMUM_NODES: usize = 100_000;
-    const MAXIMUM_STRING_BYTES: usize = 16 * 1024 * 1024;
+fn live2d_package_limits(
+    maximum_file_bytes: Option<i64>,
+    maximum_total_bytes: Option<i64>,
+) -> Result<(Live2dPackageLimits, Live2dPackageMaterializeLimits)> {
+    let maximum_file_bytes = non_negative_limit(
+        maximum_file_bytes,
+        DEFAULT_PAYLOAD_LIMIT,
+        "maximumFileBytes",
+    )?;
+    let maximum_total_bytes = non_negative_limit(
+        maximum_total_bytes,
+        DEFAULT_LIVE2D_TOTAL_LIMIT,
+        "maximumTotalBytes",
+    )?;
+    let texture = TextureReadLimits {
+        maximum_output_bytes: maximum_file_bytes,
+        ..TextureReadLimits::default()
+    };
+    let planning = Live2dPackageLimits {
+        maximum_total_moc_bytes: maximum_total_bytes,
+        maximum_total_texture_payload_bytes: maximum_total_bytes,
+        maximum_total_manifest_bytes: maximum_total_bytes,
+        texture,
+        ..Live2dPackageLimits::default()
+    };
+    let materialize = Live2dPackageMaterializeLimits {
+        maximum_file_bytes,
+        maximum_total_bytes,
+        texture,
+    };
+    Ok((planning, materialize))
+}
 
-    let mut registry = MonoBehaviourSchemaRegistry::new();
-    let mut total_string_bytes = 0_usize;
-    for schema in schemas {
-        if schema.nodes.is_empty() {
-            return Err(invalid_arg("a MonoBehaviour schema needs a root node"));
-        }
-        if schema.nodes.len() > MAXIMUM_NODES {
-            return Err(invalid_arg(format!(
-                "a MonoBehaviour schema has {} nodes; the maximum is {MAXIMUM_NODES}",
-                schema.nodes.len()
-            )));
-        }
-        let mut nodes = Vec::with_capacity(schema.nodes.len());
-        for (index, node) in schema.nodes.into_iter().enumerate() {
-            total_string_bytes = total_string_bytes
-                .checked_add(node.type_name.len())
-                .and_then(|value| value.checked_add(node.field_name.len()))
-                .ok_or_else(|| invalid_arg("MonoBehaviour schema strings overflowed"))?;
-            if total_string_bytes > MAXIMUM_STRING_BYTES {
-                return Err(invalid_arg(format!(
-                    "MonoBehaviour schema strings exceed {MAXIMUM_STRING_BYTES} bytes"
-                )));
-            }
-            nodes.push(TypeTreeNode {
-                type_name: node.type_name,
-                field_name: node.field_name,
-                byte_size: -1,
-                index: i32::try_from(index)
-                    .map_err(|_| invalid_arg("schema node index exceeds i32"))?,
-                type_flags: 0,
-                version: 1,
-                meta_flags: if node.align { 0x4000 } else { 0 },
-                level: node.level,
-                type_string_offset: None,
-                name_string_offset: None,
-                reference_type_hash: 0,
+fn convert_live2d_package_set(set: CoreLive2dPackageBytesSet) -> Result<Live2dPackageSet> {
+    let mut packages = reserve(set.packages.len(), "Live2D packages")?;
+    for package in set.packages {
+        let auxiliary_count = usize::from(package.physics.is_some())
+            .checked_add(usize::from(package.pose.is_some()))
+            .and_then(|count| count.checked_add(usize::from(package.display_info.is_some())))
+            .ok_or_else(|| invalid_arg("Live2D auxiliary file count overflowed"))?;
+        let file_count = 2_usize
+            .checked_add(package.textures.len())
+            .and_then(|count| count.checked_add(package.expressions.len()))
+            .and_then(|count| count.checked_add(package.motions.len()))
+            .and_then(|count| count.checked_add(auxiliary_count))
+            .ok_or_else(|| invalid_arg("Live2D package file count overflowed"))?;
+        let mut files = reserve(file_count, "Live2D package files")?;
+        files.push(Live2dFile {
+            file_name: package.moc_file_name,
+            data: package.moc.into(),
+        });
+        files.push(Live2dFile {
+            file_name: package.manifest_file_name,
+            data: package.manifest.into(),
+        });
+        for texture in package.textures {
+            files.push(Live2dFile {
+                file_name: texture.file_name,
+                data: texture.png.into(),
             });
         }
+        for expression in package.expressions {
+            files.push(Live2dFile {
+                file_name: expression.file_name,
+                data: expression.json.into(),
+            });
+        }
+        for motion in package.motions {
+            files.push(Live2dFile {
+                file_name: motion.file_name,
+                data: motion.json.into(),
+            });
+        }
+        for auxiliary in [package.physics, package.pose, package.display_info]
+            .into_iter()
+            .flatten()
+        {
+            files.push(Live2dFile {
+                file_name: auxiliary.file_name,
+                data: auxiliary.bytes.into(),
+            });
+        }
+        debug_assert_eq!(files.len(), file_count);
+        packages.push(Live2dPackageFiles {
+            name: package.name,
+            directory_name: package.directory_name,
+            files,
+        });
+    }
+    let mut diagnostics = reserve(set.diagnostics.len(), "Live2D diagnostics")?;
+    for diagnostic in set.diagnostics {
+        diagnostics.push(Live2dDiagnostic {
+            file_index: count_u32(diagnostic.object.file_index, "Live2D diagnostic file index")?,
+            path_id: BigInt::from(diagnostic.object.path_id),
+            kind: format!("{:?}", diagnostic.kind),
+            detail: diagnostic.message,
+        });
+    }
+    Ok(Live2dPackageSet {
+        packages,
+        diagnostics,
+    })
+}
+
+/// Converts caller-supplied schema descriptions into a lookup registry.
+///
+/// The raw arrays stay in JavaScript until their counts have passed the
+/// binding budgets. This is intentional: napi-rs' automatic `Vec<T>` input
+/// conversion allocates with `Vec::with_capacity` before this function could
+/// inspect either the schema or node count.
+fn build_schema_registry(env: Env, schemas: Array<'_>) -> Result<MonoBehaviourSchemaRegistry> {
+    let schema_count = usize::try_from(schemas.len()).expect("u32 fits usize");
+    if schema_count > MAXIMUM_SCHEMA_ENTRIES {
+        return Err(invalid_arg(format!(
+            "MonoBehaviour schema collection has {schema_count} entries, exceeding limit {MAXIMUM_SCHEMA_ENTRIES}"
+        )));
+    }
+    let mut registry = MonoBehaviourSchemaRegistry::new();
+    let mut budget = JsSchemaBudget::default();
+    let raw_env = env.raw();
+    for schema_index in 0..schemas.len() {
+        let owner = format!("MonoBehaviour schema {schema_index}");
+        let schema: Object<'_> = schemas
+            .get(schema_index)?
+            .ok_or_else(|| invalid_arg(format!("{owner} is missing")))?;
         registry
-            .push(MonoBehaviourSchemaEntry {
-                assembly_name: schema.assembly_name,
-                namespace: schema.namespace.unwrap_or_default(),
-                class_name: schema.class_name,
-                unity_version: schema.unity_version,
-                tree: TypeTree {
-                    nodes,
-                    string_buffer: Vec::new(),
-                },
-            })
+            .push(parse_schema_entry(raw_env, &schema, &owner, &mut budget)?)
             .map_err(core_error)?;
     }
     Ok(registry)
+}
+
+#[derive(Default)]
+struct JsSchemaBudget {
+    nodes: usize,
+    string_bytes: usize,
+}
+
+fn parse_schema_entry(
+    env: napi::sys::napi_env,
+    schema: &Object<'_>,
+    owner: &str,
+    budget: &mut JsSchemaBudget,
+) -> Result<MonoBehaviourSchemaEntry> {
+    let assembly_name: JsString<'_> = required_object_field(schema, "assemblyName", owner)?;
+    let class_name: JsString<'_> = required_object_field(schema, "className", owner)?;
+    let namespace: Option<JsString<'_>> = optional_object_field(schema, "namespace")?;
+    let unity_version: Option<JsString<'_>> = optional_object_field(schema, "unityVersion")?;
+    let node_values: Array<'_> = required_object_field(schema, "nodes", owner)?;
+    charge_schema_nodes(node_values.len(), owner, budget)?;
+
+    let assembly_name = copy_schema_string(
+        env,
+        assembly_name,
+        budget,
+        "MonoBehaviour schema assemblyName",
+    )?;
+    let class_name = copy_schema_string(env, class_name, budget, "MonoBehaviour schema className")?;
+    let namespace = namespace
+        .map(|value| copy_schema_string(env, value, budget, "MonoBehaviour schema namespace"))
+        .transpose()?
+        .unwrap_or_default();
+    let unity_version = unity_version
+        .map(|value| copy_schema_string(env, value, budget, "MonoBehaviour schema unityVersion"))
+        .transpose()?;
+    let nodes = parse_schema_nodes(env, node_values, owner, budget)?;
+    Ok(MonoBehaviourSchemaEntry {
+        assembly_name,
+        namespace,
+        class_name,
+        unity_version,
+        tree: TypeTree {
+            nodes,
+            string_buffer: Vec::new(),
+        },
+    })
+}
+
+fn charge_schema_nodes(count: u32, owner: &str, budget: &mut JsSchemaBudget) -> Result<()> {
+    let count = usize::try_from(count).expect("u32 fits usize");
+    if count == 0 {
+        return Err(invalid_arg("a MonoBehaviour schema needs a root node"));
+    }
+    if count > MAXIMUM_SCHEMA_NODES_PER_ENTRY {
+        return Err(invalid_arg(format!(
+            "{owner} has {count} nodes; the maximum is {MAXIMUM_SCHEMA_NODES_PER_ENTRY}"
+        )));
+    }
+    budget.nodes = budget
+        .nodes
+        .checked_add(count)
+        .ok_or_else(|| invalid_arg("MonoBehaviour schema node count overflowed"))?;
+    if budget.nodes > MAXIMUM_TOTAL_SCHEMA_NODES {
+        return Err(invalid_arg(format!(
+            "MonoBehaviour schemas contain {} nodes, exceeding limit {MAXIMUM_TOTAL_SCHEMA_NODES}",
+            budget.nodes
+        )));
+    }
+    Ok(())
+}
+
+fn parse_schema_nodes(
+    env: napi::sys::napi_env,
+    values: Array<'_>,
+    owner: &str,
+    budget: &mut JsSchemaBudget,
+) -> Result<Vec<TypeTreeNode>> {
+    let count = usize::try_from(values.len()).expect("u32 fits usize");
+    let mut nodes = reserve(count, "MonoBehaviour schema nodes")?;
+    for index in 0..values.len() {
+        let node_owner = format!("{owner} node {index}");
+        let node: Object<'_> = values
+            .get(index)?
+            .ok_or_else(|| invalid_arg(format!("{node_owner} is missing")))?;
+        let type_name: JsString<'_> = required_object_field(&node, "typeName", &node_owner)?;
+        let field_name: JsString<'_> = required_object_field(&node, "fieldName", &node_owner)?;
+        let level: u32 = required_object_field(&node, "level", &node_owner)?;
+        let align: bool = required_object_field(&node, "align", &node_owner)?;
+        nodes.push(TypeTreeNode {
+            type_name: copy_schema_string(
+                env,
+                type_name,
+                budget,
+                "MonoBehaviour schema node typeName",
+            )?,
+            field_name: copy_schema_string(
+                env,
+                field_name,
+                budget,
+                "MonoBehaviour schema node fieldName",
+            )?,
+            byte_size: -1,
+            index: i32::try_from(index)
+                .map_err(|_| invalid_arg("schema node index exceeds i32"))?,
+            type_flags: 0,
+            version: 1,
+            meta_flags: if align { 0x4000 } else { 0 },
+            level,
+            type_string_offset: None,
+            name_string_offset: None,
+            reference_type_hash: 0,
+        });
+    }
+    Ok(nodes)
+}
+
+fn copy_schema_string(
+    env: napi::sys::napi_env,
+    value: JsString<'_>,
+    budget: &mut JsSchemaBudget,
+    field: &'static str,
+) -> Result<String> {
+    let length = value.utf8_len()?;
+    budget.string_bytes = budget
+        .string_bytes
+        .checked_add(length)
+        .ok_or_else(|| invalid_arg("MonoBehaviour schema strings overflowed"))?;
+    if budget.string_bytes > MAXIMUM_SCHEMA_STRING_BYTES {
+        return Err(invalid_arg(format!(
+            "MonoBehaviour schema strings exceed {MAXIMUM_SCHEMA_STRING_BYTES} bytes"
+        )));
+    }
+    copy_js_string(env, value, length, field)
 }
 
 /// Settings objects are small; one budget covers the payload and its strings.
@@ -2656,15 +3999,82 @@ fn cubism_auxiliary_limits(maximum: u64) -> Result<CubismAuxiliaryReadLimits> {
     })
 }
 
-fn cubism_motion_targets(targets: Option<CubismMotionTargets>) -> CubismMotionTargetNames {
-    let targets = targets.unwrap_or(CubismMotionTargets {
-        parameters: None,
-        parts: None,
-    });
-    CubismMotionTargetNames {
-        parameters: targets.parameters.unwrap_or_default(),
-        parts: targets.parts.unwrap_or_default(),
+fn cubism_motion_targets(
+    targets: Option<Object<'_>>,
+    limits: CubismClipMotionReadLimits,
+) -> Result<CubismMotionTargetNames> {
+    let Some(targets) = targets else {
+        return Ok(CubismMotionTargetNames::default());
+    };
+    let env = targets.value().env;
+    let parameters: Option<Array<'_>> = optional_object_field(&targets, "parameters")?;
+    let parts: Option<Array<'_>> = optional_object_field(&targets, "parts")?;
+    let parameter_count = parameters.as_ref().map_or(0_u32, Array::len);
+    let part_count = parts.as_ref().map_or(0_u32, Array::len);
+    let total_count = usize::try_from(parameter_count)
+        .expect("u32 fits usize")
+        .checked_add(usize::try_from(part_count).expect("u32 fits usize"))
+        .ok_or_else(|| invalid_arg("Cubism motion target count overflowed"))?;
+    if total_count > limits.maximum_curves {
+        return Err(invalid_arg(format!(
+            "Cubism motion targets contain {total_count} names, exceeding limit {}",
+            limits.maximum_curves
+        )));
     }
+    let mut total_string_bytes = 0_usize;
+    Ok(CubismMotionTargetNames {
+        parameters: copy_js_string_array(
+            env,
+            parameters,
+            &mut total_string_bytes,
+            limits,
+            "Cubism parameter target",
+        )?,
+        parts: copy_js_string_array(
+            env,
+            parts,
+            &mut total_string_bytes,
+            limits,
+            "Cubism part target",
+        )?,
+    })
+}
+
+fn copy_js_string_array(
+    env: napi::sys::napi_env,
+    values: Option<Array<'_>>,
+    total_string_bytes: &mut usize,
+    limits: CubismClipMotionReadLimits,
+    field: &'static str,
+) -> Result<Vec<String>> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    let count = usize::try_from(values.len()).expect("u32 fits usize");
+    let mut copied = reserve(count, field)?;
+    for index in 0..values.len() {
+        let value: JsString<'_> = values
+            .get(index)?
+            .ok_or_else(|| invalid_arg(format!("{field} is missing index {index}")))?;
+        let length = value.utf8_len()?;
+        if length > limits.maximum_string_bytes {
+            return Err(invalid_arg(format!(
+                "{field} has {length} bytes, exceeding limit {}",
+                limits.maximum_string_bytes
+            )));
+        }
+        *total_string_bytes = total_string_bytes
+            .checked_add(length)
+            .ok_or_else(|| invalid_arg("Cubism motion target string bytes overflowed"))?;
+        if *total_string_bytes > limits.maximum_total_string_bytes {
+            return Err(invalid_arg(format!(
+                "Cubism motion target strings exceed {} bytes",
+                limits.maximum_total_string_bytes
+            )));
+        }
+        copied.push(copy_js_string(env, value, length, field)?);
+    }
+    Ok(copied)
 }
 
 fn cubism_clip_motion_limits(maximum: u64) -> Result<CubismClipMotionReadLimits> {
@@ -2750,11 +4160,12 @@ fn build_cubism_clip_motion(
 /// The names of one material property sheet, in serialized order.
 fn property_names<T>(
     properties: &[assetstudio_core::material::NamedMaterialProperty<T>],
-) -> Vec<String> {
-    properties
-        .iter()
-        .map(|property| property.name.clone())
-        .collect()
+) -> Result<Vec<String>> {
+    let mut names = reserve(properties.len(), "material property names")?;
+    for property in properties {
+        names.push(copy_string(&property.name, "material property name")?);
+    }
+    Ok(names)
 }
 
 fn texture_limits(maximum: u64) -> TextureReadLimits {
@@ -2787,6 +4198,268 @@ fn sprite_limits(maximum: u64) -> SpriteReadLimits {
     }
 }
 
+fn sprite_atlas_limits(
+    maximum_entries: Option<u32>,
+    maximum_string_bytes: Option<i64>,
+    maximum_total_string_bytes: Option<i64>,
+) -> Result<SpriteAtlasReadLimits> {
+    let defaults = SpriteAtlasReadLimits::default();
+    let maximum_entries = count_limit(maximum_entries, defaults.maximum_render_data_entries);
+    Ok(SpriteAtlasReadLimits {
+        maximum_string_bytes: usize_non_negative_limit(
+            maximum_string_bytes,
+            defaults.maximum_string_bytes,
+            "maximumStringBytes",
+        )?,
+        maximum_total_string_bytes: usize_non_negative_limit(
+            maximum_total_string_bytes,
+            defaults.maximum_total_string_bytes,
+            "maximumTotalStringBytes",
+        )?,
+        maximum_packed_sprites: maximum_entries,
+        maximum_packed_sprite_names: maximum_entries,
+        maximum_render_data_entries: maximum_entries,
+        maximum_secondary_textures: maximum_entries,
+    })
+}
+
+fn sprite_metadata_limits(options: Option<SpriteMetadataLimits>) -> Result<SpriteReadLimits> {
+    let defaults = SpriteReadLimits::default();
+    let Some(options) = options else {
+        return Ok(defaults);
+    };
+    Ok(SpriteReadLimits {
+        maximum_string_bytes: usize_non_negative_limit(
+            options.maximum_string_bytes,
+            defaults.maximum_string_bytes,
+            "maximumStringBytes",
+        )?,
+        maximum_total_string_bytes: usize_non_negative_limit(
+            options.maximum_total_string_bytes,
+            defaults.maximum_total_string_bytes,
+            "maximumTotalStringBytes",
+        )?,
+        maximum_array_elements: count_limit(
+            options.maximum_entries,
+            defaults.maximum_array_elements,
+        ),
+        maximum_mesh_bytes: non_negative_limit(
+            options.maximum_mesh_bytes,
+            defaults.maximum_mesh_bytes,
+            "maximumMeshBytes",
+        )?,
+        ..defaults
+    })
+}
+
+fn convert_sprite_atlas(atlas: SpriteAtlas) -> Result<SpriteAtlasInfo> {
+    let mut packed_sprites = reserve(atlas.packed_sprites.len(), "SpriteAtlas packed sprites")?;
+    for reference in atlas.packed_sprites {
+        packed_sprites.push(object_reference(reference));
+    }
+
+    let mut render_data_entries = reserve(
+        atlas.render_data_entries.len(),
+        "SpriteAtlas render-data entries",
+    )?;
+    for entry in atlas.render_data_entries {
+        let mut guid_bytes = reserve(16, "SpriteAtlas GUID bytes")?;
+        guid_bytes.extend_from_slice(&entry.key.guid_bytes);
+        let settings = entry.data.settings;
+        let secondary_textures = entry
+            .data
+            .secondary_textures
+            .map(|textures| {
+                let mut output = reserve(textures.len(), "SpriteAtlas secondary textures")?;
+                for texture in textures {
+                    output.push(SpriteAtlasSecondaryTexture {
+                        texture: object_reference(texture.texture),
+                        name: texture.name,
+                    });
+                }
+                Ok::<_, Error>(output)
+            })
+            .transpose()?;
+        render_data_entries.push(SpriteAtlasRenderData {
+            key: SpriteAtlasRenderDataKey {
+                guid_bytes: guid_bytes.into(),
+                value: BigInt::from(entry.key.value),
+            },
+            texture: object_reference(entry.data.texture),
+            alpha_texture: object_reference(entry.data.alpha_texture),
+            texture_rect: SpriteAtlasRect {
+                x: f64::from(entry.data.texture_rect.x),
+                y: f64::from(entry.data.texture_rect.y),
+                width: f64::from(entry.data.texture_rect.width),
+                height: f64::from(entry.data.texture_rect.height),
+            },
+            texture_rect_offset: SpriteAtlasVector2 {
+                x: f64::from(entry.data.texture_rect_offset.x),
+                y: f64::from(entry.data.texture_rect_offset.y),
+            },
+            atlas_rect_offset: SpriteAtlasVector2 {
+                x: f64::from(entry.data.atlas_rect_offset.x),
+                y: f64::from(entry.data.atlas_rect_offset.y),
+            },
+            uv_transform: SpriteAtlasVector4 {
+                x: f64::from(entry.data.uv_transform.x),
+                y: f64::from(entry.data.uv_transform.y),
+                z: f64::from(entry.data.uv_transform.z),
+                w: f64::from(entry.data.uv_transform.w),
+            },
+            downscale_multiplier: f64::from(entry.data.downscale_multiplier),
+            settings: SpriteAtlasSettings {
+                raw: settings.raw,
+                packed: settings.packed(),
+                packing_mode: u32::from(settings.packing_mode()),
+                packing_rotation: u32::from(settings.packing_rotation()),
+                mesh_type: u32::from(settings.mesh_type()),
+            },
+            secondary_textures,
+        });
+    }
+
+    Ok(SpriteAtlasInfo {
+        path_id: BigInt::from(atlas.path_id),
+        name: atlas.name,
+        packed_sprites,
+        packed_sprite_names: atlas.packed_sprite_names,
+        render_data_entries,
+        tag: atlas.tag,
+        is_variant: atlas.is_variant,
+    })
+}
+
+fn convert_sprite_metadata(sprite: Sprite) -> Result<SpriteMetadata> {
+    let Sprite {
+        object_index,
+        path_id,
+        name,
+        rect,
+        offset,
+        border,
+        pixels_to_units,
+        pivot,
+        extrude,
+        is_polygon,
+        render_data_key,
+        atlas_tags,
+        sprite_atlas,
+        render_data,
+    } = sprite;
+    let render_data_key = render_data_key
+        .map(|(guid_bytes, value)| {
+            let mut bytes = reserve(16, "Sprite GUID bytes")?;
+            bytes.extend_from_slice(&guid_bytes);
+            Ok::<_, Error>(SpriteAtlasRenderDataKey {
+                guid_bytes: bytes.into(),
+                value: BigInt::from(value),
+            })
+        })
+        .transpose()?;
+    Ok(SpriteMetadata {
+        object_index: count_u32(object_index, "Sprite object index")?,
+        path_id: BigInt::from(path_id),
+        name,
+        rect: SpriteRect {
+            x: f64::from(rect.x),
+            y: f64::from(rect.y),
+            width: f64::from(rect.width),
+            height: f64::from(rect.height),
+        },
+        offset: sprite_vector2(offset),
+        border: SpriteVector4 {
+            x: f64::from(border.x),
+            y: f64::from(border.y),
+            z: f64::from(border.z),
+            w: f64::from(border.w),
+        },
+        pixels_to_units: f64::from(pixels_to_units),
+        pivot: sprite_vector2(pivot),
+        extrude,
+        is_polygon,
+        render_data_key,
+        atlas_tags,
+        sprite_atlas: sprite_object_reference(sprite_atlas),
+        render_data: convert_sprite_render_data(render_data)?,
+    })
+}
+
+fn convert_sprite_render_data(
+    render_data: assetstudio_core::sprite::SpriteRenderData,
+) -> Result<SpriteRenderData> {
+    let assetstudio_core::sprite::SpriteRenderData {
+        texture,
+        alpha_texture,
+        secondary_textures,
+        texture_rect,
+        texture_rect_offset,
+        atlas_rect_offset,
+        settings,
+        uv_transform,
+        downscale_multiplier,
+        mesh_triangles,
+    } = render_data;
+    let mut node_secondary = reserve(secondary_textures.len(), "Sprite secondary textures")?;
+    for secondary in secondary_textures {
+        node_secondary.push(SpriteSecondaryTexture {
+            texture: sprite_object_reference(secondary.texture),
+            name: secondary.name,
+        });
+    }
+    let mut node_triangles = reserve(mesh_triangles.len(), "Sprite mesh triangles")?;
+    for [first, second, third] in mesh_triangles {
+        node_triangles.push(SpriteTriangle {
+            first: sprite_vector2(first),
+            second: sprite_vector2(second),
+            third: sprite_vector2(third),
+        });
+    }
+    Ok(SpriteRenderData {
+        texture: sprite_object_reference(texture),
+        alpha_texture: sprite_object_reference(alpha_texture),
+        secondary_textures: node_secondary,
+        texture_rect: SpriteRect {
+            x: f64::from(texture_rect.x),
+            y: f64::from(texture_rect.y),
+            width: f64::from(texture_rect.width),
+            height: f64::from(texture_rect.height),
+        },
+        texture_rect_offset: sprite_vector2(texture_rect_offset),
+        atlas_rect_offset: sprite_vector2(atlas_rect_offset),
+        settings: SpriteSettings {
+            raw: settings.raw,
+            packed: settings.packed,
+            packing_mode: match settings.packing_mode {
+                SpritePackingMode::Tight => "tight",
+                SpritePackingMode::Rectangle => "rectangle",
+            }
+            .to_owned(),
+            packing_rotation: u32::from(settings.packing_rotation),
+            mesh_type: match settings.mesh_type {
+                SpriteMeshType::FullRect => "full_rect",
+                SpriteMeshType::Tight => "tight",
+            }
+            .to_owned(),
+        },
+        uv_transform: SpriteVector4 {
+            x: f64::from(uv_transform.x),
+            y: f64::from(uv_transform.y),
+            z: f64::from(uv_transform.z),
+            w: f64::from(uv_transform.w),
+        },
+        downscale_multiplier: f64::from(downscale_multiplier),
+        mesh_triangles: node_triangles,
+    })
+}
+
+fn sprite_vector2(value: assetstudio_core::sprite::Vector2) -> SpriteVector2 {
+    SpriteVector2 {
+        x: f64::from(value.x),
+        y: f64::from(value.y),
+    }
+}
+
 /// Converts an image Core already returns in display row order, such as a
 /// decoded `Sprite`.
 fn convert_image(image: assetstudio_core::texture::RgbaImage) -> RgbaImage {
@@ -2812,6 +4485,117 @@ fn convert_decoded_images(
         output.push(convert_decoded_image(image)?);
     }
     Ok(output)
+}
+
+fn convert_animation_clip_info(
+    mut clip: assetstudio_core::animation_clip::AnimationClip,
+) -> Result<AnimationClipInfo> {
+    let streaming_info = clip.streaming_info.take();
+    let muscle = clip.muscle_clip.as_ref();
+    let acl = muscle.and_then(|value| value.clip.acl.as_ref());
+    let constant_value_count = muscle
+        .map(|value| {
+            count_u32(
+                value.clip.constant.values.count,
+                "AnimationClip constant value count",
+            )
+        })
+        .transpose()?;
+    let acl_decoder_count = acl
+        .map(|value| count_u32(value.decoder_map.count, "AnimationClip ACL decoder count"))
+        .transpose()?;
+    let (streaming_offset, streaming_size, streaming_path) = match streaming_info {
+        Some(value) => (
+            Some(BigInt::from(value.offset)),
+            Some(value.size),
+            Some(value.path),
+        ),
+        None => (None, None, None),
+    };
+    Ok(AnimationClipInfo {
+        path_id: BigInt::from(clip.path_id),
+        name: clip.name,
+        sample_rate: f64::from(clip.sample_rate),
+        wrap_mode: clip.wrap_mode,
+        legacy: clip.legacy,
+        compressed: clip.compressed,
+        use_high_quality_curve: clip.use_high_quality_curve,
+        rotation_curve_count: count_u32(
+            clip.rotation_curves.len(),
+            "AnimationClip rotation curve count",
+        )?,
+        position_curve_count: count_u32(
+            clip.position_curves.len(),
+            "AnimationClip position curve count",
+        )?,
+        scale_curve_count: count_u32(clip.scale_curves.len(), "AnimationClip scale curve count")?,
+        euler_curve_count: count_u32(clip.euler_curves.len(), "AnimationClip Euler curve count")?,
+        float_curve_count: count_u32(clip.float_curves.len(), "AnimationClip float curve count")?,
+        pptr_curve_count: count_u32(clip.pptr_curves.len(), "AnimationClip PPtr curve count")?,
+        muscle_clip_size: clip.muscle_clip_size,
+        has_muscle_clip: muscle.is_some(),
+        streamed_curve_count: muscle.map(|value| value.clip.streamed.curve_count),
+        dense_curve_count: muscle.map(|value| value.clip.dense.curve_count),
+        constant_value_count,
+        has_acl: acl.is_some(),
+        acl_frame_count: acl.map(|value| value.frame_count),
+        acl_bone_count: acl.map(|value| value.bone_count),
+        acl_sample_rate: acl.map(|value| f64::from(value.sample_rate())),
+        acl_curve_count: acl.and_then(|value| value.curve_count),
+        acl_track_byte_count: acl.map(|value| BigInt::from(value.tracks.byte_length)),
+        acl_decoder_count,
+        acl_use_fast_sample_mode: acl.and_then(|value| value.use_fast_sample_mode),
+        has_streaming_info: streaming_path.is_some(),
+        streaming_offset,
+        streaming_size,
+        streaming_path,
+    })
+}
+
+fn convert_avatar(avatar: assetstudio_core::avatar::Avatar) -> Result<Avatar> {
+    let skeleton_node_count = count_u32(
+        avatar.constant.avatar_skeleton.nodes.len(),
+        "Avatar skeleton node count",
+    )?;
+    let human_skeleton_node_count = count_u32(
+        avatar.constant.human.skeleton.nodes.len(),
+        "Avatar human skeleton node count",
+    )?;
+    let (has_human_description, human_bone_count, skeleton_bone_count, root_motion_bone_name) =
+        match avatar.human_description {
+            Some(description) => (
+                true,
+                count_u32(description.human_bones.len(), "Avatar human bone count")?,
+                count_u32(
+                    description.skeleton_bones.len(),
+                    "Avatar skeleton bone count",
+                )?,
+                Some(description.root_motion_bone_name),
+            ),
+            None => (false, 0, 0, None),
+        };
+    let path_count = count_u32(avatar.paths.len(), "Avatar path count")?;
+    let mut paths = reserve(avatar.paths.len(), "Avatar paths")?;
+    for entry in avatar.paths {
+        paths.push(AvatarPathEntry {
+            hash: entry.hash,
+            path: entry.path,
+        });
+    }
+    Ok(Avatar {
+        path_id: BigInt::from(avatar.path_id),
+        name: avatar.name,
+        declared_size: avatar.declared_avatar_size,
+        declared_avatar_size: avatar.declared_avatar_size,
+        skeleton_node_count,
+        human_skeleton_node_count,
+        path_count,
+        paths,
+        has_human_description,
+        human_bone_count,
+        skeleton_bone_count,
+        root_motion_bone_name,
+    })
 }
 
 fn object_info(object: StudioObject<'_>) -> Result<ObjectInfo> {
@@ -2848,6 +4632,219 @@ fn byte_limit(value: Option<i64>) -> Result<u64> {
     non_negative_limit(value, DEFAULT_PAYLOAD_LIMIT, "maximumBytes")
 }
 
+fn unsupported_option(field: &str, value: &str, expected: &str) -> Error {
+    if value.len() <= MAXIMUM_OPTION_DIAGNOSTIC_BYTES {
+        invalid_arg(format!(
+            "unsupported {field} {value:?}; expected {expected}"
+        ))
+    } else {
+        invalid_arg(format!(
+            "unsupported {field} value of {} UTF-8 bytes; expected {expected}",
+            value.len()
+        ))
+    }
+}
+
+fn parse_export_mode(value: Option<&str>) -> Result<ExportMode> {
+    let Some(value) = value else {
+        return Ok(ExportMode::Auto);
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(ExportMode::Auto)
+    } else if value.eq_ignore_ascii_case("raw") {
+        Ok(ExportMode::Raw)
+    } else if value.eq_ignore_ascii_case("typetree-json")
+        || value.eq_ignore_ascii_case("typetree_json")
+        || value.eq_ignore_ascii_case("json")
+    {
+        Ok(ExportMode::TypeTreeJson)
+    } else if value.eq_ignore_ascii_case("dump-text")
+        || value.eq_ignore_ascii_case("dump_text")
+        || value.eq_ignore_ascii_case("dump")
+    {
+        Ok(ExportMode::DumpText)
+    } else {
+        Err(unsupported_option(
+            "export mode",
+            value,
+            "auto, raw, typetree-json, or dump-text",
+        ))
+    }
+}
+
+fn parse_filename_format(value: Option<&str>) -> Result<FilenameFormat> {
+    let Some(value) = value else {
+        return Ok(FilenameFormat::AssetName);
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("asset-name") || value.eq_ignore_ascii_case("asset_name") {
+        Ok(FilenameFormat::AssetName)
+    } else if value.eq_ignore_ascii_case("asset-name-path-id")
+        || value.eq_ignore_ascii_case("asset_name_path_id")
+    {
+        Ok(FilenameFormat::AssetNamePathId)
+    } else if value.eq_ignore_ascii_case("path-id") || value.eq_ignore_ascii_case("path_id") {
+        Ok(FilenameFormat::PathId)
+    } else {
+        Err(unsupported_option(
+            "filename format",
+            value,
+            "asset-name, asset-name-path-id, or path-id",
+        ))
+    }
+}
+
+fn parse_audio_format(value: &str) -> Result<AudioExportFormat> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(AudioExportFormat::Auto)
+    } else if value.eq_ignore_ascii_case("raw") || value.eq_ignore_ascii_case("none") {
+        Ok(AudioExportFormat::Raw)
+    } else if value.eq_ignore_ascii_case("wav") || value.eq_ignore_ascii_case("wave") {
+        Ok(AudioExportFormat::Wav)
+    } else {
+        Err(unsupported_option(
+            "audio format",
+            value,
+            "auto, raw, or wav",
+        ))
+    }
+}
+
+fn materialize_audio_clip(
+    audio: AudioClipAsset,
+    format: AudioExportFormat,
+    maximum: u64,
+) -> Result<AudioClip> {
+    let AudioClipAsset {
+        name,
+        payload,
+        raw_extension,
+        direct_wav,
+        ..
+    } = audio;
+    let is_direct_wav = direct_wav.is_some();
+    let wav_kind = match format {
+        AudioExportFormat::Auto => direct_wav,
+        AudioExportFormat::Raw => None,
+        AudioExportFormat::Wav => Some(direct_wav.ok_or_else(|| {
+            Error::new(
+                Status::GenericFailure,
+                "AudioClip uses a compressed or unsupported audio codec and cannot be exported directly as WAV",
+            )
+        })?),
+    };
+
+    if let Some(kind) = wav_kind {
+        let expected = direct_wav_output_size(&payload, kind).map_err(core_error)?;
+        if expected > maximum {
+            return Err(invalid_arg(format!(
+                "WAV output is {expected} bytes, exceeding maximumBytes {maximum}"
+            )));
+        }
+        let expected_usize = usize::try_from(expected)
+            .map_err(|_| invalid_arg("WAV output is too large for this platform"))?;
+        let mut data = reserve(expected_usize, "AudioClip WAV output")?;
+        let written = write_direct_wav(&payload, kind, maximum, &mut data).map_err(core_error)?;
+        if written != expected || data.len() != expected_usize {
+            return Err(Error::from_reason(format!(
+                "AudioClip WAV writer produced {written} bytes, expected {expected}"
+            )));
+        }
+        Ok(AudioClip {
+            name,
+            extension: ".wav".to_owned(),
+            payload_kind: "audio_wav".to_owned(),
+            is_direct_wav,
+            data: data.into(),
+        })
+    } else {
+        let data = payload.read_to_vec(maximum).map_err(core_error)?;
+        Ok(AudioClip {
+            name,
+            extension: raw_extension,
+            payload_kind: "audio_raw".to_owned(),
+            is_direct_wav,
+            data: data.into(),
+        })
+    }
+}
+
+fn animation_clip_limits(maximum: u64) -> Result<AnimationClipReadLimits> {
+    let maximum_usize = usize::try_from(maximum)
+        .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?;
+    let defaults = AnimationClipReadLimits::default();
+    Ok(AnimationClipReadLimits {
+        maximum_object_bytes: defaults.maximum_object_bytes.min(maximum),
+        maximum_string_bytes: defaults.maximum_string_bytes.min(maximum_usize),
+        maximum_total_string_bytes: defaults.maximum_total_string_bytes.min(maximum_usize),
+        maximum_packed_bytes: defaults.maximum_packed_bytes.min(maximum),
+        maximum_total_packed_bytes: defaults.maximum_total_packed_bytes.min(maximum),
+        maximum_reference_bytes: defaults.maximum_reference_bytes.min(maximum),
+        maximum_total_allocation_bytes: defaults.maximum_total_allocation_bytes.min(maximum),
+        ..defaults
+    })
+}
+
+fn avatar_limits(maximum: u64) -> Result<AvatarReadLimits> {
+    let maximum_usize = usize::try_from(maximum)
+        .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?;
+    let defaults = AvatarReadLimits::default();
+    Ok(AvatarReadLimits {
+        maximum_object_bytes: defaults.maximum_object_bytes.min(maximum),
+        maximum_string_bytes: defaults.maximum_string_bytes.min(maximum_usize),
+        maximum_total_string_bytes: defaults.maximum_total_string_bytes.min(maximum_usize),
+        maximum_total_allocation_bytes: defaults.maximum_total_allocation_bytes.min(maximum),
+        maximum_reference_bytes: defaults.maximum_reference_bytes.min(maximum),
+        ..defaults
+    })
+}
+
+fn animation_component_limits(value: Option<i64>) -> Result<AnimationComponentReadLimits> {
+    let maximum = byte_limit(value)?;
+    let maximum_usize = usize::try_from(maximum)
+        .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?;
+    let maximum_clips = maximum_usize / std::mem::size_of::<AnimationClipOverride>();
+    Ok(AnimationComponentReadLimits {
+        maximum_object_bytes: maximum,
+        maximum_string_bytes: maximum_usize,
+        maximum_clips: maximum_clips.min(AnimationComponentReadLimits::default().maximum_clips),
+        maximum_reference_bytes: maximum,
+    })
+}
+
+fn container_metadata_limits(
+    maximum_entries: Option<u32>,
+    maximum_string_bytes: Option<i64>,
+    maximum_total_string_bytes: Option<i64>,
+) -> Result<ContainerMetadataReadLimits> {
+    let defaults = ContainerMetadataReadLimits::default();
+    let maximum_entries = count_limit(maximum_entries, defaults.maximum_container_entries);
+    Ok(ContainerMetadataReadLimits {
+        maximum_preload_references: maximum_entries,
+        maximum_container_entries: maximum_entries,
+        maximum_dependencies: maximum_entries,
+        maximum_class_version_entries: maximum_entries,
+        maximum_string_bytes: usize_non_negative_limit(
+            maximum_string_bytes,
+            defaults.maximum_string_bytes,
+            "maximumStringBytes",
+        )?,
+        maximum_total_string_bytes: usize_non_negative_limit(
+            maximum_total_string_bytes,
+            defaults.maximum_total_string_bytes,
+            "maximumTotalStringBytes",
+        )?,
+    })
+}
+
+fn usize_non_negative_limit(value: Option<i64>, default: usize, field: &str) -> Result<usize> {
+    let default = u64::try_from(default).expect("a usize limit fits u64");
+    let value = non_negative_limit(value, default, field)?;
+    usize::try_from(value).map_err(|_| invalid_arg(format!("{field} does not fit this platform")))
+}
+
 fn non_negative_limit(value: Option<i64>, default: u64, field: &str) -> Result<u64> {
     match value {
         None => Ok(default),
@@ -2860,15 +4857,31 @@ fn non_negative_limit(value: Option<i64>, default: u64, field: &str) -> Result<u
 }
 
 fn parse_image_format(value: Option<String>) -> Result<ImageFormat> {
-    let value = value.unwrap_or_else(|| "png".to_owned());
-    match value.trim().to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" => Ok(ImageFormat::Jpeg),
-        "png" => Ok(ImageFormat::Png),
-        "bmp" => Ok(ImageFormat::Bmp),
-        "tga" => Ok(ImageFormat::Tga),
-        "webp" => Ok(ImageFormat::Webp),
-        "raw_rgba" | "raw-rgba" | "rgba" => Ok(ImageFormat::RawRgba),
-        _ => Err(invalid_arg(format!("unsupported image format {value:?}"))),
+    let Some(value) = value else {
+        return Ok(ImageFormat::Png);
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("jpg") || value.eq_ignore_ascii_case("jpeg") {
+        Ok(ImageFormat::Jpeg)
+    } else if value.eq_ignore_ascii_case("png") {
+        Ok(ImageFormat::Png)
+    } else if value.eq_ignore_ascii_case("bmp") {
+        Ok(ImageFormat::Bmp)
+    } else if value.eq_ignore_ascii_case("tga") {
+        Ok(ImageFormat::Tga)
+    } else if value.eq_ignore_ascii_case("webp") {
+        Ok(ImageFormat::Webp)
+    } else if value.eq_ignore_ascii_case("raw_rgba")
+        || value.eq_ignore_ascii_case("raw-rgba")
+        || value.eq_ignore_ascii_case("rgba")
+    {
+        Ok(ImageFormat::RawRgba)
+    } else {
+        Err(unsupported_option(
+            "image format",
+            value,
+            "jpeg, png, bmp, tga, webp, or raw-rgba",
+        ))
     }
 }
 
@@ -2879,6 +4892,22 @@ fn usize_limit(value: Option<i64>) -> Result<usize> {
 
 fn count_u32(value: usize, field: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::from_reason(format!("{field} does not fit u32")))
+}
+
+fn object_reference(reference: assetstudio_core::serialized::ObjectReference) -> ObjectReference {
+    ObjectReference {
+        file_id: reference.file_id,
+        path_id: BigInt::from(reference.path_id),
+    }
+}
+
+fn sprite_object_reference(
+    reference: assetstudio_core::sprite::ObjectReference,
+) -> ObjectReference {
+    ObjectReference {
+        file_id: reference.file_id,
+        path_id: BigInt::from(reference.path_id),
+    }
 }
 
 /// A non-negative `BigInt`, for offsets and lengths.
@@ -2924,12 +4953,232 @@ fn reserve<T>(count: usize, field: &str) -> Result<Vec<T>> {
     Ok(output)
 }
 
+fn copy_slice<T: Copy>(source: &[T], field: &str) -> Result<Vec<T>> {
+    let mut output = reserve(source.len(), field)?;
+    output.extend_from_slice(source);
+    Ok(output)
+}
+
+fn copy_core_slice<T: Copy>(source: &[T], field: &'static str) -> assetstudio_core::Result<Vec<T>> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(source.len()).map_err(|error| {
+        assetstudio_core::Error::invalid_data(format!("cannot allocate {field}: {error}"))
+    })?;
+    output.extend_from_slice(source);
+    Ok(output)
+}
+
+struct FallibleOutput {
+    bytes: Vec<u8>,
+    maximum: usize,
+    field: &'static str,
+    limit_exceeded: bool,
+}
+
+impl FallibleOutput {
+    const fn new(maximum: usize, field: &'static str) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            field,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for FallibleOutput {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(input.len())
+            .ok_or_else(|| io::Error::other(format!("{} length overflowed", self.field)))?;
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(io::Error::other(format!(
+                "{} exceeds {} bytes",
+                self.field, self.maximum
+            )));
+        }
+        self.bytes.try_reserve(input.len()).map_err(|error| {
+            io::Error::other(format!("cannot allocate {}: {error}", self.field))
+        })?;
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn materialize_core_output<T>(
+    maximum: u64,
+    field: &'static str,
+    write: impl FnOnce(&mut FallibleOutput) -> assetstudio_core::Result<(u64, T)>,
+) -> Result<(Vec<u8>, T)> {
+    let maximum = usize::try_from(maximum)
+        .map_err(|_| invalid_arg(format!("{field} limit does not fit this platform")))?;
+    let mut output = FallibleOutput::new(maximum, field);
+    let write_result = write(&mut output);
+    if output.limit_exceeded {
+        return Err(invalid_arg(format!("{field} exceeds {maximum} bytes")));
+    }
+    let (written, value) = write_result.map_err(core_error)?;
+    let actual = u64::try_from(output.bytes.len())
+        .map_err(|_| invalid_arg(format!("{field} length does not fit u64")))?;
+    if written != actual {
+        return Err(Error::from_reason(format!(
+            "{field} writer reported {written} bytes but produced {actual}"
+        )));
+    }
+    Ok((output.bytes, value))
+}
+
+fn materialize_core_bytes(
+    maximum: u64,
+    field: &'static str,
+    write: impl FnOnce(&mut FallibleOutput) -> assetstudio_core::Result<u64>,
+) -> Result<Vec<u8>> {
+    materialize_core_output(maximum, field, |output| {
+        write(output).map(|written| (written, ()))
+    })
+    .map(|(bytes, ())| bytes)
+}
+
 fn copy_string(value: &str, field: &str) -> Result<String> {
     let mut output = String::new();
     output
         .try_reserve_exact(value.len())
         .map_err(|error| Error::from_reason(format!("cannot allocate {field}: {error}")))?;
     output.push_str(value);
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn for_each_path_char_lossy(
+    value: &std::ffi::OsStr,
+    mut visitor: impl FnMut(char) -> Result<()>,
+) -> Result<()> {
+    use std::char::decode_utf16;
+    use std::os::windows::ffi::OsStrExt;
+
+    for character in decode_utf16(value.encode_wide()) {
+        visitor(character.unwrap_or(char::REPLACEMENT_CHARACTER))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn for_each_path_char_lossy(
+    value: &std::ffi::OsStr,
+    mut visitor: impl FnMut(char) -> Result<()>,
+) -> Result<()> {
+    let mut input = value.as_encoded_bytes();
+    while !input.is_empty() {
+        match std::str::from_utf8(input) {
+            Ok(valid) => {
+                for character in valid.chars() {
+                    visitor(character)?;
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let valid_length = error.valid_up_to();
+                if valid_length != 0 {
+                    let valid = std::str::from_utf8(&input[..valid_length]).map_err(|_| {
+                        invalid_arg("valid filesystem UTF-8 prefix could not be decoded")
+                    })?;
+                    for character in valid.chars() {
+                        visitor(character)?;
+                    }
+                }
+                visitor(char::REPLACEMENT_CHARACTER)?;
+                let invalid_length = error
+                    .error_len()
+                    .unwrap_or_else(|| input.len() - valid_length);
+                input = &input[valid_length + invalid_length..];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_lossy_utf8_length(value: &std::ffi::OsStr, field: &'static str) -> Result<usize> {
+    let mut length = 0_usize;
+    for_each_path_char_lossy(value, |character| {
+        length = length
+            .checked_add(character.len_utf8())
+            .ok_or_else(|| invalid_arg(format!("{field} replacement length overflowed")))?;
+        Ok(())
+    })?;
+    Ok(length)
+}
+
+fn copy_path_string(path: &std::path::Path, field: &'static str) -> Result<String> {
+    let value = path.as_os_str();
+    let utf8_length = path_lossy_utf8_length(value, field)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(utf8_length)
+        .map_err(|error| Error::from_reason(format!("cannot allocate {field}: {error}")))?;
+    for_each_path_char_lossy(value, |character| {
+        output.push(character);
+        Ok(())
+    })?;
+    if output.len() != utf8_length {
+        return Err(Error::from_reason(format!(
+            "{field} changed while converting the filesystem path"
+        )));
+    }
+    Ok(output)
+}
+
+fn convert_fbx_candidates(
+    source: Vec<ModelExportCandidate>,
+    field: &'static str,
+) -> Result<Vec<FbxCandidate>> {
+    let mut output = reserve(source.len(), field)?;
+    output.extend(source.into_iter().map(into_candidate));
+    Ok(output)
+}
+
+fn convert_scene_texture_files(
+    source: Vec<assetstudio_core::scene_textures::SceneTexture>,
+    field: &'static str,
+) -> Result<Vec<Live2dFile>> {
+    let mut output = reserve(source.len(), field)?;
+    for texture in source {
+        output.push(Live2dFile {
+            file_name: texture.file_name,
+            data: texture.encoded.into(),
+        });
+    }
+    Ok(output)
+}
+
+fn convert_scene_texture_skips(
+    source: Vec<assetstudio_core::scene_textures::SceneTextureSkip>,
+    field: &'static str,
+) -> Result<Vec<String>> {
+    let mut output = reserve(source.len(), field)?;
+    for skip in source {
+        let capacity = skip
+            .property
+            .len()
+            .checked_add(skip.reason.len())
+            .and_then(|length| length.checked_add(2))
+            .ok_or_else(|| invalid_arg("skipped texture description length overflowed"))?;
+        let mut description = String::new();
+        description.try_reserve_exact(capacity).map_err(|error| {
+            Error::from_reason(format!(
+                "cannot allocate skipped texture description: {error}"
+            ))
+        })?;
+        write!(description, "{}: {}", skip.property, skip.reason)
+            .map_err(|error| Error::from_reason(format!("cannot format texture skip: {error}")))?;
+        output.push(description);
+    }
     Ok(output)
 }
 
@@ -2958,5 +5207,109 @@ fn core_error(error: assetstudio_core::Error) -> Error {
             Error::new(Status::GenericFailure, message)
         }
         other => Error::new(Status::InvalidArg, other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        copy_path_string, materialize_core_bytes, parse_audio_format, parse_export_mode,
+        parse_filename_format, parse_image_format,
+    };
+    use assetstudio_core::export::{AudioExportFormat, ExportMode, FilenameFormat};
+    use assetstudio_core::image_export::ImageFormat;
+    use std::io::Write;
+
+    fn assert_bounded_option_error(error: &napi::Error, field: &str, oversized: &str) {
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("unsupported {field} value of 4096 UTF-8 bytes")),
+            "unexpected option error: {message}"
+        );
+        assert!(!message.contains(oversized));
+    }
+
+    #[test]
+    fn option_parsers_preserve_aliases_without_echoing_large_values() {
+        assert_eq!(
+            parse_export_mode(Some(" DuMp_TeXt ")).expect("dump alias"),
+            ExportMode::DumpText
+        );
+        assert_eq!(
+            parse_filename_format(Some(" PaTh_Id ")).expect("path alias"),
+            FilenameFormat::PathId
+        );
+        assert_eq!(
+            parse_image_format(Some(" RaW-RgBa ".to_owned())).expect("RGBA alias"),
+            ImageFormat::RawRgba
+        );
+        assert_eq!(
+            parse_audio_format(" WaVe ").expect("wave alias"),
+            AudioExportFormat::Wav
+        );
+        assert_eq!(
+            parse_image_format(None).expect("default image format"),
+            ImageFormat::Png
+        );
+
+        let oversized = "é".repeat(2048);
+        assert_bounded_option_error(
+            &parse_export_mode(Some(&oversized)).expect_err("oversized export mode"),
+            "export mode",
+            &oversized,
+        );
+        assert_bounded_option_error(
+            &parse_filename_format(Some(&oversized)).expect_err("oversized filename format"),
+            "filename format",
+            &oversized,
+        );
+        assert_bounded_option_error(
+            &parse_image_format(Some(oversized.clone())).expect_err("oversized image format"),
+            "image format",
+            &oversized,
+        );
+        assert_bounded_option_error(
+            &parse_audio_format(&oversized).expect_err("oversized audio format"),
+            "audio format",
+            &oversized,
+        );
+    }
+
+    #[test]
+    fn fallible_output_enforces_the_byte_limit() {
+        let error = materialize_core_bytes(3, "test output", |output| {
+            output.write_all(b"four")?;
+            Ok(4)
+        })
+        .expect_err("four bytes must not fit a three-byte output budget");
+        assert!(error.to_string().contains("test output exceeds 3 bytes"));
+    }
+
+    #[test]
+    fn fallible_output_checks_the_writer_count() {
+        let error = materialize_core_bytes(2, "test output", |output| {
+            output.write_all(b"ok")?;
+            Ok(1)
+        })
+        .expect_err("a writer's byte count must match its output");
+        assert!(
+            error
+                .to_string()
+                .contains("writer reported 1 bytes but produced 2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_paths_preserve_platform_lossy_replacement_without_a_temporary_string() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'a', 0xff, b'b']));
+        assert_eq!(
+            copy_path_string(&path, "test report path").expect("fallible path copy"),
+            "a\u{fffd}b"
+        );
     }
 }

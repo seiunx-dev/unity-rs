@@ -226,6 +226,78 @@ fn obj_never_clobbers_an_existing_destination() {
 }
 
 #[test]
+fn obj_does_not_publish_when_the_companion_material_library_exists() {
+    let root = TestDirectory::new("obj-existing-mtl");
+    let input = root.path().join("model.assets");
+    let destination = root.path().join("model.obj");
+    let material_library = root.path().join("model.mtl");
+    fs::write(&input, synthetic_model([0.0, 0.0, 0.0, 1.0])).unwrap();
+    fs::write(&material_library, b"keep the original material library").unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "obj".into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+
+    assert_eq!(result.status.code(), Some(1));
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read(&material_library).unwrap(),
+        b"keep the original material library"
+    );
+    assert_no_fbx_temporary_files(root.path());
+}
+
+#[test]
+fn obj_total_budget_counts_the_obj_and_material_library_together() {
+    let root = TestDirectory::new("obj-total-budget");
+    let input = root.path().join("model.assets");
+    let destination = root.path().join("model.obj");
+    let material_library = root.path().join("model.mtl");
+    fs::write(&input, synthetic_model([0.0, 0.0, 0.0, 1.0])).unwrap();
+
+    let baseline = cli(
+        root.path(),
+        [
+            "obj".into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+    assert_success(&baseline);
+    let obj_bytes = fs::metadata(&destination).unwrap().len();
+    let mtl_bytes = fs::metadata(&material_library).unwrap().len();
+    let per_file_limit = obj_bytes.max(mtl_bytes);
+    assert!(obj_bytes.checked_add(mtl_bytes).unwrap() > per_file_limit);
+    fs::remove_file(&destination).unwrap();
+    fs::remove_file(&material_library).unwrap();
+
+    let limited = cli(
+        root.path(),
+        [
+            "obj".into(),
+            "--maximum-output-bytes".into(),
+            per_file_limit.to_string().into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+    assert_eq!(limited.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&limited.stderr).contains("total output limit"),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+    assert!(!destination.exists());
+    assert!(!material_library.exists());
+    assert_no_fbx_temporary_files(root.path());
+}
+
+#[test]
 fn fbx_budget_invalid_input_and_general_rotation_are_handled_atomically() {
     let root = TestDirectory::new("failures");
     let input = root.path().join("model.assets");
@@ -443,7 +515,7 @@ fn fbx_rejects_symbolic_link_output_ancestors() {
     let real = root.path().join("real");
     let linked = root.path().join("linked");
     fs::write(&input, synthetic_model([0.0, 0.0, 0.0, 1.0])).unwrap();
-    fs::create_dir(&real).unwrap();
+    fs::create_dir_all(real.join("existing")).unwrap();
     symlink(&real, &linked).unwrap();
 
     let result = cli(
@@ -451,13 +523,38 @@ fn fbx_rejects_symbolic_link_output_ancestors() {
         [
             "fbx".into(),
             input.as_os_str().into(),
-            linked.join("model.fbx").into_os_string(),
+            linked.join("existing/model.fbx").into_os_string(),
         ],
     );
     assert_eq!(result.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("symbolic link"));
-    assert!(!real.join("model.fbx").exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("symbolic-link"));
+    assert!(!real.join("existing/model.fbx").exists());
     assert_no_fbx_temporary_files(&real);
+}
+
+#[test]
+fn fbx_creates_a_deep_relative_output_parent_without_quadratic_parent_copies() {
+    let root = TestDirectory::new("deep-relative-output");
+    let input = root.path().join("model.assets");
+    fs::write(&input, synthetic_model([0.0, 0.0, 0.0, 1.0])).unwrap();
+    let mut destination = PathBuf::new();
+    for index in 0..64 {
+        destination.push(format!("d{index}"));
+    }
+    destination.push("model.fbx");
+
+    let result = cli(
+        root.path(),
+        [
+            "fbx".into(),
+            input.as_os_str().into(),
+            destination.as_os_str().into(),
+        ],
+    );
+
+    assert_success(&result);
+    assert!(root.path().join(&destination).is_file());
+    assert_no_fbx_temporary_files(root.path().join(&destination).parent().unwrap());
 }
 
 fn cli<I>(current_directory: &Path, arguments: I) -> Output

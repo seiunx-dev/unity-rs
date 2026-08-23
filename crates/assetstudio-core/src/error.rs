@@ -50,4 +50,14 @@ impl From<io::Error> for Error {
     }
 }
 
+/// A bounded writer validating an in-memory payload has no external I/O to
+/// fail. Preserve its diagnostic while classifying budget/length failures as
+/// invalid caller/input data instead of a filesystem error.
+pub(crate) fn output_validation<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| match error {
+        Error::Io(error) => Error::invalid_data(error.to_string()),
+        error => error,
+    })
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

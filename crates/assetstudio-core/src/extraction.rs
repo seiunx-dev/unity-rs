@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -11,6 +12,9 @@ use crate::bundle::{
 use crate::compression::{CompressionLimits, ZipContainer, decompress_brotli, decompress_gzip};
 use crate::endian::{Endian, EndianReader};
 use crate::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
+use crate::filesystem_text::{
+    copy_os_str_with_replacement, for_each_os_str_char_lossy, lossy_os_str_utf8_length,
+};
 use crate::legacy_bundle::LegacyBundle;
 use crate::source::Region;
 use crate::unity_cn::UnityCnKey;
@@ -27,7 +31,12 @@ pub struct ExtractionLimits {
     pub maximum_single_entry_bytes: u64,
     pub maximum_expanded_bytes: u64,
     pub maximum_output_bytes: u64,
+    /// Maximum bytes in one filesystem input path, caller label, archive path,
+    /// or fully qualified recursive diagnostic label.
     pub maximum_path_bytes: usize,
+    /// Maximum cumulative bytes retained for filesystem traversal paths and
+    /// recursive diagnostic labels during one extraction.
+    pub maximum_total_path_bytes: usize,
     pub compression: CompressionLimits,
 }
 
@@ -41,6 +50,7 @@ impl Default for ExtractionLimits {
             maximum_expanded_bytes: 4 * 1024 * 1024 * 1024,
             maximum_output_bytes: 4 * 1024 * 1024 * 1024,
             maximum_path_bytes: 32_767,
+            maximum_total_path_bytes: 64 * 1024 * 1024,
             compression: CompressionLimits::default(),
         }
     }
@@ -97,6 +107,47 @@ pub struct ExtractionReport {
     pub output_bytes: u64,
 }
 
+#[derive(Debug, Default)]
+struct ExtractionPathBudget {
+    bytes: usize,
+}
+
+impl ExtractionPathBudget {
+    fn charge_path(&mut self, length: usize, limits: ExtractionLimits) -> Result<()> {
+        self.bytes = self.checked_path_total(length, limits)?;
+        Ok(())
+    }
+
+    fn checked_path_total(&self, length: usize, limits: ExtractionLimits) -> Result<usize> {
+        if length > limits.maximum_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "extraction path or label is {length} bytes, exceeding limit {}",
+                limits.maximum_path_bytes
+            )));
+        }
+        self.checked_additional_total(length, limits)
+    }
+
+    fn charge_additional(&mut self, length: usize, limits: ExtractionLimits) -> Result<()> {
+        self.bytes = self.checked_additional_total(length, limits)?;
+        Ok(())
+    }
+
+    fn checked_additional_total(&self, length: usize, limits: ExtractionLimits) -> Result<usize> {
+        let total = self
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| Error::invalid_data("extraction path byte count overflowed"))?;
+        if total > limits.maximum_total_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "extraction paths total {total} bytes, exceeding limit {}",
+                limits.maximum_total_path_bytes
+            )));
+        }
+        Ok(total)
+    }
+}
+
 /// Recursively extracts one regular file or a directory tree.
 ///
 /// Child symlinks are never followed. Every archive path is converted to a
@@ -107,6 +158,7 @@ pub fn extract_path(
     options: ExtractionOptions,
 ) -> Result<ExtractionReport> {
     validate_limits(options.limits)?;
+    let mut path_budget = ExtractionPathBudget::default();
     let metadata = fs::symlink_metadata(input)?;
     if metadata.file_type().is_symlink() {
         return Err(Error::invalid_data(format!(
@@ -121,29 +173,34 @@ pub fn extract_path(
         let file_name = input.file_name().ok_or_else(|| {
             Error::invalid_data(format!("input file has no name: {}", input.display()))
         })?;
-        vec![(
-            input.to_owned(),
-            sanitize_component_path(file_name.to_string_lossy().as_ref(), options.limits)?,
-        )]
+        let mut roots = Vec::new();
+        roots.try_reserve_exact(1).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate input roots: {error}"))
+        })?;
+        roots.push((
+            copy_filesystem_path(input, options.limits, &mut path_budget)?,
+            sanitize_os_component_path(file_name, options.limits)?,
+        ));
+        roots
     } else if metadata.is_dir() {
         if output_absolute.starts_with(&input_absolute) {
             return Err(Error::invalid_data(
                 "output directory must not be inside the input directory",
             ));
         }
-        collect_regular_files(input, options.limits)?
-            .into_iter()
-            .map(|path| {
-                let relative = path
-                    .strip_prefix(input)
-                    .map_err(|_| Error::invalid_data("directory input escaped its traversal root"))?
-                    .to_owned();
-                Ok((
-                    path,
-                    sanitize_filesystem_relative_path(&relative, options.limits)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?
+        let files = collect_regular_files(input, options.limits, &mut path_budget)?;
+        let mut roots = Vec::new();
+        roots.try_reserve_exact(files.len()).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate extraction input roots: {error}"))
+        })?;
+        for path in files {
+            let relative = path
+                .strip_prefix(input)
+                .map_err(|_| Error::invalid_data("directory input escaped its traversal root"))?;
+            let output_path = sanitize_filesystem_relative_path(relative, options.limits)?;
+            roots.push((path, output_path));
+        }
+        roots
     } else {
         return Err(Error::invalid_data(format!(
             "input is neither a regular file nor a directory: {}",
@@ -152,13 +209,14 @@ pub fn extract_path(
     };
 
     ensure_secure_directory(&output_absolute)?;
-    let mut extractor = Extractor::new(output_absolute, options);
+    let limits = options.limits;
+    let mut extractor = Extractor::with_path_budget(output_absolute, options, path_budget);
     for (path, relative) in roots {
-        let label = path.to_string_lossy().into_owned();
+        let label = filesystem_path_label(&path, limits, &mut extractor.budget.paths)?;
         let result = Region::from_file(&path)
             .and_then(|region| extractor.process_region(&label, region, relative, 0));
         if let Err(error) = result {
-            extractor.record_failure(label, &error);
+            extractor.record_failure(label, &error)?;
         }
     }
     Ok(extractor.report)
@@ -172,13 +230,15 @@ pub fn extract_region(
     options: ExtractionOptions,
 ) -> Result<ExtractionReport> {
     validate_limits(options.limits)?;
+    let mut path_budget = ExtractionPathBudget::default();
+    path_budget.charge_path(label.len(), options.limits)?;
     let output_absolute = lexical_absolute(output_root)?;
     ensure_secure_directory(&output_absolute)?;
     let file_name = label.rsplit(['/', '\\']).next().unwrap_or(label);
     let relative = sanitize_component_path(file_name, options.limits)?;
-    let mut extractor = Extractor::new(output_absolute, options);
+    let mut extractor = Extractor::with_path_budget(output_absolute, options, path_budget);
     if let Err(error) = extractor.process_region(label, region, relative, 0) {
-        extractor.record_failure(label.to_owned(), &error);
+        extractor.record_failure(copy_extraction_label(label)?, &error)?;
     }
     Ok(extractor.report)
 }
@@ -191,6 +251,7 @@ enum ClaimKind {
 
 #[derive(Debug, Default)]
 struct ExtractionBudget {
+    paths: ExtractionPathBudget,
     entries: usize,
     expanded_bytes: u64,
 }
@@ -206,19 +267,28 @@ struct Extractor {
     /// this has to be safe on, so a claim has to be found by that comparison.
     /// Doing it by scanning every key made allocation quadratic in the number
     /// of entries, and an archive with tens of thousands of them in one
-    /// directory spent all its time there.
-    claims: BTreeMap<PathBuf, ClaimKind>,
+    /// directory spent all its time there. The map is never iterated for
+    /// output ordering, so randomized hashing cannot affect file names; growth
+    /// is reserved fallibly before every insertion.
+    claims: HashMap<PathBuf, ClaimKind>,
     temporary_sequence: u64,
     report: ExtractionReport,
 }
 
 impl Extractor {
-    fn new(output_root: PathBuf, options: ExtractionOptions) -> Self {
+    fn with_path_budget(
+        output_root: PathBuf,
+        options: ExtractionOptions,
+        path_budget: ExtractionPathBudget,
+    ) -> Self {
         Self {
             output_root,
             options,
-            budget: ExtractionBudget::default(),
-            claims: BTreeMap::new(),
+            budget: ExtractionBudget {
+                paths: path_budget,
+                ..ExtractionBudget::default()
+            },
+            claims: HashMap::new(),
             temporary_sequence: 0,
             report: ExtractionReport::default(),
         }
@@ -284,11 +354,15 @@ impl Extractor {
             detection.file_type,
             FileType::AssetsFile | FileType::ResourceFile
         ) {
-            decoded_leaf_path(&desired_path, wrapper)?
+            decoded_leaf_path(
+                &desired_path,
+                wrapper,
+                self.options.limits.maximum_path_bytes,
+            )?
         } else {
             desired_path
         };
-        let child_label = format!("{label}::{wrapper}");
+        let child_label = self.nested_label(label, wrapper)?;
         self.process_detected_region(&child_label, decoded, child_path, next_depth, detection)
     }
 
@@ -313,20 +387,26 @@ impl Extractor {
         let next_depth = self.next_depth(depth)?;
         for index in 0..web.entries.len() {
             let entry = &web.entries[index];
-            let child_label = nested_label(label, &entry.path);
+            let child_label = self.nested_label(label, &entry.path)?;
             let result = self
                 .charge_entry(entry.data_length)
                 .and_then(|()| sanitize_archive_path(&entry.path, self.options.limits))
                 .and_then(|path| {
+                    let desired_path = join_relative_path_fallibly(
+                        &container,
+                        &path,
+                        self.options.limits.maximum_path_bytes,
+                        "nested extraction output path",
+                    )?;
                     self.process_region(
                         &child_label,
                         web.entry_region(index)?,
-                        container.join(path),
+                        desired_path,
                         next_depth,
                     )
                 });
             if let Err(error) = result {
-                self.record_failure(child_label, &error);
+                self.record_failure(child_label, &error)?;
             }
         }
         Ok(())
@@ -347,20 +427,26 @@ impl Extractor {
         let next_depth = self.next_depth(depth)?;
         for index in 0..archive.entries.len() {
             let entry = &archive.entries[index];
-            let child_label = nested_label(label, &entry.path);
+            let child_label = self.nested_label(label, &entry.path)?;
             let result = self
                 .charge_entry(entry.size)
                 .and_then(|()| sanitize_archive_path(&entry.path, self.options.limits))
                 .and_then(|path| {
+                    let desired_path = join_relative_path_fallibly(
+                        &container,
+                        &path,
+                        self.options.limits.maximum_path_bytes,
+                        "nested extraction output path",
+                    )?;
                     self.process_region(
                         &child_label,
                         archive.read_entry(index)?,
-                        container.join(path),
+                        desired_path,
                         next_depth,
                     )
                 });
             if let Err(error) = result {
-                self.record_failure(child_label, &error);
+                self.record_failure(child_label, &error)?;
             }
         }
         Ok(())
@@ -428,21 +514,27 @@ impl Extractor {
         let next_depth = self.next_depth(depth)?;
         for index in 0..bundle.entries.len() {
             let entry = &bundle.entries[index];
-            let child_label = nested_label(label, &entry.path);
+            let child_label = self.nested_label(label, &entry.path)?;
             let result = self
                 .charge_entry(entry.size)
                 .and_then(|()| sanitize_archive_path(&entry.path, self.options.limits))
                 .and_then(|path| {
+                    let desired_path = join_relative_path_fallibly(
+                        &container,
+                        &path,
+                        self.options.limits.maximum_path_bytes,
+                        "nested extraction output path",
+                    )?;
                     self.process_unity_fs_entry(
                         &child_label,
-                        container.join(path),
+                        desired_path,
                         next_depth,
                         bundle,
                         index,
                     )
                 });
             if let Err(error) = result {
-                self.record_failure(child_label, &error);
+                self.record_failure(child_label, &error)?;
             }
         }
         Ok(())
@@ -494,20 +586,26 @@ impl Extractor {
         let next_depth = self.next_depth(depth)?;
         for index in 0..bundle.entries.len() {
             let entry = &bundle.entries[index];
-            let child_label = nested_label(label, &entry.path);
+            let child_label = self.nested_label(label, &entry.path)?;
             let result = self
                 .charge_entry(entry.size)
                 .and_then(|()| sanitize_archive_path(&entry.path, self.options.limits))
                 .and_then(|path| {
+                    let desired_path = join_relative_path_fallibly(
+                        &container,
+                        &path,
+                        self.options.limits.maximum_path_bytes,
+                        "nested extraction output path",
+                    )?;
                     self.process_region(
                         &child_label,
                         bundle.entry_region(index)?,
-                        container.join(path),
+                        desired_path,
                         next_depth,
                     )
                 });
             if let Err(error) = result {
-                self.record_failure(child_label, &error);
+                self.record_failure(child_label, &error)?;
             }
         }
         Ok(())
@@ -536,14 +634,16 @@ impl Extractor {
             )));
         }
         let relative = self.allocate_path(desired_path, ClaimKind::File)?;
-        let output_path = self.output_root.join(&relative);
+        let output_path = join_relative_path_fallibly(
+            &self.output_root,
+            &relative,
+            usize::MAX,
+            "absolute extraction output path",
+        )?;
         ensure_secure_parent(&self.output_root, &relative)?;
         match safe_file_state(&output_path)? {
             FileState::Regular if !self.options.overwrite_existing => {
-                self.report.skipped_existing.push(ExtractionSkip {
-                    source: label.to_owned(),
-                    output_path,
-                });
+                self.push_skipped(label, output_path)?;
                 return Ok(());
             }
             FileState::Regular | FileState::Missing => {}
@@ -573,19 +673,35 @@ impl Extractor {
             )));
         }
 
+        let source = copy_extraction_label(label)?;
+        reserve_report_entry(&mut self.report.extracted, "extraction records")?;
+        // A no-clobber destination can appear between the initial check and
+        // atomic publication. Reserve both possible report variants before
+        // writing so success never creates a file and then fails to record it.
+        reserve_report_entry(&mut self.report.skipped_existing, "extraction skips")?;
         let outcome = self.atomic_write(&output_path, length, copy)?;
         if outcome == PersistOutcome::SkippedExisting {
             self.report.skipped_existing.push(ExtractionSkip {
-                source: label.to_owned(),
+                source,
                 output_path,
             });
             return Ok(());
         }
         self.report.output_bytes = new_total;
         self.report.extracted.push(ExtractionRecord {
-            source: label.to_owned(),
+            source,
             output_path,
             bytes: length,
+        });
+        Ok(())
+    }
+
+    fn push_skipped(&mut self, label: &str, output_path: PathBuf) -> Result<()> {
+        let source = copy_extraction_label(label)?;
+        reserve_report_entry(&mut self.report.skipped_existing, "extraction skips")?;
+        self.report.skipped_existing.push(ExtractionSkip {
+            source,
+            output_path,
         });
         Ok(())
     }
@@ -645,12 +761,34 @@ impl Extractor {
                 source_path.display()
             ))
         })?;
-        let mut unpacked_name = file_name.to_string_lossy().into_owned();
+        let file_name = file_name
+            .to_str()
+            .ok_or_else(|| Error::invalid_data("container output file name is not valid UTF-8"))?;
+        let unpacked_length = file_name
+            .len()
+            .checked_add("_unpacked".len())
+            .ok_or_else(|| Error::invalid_data("container output file name length overflowed"))?;
+        if unpacked_length > MAX_PORTABLE_COMPONENT_BYTES {
+            return Err(Error::invalid_data(format!(
+                "container output component is {unpacked_length} bytes, exceeding portable limit {MAX_PORTABLE_COMPONENT_BYTES}"
+            )));
+        }
+        let mut unpacked_name = String::new();
+        unpacked_name
+            .try_reserve_exact(unpacked_length)
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate container output component: {error}"
+                ))
+            })?;
+        unpacked_name.push_str(file_name);
         unpacked_name.push_str("_unpacked");
-        let desired = source_path
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join(unpacked_name);
+        let desired = join_relative_path_fallibly(
+            source_path.parent().unwrap_or_else(|| Path::new("")),
+            Path::new(&unpacked_name),
+            self.options.limits.maximum_path_bytes,
+            "container output path",
+        )?;
         let relative = self.allocate_path(&desired, ClaimKind::Directory)?;
         ensure_secure_relative_directory(&self.output_root, &relative)?;
         Ok(relative)
@@ -660,14 +798,25 @@ impl Extractor {
         let resolved = self.resolve_parent_collisions(desired)?;
         for collision_index in 0_u64.. {
             let candidate = if collision_index == 0 {
-                resolved.clone()
+                copy_path_fallibly(&resolved, "resolved extraction output path")?
             } else {
-                suffixed_path(&resolved, collision_index)?
+                suffixed_path(
+                    &resolved,
+                    collision_index,
+                    self.options.limits.maximum_path_bytes,
+                )?
             };
-            if self.path_is_claimed(&candidate) {
+            let (key, claimed_path_total) =
+                portable_key(&candidate, self.options.limits, &self.budget.paths)?;
+            if self.claims.contains_key(&key) {
                 continue;
             }
-            let absolute = self.output_root.join(&candidate);
+            let absolute = join_relative_path_fallibly(
+                &self.output_root,
+                &candidate,
+                usize::MAX,
+                "absolute extraction collision path",
+            )?;
             let usable = match safe_path_kind(&absolute)? {
                 ExistingKind::Symlink => {
                     return Err(Error::invalid_data(format!(
@@ -681,39 +830,55 @@ impl Extractor {
                 ExistingKind::Missing => true,
             };
             if usable {
-                self.claims.insert(portable_key(&candidate), kind);
+                self.claims.try_reserve(1).map_err(|error| {
+                    Error::invalid_data(format!("cannot grow extraction path claims: {error}"))
+                })?;
+                self.budget.paths.bytes = claimed_path_total;
+                self.claims.insert(key, kind);
                 return Ok(candidate);
             }
         }
         Err(Error::invalid_data("output collision counter overflowed"))
     }
 
-    fn path_is_claimed(&self, candidate: &Path) -> bool {
-        self.claims.contains_key(&portable_key(candidate))
-    }
-
     fn resolve_parent_collisions(&self, desired: &Path) -> Result<PathBuf> {
-        let mut components = desired
-            .components()
-            .map(|component| match component {
-                Component::Normal(value) => Ok(value.to_string_lossy().into_owned()),
-                _ => Err(Error::invalid_data("output path is not strictly relative")),
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let component_count = desired.components().count();
+        let mut components = Vec::new();
+        components
+            .try_reserve_exact(component_count)
+            .map_err(|error| {
+                Error::invalid_data(format!("cannot allocate output path components: {error}"))
+            })?;
+        for component in desired.components() {
+            let Component::Normal(value) = component else {
+                return Err(Error::invalid_data("output path is not strictly relative"));
+            };
+            let value = value
+                .to_str()
+                .ok_or_else(|| Error::invalid_data("output path component is not valid UTF-8"))?;
+            components.push(copy_string_fallibly(value, "output path component")?);
+        }
         if components.is_empty() {
             return Err(Error::invalid_data("output path is empty"));
         }
         for index in 0..components.len().saturating_sub(1) {
-            let original = components[index].clone();
+            let original = copy_string_fallibly(&components[index], "original output component")?;
             for collision_index in 0_u64.. {
-                components[index] = if collision_index == 0 {
-                    original.clone()
-                } else {
-                    suffixed_component(&original, collision_index)?
-                };
-                let prefix = components[..=index].iter().collect::<PathBuf>();
-                let absolute = self.output_root.join(&prefix);
-                let claim = self.claim_kind(&prefix);
+                if collision_index != 0 {
+                    components[index] = suffixed_component(&original, collision_index)?;
+                }
+                let prefix = path_from_components(
+                    &components[..=index],
+                    self.options.limits.maximum_path_bytes,
+                    "extraction output parent",
+                )?;
+                let absolute = join_relative_path_fallibly(
+                    &self.output_root,
+                    &prefix,
+                    usize::MAX,
+                    "absolute extraction output parent",
+                )?;
+                let claim = self.claim_kind(&prefix)?;
                 match safe_path_kind(&absolute)? {
                     ExistingKind::Symlink => {
                         return Err(Error::invalid_data(format!(
@@ -734,11 +899,16 @@ impl Extractor {
                 }
             }
         }
-        Ok(components.iter().collect())
+        path_from_components(
+            &components,
+            self.options.limits.maximum_path_bytes,
+            "resolved extraction output path",
+        )
     }
 
-    fn claim_kind(&self, path: &Path) -> Option<ClaimKind> {
-        self.claims.get(&portable_key(path)).copied()
+    fn claim_kind(&self, path: &Path) -> Result<Option<ClaimKind>> {
+        let (key, _) = portable_key(path, self.options.limits, &self.budget.paths)?;
+        Ok(self.claims.get(&key).copied())
     }
 
     fn charge_entry(&mut self, length: u64) -> Result<()> {
@@ -789,6 +959,10 @@ impl Extractor {
             )));
         }
         Ok(next)
+    }
+
+    fn nested_label(&mut self, parent: &str, child: &str) -> Result<String> {
+        nested_label(parent, child, self.options.limits, &mut self.budget.paths)
     }
 
     fn stream_compression_limits(&self) -> Result<CompressionLimits> {
@@ -854,22 +1028,35 @@ impl Extractor {
                 .temporary_sequence
                 .checked_add(1)
                 .ok_or_else(|| Error::invalid_data("temporary file counter overflowed"))?;
-            let candidate = directory.join(format!(
-                ".assetstudio-tmp-{}-{}",
-                std::process::id(),
-                self.temporary_sequence
-            ));
+            let mut name = FallibleFormatString::default();
+            fmt::write(
+                &mut name,
+                format_args!(
+                    ".assetstudio-tmp-{}-{}",
+                    std::process::id(),
+                    self.temporary_sequence
+                ),
+            )
+            .map_err(|_| Error::invalid_data("cannot allocate extraction temporary file name"))?;
+            let candidate = join_relative_path_fallibly(
+                directory,
+                Path::new(&name.value),
+                usize::MAX,
+                "extraction temporary path",
+            )?;
             if matches!(safe_path_kind(&candidate)?, ExistingKind::Missing) {
                 return Ok(candidate);
             }
         }
     }
 
-    fn record_failure(&mut self, source: String, error: &Error) {
-        self.report.failures.push(ExtractionFailure {
-            source,
-            error: error.to_string(),
-        });
+    fn record_failure(&mut self, source: String, error: &Error) -> Result<()> {
+        let error = format_extraction_error(error)?;
+        reserve_report_entry(&mut self.report.failures, "extraction failures")?;
+        self.report
+            .failures
+            .push(ExtractionFailure { source, error });
+        Ok(())
     }
 }
 
@@ -944,8 +1131,10 @@ impl TemporaryFile {
         if !overwrite {
             return match fs::hard_link(&self.path, destination) {
                 Ok(()) => {
-                    fs::remove_file(&self.path)?;
-                    self.persisted = true;
+                    // The destination is committed once the hard-link exists.
+                    // A temporary-link cleanup failure is retried by Drop and
+                    // must not be reported as a failed extraction.
+                    self.persisted = fs::remove_file(&self.path).is_ok();
                     Ok(PersistOutcome::Written)
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -977,15 +1166,18 @@ impl TemporaryFile {
         destination: &Path,
         original_error: io::Error,
     ) -> Result<PersistOutcome> {
-        let backup = self.path.with_extension("replace-backup");
+        let backup = extraction_backup_path(&self.path)?;
         if !matches!(safe_path_kind(&backup)?, ExistingKind::Missing) {
             return Err(original_error.into());
         }
         fs::rename(destination, &backup).map_err(|_| original_error)?;
         match fs::rename(&self.path, destination) {
             Ok(()) => {
-                self.persisted = true;
-                fs::remove_file(backup)?;
+                // The new destination is committed. Point Drop at the backup
+                // of the previous file so cleanup can be retried without
+                // changing the publication result.
+                self.path = backup;
+                self.persisted = fs::remove_file(&self.path).is_ok();
                 Ok(PersistOutcome::Written)
             }
             Err(error) => {
@@ -1047,19 +1239,138 @@ fn safe_path_kind(path: &Path) -> Result<ExistingKind> {
     }
 }
 
-fn collect_regular_files(root: &Path, limits: ExtractionLimits) -> Result<Vec<PathBuf>> {
+fn filesystem_path_byte_length(path: &Path) -> usize {
+    path.as_os_str().as_encoded_bytes().len()
+}
+
+fn copy_path_fallibly(path: &Path, label: &str) -> Result<PathBuf> {
+    let length = filesystem_path_byte_length(path);
+    let mut copy = PathBuf::new();
+    copy.try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    copy.push(path);
+    Ok(copy)
+}
+
+fn join_relative_path_fallibly(
+    parent: &Path,
+    child: &Path,
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<PathBuf> {
+    if child.is_absolute() {
+        return Err(Error::invalid_data(format!("{label} child is absolute")));
+    }
+    let parent_bytes = parent.as_os_str().as_encoded_bytes();
+    let child_bytes = child.as_os_str().as_encoded_bytes();
+    if child_bytes.is_empty() {
+        return copy_path_fallibly(parent, label);
+    }
+    let separator_length =
+        usize::from(!parent_bytes.is_empty() && !matches!(parent_bytes.last(), Some(b'/' | b'\\')));
+    let length = parent_bytes
+        .len()
+        .checked_add(separator_length)
+        .and_then(|length| length.checked_add(child_bytes.len()))
+        .ok_or_else(|| Error::invalid_data(format!("{label} length overflowed")))?;
+    if length > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "{label} is {length} bytes, exceeding limit {maximum_bytes}"
+        )));
+    }
+    let mut path = PathBuf::new();
+    path.try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    path.push(parent);
+    path.push(child);
+    if filesystem_path_byte_length(&path) > length {
+        return Err(Error::invalid_data(format!(
+            "{label} grew beyond its checked allocation"
+        )));
+    }
+    Ok(path)
+}
+
+fn copy_filesystem_path(
+    path: &Path,
+    limits: ExtractionLimits,
+    budget: &mut ExtractionPathBudget,
+) -> Result<PathBuf> {
+    let length = filesystem_path_byte_length(path);
+    budget.charge_path(length, limits)?;
+    let mut copy = PathBuf::new();
+    copy.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate extraction input path: {error}"))
+    })?;
+    copy.push(path);
+    Ok(copy)
+}
+
+fn join_filesystem_path(
+    parent: &Path,
+    child: &OsStr,
+    limits: ExtractionLimits,
+    budget: &mut ExtractionPathBudget,
+) -> Result<PathBuf> {
+    let parent_bytes = parent.as_os_str().as_encoded_bytes();
+    let separator_length =
+        usize::from(!parent_bytes.is_empty() && !matches!(parent_bytes.last(), Some(b'/' | b'\\')));
+    let length = parent_bytes
+        .len()
+        .checked_add(separator_length)
+        .and_then(|length| length.checked_add(child.as_encoded_bytes().len()))
+        .ok_or_else(|| Error::invalid_data("extraction input path length overflowed"))?;
+    budget.charge_path(length, limits)?;
+    let mut path = PathBuf::new();
+    path.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate extraction input path: {error}"))
+    })?;
+    path.push(parent);
+    path.push(child);
+    if filesystem_path_byte_length(&path) > length {
+        return Err(Error::invalid_data(
+            "extraction input path grew beyond its checked allocation",
+        ));
+    }
+    Ok(path)
+}
+
+fn filesystem_path_label(
+    path: &Path,
+    limits: ExtractionLimits,
+    budget: &mut ExtractionPathBudget,
+) -> Result<String> {
+    let encoded_length = filesystem_path_byte_length(path);
+    let utf8_length = lossy_os_str_utf8_length(path.as_os_str())?;
+    if utf8_length > limits.maximum_path_bytes {
+        return Err(Error::invalid_data(format!(
+            "input filesystem label is {} UTF-8 bytes, exceeding limit {}",
+            utf8_length, limits.maximum_path_bytes
+        )));
+    }
+    if utf8_length > encoded_length {
+        budget.charge_additional(utf8_length - encoded_length, limits)?;
+    }
+    copy_os_str_with_replacement(path.as_os_str(), utf8_length, "extraction input label")
+}
+
+fn collect_regular_files(
+    root: &Path,
+    limits: ExtractionLimits,
+    path_budget: &mut ExtractionPathBudget,
+) -> Result<Vec<PathBuf>> {
     let mut directories = Vec::new();
     directories.try_reserve(1).map_err(|error| {
         Error::invalid_data(format!(
             "cannot allocate extraction directory queue: {error}"
         ))
     })?;
-    directories.push(root.to_owned());
+    directories.push(copy_filesystem_path(root, limits, path_budget)?);
     let mut files = Vec::new();
     let mut entry_count = 0_usize;
     while let Some(directory) = directories.pop() {
         let mut children = Vec::new();
-        for child in fs::read_dir(directory)? {
+        for child in fs::read_dir(&directory)? {
             entry_count = entry_count.checked_add(1).ok_or_else(|| {
                 Error::invalid_data("extraction directory entry count overflowed")
             })?;
@@ -1069,21 +1380,26 @@ fn collect_regular_files(root: &Path, limits: ExtractionLimits) -> Result<Vec<Pa
                     limits.maximum_entries
                 )));
             }
+            let child = child?;
+            let file_type = child.file_type()?;
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+            let path = join_filesystem_path(&directory, &child.file_name(), limits, path_budget)?;
             children.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!(
                     "cannot allocate extraction directory entries: {error}"
                 ))
             })?;
-            children.push(child?);
+            children.push((path, file_type));
         }
-        children.sort_unstable_by_key(fs::DirEntry::file_name);
-        for child in children.into_iter().rev() {
-            let file_type = child.file_type()?;
+        children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for (path, file_type) in children.into_iter().rev() {
             if file_type.is_dir() {
                 directories.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot grow extraction directory queue: {error}"))
                 })?;
-                directories.push(child.path());
+                directories.push(path);
             } else if file_type.is_file() {
                 if files.len() >= limits.maximum_input_files {
                     return Err(Error::invalid_data(format!(
@@ -1094,7 +1410,7 @@ fn collect_regular_files(root: &Path, limits: ExtractionLimits) -> Result<Vec<Pa
                 files.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot grow extraction input list: {error}"))
                 })?;
-                files.push(child.path());
+                files.push(path);
             }
         }
     }
@@ -1122,6 +1438,7 @@ fn validate_limits(limits: ExtractionLimits) -> Result<()> {
         || limits.maximum_expanded_bytes == 0
         || limits.maximum_output_bytes == 0
         || limits.maximum_path_bytes == 0
+        || limits.maximum_total_path_bytes == 0
     {
         return Err(Error::invalid_data(
             "extraction count and byte limits must be greater than zero",
@@ -1131,14 +1448,17 @@ fn validate_limits(limits: ExtractionLimits) -> Result<()> {
 }
 
 fn sanitize_archive_path(path: &str, limits: ExtractionLimits) -> Result<PathBuf> {
-    let normalized = path.replace('\\', "/");
-    if normalized.starts_with('/') || normalized.starts_with("//") {
+    if path
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+    {
         return Err(Error::invalid_data(format!(
             "archive entry path must be relative: {path:?}"
         )));
     }
-    if normalized
-        .split('/')
+    if path
+        .split(['/', '\\'])
         .next()
         .is_some_and(is_windows_drive_component)
     {
@@ -1147,7 +1467,7 @@ fn sanitize_archive_path(path: &str, limits: ExtractionLimits) -> Result<PathBuf
         )));
     }
     let mut result = PathBuf::new();
-    for component in normalized.split('/') {
+    for component in path.split(['/', '\\']) {
         match component {
             "" | "." => {}
             ".." => {
@@ -1158,7 +1478,7 @@ fn sanitize_archive_path(path: &str, limits: ExtractionLimits) -> Result<PathBuf
             value => result.push(sanitize_component(value)?),
         }
     }
-    validate_relative_output_path(&result, limits, path)?;
+    validate_relative_output_path(&result, limits)?;
     Ok(result)
 }
 
@@ -1167,7 +1487,7 @@ fn sanitize_filesystem_relative_path(path: &Path, limits: ExtractionLimits) -> R
     for component in path.components() {
         match component {
             Component::Normal(value) => {
-                result.push(sanitize_component(value.to_string_lossy().as_ref())?);
+                result.push(sanitize_os_component(value)?);
             }
             _ => {
                 return Err(Error::invalid_data(format!(
@@ -1177,55 +1497,101 @@ fn sanitize_filesystem_relative_path(path: &Path, limits: ExtractionLimits) -> R
             }
         }
     }
-    validate_relative_output_path(&result, limits, &path.display().to_string())?;
+    validate_relative_output_path(&result, limits)?;
     Ok(result)
 }
 
 fn sanitize_component_path(component: &str, limits: ExtractionLimits) -> Result<PathBuf> {
     let result = PathBuf::from(sanitize_component(component)?);
-    validate_relative_output_path(&result, limits, component)?;
+    validate_relative_output_path(&result, limits)?;
+    Ok(result)
+}
+
+fn sanitize_os_component_path(component: &OsStr, limits: ExtractionLimits) -> Result<PathBuf> {
+    let result = PathBuf::from(sanitize_os_component(component)?);
+    validate_relative_output_path(&result, limits)?;
     Ok(result)
 }
 
 fn sanitize_component(component: &str) -> Result<String> {
-    let mut sanitized = String::with_capacity(component.len());
+    // Archive entry names are untrusted. Do not reserve the full declared
+    // component before applying the portable 240-byte ceiling: a malformed
+    // entry can otherwise force a large allocation only to be rejected below.
+    let mut sanitized = String::new();
     for character in component.chars() {
-        if character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
-            sanitized.push('_');
-        } else {
-            sanitized.push(character);
-        }
+        push_sanitized_character(&mut sanitized, character)?;
     }
+    finish_sanitized_component(sanitized)
+}
+
+fn sanitize_os_component(component: &OsStr) -> Result<String> {
+    let mut sanitized = String::new();
+    for_each_os_str_char_lossy(component, |character| {
+        push_sanitized_character(&mut sanitized, character)
+    })?;
+    finish_sanitized_component(sanitized)
+}
+
+fn push_sanitized_character(sanitized: &mut String, character: char) -> Result<()> {
+    let sanitized_character =
+        if character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            '_'
+        } else {
+            character
+        };
+    let next_length = sanitized
+        .len()
+        .checked_add(sanitized_character.len_utf8())
+        .ok_or_else(|| Error::invalid_data("path component length overflowed"))?;
+    if next_length > MAX_PORTABLE_COMPONENT_BYTES {
+        return Err(Error::invalid_data(format!(
+            "path component is at least {next_length} bytes, exceeding portable limit {MAX_PORTABLE_COMPONENT_BYTES}",
+        )));
+    }
+    sanitized
+        .try_reserve_exact(sanitized_character.len_utf8())
+        .map_err(|error| {
+            Error::invalid_data(format!("cannot allocate sanitized path component: {error}"))
+        })?;
+    sanitized.push(sanitized_character);
+    Ok(())
+}
+
+fn finish_sanitized_component(mut sanitized: String) -> Result<String> {
     while sanitized.ends_with([' ', '.']) {
         sanitized.pop();
         sanitized.push('_');
     }
     if sanitized.is_empty() || matches!(sanitized.as_str(), "." | "..") {
+        sanitized.try_reserve_exact(1).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate sanitized path component: {error}"))
+        })?;
         sanitized.push('_');
     }
     if is_windows_reserved_name(&sanitized) {
+        if sanitized.len() == MAX_PORTABLE_COMPONENT_BYTES {
+            return Err(Error::invalid_data(format!(
+                "reserved path component needs a prefix beyond portable limit {MAX_PORTABLE_COMPONENT_BYTES}",
+            )));
+        }
+        sanitized.try_reserve_exact(1).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate sanitized path component: {error}"))
+        })?;
         sanitized.insert(0, '_');
-    }
-    if sanitized.len() > MAX_PORTABLE_COMPONENT_BYTES {
-        return Err(Error::invalid_data(format!(
-            "path component is {} bytes, exceeding portable limit {MAX_PORTABLE_COMPONENT_BYTES}",
-            sanitized.len()
-        )));
     }
     Ok(sanitized)
 }
 
-fn validate_relative_output_path(
-    path: &Path,
-    limits: ExtractionLimits,
-    original: &str,
-) -> Result<()> {
+fn validate_relative_output_path(path: &Path, limits: ExtractionLimits) -> Result<()> {
     if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(Error::invalid_data(format!(
-            "archive entry path is empty or absolute: {original:?}"
-        )));
+        return Err(Error::invalid_data(
+            "sanitized extraction path is empty or absolute",
+        ));
     }
-    let length = path.to_string_lossy().len();
+    let length = path
+        .to_str()
+        .ok_or_else(|| Error::invalid_data("output path is not valid UTF-8"))?
+        .len();
     if length > limits.maximum_path_bytes {
         return Err(Error::invalid_data(format!(
             "output path is {length} bytes, exceeding limit {}",
@@ -1250,11 +1616,13 @@ fn is_windows_reserved_name(component: &str) -> bool {
             .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
 
-fn decoded_leaf_path(path: &Path, wrapper: &str) -> Result<PathBuf> {
+fn decoded_leaf_path(path: &Path, wrapper: &str, maximum_bytes: usize) -> Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         Error::invalid_data(format!("wrapped path has no file name: {}", path.display()))
     })?;
-    let value = file_name.to_string_lossy();
+    let value = file_name
+        .to_str()
+        .ok_or_else(|| Error::invalid_data("wrapped output file name is not valid UTF-8"))?;
     let extensions: &[&str] = match wrapper {
         "gzip" => &[".gzip", ".gz"],
         "brotli" => &[".brotli", ".br"],
@@ -1263,49 +1631,238 @@ fn decoded_leaf_path(path: &Path, wrapper: &str) -> Result<PathBuf> {
     let decoded = extensions
         .iter()
         .find_map(|extension| {
-            value
-                .to_ascii_lowercase()
-                .strip_suffix(extension)
-                .map(|prefix| value[..prefix.len()].to_owned())
+            let prefix_length = value.len().checked_sub(extension.len())?;
+            value[prefix_length..]
+                .eq_ignore_ascii_case(extension)
+                .then_some(&value[..prefix_length])
         })
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("{value}.decoded"));
-    Ok(path.parent().unwrap_or_else(|| Path::new("")).join(decoded))
+        .filter(|name| !name.is_empty());
+    let decoded = if let Some(decoded) = decoded {
+        copy_string_fallibly(decoded, "decoded wrapper file name")?
+    } else {
+        let length = value
+            .len()
+            .checked_add(".decoded".len())
+            .ok_or_else(|| Error::invalid_data("decoded wrapper name length overflowed"))?;
+        if length > MAX_PORTABLE_COMPONENT_BYTES {
+            return Err(Error::invalid_data(format!(
+                "decoded wrapper component is {length} bytes, exceeding portable limit {MAX_PORTABLE_COMPONENT_BYTES}"
+            )));
+        }
+        let mut decoded = String::new();
+        decoded.try_reserve_exact(length).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate decoded wrapper name: {error}"))
+        })?;
+        decoded.push_str(value);
+        decoded.push_str(".decoded");
+        decoded
+    };
+    join_relative_path_fallibly(
+        path.parent().unwrap_or_else(|| Path::new("")),
+        Path::new(&decoded),
+        maximum_bytes,
+        "decoded wrapper output path",
+    )
 }
 
-fn suffixed_path(path: &Path, index: u64) -> Result<PathBuf> {
+fn suffixed_path(path: &Path, index: u64, maximum_bytes: usize) -> Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         Error::invalid_data(format!(
             "collision path has no file name: {}",
             path.display()
         ))
     })?;
-    let component = suffixed_component(file_name.to_string_lossy().as_ref(), index)?;
-    Ok(path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join(component))
+    let component = suffixed_component(
+        file_name
+            .to_str()
+            .ok_or_else(|| Error::invalid_data("collision file name is not valid UTF-8"))?,
+        index,
+    )?;
+    join_relative_path_fallibly(
+        path.parent().unwrap_or_else(|| Path::new("")),
+        Path::new(&component),
+        maximum_bytes,
+        "suffixed extraction output path",
+    )
 }
 
 fn suffixed_component(component: &str, index: u64) -> Result<String> {
     let path = Path::new(component);
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let extension = path.extension().map(|value| value.to_string_lossy());
-    let mut output = format!("{stem}~{index}");
-    if let Some(extension) = extension {
-        output.push('.');
-        output.push_str(&extension);
+    let stem = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_str()
+        .ok_or_else(|| Error::invalid_data("collision stem is not valid UTF-8"))?;
+    let extension = path
+        .extension()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| Error::invalid_data("collision extension is not valid UTF-8"))
+        })
+        .transpose()?;
+    let mut digits = 1_usize;
+    let mut remaining = index;
+    while remaining >= 10 {
+        remaining /= 10;
+        digits += 1;
     }
-    if output.len() > MAX_PORTABLE_COMPONENT_BYTES {
+    let length = stem
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(digits))
+        .and_then(|length| {
+            extension.map_or(Some(length), |extension| {
+                length
+                    .checked_add(1)
+                    .and_then(|length| length.checked_add(extension.len()))
+            })
+        })
+        .ok_or_else(|| Error::invalid_data("collision suffix length overflowed"))?;
+    if length > MAX_PORTABLE_COMPONENT_BYTES {
         return Err(Error::invalid_data(
             "collision suffix makes output component too long",
         ));
     }
+    let mut output = String::new();
+    output.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate collision output component: {error}"
+        ))
+    })?;
+    output.push_str(stem);
+    output.push('~');
+    fmt::write(&mut output, format_args!("{index}"))
+        .map_err(|_| Error::invalid_data("cannot format collision suffix"))?;
+    if let Some(extension) = extension {
+        output.push('.');
+        output.push_str(extension);
+    }
+    debug_assert_eq!(output.len(), length);
     Ok(output)
 }
 
-fn nested_label(parent: &str, child: &str) -> String {
-    format!("{parent}::{}", child.replace('\\', "/"))
+fn copy_extraction_label(value: &str) -> Result<String> {
+    copy_string_fallibly(value, "extraction source label")
+}
+
+fn extraction_backup_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::invalid_data("extraction temporary file name is not valid UTF-8"))?;
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::invalid_data("extraction temporary file stem is not valid UTF-8"))?;
+    let length = stem
+        .len()
+        .checked_add(".replace-backup".len())
+        .ok_or_else(|| Error::invalid_data("extraction backup name length overflowed"))?;
+    let mut name = String::new();
+    name.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate extraction backup name: {error}"))
+    })?;
+    name.push_str(stem);
+    name.push_str(".replace-backup");
+    join_relative_path_fallibly(
+        path.parent().unwrap_or_else(|| Path::new("")),
+        Path::new(&name),
+        usize::MAX,
+        "extraction replacement backup path",
+    )
+}
+
+fn copy_string_fallibly(value: &str, label: &str) -> Result<String> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn path_from_components(
+    components: &[String],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<PathBuf> {
+    let separators = components.len().saturating_sub(1);
+    let length = components
+        .iter()
+        .try_fold(separators, |length, component| {
+            length
+                .checked_add(component.len())
+                .ok_or_else(|| Error::invalid_data(format!("{label} length overflowed")))
+        })?;
+    if length > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "{label} is {length} bytes, exceeding limit {maximum_bytes}"
+        )));
+    }
+    let mut path = String::new();
+    path.try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 {
+            path.push(std::path::MAIN_SEPARATOR);
+        }
+        path.push_str(component);
+    }
+    debug_assert_eq!(path.len(), length);
+    Ok(PathBuf::from(path))
+}
+
+fn reserve_report_entry<T>(values: &mut Vec<T>, label: &str) -> Result<()> {
+    values
+        .try_reserve(1)
+        .map_err(|error| Error::invalid_data(format!("cannot grow {label}: {error}")))
+}
+
+#[derive(Default)]
+struct FallibleFormatString {
+    value: String,
+}
+
+impl fmt::Write for FallibleFormatString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.value
+            .try_reserve(value.len())
+            .map_err(|_| fmt::Error)?;
+        self.value.push_str(value);
+        Ok(())
+    }
+}
+
+fn format_extraction_error(error: &Error) -> Result<String> {
+    let mut output = FallibleFormatString::default();
+    fmt::write(&mut output, format_args!("{error}"))
+        .map_err(|_| Error::invalid_data("cannot allocate extraction failure message"))?;
+    Ok(output.value)
+}
+
+fn nested_label(
+    parent: &str,
+    child: &str,
+    limits: ExtractionLimits,
+    budget: &mut ExtractionPathBudget,
+) -> Result<String> {
+    let length = parent
+        .len()
+        .checked_add(2)
+        .and_then(|length| length.checked_add(child.len()))
+        .ok_or_else(|| Error::invalid_data("nested extraction label length overflowed"))?;
+    budget.charge_path(length, limits)?;
+    let mut label = String::new();
+    label.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate nested extraction label: {error}"))
+    })?;
+    label.push_str(parent);
+    label.push_str("::");
+    for character in child.chars() {
+        label.push(if character == '\\' { '/' } else { character });
+    }
+    debug_assert_eq!(label.len(), length);
+    Ok(label)
 }
 
 /// The form two paths share when they name the same file on a
@@ -1314,19 +1871,82 @@ fn nested_label(parent: &str, child: &str) -> String {
 /// Components rather than the whole string: a component can never contain a
 /// separator, so joining the lowercased components back up cannot make two
 /// different paths collide.
-fn portable_key(path: &Path) -> PathBuf {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-        .collect()
+fn portable_key(
+    path: &Path,
+    limits: ExtractionLimits,
+    budget: &ExtractionPathBudget,
+) -> Result<(PathBuf, usize)> {
+    let mut length = 0_usize;
+    let mut component_count = 0_usize;
+    for component in path.components() {
+        let Component::Normal(value) = component else {
+            return Err(Error::invalid_data(
+                "portable output key is not strictly relative",
+            ));
+        };
+        let value = value.to_str().ok_or_else(|| {
+            Error::invalid_data("portable output key component is not valid UTF-8")
+        })?;
+        if component_count != 0 {
+            length = length
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_data("portable output key length overflowed"))?;
+        }
+        component_count = component_count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("portable output component count overflowed"))?;
+        for character in value.chars() {
+            for lowercase in character.to_lowercase() {
+                length = length
+                    .checked_add(lowercase.len_utf8())
+                    .ok_or_else(|| Error::invalid_data("portable output key length overflowed"))?;
+            }
+        }
+    }
+    let retained_total = budget.checked_path_total(length, limits)?;
+    let mut key = String::new();
+    key.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate portable output key: {error}"))
+    })?;
+    for (index, component) in path.components().enumerate() {
+        let Component::Normal(value) = component else {
+            return Err(Error::invalid_data(
+                "portable output key is not strictly relative",
+            ));
+        };
+        let value = value.to_str().ok_or_else(|| {
+            Error::invalid_data("portable output key component is not valid UTF-8")
+        })?;
+        if index != 0 {
+            key.push(std::path::MAIN_SEPARATOR);
+        }
+        for character in value.chars() {
+            key.extend(character.to_lowercase());
+        }
+    }
+    debug_assert_eq!(key.len(), length);
+    Ok((PathBuf::from(key), retained_total))
 }
 
 fn lexical_absolute(path: &Path) -> Result<PathBuf> {
     let joined = if path.is_absolute() {
-        path.to_owned()
+        copy_path_fallibly(path, "absolute extraction path")?
     } else {
-        std::env::current_dir()?.join(path)
+        join_relative_path_fallibly(
+            &std::env::current_dir()?,
+            path,
+            usize::MAX,
+            "absolute extraction path",
+        )?
     };
     let mut normalized = PathBuf::new();
+    normalized
+        .try_reserve_exact(joined.as_os_str().as_encoded_bytes().len())
+        .map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate normalized extraction path: {error}"
+            ))
+        })?;
     for component in joined.components() {
         match component {
             Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
@@ -1359,6 +1979,11 @@ fn ensure_secure_directory(path: &Path) -> Result<()> {
 
 fn reject_symlink_ancestors(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
+    current
+        .try_reserve_exact(path.as_os_str().as_encoded_bytes().len())
+        .map_err(|error| {
+            Error::invalid_data(format!("cannot allocate output ancestor path: {error}"))
+        })?;
     for component in path.components() {
         current.push(component.as_os_str());
         if matches!(component, Component::Prefix(_) | Component::RootDir) {
@@ -1418,20 +2043,16 @@ fn is_trusted_system_output_alias(path: &Path) -> bool {
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
-    let mut ancestor = path.to_owned();
-    let mut suffix = PathBuf::new();
+    let mut ancestor = copy_path_fallibly(path, "output ancestor path")?;
     loop {
         match safe_path_kind(&ancestor)? {
             ExistingKind::Missing => {
-                let component = ancestor.file_name().ok_or_else(|| {
+                ancestor.file_name().ok_or_else(|| {
                     Error::invalid_data(format!(
                         "missing output ancestor has no name: {}",
                         ancestor.display()
                     ))
                 })?;
-                let mut new_suffix = PathBuf::from(component);
-                new_suffix.push(suffix);
-                suffix = new_suffix;
                 if !ancestor.pop() {
                     return Ok(None);
                 }
@@ -1440,6 +2061,10 @@ fn nearest_existing_ancestor(path: &Path) -> Result<Option<(PathBuf, PathBuf)>> 
             | ExistingKind::Regular
             | ExistingKind::Other
             | ExistingKind::Symlink => {
+                let suffix = path.strip_prefix(&ancestor).map_err(|_| {
+                    Error::invalid_data("output path escaped its nearest existing ancestor")
+                })?;
+                let suffix = copy_path_fallibly(suffix, "output ancestor suffix")?;
                 return Ok(Some((ancestor, suffix)));
             }
         }
@@ -1447,6 +2072,16 @@ fn nearest_existing_ancestor(path: &Path) -> Result<Option<(PathBuf, PathBuf)>> 
 }
 
 fn create_secure_suffix(mut current: PathBuf, suffix: &Path) -> Result<()> {
+    let separator = usize::from(!current.as_os_str().is_empty() && !suffix.as_os_str().is_empty());
+    let additional = suffix
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .checked_add(separator)
+        .ok_or_else(|| Error::invalid_data("output directory path length overflowed"))?;
+    current.try_reserve_exact(additional).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate output directory path: {error}"))
+    })?;
     for component in suffix.components() {
         let Component::Normal(component) = component else {
             return Err(Error::invalid_data(
@@ -1483,7 +2118,8 @@ fn create_secure_suffix(mut current: PathBuf, suffix: &Path) -> Result<()> {
 }
 
 fn ensure_secure_relative_directory(root: &Path, relative: &Path) -> Result<()> {
-    let path = root.join(relative);
+    let path =
+        join_relative_path_fallibly(root, relative, usize::MAX, "absolute extraction directory")?;
     if !path.starts_with(root) {
         return Err(Error::invalid_data("output directory escaped its root"));
     }
@@ -1507,14 +2143,293 @@ mod tests {
     use flate2::write::GzEncoder;
     use zip::write::SimpleFileOptions;
 
+    use crate::Error;
     use crate::source::Region;
 
     use super::{
-        ExtractionLimits, ExtractionOptions, PersistOutcome, TemporaryFile, extract_path,
-        extract_region,
+        ClaimKind, ExtractionLimits, ExtractionOptions, ExtractionPathBudget, Extractor,
+        MAX_PORTABLE_COMPONENT_BYTES, PersistOutcome, TemporaryFile, decoded_leaf_path,
+        ensure_secure_directory, extract_path, extract_region, extraction_backup_path,
+        filesystem_path_label, format_extraction_error, join_relative_path_fallibly,
+        lexical_absolute, nearest_existing_ancestor, nested_label, path_from_components,
+        portable_key, sanitize_component, sanitize_filesystem_relative_path, sanitize_os_component,
+        suffixed_component, suffixed_path,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn output_path_builders_are_fallible_bounded_and_preserve_empty_parents() {
+        let root = Path::new("output-root");
+        assert_eq!(
+            join_relative_path_fallibly(root, Path::new(""), usize::MAX, "test path").unwrap(),
+            root
+        );
+        let error =
+            join_relative_path_fallibly(root, Path::new("child"), 16, "test path").unwrap_err();
+        assert!(error.to_string().contains("is 17 bytes"));
+
+        assert_eq!(
+            path_from_components(
+                &["parent".to_owned(), "child".to_owned()],
+                12,
+                "test components",
+            )
+            .unwrap(),
+            PathBuf::from("parent").join("child")
+        );
+        let error = path_from_components(
+            &["parent".to_owned(), "child".to_owned()],
+            11,
+            "test components",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeding limit 11"));
+
+        let directory = TestDirectory::new("container-component-limit");
+        let mut extractor = Extractor::with_path_budget(
+            directory.path().to_path_buf(),
+            ExtractionOptions::default(),
+            ExtractionPathBudget::default(),
+        );
+        let oversized = "a".repeat(MAX_PORTABLE_COMPONENT_BYTES);
+        let error = extractor
+            .allocate_container_directory(Path::new(&oversized))
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeding portable limit"));
+
+        assert_eq!(
+            decoded_leaf_path(Path::new("payload.GZ"), "gzip", 7).unwrap(),
+            PathBuf::from("payload")
+        );
+        let oversized_decoded = PathBuf::from("a".repeat(233));
+        let error = decoded_leaf_path(&oversized_decoded, "gzip", usize::MAX).unwrap_err();
+        assert!(error.to_string().contains("exceeding portable limit"));
+
+        assert_eq!(suffixed_component("asset.bin", 10).unwrap(), "asset~10.bin");
+        let oversized_suffix = "a".repeat(239);
+        let error = suffixed_component(&oversized_suffix, 1).unwrap_err();
+        assert!(error.to_string().contains("too long"));
+        let error = suffixed_path(Path::new("parent/asset.bin"), 1, 17).unwrap_err();
+        assert!(error.to_string().contains("exceeding limit 17"));
+
+        let temporary = extractor.next_temporary_path(directory.path()).unwrap();
+        assert_eq!(temporary.parent(), Some(directory.path()));
+        assert!(
+            temporary
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with(".assetstudio-tmp-"))
+        );
+        assert_eq!(
+            extraction_backup_path(Path::new("group/.assetstudio-tmp-1-2")).unwrap(),
+            PathBuf::from("group/.assetstudio-tmp-1-2.replace-backup")
+        );
+    }
+
+    #[test]
+    fn portable_claim_keys_are_fallible_case_insensitive_and_budgeted() {
+        let limits = ExtractionLimits::default();
+        let budget = ExtractionPathBudget::default();
+        let (key, retained_total) = portable_key(Path::new("İ/ASSET"), limits, &budget).unwrap();
+        assert_eq!(key, PathBuf::from("i\u{307}").join("asset"));
+        assert_eq!(retained_total, key.as_os_str().as_encoded_bytes().len());
+        assert_eq!(budget.bytes, 0, "a temporary lookup must not commit bytes");
+
+        let mut budget = ExtractionPathBudget::default();
+        budget.charge_path(4, limits).unwrap();
+        let key_bytes = key.as_os_str().as_encoded_bytes().len();
+        let limited = ExtractionLimits {
+            maximum_total_path_bytes: 4 + key_bytes - 1,
+            ..limits
+        };
+        let error = portable_key(Path::new("İ/ASSET"), limited, &budget).unwrap_err();
+        assert!(error.to_string().contains("extraction paths total"));
+        assert_eq!(budget.bytes, 4);
+
+        let root = TestDirectory::new("fallible-claims");
+        let mut extractor = Extractor::with_path_budget(
+            root.path().to_path_buf(),
+            ExtractionOptions::default(),
+            ExtractionPathBudget::default(),
+        );
+        let first = extractor
+            .allocate_path(Path::new("Asset.bin"), ClaimKind::File)
+            .unwrap();
+        let second = extractor
+            .allocate_path(Path::new("asset.bin"), ClaimKind::File)
+            .unwrap();
+        assert_eq!(first, PathBuf::from("Asset.bin"));
+        assert_eq!(second, PathBuf::from("asset~1.bin"));
+        assert_eq!(extractor.claims.len(), 2);
+        assert!(extractor.budget.paths.bytes > 0);
+    }
+
+    #[test]
+    fn caller_output_roots_normalize_and_create_deep_suffixes_linearly() {
+        let root = TestDirectory::new("output-root-builders");
+        let lexical = root
+            .path()
+            .join("discarded")
+            .join("..")
+            .join("kept")
+            .join(".")
+            .join("leaf");
+        assert_eq!(
+            lexical_absolute(&lexical).unwrap(),
+            root.path().join("kept/leaf")
+        );
+
+        let target = root.path().join("one/two/three/four");
+        let (ancestor, suffix) = nearest_existing_ancestor(&target).unwrap().unwrap();
+        assert_eq!(ancestor, root.path());
+        assert_eq!(suffix, PathBuf::from("one/two/three/four"));
+
+        ensure_secure_directory(&target).unwrap();
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn failure_messages_preserve_error_families_through_fallible_formatting() {
+        assert_eq!(
+            format_extraction_error(&Error::invalid_data("invalid payload")).unwrap(),
+            "invalid payload"
+        );
+        assert_eq!(
+            format_extraction_error(&Error::unsupported("future layout")).unwrap(),
+            "unsupported: future layout"
+        );
+        assert_eq!(
+            format_extraction_error(&Error::from(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing input",
+            )))
+            .unwrap(),
+            "missing input"
+        );
+    }
+
+    #[test]
+    fn bounds_root_and_nested_diagnostic_labels_before_allocation() {
+        let root = TestDirectory::new("label-budgets");
+        let root_error = extract_region(
+            "12345",
+            Region::from_bytes(b"payload".as_slice()),
+            &root.path().join("root-label-output"),
+            ExtractionOptions {
+                limits: ExtractionLimits {
+                    maximum_path_bytes: 4,
+                    ..ExtractionLimits::default()
+                },
+                ..ExtractionOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(root_error.to_string().contains("path or label is 5 bytes"));
+        assert!(!root.path().join("root-label-output").exists());
+
+        let mut budget = ExtractionPathBudget::default();
+        let limits = ExtractionLimits {
+            maximum_total_path_bytes: 12,
+            ..ExtractionLimits::default()
+        };
+        budget.charge_path(4, limits).unwrap();
+        let nested_error = nested_label("root", "a\\b", limits, &mut budget).unwrap_err();
+        assert!(nested_error.to_string().contains("paths total 13 bytes"));
+        assert_eq!(budget.bytes, 4);
+
+        let limits = ExtractionLimits {
+            maximum_total_path_bytes: 13,
+            ..ExtractionLimits::default()
+        };
+        assert_eq!(
+            nested_label("root", "a\\b", limits, &mut budget).unwrap(),
+            "root::a/b"
+        );
+        assert_eq!(budget.bytes, 13);
+    }
+
+    #[test]
+    fn sanitizes_path_components_within_the_portable_budget() {
+        let ascii_boundary = "a".repeat(MAX_PORTABLE_COMPONENT_BYTES);
+        assert_eq!(sanitize_component(&ascii_boundary).unwrap(), ascii_boundary);
+
+        let unicode_boundary = "界".repeat(MAX_PORTABLE_COMPONENT_BYTES / "界".len());
+        assert_eq!(unicode_boundary.len(), MAX_PORTABLE_COMPONENT_BYTES);
+        assert_eq!(
+            sanitize_component(&unicode_boundary).unwrap(),
+            unicode_boundary
+        );
+
+        let oversized = format!("{ascii_boundary}b");
+        let error = sanitize_component(&oversized).unwrap_err();
+        assert!(error.to_string().contains("portable limit 240"), "{error}");
+
+        let reserved_at_boundary = format!("CON.{}", "x".repeat(236));
+        assert_eq!(reserved_at_boundary.len(), MAX_PORTABLE_COMPONENT_BYTES);
+        let error = sanitize_component(&reserved_at_boundary).unwrap_err();
+        assert!(error.to_string().contains("needs a prefix"), "{error}");
+        assert_eq!(sanitize_component("CON").unwrap(), "_CON");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streams_non_utf8_filesystem_names_under_component_and_label_budgets() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let accepted = OsString::from_vec(vec![0xff; 80]);
+        let expected = "\u{fffd}".repeat(80);
+        let sanitized = sanitize_os_component(&accepted).unwrap();
+        assert_eq!(sanitized, expected);
+        assert_eq!(sanitized.len(), MAX_PORTABLE_COMPONENT_BYTES);
+        assert_eq!(
+            sanitize_filesystem_relative_path(Path::new(&accepted), ExtractionLimits::default())
+                .unwrap()
+                .to_str(),
+            Some(expected.as_str())
+        );
+
+        let rejected = OsString::from_vec(vec![0xff; 81]);
+        let error = sanitize_os_component(&rejected).unwrap_err();
+        assert!(error.to_string().contains("at least 243 bytes"), "{error}");
+
+        let mixed = OsString::from_vec(vec![b'a', 0xff, b':', 0x80]);
+        assert_eq!(sanitize_os_component(&mixed).unwrap(), "a\u{fffd}_\u{fffd}");
+
+        let path = PathBuf::from(OsString::from_vec(vec![0xff, 0xfe]));
+        let mut budget = ExtractionPathBudget::default();
+        let per_path_limits = ExtractionLimits {
+            maximum_path_bytes: 5,
+            ..ExtractionLimits::default()
+        };
+        let error = filesystem_path_label(&path, per_path_limits, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("is 6 UTF-8 bytes"), "{error}");
+        assert_eq!(budget.bytes, 0);
+
+        let cumulative_limits = ExtractionLimits {
+            maximum_path_bytes: 6,
+            maximum_total_path_bytes: 5,
+            ..ExtractionLimits::default()
+        };
+        budget.charge_path(2, cumulative_limits).unwrap();
+        let error = filesystem_path_label(&path, cumulative_limits, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("paths total 6 bytes"), "{error}");
+        assert_eq!(budget.bytes, 2);
+
+        let exact_limits = ExtractionLimits {
+            maximum_path_bytes: 6,
+            maximum_total_path_bytes: 6,
+            ..ExtractionLimits::default()
+        };
+        let mut exact_budget = ExtractionPathBudget::default();
+        exact_budget.charge_path(2, exact_limits).unwrap();
+        assert_eq!(
+            filesystem_path_label(&path, exact_limits, &mut exact_budget).unwrap(),
+            "\u{fffd}\u{fffd}"
+        );
+        assert_eq!(exact_budget.bytes, 6);
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -1707,6 +2622,7 @@ mod tests {
             ("C:\\drive.bin", b"drive"),
             ("//unc-share.bin", b"unc"),
             ("safe/data.bin", b"safe"),
+            ("safe\\nested\\data.bin", b"safe backslash"),
         ]);
 
         let report = extract_region(
@@ -1717,7 +2633,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.extracted.len(), 1);
+        assert_eq!(report.extracted.len(), 2);
         assert_eq!(report.failures.len(), 6);
         // Each rejection has to be the one intended: a path that merely failed
         // to parse would count the same and prove nothing about the guard.
@@ -1754,6 +2670,10 @@ mod tests {
             fs::read(output.join("web.data_unpacked/safe/data.bin")).unwrap(),
             b"safe"
         );
+        assert_eq!(
+            fs::read(output.join("web.data_unpacked/safe/nested/data.bin")).unwrap(),
+            b"safe backslash"
+        );
         assert!(!root.path().join("escape.bin").exists());
         assert!(!output.join("absolute.bin").exists());
         for escaped in [
@@ -1781,7 +2701,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(written.len(), 2, "{written:?}");
     }
 
     #[test]
@@ -1919,6 +2839,43 @@ mod tests {
         assert!(
             entry_error.to_string().contains("exceeds 2 entries"),
             "{entry_error}"
+        );
+
+        let root_path_bytes = super::filesystem_path_byte_length(&input);
+        let path_error = extract_path(
+            &input,
+            &root.path().join("path-output"),
+            ExtractionOptions {
+                limits: ExtractionLimits {
+                    maximum_total_path_bytes: root_path_bytes,
+                    ..ExtractionLimits::default()
+                },
+                ..ExtractionOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            path_error.to_string().contains("extraction paths total"),
+            "{path_error}"
+        );
+
+        let single_path_error = extract_path(
+            &input,
+            &root.path().join("single-path-output"),
+            ExtractionOptions {
+                limits: ExtractionLimits {
+                    maximum_path_bytes: root_path_bytes - 1,
+                    ..ExtractionLimits::default()
+                },
+                ..ExtractionOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            single_path_error
+                .to_string()
+                .contains("extraction path or label is"),
+            "{single_path_error}"
         );
     }
 

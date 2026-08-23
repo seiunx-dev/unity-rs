@@ -109,7 +109,7 @@ impl WebFile {
                 )));
             }
 
-            let file_name = portable_file_name(&path).to_owned();
+            let file_name = copy_portable_file_name(&path, "WebData file name")?;
             if entries.len() == entries.capacity() {
                 entries.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot allocate WebData entry table: {error}"))
@@ -163,8 +163,14 @@ fn checked_u64(value: i32, field: &str) -> Result<u64> {
         .map_err(|_| Error::invalid_data(format!("{field} cannot be negative: {value}")))
 }
 
-fn portable_file_name(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
+fn copy_portable_file_name(path: &str, field: &str) -> Result<String> {
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let mut copied = String::new();
+    copied
+        .try_reserve_exact(file_name.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    copied.push_str(file_name);
+    Ok(copied)
 }
 
 #[cfg(test)]
@@ -174,8 +180,11 @@ mod tests {
     use super::{WebFile, WebParseLimits};
 
     fn sample_web_file() -> Vec<u8> {
+        sample_web_file_with_path(b"folder/test.bin")
+    }
+
+    fn sample_web_file_with_path(path: &[u8]) -> Vec<u8> {
         let signature = b"UnityWebData1.0\0";
-        let path = b"folder/test.bin";
         let payload = b"payload";
         let header_length = signature.len() + 4 + 12 + path.len();
         let header_length_i32 = i32::try_from(header_length).unwrap();
@@ -203,6 +212,18 @@ mod tests {
         assert_eq!(web_file.entries[0].path, "folder/test.bin");
         assert_eq!(web_file.entries[0].file_name, "test.bin");
         assert_eq!(web_file.read_entry(0).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn copies_a_unicode_file_name_after_a_windows_separator() {
+        let path = "folder\\目录\\表.bin";
+        let web_file = WebFile::open(Region::from_bytes(sample_web_file_with_path(
+            path.as_bytes(),
+        )))
+        .unwrap();
+
+        assert_eq!(web_file.entries[0].path, path);
+        assert_eq!(web_file.entries[0].file_name, "表.bin");
     }
 
     #[test]

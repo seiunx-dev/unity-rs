@@ -288,12 +288,12 @@ pub fn project_cubism_fade_motion(
         motion_length,
         curves: projected,
     };
-    motion.write_motion3_json(
+    crate::error::output_validation(motion.write_motion3_json(
         &CubismMotionTargetNames::default(),
         false,
         &mut io::sink(),
         limits.maximum_output_bytes,
-    )?;
+    ))?;
     Ok(motion)
 }
 
@@ -425,11 +425,20 @@ fn target_for(id: &str, targets: &CubismMotionTargetNames) -> &'static str {
         "Model"
     } else if contains_name(&targets.parameters, id) {
         "Parameter"
-    } else if contains_name(&targets.parts, id) || id.to_ascii_lowercase().contains("part") {
+    } else if contains_name(&targets.parts, id)
+        || contains_ascii_case_insensitive(id.as_bytes(), b"part")
+    {
         "PartOpacity"
     } else {
         "Parameter"
     }
+}
+
+fn contains_ascii_case_insensitive(value: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && value
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn contains_name(values: &[String], target: &str) -> bool {
@@ -723,7 +732,9 @@ impl<W: Write> Write for BoundedWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CubismFadeMotionReadLimits, CubismMotionTargetNames, project_cubism_fade_motion};
+    use super::{
+        CubismFadeMotionReadLimits, CubismMotionTargetNames, project_cubism_fade_motion, target_for,
+    };
     use crate::type_tree::{TypeField, TypeValue};
 
     fn object(fields: Vec<(&str, TypeValue)>) -> TypeValue {
@@ -814,6 +825,21 @@ mod tests {
                 .write_motion3_json(&targets, false, &mut Vec::new(), written - 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn classifies_part_targets_without_materializing_a_lowercase_identifier() {
+        let targets = CubismMotionTargetNames {
+            parameters: Vec::new(),
+            parts: vec!["ArmOpacity".to_owned()],
+        };
+        assert_eq!(target_for("ArmOpacity", &targets), "PartOpacity");
+        assert_eq!(target_for("DrawablePaRtOpacity", &targets), "PartOpacity");
+        assert_eq!(target_for("ParameterAngleX", &targets), "Parameter");
+
+        let mut long = "x".repeat(4096);
+        long.push_str("PART");
+        assert_eq!(target_for(&long, &targets), "PartOpacity");
     }
 
     #[test]

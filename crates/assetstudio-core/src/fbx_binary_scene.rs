@@ -20,6 +20,99 @@ use crate::fbx_scene_ascii::{MaterialProperties, StaticScene, polygon_end};
 use crate::model_ir::ModelIr;
 use crate::{Error, Result};
 
+/// Cumulative bytes copied into input-derived FBX string properties before
+/// the binary encoder gets a chance to enforce its final output limit.
+struct SceneStringBudget {
+    maximum_bytes: u64,
+    used_bytes: u64,
+}
+
+impl SceneStringBudget {
+    const fn new(maximum_bytes: u64) -> Self {
+        Self {
+            maximum_bytes,
+            used_bytes: 0,
+        }
+    }
+
+    fn composed(&mut self, prefix: &str, value: &str, suffix: &str, label: &str) -> Result<String> {
+        let length = prefix
+            .len()
+            .checked_add(value.len())
+            .and_then(|length| length.checked_add(suffix.len()))
+            .ok_or_else(|| Error::invalid_data(format!("binary FBX {label} length overflowed")))?;
+        let length_u64 = u64::try_from(length)
+            .map_err(|_| Error::invalid_data(format!("binary FBX {label} length overflowed")))?;
+        let total = self
+            .used_bytes
+            .checked_add(length_u64)
+            .ok_or_else(|| Error::invalid_data("binary FBX scene string budget overflowed"))?;
+        if total > self.maximum_bytes {
+            return Err(Error::invalid_data(format!(
+                "binary FBX scene strings need {total} bytes, exceeding the {} byte output limit",
+                self.maximum_bytes
+            )));
+        }
+        let mut output = String::new();
+        output.try_reserve_exact(length).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate binary FBX {label}: {error}"))
+        })?;
+        output.push_str(prefix);
+        output.push_str(value);
+        output.push_str(suffix);
+        self.used_bytes = total;
+        Ok(output)
+    }
+
+    fn prefixed(&mut self, prefix: &str, value: &str, label: &str) -> Result<String> {
+        self.composed(prefix, value, "", label)
+    }
+
+    fn copy(&mut self, value: &str, label: &str) -> Result<String> {
+        self.composed("", value, "", label)
+    }
+}
+
+fn reserve_exact<T>(values: &mut Vec<T>, additional: usize, label: &str) -> Result<()> {
+    values.try_reserve_exact(additional).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate binary FBX {label}: {error}"))
+    })
+}
+
+fn scaled_length(count: usize, factor: usize, label: &str) -> Result<usize> {
+    count
+        .checked_mul(factor)
+        .ok_or_else(|| Error::invalid_data(format!("binary FBX {label} length overflowed")))
+}
+
+fn push_node(values: &mut Vec<FbxNode>, node: FbxNode, label: &str) -> Result<()> {
+    values.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate binary FBX {label}: {error}"))
+    })?;
+    values.push(node);
+    Ok(())
+}
+
+fn extend_nodes(values: &mut Vec<FbxNode>, mut nodes: Vec<FbxNode>, label: &str) -> Result<()> {
+    reserve_exact(values, nodes.len(), label)?;
+    values.append(&mut nodes);
+    Ok(())
+}
+
+fn f32_values(values: &[f32], label: &str) -> Result<Vec<f64>> {
+    let mut output = Vec::new();
+    reserve_exact(&mut output, values.len(), label)?;
+    output.extend(values.iter().map(|value| f64::from(*value)));
+    Ok(output)
+}
+
+fn matrix_values(values: &[f64; 16], label: &str) -> Result<Vec<f64>> {
+    let mut output = Vec::new();
+    reserve_exact(&mut output, values.len(), label)?;
+    output.extend_from_slice(values);
+    Ok(output)
+}
+
 /// Writes a model's static scene as binary FBX 7.4.
 ///
 /// Refuses a model carrying anything this layout does not yet emit, rather
@@ -55,7 +148,8 @@ pub fn write_model_ir_fbx_binary_full<W: Write>(
     maximum_output_bytes: u64,
 ) -> Result<u64> {
     let scene = StaticScene::from_model(model, animations, textures)?;
-    let roots = build_scene_nodes(&scene)?;
+    let mut strings = SceneStringBudget::new(maximum_output_bytes);
+    let roots = build_scene_nodes(&scene, &mut strings)?;
     let bytes = crate::fbx_binary::read_fbx_binary(&roots, maximum_output_bytes)?;
     output.write_all(&bytes)?;
     u64::try_from(bytes.len()).map_err(|_| Error::invalid_data("binary FBX length overflowed"))
@@ -69,61 +163,106 @@ pub fn read_model_ir_fbx_binary(model: &ModelIr, maximum_output_bytes: u64) -> R
 }
 
 /// The complete top-level record list.
-fn build_scene_nodes(scene: &StaticScene<'_>) -> Result<Vec<FbxNode>> {
+fn build_scene_nodes(
+    scene: &StaticScene<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<Vec<FbxNode>> {
     let mut objects = FbxNode::new("Objects");
     for node in &scene.nodes {
-        objects.children.push(model_node(node));
+        push_node(
+            &mut objects.children,
+            model_node(node, strings)?,
+            "object records",
+        )?;
     }
     for geometry in &scene.geometries {
-        objects.children.push(geometry_node(geometry)?);
+        push_node(
+            &mut objects.children,
+            geometry_node(geometry, strings)?,
+            "object records",
+        )?;
     }
     for material in &scene.materials {
-        objects.children.push(material_node(material));
+        push_node(
+            &mut objects.children,
+            material_node(material, strings)?,
+            "object records",
+        )?;
     }
     for texture in &scene.textures {
-        objects.children.push(texture_node(texture));
-        objects.children.push(video_node(texture));
+        push_node(
+            &mut objects.children,
+            texture_node(texture, strings)?,
+            "object records",
+        )?;
+        push_node(
+            &mut objects.children,
+            video_node(texture, strings)?,
+            "object records",
+        )?;
     }
     for geometry in &scene.geometries {
         if let Some(morph) = &geometry.morph {
             for channel in &morph.channels {
                 for shape in &channel.shapes {
-                    objects
-                        .children
-                        .push(shape_geometry_node(geometry.mesh, shape)?);
+                    push_node(
+                        &mut objects.children,
+                        shape_geometry_node(geometry.mesh, shape, strings)?,
+                        "object records",
+                    )?;
                 }
             }
         }
     }
     for geometry in &scene.geometries {
         if let Some(skin) = &geometry.skin {
-            objects.children.push(skin_node(skin));
+            push_node(
+                &mut objects.children,
+                skin_node(skin, strings)?,
+                "object records",
+            )?;
             for cluster in &skin.clusters {
-                objects.children.push(cluster_node(cluster));
+                push_node(
+                    &mut objects.children,
+                    cluster_node(cluster, strings)?,
+                    "object records",
+                )?;
             }
         }
         if let Some(morph) = &geometry.morph {
-            objects.children.push(morph_node(morph));
+            push_node(
+                &mut objects.children,
+                morph_node(morph, strings)?,
+                "object records",
+            )?;
             for channel in &morph.channels {
-                objects.children.push(morph_channel_node(channel));
+                push_node(
+                    &mut objects.children,
+                    morph_channel_node(channel, strings)?,
+                    "object records",
+                )?;
             }
         }
     }
 
     let mut animation_objects = Vec::new();
     for animation in &scene.animations {
-        animation_objects.extend(animation_nodes(animation)?);
+        extend_nodes(
+            &mut animation_objects,
+            animation_nodes(animation, strings)?,
+            "animation object records",
+        )?;
     }
-    objects.children.extend(animation_objects);
+    extend_nodes(&mut objects.children, animation_objects, "object records")?;
 
     Ok(vec![
         header_extension(),
         global_settings(),
         documents(),
         FbxNode::new("References"),
-        definitions(scene),
+        definitions(scene)?,
         objects,
-        connections(scene),
+        connections(scene)?,
         FbxNode::new("Takes")
             .child(FbxNode::new("Current").with(FbxProperty::String(String::new()))),
     ])
@@ -187,7 +326,7 @@ fn documents() -> FbxNode {
         )
 }
 
-fn definitions(scene: &StaticScene<'_>) -> FbxNode {
+fn definitions(scene: &StaticScene<'_>) -> Result<FbxNode> {
     let mut definitions = FbxNode::new("Definitions")
         .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
         .child(FbxNode::new("Count").with(FbxProperty::I32(10)));
@@ -197,25 +336,29 @@ fn definitions(scene: &StaticScene<'_>) -> FbxNode {
         ("Material", scene.materials.len()),
         ("Texture", scene.textures.len()),
         ("Video", scene.textures.len()),
-        ("Deformer", deformer_count(scene)),
+        ("Deformer", deformer_count(scene)?),
         ("AnimationStack", scene.animations.len()),
         ("AnimationLayer", scene.animations.len()),
-        ("AnimationCurveNode", curve_node_count(scene)),
-        ("AnimationCurve", curve_count(scene)),
+        ("AnimationCurveNode", curve_node_count(scene)?),
+        ("AnimationCurve", curve_count(scene)?),
     ] {
-        definitions.children.push(
+        let count = i32::try_from(count)
+            .map_err(|_| Error::invalid_data(format!("binary FBX {name} count exceeds i32")))?;
+        push_node(
+            &mut definitions.children,
             FbxNode::new("ObjectType")
                 .with(FbxProperty::String(name.to_owned()))
-                .child(
-                    FbxNode::new("Count")
-                        .with(FbxProperty::I32(i32::try_from(count).unwrap_or(i32::MAX))),
-                ),
-        );
+                .child(FbxNode::new("Count").with(FbxProperty::I32(count))),
+            "definition records",
+        )?;
     }
-    definitions
+    Ok(definitions)
 }
 
-fn model_node(node: &crate::fbx_scene_ascii::NodePlan<'_>) -> FbxNode {
+fn model_node(
+    node: &crate::fbx_scene_ascii::NodePlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
     let kind = if node.has_geometry {
         "Mesh"
     } else if node.is_bone {
@@ -240,14 +383,18 @@ fn model_node(node: &crate::fbx_scene_ascii::NodePlan<'_>) -> FbxNode {
                 .with(FbxProperty::F64(f64::from(values[2]))),
         );
     }
-    FbxNode::new("Model")
+    Ok(FbxNode::new("Model")
         .with(FbxProperty::I64(node.id))
-        .with(FbxProperty::String(format!("Model::{}", node.name)))
+        .with(FbxProperty::String(strings.prefixed(
+            "Model::",
+            node.name,
+            "model name",
+        )?))
         .with(FbxProperty::String(kind.to_owned()))
         .child(FbxNode::new("Version").with(FbxProperty::I32(232)))
         .child(properties)
         .child(FbxNode::new("Shading").with(FbxProperty::Bool(true)))
-        .child(FbxNode::new("Culling").with(FbxProperty::String("CullingOff".to_owned())))
+        .child(FbxNode::new("Culling").with(FbxProperty::String("CullingOff".to_owned()))))
 }
 
 /// One geometry record: mirrored vertices and the polygon index run.
@@ -255,9 +402,17 @@ fn model_node(node: &crate::fbx_scene_ascii::NodePlan<'_>) -> FbxNode {
 /// X is mirrored and the winding reversed, exactly as the ASCII writer does,
 /// and the last index of every polygon is stored as its negative-one's
 /// complement, which is how FBX marks a polygon's end.
-fn geometry_node(geometry: &crate::fbx_scene_ascii::GeometryPlan<'_>) -> Result<FbxNode> {
+fn geometry_node(
+    geometry: &crate::fbx_scene_ascii::GeometryPlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
     let mesh = geometry.mesh;
-    let mut vertices = Vec::with_capacity(mesh.vertices.len() * 3);
+    let mut vertices = Vec::new();
+    reserve_exact(
+        &mut vertices,
+        scaled_length(mesh.vertices.len(), 3, "vertex scalar")?,
+        "vertex scalars",
+    )?;
     for vertex in &mesh.vertices {
         vertices.push(f64::from(-vertex[0]));
         vertices.push(f64::from(vertex[1]));
@@ -265,6 +420,12 @@ fn geometry_node(geometry: &crate::fbx_scene_ascii::GeometryPlan<'_>) -> Result<
     }
 
     let mut indices = Vec::new();
+    let index_count = mesh.sub_meshes.iter().try_fold(0_usize, |total, submesh| {
+        total
+            .checked_add(submesh.indices.len())
+            .ok_or_else(|| Error::invalid_data("binary FBX polygon index count overflowed"))
+    })?;
+    reserve_exact(&mut indices, index_count, "polygon indices")?;
     for submesh in &mesh.sub_meshes {
         for triangle in submesh.indices.chunks_exact(3) {
             indices.push(
@@ -287,14 +448,21 @@ fn geometry_node(geometry: &crate::fbx_scene_ascii::GeometryPlan<'_>) -> Result<
 
     Ok(FbxNode::new("Geometry")
         .with(FbxProperty::I64(geometry.id))
-        .with(FbxProperty::String(format!("Geometry::{}", mesh.name)))
+        .with(FbxProperty::String(strings.prefixed(
+            "Geometry::",
+            &mesh.name,
+            "geometry name",
+        )?))
         .with(FbxProperty::String("Mesh".to_owned()))
         .child(FbxNode::new("GeometryVersion").with(FbxProperty::I32(124)))
         .child(FbxNode::new("Vertices").with(FbxProperty::F64Array(vertices)))
         .child(FbxNode::new("PolygonVertexIndex").with(FbxProperty::I32Array(indices))))
 }
 
-fn material_node(material: &crate::fbx_scene_ascii::MaterialPlan<'_>) -> FbxNode {
+fn material_node(
+    material: &crate::fbx_scene_ascii::MaterialPlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
     let name = material
         .material
         .map_or("DefaultMaterial", |material| &material.name);
@@ -331,19 +499,26 @@ fn material_node(material: &crate::fbx_scene_ascii::MaterialPlan<'_>) -> FbxNode
                 .with(FbxProperty::F64(f64::from(value))),
         );
     }
-    FbxNode::new("Material")
+    Ok(FbxNode::new("Material")
         .with(FbxProperty::I64(material.id))
-        .with(FbxProperty::String(format!("Material::{name}")))
+        .with(FbxProperty::String(strings.prefixed(
+            "Material::",
+            name,
+            "material name",
+        )?))
         .with(FbxProperty::String(String::new()))
         .child(FbxNode::new("Version").with(FbxProperty::I32(102)))
         .child(FbxNode::new("ShadingModel").with(FbxProperty::String("phong".to_owned())))
         .child(FbxNode::new("MultiLayer").with(FbxProperty::I32(0)))
-        .child(properties)
+        .child(properties))
 }
 
 /// One `Texture` record, carrying the UV transform FBX keeps on the texture
 /// rather than on the binding.
-fn texture_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
+fn texture_node(
+    texture: &crate::fbx_scene_ascii::TexturePlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
     let mut properties = FbxNode::new("Properties70");
     properties.children.push(
         FbxNode::new("P")
@@ -376,35 +551,31 @@ fn texture_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
                 .with(FbxProperty::F64(third)),
         );
     }
-    FbxNode::new("Texture")
+    let texture_name = strings.prefixed("Texture::", texture.file_name, "texture object name")?;
+    let texture_property_name =
+        strings.prefixed("Texture::", texture.file_name, "texture property name")?;
+    let media_name = strings.prefixed("Video::", texture.file_name, "texture media name")?;
+    let file_name = strings.copy(texture.file_name, "texture file name")?;
+    let relative_file_name = strings.copy(texture.file_name, "texture relative file name")?;
+    Ok(FbxNode::new("Texture")
         .with(FbxProperty::I64(texture.id))
-        .with(FbxProperty::String(format!(
-            "Texture::{}",
-            texture.file_name
-        )))
+        .with(FbxProperty::String(texture_name))
         .with(FbxProperty::String(String::new()))
         .child(FbxNode::new("Type").with(FbxProperty::String("TextureVideoClip".to_owned())))
         .child(FbxNode::new("Version").with(FbxProperty::I32(202)))
-        .child(
-            FbxNode::new("TextureName").with(FbxProperty::String(format!(
-                "Texture::{}",
-                texture.file_name
-            ))),
-        )
+        .child(FbxNode::new("TextureName").with(FbxProperty::String(texture_property_name)))
         .child(properties)
-        .child(
-            FbxNode::new("Media")
-                .with(FbxProperty::String(format!("Video::{}", texture.file_name))),
-        )
-        .child(FbxNode::new("FileName").with(FbxProperty::String(texture.file_name.to_owned())))
-        .child(
-            FbxNode::new("RelativeFilename")
-                .with(FbxProperty::String(texture.file_name.to_owned())),
-        )
+        .child(FbxNode::new("Media").with(FbxProperty::String(media_name)))
+        .child(FbxNode::new("FileName").with(FbxProperty::String(file_name)))
+        .child(FbxNode::new("RelativeFilename").with(FbxProperty::String(relative_file_name))))
 }
 
 /// The `Video` clip a `Texture` reads its bytes through.
-fn video_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
+fn video_node(
+    texture: &crate::fbx_scene_ascii::TexturePlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
+    let path = strings.copy(texture.file_name, "video path")?;
     let mut properties = FbxNode::new("Properties70");
     properties.children.push(
         FbxNode::new("P")
@@ -412,68 +583,85 @@ fn video_node(texture: &crate::fbx_scene_ascii::TexturePlan<'_>) -> FbxNode {
             .with(FbxProperty::String("KString".to_owned()))
             .with(FbxProperty::String("XRefUrl".to_owned()))
             .with(FbxProperty::String(String::new()))
-            .with(FbxProperty::String(texture.file_name.to_owned())),
+            .with(FbxProperty::String(path)),
     );
-    FbxNode::new("Video")
+    let video_name = strings.prefixed("Video::", texture.file_name, "video object name")?;
+    let file_name = strings.copy(texture.file_name, "video file name")?;
+    let relative_file_name = strings.copy(texture.file_name, "video relative file name")?;
+    Ok(FbxNode::new("Video")
         .with(FbxProperty::I64(texture.video_id))
-        .with(FbxProperty::String(format!("Video::{}", texture.file_name)))
+        .with(FbxProperty::String(video_name))
         .with(FbxProperty::String("Clip".to_owned()))
         .child(FbxNode::new("Type").with(FbxProperty::String("Clip".to_owned())))
         .child(properties)
         .child(FbxNode::new("UseMipMap").with(FbxProperty::I32(0)))
-        .child(FbxNode::new("Filename").with(FbxProperty::String(texture.file_name.to_owned())))
-        .child(
-            FbxNode::new("RelativeFilename")
-                .with(FbxProperty::String(texture.file_name.to_owned())),
-        )
+        .child(FbxNode::new("Filename").with(FbxProperty::String(file_name)))
+        .child(FbxNode::new("RelativeFilename").with(FbxProperty::String(relative_file_name))))
 }
 
 /// Every skin and cluster record the scene will emit.
-fn deformer_count(scene: &StaticScene<'_>) -> usize {
-    let skins: usize = scene
+fn deformer_count(scene: &StaticScene<'_>) -> Result<usize> {
+    scene
         .geometries
         .iter()
-        .filter_map(|geometry| geometry.skin.as_ref())
-        .map(|skin| 1 + skin.clusters.len())
-        .sum();
-    let morphs: usize = scene
-        .geometries
-        .iter()
-        .filter_map(|geometry| geometry.morph.as_ref())
-        .map(|morph| 1 + morph.channels.len())
-        .sum();
-    skins + morphs
+        .try_fold(0_usize, |total, geometry| {
+            let skin_count = geometry
+                .skin
+                .as_ref()
+                .map_or(0, |skin| skin.clusters.len().saturating_add(1));
+            let morph_count = geometry
+                .morph
+                .as_ref()
+                .map_or(0, |morph| morph.channels.len().saturating_add(1));
+            total
+                .checked_add(skin_count)
+                .and_then(|value| value.checked_add(morph_count))
+                .ok_or_else(|| Error::invalid_data("binary FBX deformer count overflowed"))
+        })
 }
 
 /// The skin deformer a mesh's clusters hang from.
-fn skin_node(skin: &crate::fbx_scene_ascii::SkinPlan<'_>) -> FbxNode {
-    FbxNode::new("Deformer")
+fn skin_node(
+    skin: &crate::fbx_scene_ascii::SkinPlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
+    Ok(FbxNode::new("Deformer")
         .with(FbxProperty::I64(skin.id))
-        .with(FbxProperty::String(format!("Deformer::{}", skin.name)))
+        .with(FbxProperty::String(strings.prefixed(
+            "Deformer::",
+            skin.name,
+            "skin name",
+        )?))
         .with(FbxProperty::String("Skin".to_owned()))
         .child(FbxNode::new("Version").with(FbxProperty::I32(101)))
-        .child(FbxNode::new("Link_DeformAcuracy").with(FbxProperty::F64(50.0)))
+        .child(FbxNode::new("Link_DeformAcuracy").with(FbxProperty::F64(50.0))))
 }
 
 /// One cluster: the vertices a bone influences, their weights, and the two
 /// matrices that place the bone against the mesh at bind time.
-fn cluster_node(cluster: &crate::fbx_scene_ascii::ClusterPlan<'_>) -> FbxNode {
-    let indices: Vec<i32> = cluster
-        .indices
-        .iter()
-        .map(|index| i32::try_from(*index).unwrap_or(i32::MAX))
-        .collect();
-    let weights: Vec<f64> = cluster
-        .weights
-        .iter()
-        .map(|weight| f64::from(*weight))
-        .collect();
-    FbxNode::new("Deformer")
+fn cluster_node(
+    cluster: &crate::fbx_scene_ascii::ClusterPlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
+    let mut indices = Vec::new();
+    reserve_exact(&mut indices, cluster.indices.len(), "cluster indices")?;
+    indices.extend(
+        cluster
+            .indices
+            .iter()
+            .map(|index| i32::try_from(*index).unwrap_or(i32::MAX)),
+    );
+    let weights = f32_values(&cluster.weights, "cluster weights")?;
+    let transform = matrix_values(&cluster.transform.0, "cluster transform")?;
+    let transform_link = matrix_values(&cluster.transform_link.0, "cluster link transform")?;
+    Ok(FbxNode::new("Deformer")
         .with(FbxProperty::I64(cluster.id))
-        .with(FbxProperty::String(format!(
-            "SubDeformer::{}Cluster",
-            cluster.bone_name
-        )))
+        .with(FbxProperty::String(strings.composed(
+            "SubDeformer::",
+            cluster.bone_name,
+            "Cluster",
+            "skin cluster name",
+        )?))
         .with(FbxProperty::String("Cluster".to_owned()))
         .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
         .child(
@@ -483,42 +671,44 @@ fn cluster_node(cluster: &crate::fbx_scene_ascii::ClusterPlan<'_>) -> FbxNode {
         )
         .child(FbxNode::new("Indexes").with(FbxProperty::I32Array(indices)))
         .child(FbxNode::new("Weights").with(FbxProperty::F64Array(weights)))
-        .child(FbxNode::new("Transform").with(FbxProperty::F64Array(cluster.transform.0.to_vec())))
-        .child(
-            FbxNode::new("TransformLink")
-                .with(FbxProperty::F64Array(cluster.transform_link.0.to_vec())),
-        )
+        .child(FbxNode::new("Transform").with(FbxProperty::F64Array(transform)))
+        .child(FbxNode::new("TransformLink").with(FbxProperty::F64Array(transform_link))))
 }
 
 /// The blend-shape deformer a mesh's channels hang from.
-fn morph_node(morph: &crate::fbx_scene_ascii::MorphPlan<'_>) -> FbxNode {
-    FbxNode::new("Deformer")
+fn morph_node(
+    morph: &crate::fbx_scene_ascii::MorphPlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
+    Ok(FbxNode::new("Deformer")
         .with(FbxProperty::I64(morph.id))
-        .with(FbxProperty::String(format!(
-            "Deformer::{}BlendShape",
-            morph.name
-        )))
+        .with(FbxProperty::String(strings.composed(
+            "Deformer::",
+            morph.name,
+            "BlendShape",
+            "blend-shape name",
+        )?))
         .with(FbxProperty::String("BlendShape".to_owned()))
-        .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
+        .child(FbxNode::new("Version").with(FbxProperty::I32(100))))
 }
 
 /// One channel: a named target and the weights at which its shapes apply.
-fn morph_channel_node(channel: &crate::fbx_scene_ascii::MorphChannelPlan<'_>) -> FbxNode {
-    let weights: Vec<f64> = channel
-        .full_weights
-        .iter()
-        .map(|weight| f64::from(*weight))
-        .collect();
-    FbxNode::new("Deformer")
+fn morph_channel_node(
+    channel: &crate::fbx_scene_ascii::MorphChannelPlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<FbxNode> {
+    let weights = f32_values(channel.full_weights, "blend-shape weights")?;
+    Ok(FbxNode::new("Deformer")
         .with(FbxProperty::I64(channel.id))
-        .with(FbxProperty::String(format!(
-            "SubDeformer::{}",
-            channel.name
-        )))
+        .with(FbxProperty::String(strings.prefixed(
+            "SubDeformer::",
+            channel.name,
+            "blend-shape channel name",
+        )?))
         .with(FbxProperty::String("BlendShapeChannel".to_owned()))
         .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
         .child(FbxNode::new("DeformPercent").with(FbxProperty::F64(0.0)))
-        .child(FbxNode::new("FullWeights").with(FbxProperty::F64Array(weights)))
+        .child(FbxNode::new("FullWeights").with(FbxProperty::F64Array(weights))))
 }
 
 /// One target shape's geometry.
@@ -529,9 +719,16 @@ fn morph_channel_node(channel: &crate::fbx_scene_ascii::MorphChannelPlan<'_>) ->
 fn shape_geometry_node(
     mesh: &crate::mesh::Mesh,
     shape: &crate::fbx_scene_ascii::ShapePlan<'_>,
+    strings: &mut SceneStringBudget,
 ) -> Result<FbxNode> {
-    let mut indices = Vec::with_capacity(shape.vertices.len());
-    let mut offsets = Vec::with_capacity(shape.vertices.len() * 3);
+    let mut indices = Vec::new();
+    reserve_exact(&mut indices, shape.vertices.len(), "target-shape indices")?;
+    let mut offsets = Vec::new();
+    reserve_exact(
+        &mut offsets,
+        scaled_length(shape.vertices.len(), 3, "target-shape offset")?,
+        "target-shape offsets",
+    )?;
     for vertex in shape.vertices {
         let index = usize::try_from(vertex.index)
             .map_err(|_| Error::invalid_data("FBX target-shape vertex index does not fit usize"))?;
@@ -551,13 +748,22 @@ fn shape_geometry_node(
     }
     let mut node = FbxNode::new("Geometry")
         .with(FbxProperty::I64(shape.id))
-        .with(FbxProperty::String(format!("Geometry::{}", shape.name)))
+        .with(FbxProperty::String(strings.prefixed(
+            "Geometry::",
+            &shape.name,
+            "target-shape name",
+        )?))
         .with(FbxProperty::String("Shape".to_owned()))
         .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
         .child(FbxNode::new("Indexes").with(FbxProperty::I32Array(indices)))
         .child(FbxNode::new("Vertices").with(FbxProperty::F64Array(offsets)));
     if shape.frame.has_normals {
-        let mut normals = Vec::with_capacity(shape.vertices.len() * 3);
+        let mut normals = Vec::new();
+        reserve_exact(
+            &mut normals,
+            scaled_length(shape.vertices.len(), 3, "target-shape normal")?,
+            "target-shape normals",
+        )?;
         for vertex in shape.vertices {
             normals.push(f64::from(-vertex.normal[0]));
             normals.push(f64::from(vertex.normal[1]));
@@ -569,26 +775,52 @@ fn shape_geometry_node(
 }
 
 /// One curve node per animated property, plus one per blend-shape channel.
-fn curve_node_count(scene: &StaticScene<'_>) -> usize {
+fn curve_node_count(scene: &StaticScene<'_>) -> Result<usize> {
     scene
         .animations
         .iter()
-        .map(|animation| animation.properties.len() + animation.blend_shapes.len())
-        .sum()
+        .try_fold(0_usize, |total, animation| {
+            total
+                .checked_add(animation.properties.len())
+                .and_then(|value| value.checked_add(animation.blend_shapes.len()))
+                .ok_or_else(|| {
+                    Error::invalid_data("binary FBX animation curve-node count overflowed")
+                })
+        })
 }
 
 /// Three curves per vector property, one per blend-shape channel.
-fn curve_count(scene: &StaticScene<'_>) -> usize {
+fn curve_count(scene: &StaticScene<'_>) -> Result<usize> {
     scene
         .animations
         .iter()
-        .map(|animation| animation.properties.len() * 3 + animation.blend_shapes.len())
-        .sum()
+        .try_fold(0_usize, |total, animation| {
+            let property_curves =
+                scaled_length(animation.properties.len(), 3, "animation property-curve")?;
+            total
+                .checked_add(property_curves)
+                .and_then(|value| value.checked_add(animation.blend_shapes.len()))
+                .ok_or_else(|| Error::invalid_data("binary FBX animation curve count overflowed"))
+        })
 }
 
 /// A clip's stack, its layer, and every curve node and curve beneath them.
-fn animation_nodes(animation: &crate::fbx_scene_ascii::AnimationPlan<'_>) -> Result<Vec<FbxNode>> {
+fn animation_nodes(
+    animation: &crate::fbx_scene_ascii::AnimationPlan<'_>,
+    strings: &mut SceneStringBudget,
+) -> Result<Vec<FbxNode>> {
     let mut nodes = Vec::new();
+    let property_nodes = scaled_length(animation.properties.len(), 4, "animation property object")?;
+    let blend_shape_nodes = scaled_length(
+        animation.blend_shapes.len(),
+        2,
+        "blend-shape animation object",
+    )?;
+    let node_count = 2_usize
+        .checked_add(property_nodes)
+        .and_then(|value| value.checked_add(blend_shape_nodes))
+        .ok_or_else(|| Error::invalid_data("binary FBX animation object count overflowed"))?;
+    reserve_exact(&mut nodes, node_count, "animation object records")?;
     let mut stack_properties = FbxNode::new("Properties70");
     for (name, value) in [("LocalStart", 0), ("LocalStop", animation.stop_time)] {
         stack_properties.children.push(
@@ -600,17 +832,21 @@ fn animation_nodes(animation: &crate::fbx_scene_ascii::AnimationPlan<'_>) -> Res
                 .with(FbxProperty::I64(value)),
         );
     }
-    nodes.push(
+    push_node(
+        &mut nodes,
         FbxNode::new("AnimationStack")
             .with(FbxProperty::I64(animation.stack_id))
-            .with(FbxProperty::String(format!(
-                "AnimStack::{}",
-                animation.name
-            )))
+            .with(FbxProperty::String(strings.prefixed(
+                "AnimStack::",
+                animation.name,
+                "animation stack name",
+            )?))
             .with(FbxProperty::String(String::new()))
             .child(stack_properties),
-    );
-    nodes.push(
+        "animation object records",
+    )?;
+    push_node(
+        &mut nodes,
         FbxNode::new("AnimationLayer")
             .with(FbxProperty::I64(animation.layer_id))
             .with(FbxProperty::String("AnimLayer::Base Layer".to_owned()))
@@ -618,18 +854,33 @@ fn animation_nodes(animation: &crate::fbx_scene_ascii::AnimationPlan<'_>) -> Res
             .child(FbxNode::new("Version").with(FbxProperty::I32(100)))
             .child(FbxNode::new("Weight").with(FbxProperty::F64(100.0)))
             .child(FbxNode::new("BlendMode").with(FbxProperty::I32(0))),
-    );
+        "animation object records",
+    )?;
 
-    nodes.extend(property_animation_nodes(animation)?);
-    nodes.extend(blend_shape_animation_nodes(animation)?);
+    extend_nodes(
+        &mut nodes,
+        property_animation_nodes(animation, strings)?,
+        "animation object records",
+    )?;
+    extend_nodes(
+        &mut nodes,
+        blend_shape_animation_nodes(animation, strings)?,
+        "animation object records",
+    )?;
     Ok(nodes)
 }
 
 /// One curve node and three curves per animated vector property.
 fn property_animation_nodes(
     animation: &crate::fbx_scene_ascii::AnimationPlan<'_>,
+    strings: &mut SceneStringBudget,
 ) -> Result<Vec<FbxNode>> {
     let mut nodes = Vec::new();
+    reserve_exact(
+        &mut nodes,
+        scaled_length(animation.properties.len(), 4, "animation property object")?,
+        "animation property records",
+    )?;
     for property in &animation.properties {
         let token = property.kind.token();
         let defaults = property.kind.defaults();
@@ -647,30 +898,39 @@ fn property_animation_nodes(
                     .with(FbxProperty::F64(f64::from(*default))),
             );
         }
-        nodes.push(
+        push_node(
+            &mut nodes,
             FbxNode::new("AnimationCurveNode")
                 .with(FbxProperty::I64(property.node_id))
-                .with(FbxProperty::String(format!("AnimCurveNode::{token}")))
+                .with(FbxProperty::String(strings.prefixed(
+                    "AnimCurveNode::",
+                    token,
+                    "animation curve-node name",
+                )?))
                 .with(FbxProperty::String(String::new()))
                 .child(curve_properties),
-        );
+            "animation property records",
+        )?;
         for (component, id) in property.curve_ids.iter().enumerate() {
-            let mut times = Vec::with_capacity(property.keys.len());
-            let mut values = Vec::with_capacity(property.keys.len());
+            let mut times = Vec::new();
+            reserve_exact(&mut times, property.keys.len(), "animation key times")?;
+            let mut values = Vec::new();
+            reserve_exact(&mut values, property.keys.len(), "animation key values")?;
             for key in property.keys {
                 times.push(crate::fbx_scene_ascii::fbx_key_time(key.time)?);
                 values.push(key.value[component]);
             }
-            nodes.push(curve_node(
-                *id,
-                &format!(
-                    "{token}_{}",
-                    crate::fbx_scene_ascii::animation_component_name(component)
-                ),
-                defaults[component],
-                times,
-                values,
-            ));
+            let suffix = match component {
+                0 => "_X",
+                1 => "_Y",
+                _ => "_Z",
+            };
+            let name = strings.composed("AnimCurve::", token, suffix, "animation curve name")?;
+            push_node(
+                &mut nodes,
+                curve_node(*id, name, defaults[component], times, values),
+                "animation property records",
+            )?;
         }
     }
 
@@ -680,16 +940,28 @@ fn property_animation_nodes(
 /// One curve node and one curve per animated blend-shape channel.
 fn blend_shape_animation_nodes(
     animation: &crate::fbx_scene_ascii::AnimationPlan<'_>,
+    strings: &mut SceneStringBudget,
 ) -> Result<Vec<FbxNode>> {
     let mut nodes = Vec::new();
+    reserve_exact(
+        &mut nodes,
+        scaled_length(
+            animation.blend_shapes.len(),
+            2,
+            "blend-shape animation object",
+        )?,
+        "blend-shape animation records",
+    )?;
     for blend_shape in &animation.blend_shapes {
-        nodes.push(
+        push_node(
+            &mut nodes,
             FbxNode::new("AnimationCurveNode")
                 .with(FbxProperty::I64(blend_shape.node_id))
-                .with(FbxProperty::String(format!(
-                    "AnimCurveNode::{}",
-                    blend_shape.channel_name
-                )))
+                .with(FbxProperty::String(strings.prefixed(
+                    "AnimCurveNode::",
+                    blend_shape.channel_name,
+                    "blend-shape curve-node name",
+                )?))
                 .with(FbxProperty::String(String::new()))
                 .child(
                     FbxNode::new("Properties70").child(
@@ -701,27 +973,43 @@ fn blend_shape_animation_nodes(
                             .with(FbxProperty::F64(0.0)),
                     ),
                 ),
-        );
-        let mut times = Vec::with_capacity(blend_shape.keys.len());
-        let mut values = Vec::with_capacity(blend_shape.keys.len());
+            "blend-shape animation records",
+        )?;
+        let mut times = Vec::new();
+        reserve_exact(&mut times, blend_shape.keys.len(), "blend-shape key times")?;
+        let mut values = Vec::new();
+        reserve_exact(
+            &mut values,
+            blend_shape.keys.len(),
+            "blend-shape key values",
+        )?;
         for key in blend_shape.keys {
             times.push(crate::fbx_scene_ascii::fbx_key_time(key.time)?);
             values.push(key.value);
         }
-        nodes.push(curve_node(
-            blend_shape.curve_id,
-            &format!("{}_DeformPercent", blend_shape.channel_name),
-            0.0,
-            times,
-            values,
-        ));
+        push_node(
+            &mut nodes,
+            curve_node(
+                blend_shape.curve_id,
+                strings.composed(
+                    "AnimCurve::",
+                    blend_shape.channel_name,
+                    "_DeformPercent",
+                    "blend-shape curve name",
+                )?,
+                0.0,
+                times,
+                values,
+            ),
+            "blend-shape animation records",
+        )?;
     }
     Ok(nodes)
 }
 
 /// One curve: its key times, values and the per-key attribute arrays a reader
 /// expects even when every key shares the same interpolation.
-fn curve_node(id: i64, name: &str, default: f32, times: Vec<i64>, values: Vec<f32>) -> FbxNode {
+fn curve_node(id: i64, name: String, default: f32, times: Vec<i64>, values: Vec<f32>) -> FbxNode {
     // 24836 is the cubic-auto flag the ASCII writer emits for every key. The
     // attribute arrays are indexed by KeyAttrRefCount runs, so one entry
     // covering every key is what a uniform curve looks like.
@@ -729,7 +1017,7 @@ fn curve_node(id: i64, name: &str, default: f32, times: Vec<i64>, values: Vec<f3
     let key_count = i32::try_from(times.len()).unwrap_or(i32::MAX);
     FbxNode::new("AnimationCurve")
         .with(FbxProperty::I64(id))
-        .with(FbxProperty::String(format!("AnimCurve::{name}")))
+        .with(FbxProperty::String(name))
         .with(FbxProperty::String(String::new()))
         .child(FbxNode::new("Default").with(FbxProperty::F64(f64::from(default))))
         .child(FbxNode::new("KeyVer").with(FbxProperty::I32(4008)))
@@ -741,106 +1029,138 @@ fn curve_node(id: i64, name: &str, default: f32, times: Vec<i64>, values: Vec<f3
 }
 
 /// Object-to-object links, in the same order the ASCII writer emits them.
-fn connections(scene: &StaticScene<'_>) -> FbxNode {
-    let mut records: Vec<FbxNode> = Vec::new();
-    let link = |records: &mut Vec<FbxNode>, child: i64, parent: i64| {
-        records.push(
-            FbxNode::new("C")
-                .with(FbxProperty::String("OO".to_owned()))
-                .with(FbxProperty::I64(child))
-                .with(FbxProperty::I64(parent)),
-        );
-    };
+fn push_connection(
+    records: &mut Vec<FbxNode>,
+    kind: &str,
+    child: i64,
+    parent: i64,
+    property: Option<&str>,
+) -> Result<()> {
+    let mut node = FbxNode::new("C")
+        .with(FbxProperty::String(kind.to_owned()))
+        .with(FbxProperty::I64(child))
+        .with(FbxProperty::I64(parent));
+    if let Some(property) = property {
+        node = node.with(FbxProperty::String(property.to_owned()));
+    }
+    push_node(records, node, "connection records")
+}
+
+fn append_object_connections(scene: &StaticScene<'_>, records: &mut Vec<FbxNode>) -> Result<()> {
     for node in &scene.nodes {
-        link(&mut records, node.id, node.parent_id);
+        push_connection(records, "OO", node.id, node.parent_id, None)?;
     }
     for geometry in &scene.geometries {
-        link(&mut records, geometry.id, geometry.model_id);
+        push_connection(records, "OO", geometry.id, geometry.model_id, None)?;
         for material_id in &geometry.material_ids {
-            link(&mut records, *material_id, geometry.model_id);
+            push_connection(records, "OO", *material_id, geometry.model_id, None)?;
         }
     }
     for texture in &scene.textures {
-        link(&mut records, texture.video_id, texture.id);
+        push_connection(records, "OO", texture.video_id, texture.id, None)?;
     }
     for geometry in &scene.geometries {
         if let Some(skin) = &geometry.skin {
-            link(&mut records, skin.id, geometry.id);
+            push_connection(records, "OO", skin.id, geometry.id, None)?;
             for cluster in &skin.clusters {
-                link(&mut records, cluster.id, skin.id);
-                link(&mut records, cluster.bone_model_id, cluster.id);
+                push_connection(records, "OO", cluster.id, skin.id, None)?;
+                push_connection(records, "OO", cluster.bone_model_id, cluster.id, None)?;
             }
         }
         if let Some(morph) = &geometry.morph {
-            link(&mut records, morph.id, geometry.id);
+            push_connection(records, "OO", morph.id, geometry.id, None)?;
             for channel in &morph.channels {
-                link(&mut records, channel.id, morph.id);
+                push_connection(records, "OO", channel.id, morph.id, None)?;
                 for shape in &channel.shapes {
-                    link(&mut records, shape.id, channel.id);
+                    push_connection(records, "OO", shape.id, channel.id, None)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+fn animation_component_property(component: usize) -> &'static str {
+    match component {
+        0 => "d|X",
+        1 => "d|Y",
+        _ => "d|Z",
+    }
+}
+
+fn append_animation_connections(scene: &StaticScene<'_>, records: &mut Vec<FbxNode>) -> Result<()> {
     for animation in &scene.animations {
-        link(&mut records, animation.layer_id, animation.stack_id);
+        push_connection(records, "OO", animation.layer_id, animation.stack_id, None)?;
         for property in &animation.properties {
-            link(&mut records, property.node_id, animation.layer_id);
-            for id in &property.curve_ids {
-                records.push(
-                    FbxNode::new("C")
-                        .with(FbxProperty::String("OP".to_owned()))
-                        .with(FbxProperty::I64(*id))
-                        .with(FbxProperty::I64(property.node_id))
-                        .with(FbxProperty::String("d|X".to_owned())),
-                );
+            push_connection(records, "OO", property.node_id, animation.layer_id, None)?;
+            push_connection(
+                records,
+                "OP",
+                property.node_id,
+                property.model_id,
+                Some(property.kind.fbx_property()),
+            )?;
+            for (component, id) in property.curve_ids.iter().enumerate() {
+                push_connection(
+                    records,
+                    "OP",
+                    *id,
+                    property.node_id,
+                    Some(animation_component_property(component)),
+                )?;
             }
-            records.push(
-                FbxNode::new("C")
-                    .with(FbxProperty::String("OP".to_owned()))
-                    .with(FbxProperty::I64(property.node_id))
-                    .with(FbxProperty::I64(property.model_id))
-                    .with(FbxProperty::String(property.kind.fbx_property().to_owned())),
-            );
         }
         for blend_shape in &animation.blend_shapes {
-            link(&mut records, blend_shape.node_id, animation.layer_id);
-            records.push(
-                FbxNode::new("C")
-                    .with(FbxProperty::String("OP".to_owned()))
-                    .with(FbxProperty::I64(blend_shape.curve_id))
-                    .with(FbxProperty::I64(blend_shape.node_id))
-                    .with(FbxProperty::String("d|DeformPercent".to_owned())),
-            );
-            records.push(
-                FbxNode::new("C")
-                    .with(FbxProperty::String("OP".to_owned()))
-                    .with(FbxProperty::I64(blend_shape.node_id))
-                    .with(FbxProperty::I64(blend_shape.channel_id))
-                    .with(FbxProperty::String("DeformPercent".to_owned())),
-            );
+            push_connection(records, "OO", blend_shape.node_id, animation.layer_id, None)?;
+            push_connection(
+                records,
+                "OP",
+                blend_shape.node_id,
+                blend_shape.channel_id,
+                Some("DeformPercent"),
+            )?;
+            push_connection(
+                records,
+                "OP",
+                blend_shape.curve_id,
+                blend_shape.node_id,
+                Some("d|DeformPercent"),
+            )?;
         }
     }
+    Ok(())
+}
+
+fn append_material_connections(scene: &StaticScene<'_>, records: &mut Vec<FbxNode>) -> Result<()> {
     // Object-to-property links name the material channel the texture drives.
     for material in &scene.materials {
         for texture in &material.textures {
-            records.push(
-                FbxNode::new("C")
-                    .with(FbxProperty::String("OP".to_owned()))
-                    .with(FbxProperty::I64(texture.texture_id))
-                    .with(FbxProperty::I64(material.id))
-                    .with(FbxProperty::String(texture.slot.fbx_property().to_owned())),
-            );
+            push_connection(
+                records,
+                "OP",
+                texture.texture_id,
+                material.id,
+                Some(texture.slot.fbx_property()),
+            )?;
         }
     }
+    Ok(())
+}
+
+fn connections(scene: &StaticScene<'_>) -> Result<FbxNode> {
+    let mut records: Vec<FbxNode> = Vec::new();
+    append_object_connections(scene, &mut records)?;
+    append_animation_connections(scene, &mut records)?;
+    append_material_connections(scene, &mut records)?;
     let mut connections = FbxNode::new("Connections");
     connections.children = records;
-    connections
+    Ok(connections)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        read_model_ir_fbx_binary, write_model_ir_fbx_binary,
+        read_model_ir_fbx_binary, reserve_exact, scaled_length, write_model_ir_fbx_binary,
         write_model_ir_fbx_binary_with_textures,
     };
     use crate::fbx_ascii::write_model_ir_fbx_ascii;
@@ -1225,6 +1545,25 @@ mod tests {
             FbxProperty::F32Array(values) => assert_eq!(values, &[0.0, 1.0]),
             other => panic!("key values are not a float array: {other:?}"),
         }
+
+        let connections = roots
+            .iter()
+            .find(|node| node.name == "Connections")
+            .expect("a Connections record");
+        let mut components: Vec<&str> = connections
+            .children
+            .iter()
+            .filter_map(|node| match node.properties.last() {
+                Some(FbxProperty::String(value))
+                    if matches!(value.as_str(), "d|X" | "d|Y" | "d|Z") =>
+                {
+                    Some(value.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        components.sort_unstable();
+        assert_eq!(components, ["d|X", "d|Y", "d|Z"]);
     }
 
     #[test]
@@ -1256,6 +1595,23 @@ mod tests {
         // Every object is linked to something; an unlinked object would not
         // appear in an importer's scene at all.
         assert!(!roots[6].children.is_empty());
+    }
+
+    #[test]
+    fn rejects_cumulative_scene_strings_before_encoding() {
+        let model = model_fixture();
+        let mut output = Vec::new();
+        let error = write_model_ir_fbx_binary(&model, &mut output, 20).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("scene strings need 25 bytes, exceeding the 20 byte output limit"),
+            "{error}"
+        );
+        assert!(
+            output.is_empty(),
+            "the writer published bytes before the scene budget failed"
+        );
     }
 
     #[test]
@@ -1451,5 +1807,14 @@ mod tests {
         assert!(objects.children.iter().any(|node| {
             node.properties.get(2) == Some(&FbxProperty::String("BlendShape".to_owned()))
         }));
+    }
+
+    #[test]
+    fn rejects_scene_projection_allocation_overflow_before_growth() {
+        assert!(scaled_length(usize::MAX, 2, "test values").is_err());
+
+        let mut values = Vec::<u8>::new();
+        assert!(reserve_exact(&mut values, usize::MAX, "test values").is_err());
+        assert!(values.is_empty());
     }
 }

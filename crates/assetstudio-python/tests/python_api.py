@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
+import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -10,7 +13,9 @@ from assetstudio import (
     AclCompressedTracks,
     AclDecodedClip,
     AnimationClip,
+    AnimatorOverrideController,
     AnimatorController,
+    AssetBundle,
     AssetStudio,
     Avatar,
     AudioClip,
@@ -27,6 +32,7 @@ from assetstudio import (
     ExportLimits,
     ExtractionLimits,
     FbxCandidate,
+    LegacyAnimation,
     Live2dPackage,
     Material,
     ModelTextureLimits,
@@ -34,9 +40,20 @@ from assetstudio import (
     MonoBehaviourSchemas,
     MonoScript,
     PlayerSettings,
+    PreloadData,
     ResourceInfo,
     ResourceIterator,
+    ResourceManager,
     SceneLimits,
+    SpriteAtlas,
+    SpriteAtlasRenderData,
+    SpriteAtlasRenderDataKey,
+    SpriteAtlasSecondaryTexture,
+    SpriteMetadata,
+    SpriteMetadataLimits,
+    SpriteRenderData,
+    SpriteSecondaryTexture,
+    SpriteSettings,
     extract,
 )
 
@@ -1025,6 +1042,79 @@ def synthetic_tuanjie_animation_clip() -> bytes:
     return finish_v22_asset(74, payload, "2022.3.61t1")
 
 
+def synthetic_legacy_animation_component() -> bytes:
+    payload = bytearray()
+    push_pptr(payload, 31)  # GameObject
+    payload.append(1)  # enabled
+    align(payload, 4)
+    push_pptr(payload, 70)  # default clip
+    push_i32(payload, 2)
+    push_pptr(payload, 71)
+    push_pptr(payload, 72)
+    payload.extend(b"\xaa\xbb")  # unparsed version-dependent tail
+    return finish_v22_asset(111, payload)
+
+
+def synthetic_animator_override_controller() -> bytes:
+    payload = bytearray()
+    push_aligned_string(payload, "python override controller")
+    push_pptr(payload, 90)  # base AnimatorController
+    push_i32(payload, 2)
+    push_pptr(payload, 71)
+    push_pptr(payload, 73)
+    push_pptr(payload, 72)
+    push_pptr(payload, 74)
+    payload.append(0xCC)  # unparsed version-dependent tail
+    return finish_v22_asset(221, payload)
+
+
+def synthetic_container_metadata_objects() -> bytes:
+    asset_bundle = bytearray()
+    push_aligned_string(asset_bundle, "root")
+    push_i32(asset_bundle, 2)
+    push_pptr(asset_bundle, 11)
+    push_pptr(asset_bundle, 12)
+    push_i32(asset_bundle, 2)
+    for key, preload_index, asset_path_id in (
+        ("bundle/first", 0, 11),
+        ("bundle/second", 1, 12),
+    ):
+        push_aligned_string(asset_bundle, key)
+        push_i32(asset_bundle, preload_index)
+        push_i32(asset_bundle, 1)
+        push_pptr(asset_bundle, asset_path_id)
+    push_i32(asset_bundle, 0)  # main asset preload index
+    push_i32(asset_bundle, 0)  # main asset preload size
+    push_pptr(asset_bundle, 0)
+    push_u32(asset_bundle, 0)  # runtime compatibility
+    push_aligned_string(asset_bundle, "python-bundle")
+    push_i32(asset_bundle, 2)
+    push_aligned_string(asset_bundle, "shared-a")
+    push_aligned_string(asset_bundle, "shared-b")
+    asset_bundle.append(0)  # ordinary AssetBundle; preload ranges use its local table
+
+    resource_manager = bytearray()
+    push_i32(resource_manager, 2)
+    push_aligned_string(resource_manager, "resource/first")
+    push_pptr(resource_manager, 21)
+    push_aligned_string(resource_manager, "resource/second")
+    push_pptr(resource_manager, 22)
+
+    preload_data = bytearray()
+    push_aligned_string(preload_data, "python-preload")
+    push_i32(preload_data, 2)
+    push_pptr(preload_data, 31)
+    push_pptr(preload_data, 32)
+
+    return finish_v22_objects(
+        (
+            (142, 7, asset_bundle),
+            (147, 8, resource_manager),
+            (150, 9, preload_data),
+        )
+    )
+
+
 def push_tuanjie_animation_xform(output: bytearray) -> None:
     push_f32s(output, (0.0,) * 10)
 
@@ -1894,8 +1984,58 @@ def finish_v22_asset(
     return bytes(output)
 
 
+def assert_schema_construction_releases_gil() -> None:
+    """The pure-Rust 100k-node validation must not monopolize Python."""
+
+    # The binding must check the Python list length before asking PyO3 to
+    # convert every element into owned Rust strings. Invalid entries prove the
+    # count guard runs first rather than merely rejecting after conversion.
+    oversized_nodes = [None] * 1_000_001
+    try:
+        MonoBehaviourSchema("Probe.dll", "Probe", oversized_nodes)
+    except ValueError as error:
+        assert "1000001 nodes" in str(error)
+    else:
+        raise AssertionError("oversized schema input must be rejected before conversion")
+
+    ready = threading.Event()
+    start = threading.Event()
+    ran = threading.Event()
+
+    def worker() -> None:
+        ready.set()
+        start.wait()
+        ran.set()
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert ready.wait(5), "GIL probe worker did not start"
+    nodes = [("MonoBehaviour", "Base", 0, False)] + [
+        ("SInt32", "value", 1, False)
+    ] * 99_999
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1_000.0)
+    try:
+        start.set()
+        assert not ran.is_set(), "GIL probe ran before entering the Rust constructor"
+        schema = MonoBehaviourSchema("Probe.dll", "Probe", nodes)
+        assert schema.node_count == 100_000
+        assert ran.is_set(), "MonoBehaviourSchema construction held the GIL"
+    finally:
+        sys.setswitchinterval(previous_interval)
+        start.set()
+        thread.join(5)
+    assert not thread.is_alive(), "GIL probe worker did not finish"
+
+
 def main() -> None:
+    assert_schema_construction_releases_gil()
     assert AnimationClip.__name__ == "AnimationClip"
+    assert LegacyAnimation.__name__ == "LegacyAnimation"
+    assert AnimatorOverrideController.__name__ == "AnimatorOverrideController"
+    assert AssetBundle.__name__ == "AssetBundle"
+    assert ResourceManager.__name__ == "ResourceManager"
+    assert PreloadData.__name__ == "PreloadData"
     assert AclCompressedTracks.__name__ == "AclCompressedTracks"
     assert AclDecodedClip.__name__ == "AclDecodedClip"
     assert AnimatorController.__name__ == "AnimatorController"
@@ -1908,6 +2048,15 @@ def main() -> None:
     assert ResourceInfo.__name__ == "ResourceInfo"
     assert ResourceIterator.__name__ == "ResourceIterator"
     assert SceneLimits.__name__ == "SceneLimits"
+    assert SpriteAtlas.__name__ == "SpriteAtlas"
+    assert SpriteAtlasRenderData.__name__ == "SpriteAtlasRenderData"
+    assert SpriteAtlasRenderDataKey.__name__ == "SpriteAtlasRenderDataKey"
+    assert SpriteAtlasSecondaryTexture.__name__ == "SpriteAtlasSecondaryTexture"
+    assert SpriteMetadata.__name__ == "SpriteMetadata"
+    assert SpriteMetadataLimits.__name__ == "SpriteMetadataLimits"
+    assert SpriteRenderData.__name__ == "SpriteRenderData"
+    assert SpriteSecondaryTexture.__name__ == "SpriteSecondaryTexture"
+    assert SpriteSettings.__name__ == "SpriteSettings"
     assert FbxCandidate.__name__ == "FbxCandidate"
     assert hasattr(Live2dPackage, "eye_blink_parameters")
     assert hasattr(Live2dPackage, "lip_sync_parameters")
@@ -1934,6 +2083,22 @@ def main() -> None:
         assert memory_studio.file_count == 1
         assert memory_studio.files()[0].path == "memory-fixture.assets"
         assert memory_studio.read_text(0, 7) == b"hello python"
+        try:
+            AssetStudio.from_bytes(
+                b"resource", name="12345", maximum_path_bytes=4
+            )
+        except ValueError as error:
+            assert "path limit 4" in str(error)
+        else:
+            raise AssertionError("in-memory input names must obey the path limit")
+        try:
+            AssetStudio.from_bytes(
+                b"resource", name="12345", maximum_total_path_bytes=4
+            )
+        except ValueError as error:
+            assert "total path limit 4" in str(error)
+        else:
+            raise AssertionError("one input name must obey the total path limit")
         try:
             AssetStudio.from_bytes(synthetic_text_asset(), maximum_bytes=1)
         except ValueError:
@@ -2034,6 +2199,33 @@ def main() -> None:
         assert external_video.extension == ".mp4"
         assert external_video.data == b"video-bin"
         try:
+            AssetStudio.from_memory_files([None], maximum_files=0)
+        except ValueError as error:
+            assert "1 files" in str(error)
+        else:
+            raise AssertionError(
+                "memory file count must be checked before tuple conversion"
+            )
+        empty_key_studio = AssetStudio.from_memory_files(
+            [], unity_cn_key=b"0123456789abcdef"
+        )
+        assert empty_key_studio.file_count == 0
+        assert (
+            AssetStudio.from_memory_files(
+                [], unity_cn_key="0123456789abcdef"
+            ).file_count
+            == 0
+        )
+        for invalid_key in (b"short", "short", [0] * 16):
+            try:
+                AssetStudio.from_memory_files([], unity_cn_key=invalid_key)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    "UnityCN keys must be exactly 16 UTF-8 bytes or raw bytes"
+                )
+        try:
             AssetStudio.from_memory_files(
                 [("a", b"a"), ("b", b"b")], maximum_files=1
             )
@@ -2058,11 +2250,25 @@ def main() -> None:
         else:
             raise AssertionError("memory total byte limit should be enforced")
         try:
+            AssetStudio.from_memory_files(
+                [("abc", b"a"), ("de", b"b")], maximum_total_path_bytes=4
+            )
+        except ValueError as error:
+            assert "names total 5 bytes" in str(error)
+        else:
+            raise AssertionError("memory input names must share one path budget")
+        try:
             AssetStudio(Path(directory), maximum_input_directories=0)
         except ValueError:
             pass
         else:
             raise AssertionError("directory traversal limits should be enforced")
+        try:
+            AssetStudio(path, maximum_path_bytes=1)
+        except ValueError as error:
+            assert "asset path" in str(error)
+        else:
+            raise AssertionError("filesystem input labels must obey the path limit")
 
         # A game directory mixes readable assets with containers whose layout
         # has never been verified. By default one of those fails the whole
@@ -2249,6 +2455,13 @@ def main() -> None:
         assert extracted_record.bytes == path.stat().st_size
         assert Path(extracted_record.output_path).read_bytes() == path.read_bytes()
         assert extraction.output_bytes == path.stat().st_size
+        if sys.platform.startswith("linux"):
+            raw_output = os.fsencode(directory) + b"/extracted-\xff"
+            invalid_output = Path(os.fsdecode(raw_output))
+            invalid_path_report = extract(path, invalid_output)
+            assert len(invalid_path_report.extracted) == 1
+            assert "\ufffd" in invalid_path_report.extracted[0].output_path
+            assert os.path.isdir(raw_output)
         skipped = extract(path, extraction_output)
         assert skipped.extracted == []
         assert len(skipped.skipped_existing) == 1
@@ -2268,6 +2481,25 @@ def main() -> None:
         assert not any(
             child.is_file() for child in extraction_limited_output.rglob("*")
         )
+        path_budget_input = Path(directory) / "path-budget-input"
+        path_budget_input.mkdir()
+        (path_budget_input / "payload.bin").write_bytes(b"payload")
+        path_budget = ExtractionLimits(
+            maximum_total_path_bytes=len(str(path_budget_input).encode("utf-8"))
+        )
+        assert path_budget.maximum_total_path_bytes == len(
+            str(path_budget_input).encode("utf-8")
+        )
+        try:
+            extract(
+                path_budget_input,
+                Path(directory) / "path-budget-output",
+                limits=path_budget,
+            )
+        except ValueError as error:
+            assert "extraction paths total" in str(error)
+        else:
+            raise AssertionError("cumulative extraction path budget should be enforced")
         oodle_path = Path(directory) / "oodle.bundle"
         oodle_path.write_bytes(oodle_bundle)
         oodle_extract_output = Path(directory) / "oodle-extracted"
@@ -2409,6 +2641,97 @@ def main() -> None:
         sprite_path = Path(directory) / "sprite.assets"
         sprite_path.write_bytes(synthetic_sprite_with_atlas_backfill())
         sprite_studio = AssetStudio(sprite_path)
+        sprite_metadata = sprite_studio.read_sprite_metadata(0, 7)
+        assert isinstance(sprite_metadata, SpriteMetadata)
+        assert sprite_metadata.object_index == 0
+        assert sprite_metadata.path_id == 7
+        assert sprite_metadata.name == "python sprite"
+        assert sprite_metadata.rect == (0.0, 0.0, 1.0, 1.0)
+        assert sprite_metadata.offset == (0.0, 0.0)
+        assert sprite_metadata.border == (0.0, 0.0, 0.0, 0.0)
+        assert sprite_metadata.pixels_to_units == 100.0
+        assert sprite_metadata.pivot == (0.5, 0.5)
+        assert sprite_metadata.extrude == 0
+        assert sprite_metadata.is_polygon is False
+        assert sprite_metadata.render_data_key is not None
+        assert sprite_metadata.render_data_key.guid_bytes == bytes(16)
+        assert sprite_metadata.render_data_key.value == 0
+        assert sprite_metadata.atlas_tags == []
+        assert sprite_metadata.sprite_atlas == (0, 0)
+        sprite_render_data = sprite_metadata.render_data
+        assert isinstance(sprite_render_data, SpriteRenderData)
+        assert sprite_render_data.texture == (0, 8)
+        assert sprite_render_data.alpha_texture == (0, 0)
+        assert sprite_render_data.secondary_textures == []
+        assert sprite_render_data.texture_rect == (0.0, 0.0, 1.0, 1.0)
+        assert sprite_render_data.texture_rect_offset == (0.0, 0.0)
+        assert sprite_render_data.atlas_rect_offset == (0.0, 0.0)
+        assert sprite_render_data.uv_transform == (0.0, 0.0, 1.0, 1.0)
+        assert sprite_render_data.downscale_multiplier == 1.0
+        assert sprite_render_data.mesh_triangles == []
+        assert isinstance(sprite_render_data.settings, SpriteSettings)
+        assert sprite_render_data.settings.raw == 2
+        assert sprite_render_data.settings.packed is False
+        assert sprite_render_data.settings.packing_mode == "rectangle"
+        assert sprite_render_data.settings.packing_rotation == 0
+        assert sprite_render_data.settings.mesh_type == "full_rect"
+        default_sprite_limits = SpriteMetadataLimits()
+        assert default_sprite_limits.maximum_entries == 1_000_000
+        assert default_sprite_limits.maximum_string_bytes == 16_777_216
+        assert default_sprite_limits.maximum_total_string_bytes == 33_554_432
+        assert default_sprite_limits.maximum_mesh_bytes == 536_870_912
+        for limits in (
+            SpriteMetadataLimits(maximum_entries=0),
+            SpriteMetadataLimits(maximum_string_bytes=5),
+            SpriteMetadataLimits(maximum_total_string_bytes=5),
+            SpriteMetadataLimits(maximum_mesh_bytes=0),
+        ):
+            try:
+                sprite_studio.read_sprite_metadata(0, 7, limits=limits)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Sprite metadata limits should be enforced")
+
+        sprite_atlas = sprite_studio.read_sprite_atlas(0, 9)
+        assert isinstance(sprite_atlas, SpriteAtlas)
+        assert sprite_atlas.path_id == 9
+        assert sprite_atlas.name == "python atlas"
+        assert sprite_atlas.packed_sprites == [(0, 7)]
+        assert sprite_atlas.packed_sprite_names == ["python sprite"]
+        assert sprite_atlas.tag == "python"
+        assert sprite_atlas.is_variant is False
+        assert len(sprite_atlas.render_data_entries) == 1
+        atlas_entry = sprite_atlas.render_data_entries[0]
+        assert isinstance(atlas_entry, SpriteAtlasRenderData)
+        assert isinstance(atlas_entry.key, SpriteAtlasRenderDataKey)
+        assert atlas_entry.key.guid_bytes == bytes(16)
+        assert atlas_entry.key.value == 0
+        assert atlas_entry.texture == (0, 10)
+        assert atlas_entry.alpha_texture == (0, 0)
+        assert atlas_entry.texture_rect == (0.0, 0.0, 1.0, 1.0)
+        assert atlas_entry.texture_rect_offset == (0.0, 0.0)
+        assert atlas_entry.atlas_rect_offset == (0.0, 0.0)
+        assert atlas_entry.uv_transform == (0.0, 0.0, 1.0, 1.0)
+        assert atlas_entry.downscale_multiplier == 1.0
+        assert atlas_entry.settings_raw == 2
+        assert atlas_entry.packed is False
+        assert atlas_entry.packing_mode == 1
+        assert atlas_entry.packing_rotation == 0
+        assert atlas_entry.mesh_type == 0
+        assert atlas_entry.secondary_textures == []
+        for kwargs in (
+            {"maximum_entries": 0},
+            {"maximum_string_bytes": 5},
+            {"maximum_total_string_bytes": 12},
+        ):
+            try:
+                sprite_studio.read_sprite_atlas(0, 9, **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("SpriteAtlas limits should be enforced")
+
         sprite_image = sprite_studio.read_sprite(0, 7)
         assert repr(sprite_image) == "RgbaImage(width=1, height=1)"
         assert sprite_image.rgba == bytes((9, 8, 7, 255))
@@ -2421,14 +2744,18 @@ def main() -> None:
 
         tight_sprite_path = Path(directory) / "tight-sprite.assets"
         tight_sprite_path.write_bytes(synthetic_tight_sprite())
-        tight_sprite = AssetStudio(tight_sprite_path).read_sprite(0, 7)
+        tight_sprite_studio = AssetStudio(tight_sprite_path)
+        tight_metadata = tight_sprite_studio.read_sprite_metadata(0, 7)
+        assert tight_metadata.render_data.settings.packing_mode == "tight"
+        assert len(tight_metadata.render_data.mesh_triangles) == 1
+        tight_sprite = tight_sprite_studio.read_sprite(0, 7)
         assert (tight_sprite.width, tight_sprite.height) == (2, 2)
         assert tight_sprite.rgba == bytes(
             (30, 3, 3, 255, 0, 0, 0, 0, 10, 1, 1, 255, 20, 2, 2, 255)
         )
 
         webp_output = Path(directory) / "webp-export"
-        webp_report = texture_studio.export(webp_output, image_format="webp")
+        webp_report = texture_studio.export(webp_output, image_format=" WeBp ")
         assert webp_report.failures == []
         assert len(webp_report.exported) == 1
         webp_path = Path(webp_report.exported[0])
@@ -2478,7 +2805,7 @@ def main() -> None:
         assert audio.data[36:44] == b"data\x04\0\0\0"
         assert audio.data[44:] == b"\x01\x02\x03\x04"
 
-        raw_audio = audio_studio.read_audio_clip(0, 7, format="raw")
+        raw_audio = audio_studio.read_audio_clip(0, 7, format=" RaW ")
         assert raw_audio.extension == ".AudioClip"
         assert raw_audio.payload_kind == "audio_raw"
         assert raw_audio.data == b"\x01\x02\x03\x04"
@@ -2499,6 +2826,16 @@ def main() -> None:
                 raise AssertionError(
                     f"audio format {invalid_format} should fail in this test"
                 )
+
+        oversized_option = "é" * 2048
+        try:
+            audio_studio.read_audio_clip(0, 7, format=oversized_option)
+        except ValueError as error:
+            message = str(error)
+            assert "unsupported audio format value of 4096 UTF-8 bytes" in message
+            assert oversized_option not in message
+        else:
+            raise AssertionError("an oversized audio format should be rejected")
 
         audio_export = audio_studio.export(Path(directory) / "audio-export")
         assert audio_export.failures == []
@@ -2766,6 +3103,22 @@ def main() -> None:
         # lines refer to; an empty library would leave every face unmaterialed.
         assert model_obj.material_library.startswith(b"newmtl ")
         assert b"usemtl " in model_obj.obj
+        exact_model_limit = max(len(model_obj.obj), len(model_obj.material_library))
+        exact_model_obj = AssetStudio(model_path).read_model_obj(
+            material_library_name="python-model.mtl",
+            maximum_bytes=exact_model_limit,
+        )
+        assert exact_model_obj.obj == model_obj.obj
+        assert exact_model_obj.material_library == model_obj.material_library
+        try:
+            AssetStudio(model_path).read_model_obj(
+                material_library_name="python-model.mtl",
+                maximum_bytes=exact_model_limit - 1,
+            )
+        except ValueError as error:
+            assert "exceeds" in str(error)
+        else:
+            raise AssertionError("model OBJ/MTL output limits must be enforced")
         # This fixture has no material textures, which is an empty list rather
         # than an error, and nothing was skipped for a reason worth reporting.
         assert model_obj.textures == []
@@ -2777,6 +3130,18 @@ def main() -> None:
         )
         assert textured.fbx.startswith(b"; FBX 7.4.0 project file\n")
         assert textured.textures == []
+        exact_textured = AssetStudio(model_path).read_fbx_with_textures(
+            maximum_bytes=len(textured.fbx)
+        )
+        assert exact_textured.fbx == textured.fbx
+        try:
+            AssetStudio(model_path).read_fbx_with_textures(
+                maximum_bytes=len(textured.fbx) - 1
+            )
+        except ValueError as error:
+            assert "exceeds" in str(error)
+        else:
+            raise AssertionError("textured FBX output limits must be enforced")
 
         # Core and the CLI already accept every image encoding for model
         # textures. The Python model APIs must pass that choice through rather
@@ -2974,12 +3339,35 @@ def main() -> None:
             raise AssertionError("invalid ACL decoder output should be rejected")
         try:
             AssetStudio(animation_path).decode_acl_tracks(
-                0, 7, decode_acl, maximum_values=83
+                0,
+                7,
+                lambda *_args: ([None] * 13, [None] * 7, [None] * 84, 7),
             )
-        except ValueError:
-            pass
+        except ValueError as error:
+            assert "returned 13 times for 12 declared frames" in str(error)
+        else:
+            raise AssertionError(
+                "ACL list lengths must be checked before element conversion"
+            )
+
+        acl_limit_decoder_called = False
+
+        def must_not_decode_acl(
+            *_args: object,
+        ) -> tuple[list[float], list[int], list[float], int]:
+            nonlocal acl_limit_decoder_called
+            acl_limit_decoder_called = True
+            return ([], [], [], 0)
+
+        try:
+            AssetStudio(animation_path).decode_acl_tracks(
+                0, 7, must_not_decode_acl, maximum_values=83
+            )
+        except ValueError as error:
+            assert "requires 84 values, exceeding limit 83" in str(error)
         else:
             raise AssertionError("ACL decoded output limit should be enforced")
+        assert not acl_limit_decoder_called
         try:
             AssetStudio(animation_path).inspect_acl_tracks(
                 0, 7, maximum_decompressed_values=359
@@ -3007,6 +3395,96 @@ def main() -> None:
             pass
         else:
             raise AssertionError("AnimationClip object limit should be enforced")
+
+        legacy_animation_path = Path(directory) / "legacy-animation.assets"
+        legacy_animation_path.write_bytes(synthetic_legacy_animation_component())
+        legacy_animation = AssetStudio(legacy_animation_path).read_legacy_animation(0, 7)
+        assert isinstance(legacy_animation, LegacyAnimation)
+        assert legacy_animation.path_id == 7
+        assert legacy_animation.game_object == (0, 31)
+        assert legacy_animation.enabled == 1
+        assert legacy_animation.default_clip == (0, 70)
+        assert legacy_animation.clips == [(0, 71), (0, 72)]
+        assert legacy_animation.trailing_bytes == 2
+        try:
+            AssetStudio(legacy_animation_path).read_legacy_animation(
+                0, 7, maximum_bytes=1
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("legacy Animation object limit should be enforced")
+
+        override_path = Path(directory) / "animator-override.assets"
+        override_path.write_bytes(synthetic_animator_override_controller())
+        override = AssetStudio(override_path).read_animator_override_controller(0, 7)
+        assert isinstance(override, AnimatorOverrideController)
+        assert override.path_id == 7
+        assert override.name == "python override controller"
+        assert override.controller == (0, 90)
+        assert override.clip_overrides == [
+            ((0, 71), (0, 73)),
+            ((0, 72), (0, 74)),
+        ]
+        assert override.trailing_bytes == 1
+        try:
+            AssetStudio(override_path).read_animator_override_controller(
+                0, 7, maximum_bytes=1
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "AnimatorOverrideController object limit should be enforced"
+            )
+
+        container_path = Path(directory) / "container-metadata.assets"
+        container_path.write_bytes(synthetic_container_metadata_objects())
+        container_studio = AssetStudio(container_path)
+        bundle = container_studio.read_asset_bundle(0, 7)
+        assert isinstance(bundle, AssetBundle)
+        assert bundle.path_id == 7
+        assert bundle.name == "python-bundle"
+        assert bundle.object_name == "root"
+        assert bundle.asset_bundle_name == "python-bundle"
+        assert bundle.preload_table == [(0, 11), (0, 12)]
+        assert bundle.container == [
+            ("bundle/first", 0, 1, (0, 11)),
+            ("bundle/second", 1, 1, (0, 12)),
+        ]
+        assert bundle.dependencies == ["shared-a", "shared-b"]
+        assert bundle.is_streamed_scene_asset_bundle is False
+
+        manager = container_studio.read_resource_manager(0, 8)
+        assert isinstance(manager, ResourceManager)
+        assert manager.path_id == 8
+        assert manager.container == [
+            ("resource/first", (0, 21)),
+            ("resource/second", (0, 22)),
+        ]
+
+        preload = container_studio.read_preload_data(0, 9)
+        assert isinstance(preload, PreloadData)
+        assert preload.path_id == 9
+        assert preload.name == "python-preload"
+        assert preload.assets == [(0, 31), (0, 32)]
+
+        for method, path_id, kwargs in (
+            (container_studio.read_asset_bundle, 7, {"maximum_entries": 1}),
+            (
+                container_studio.read_asset_bundle,
+                7,
+                {"maximum_total_string_bytes": 1},
+            ),
+            (container_studio.read_resource_manager, 8, {"maximum_entries": 1}),
+            (container_studio.read_preload_data, 9, {"maximum_entries": 1}),
+        ):
+            try:
+                method(0, path_id, **kwargs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("container metadata limits should be enforced")
 
         controller_path = Path(directory) / "tuanjie-controller.assets"
         controller_path.write_bytes(synthetic_tuanjie_animator_controller())
@@ -3119,9 +3597,21 @@ def main() -> None:
         assert parameter.value == 0.25
         assert parameter.blend == "Multiply"
         assert b'"Blend": 1' in expression.json
+        exact_expression = AssetStudio(expression_path).read_cubism_expression(
+            0, 7, maximum_output_bytes=len(expression.json)
+        )
+        assert exact_expression.json == expression.json
+        try:
+            AssetStudio(expression_path).read_cubism_expression(
+                0, 7, maximum_output_bytes=len(expression.json) - 1
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Cubism expression output limits must be enforced")
         dump_report = AssetStudio(expression_path).export(
             Path(directory) / "dump-text",
-            mode="dump_text",
+            mode=" DuMp_TeXt ",
         )
         assert dump_report.failures == []
         assert len(dump_report.exported) == 1
@@ -3131,6 +3621,24 @@ def main() -> None:
         assert dump_bytes.endswith(b"\r\n")
         direct_dump = AssetStudio(expression_path).read_type_tree_dump(0, 7)
         assert direct_dump.encode("utf-8") == dump_bytes
+        oversized_option = "é" * 2048
+        for field, options in (
+            ("export mode", {"mode": oversized_option}),
+            ("image format", {"image_format": oversized_option}),
+        ):
+            try:
+                AssetStudio(expression_path).export(
+                    Path(directory) / f"oversized-{field.replace(' ', '-')}",
+                    **options,
+                )
+            except ValueError as error:
+                message = str(error)
+                assert (
+                    f"unsupported {field} value of 4096 UTF-8 bytes" in message
+                )
+                assert oversized_option not in message
+            else:
+                raise AssertionError(f"an oversized {field} should be rejected")
         try:
             AssetStudio(expression_path).read_type_tree_dump(0, 7, maximum_bytes=8)
         except ValueError:
@@ -3179,6 +3687,18 @@ def main() -> None:
             b'"Destination": {\n            "Target": "Parameter",\n'
             b'            "Id": "ParamHair"\n          }'
         ) in physics.json
+        exact_physics = AssetStudio(physics_path).read_cubism_physics(
+            0, 7, motion_fps=60.0, maximum_output_bytes=len(physics.json)
+        )
+        assert exact_physics.json == physics.json
+        try:
+            AssetStudio(physics_path).read_cubism_physics(
+                0, 7, motion_fps=60.0, maximum_output_bytes=len(physics.json) - 1
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Cubism physics output limits must be enforced")
 
         motion_path = Path(directory) / "motion.assets"
         motion_path.write_bytes(synthetic_cubism_fade_motion())
@@ -3194,6 +3714,18 @@ def main() -> None:
         assert motion.keyframe_count == 2
         assert b'"CurveCount": 1' in motion.json
         assert b'"Id": "ParamAngleX"' in motion.json
+        exact_motion = AssetStudio(motion_path).read_cubism_fade_motion(
+            0, 7, maximum_output_bytes=len(motion.json)
+        )
+        assert exact_motion.json == motion.json
+        try:
+            AssetStudio(motion_path).read_cubism_fade_motion(
+                0, 7, maximum_output_bytes=len(motion.json) - 1
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Cubism motion output limits must be enforced")
 
 
 if __name__ == "__main__":

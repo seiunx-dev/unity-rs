@@ -82,6 +82,8 @@ studio = AssetStudio(
     maximum_input_files=100_000,
     maximum_input_directories=100_000,
     maximum_directory_entries=200_000,
+    maximum_path_bytes=1_048_576,
+    maximum_total_path_bytes=67_108_864,
 )
 
 memory_studio = AssetStudio.from_bytes(downloaded_bundle, name="download.bundle")
@@ -113,7 +115,10 @@ page = studio.object_page(0, offset=0, limit=4096)
 extraction = extract(
     "bundle.ab",
     "unpacked",
-    limits=ExtractionLimits(maximum_output_bytes=4 * 1024 * 1024 * 1024),
+    limits=ExtractionLimits(
+        maximum_output_bytes=4 * 1024 * 1024 * 1024,
+        maximum_total_path_bytes=64 * 1024 * 1024,
+    ),
 )
 # The same callback can be supplied to recursive extraction.
 oodle_extraction = extract(
@@ -249,19 +254,29 @@ defaults. Bulk export additionally limits the object count and cumulative
 published bytes. `iter_files()` and `iter_objects()` are lazy and keep their
 originating `AssetStudio` alive; `files()` and `objects()` remain convenience
 lists with a one-million-entry safety ceiling. CPU-heavy parsing and export
-release Python's GIL. Export
-never follows symbolic-link destinations and publishes files atomically; by
-default it does not overwrite existing files.
+release Python's GIL. The pure-Rust validation, node conversion, and registry
+construction performed by `MonoBehaviourSchema` do too. Its Python-list length
+and cumulative UTF-8 budget are checked before copying the input; only this
+bounded conversion of the caller's Python strings and tuples remains under the
+GIL. Export never follows symbolic-link destinations and publishes files
+atomically; by default it does not overwrite existing files.
 
-This package is alpha while the checked-in .NET implementation remains the
-format oracle. GUI support and further C ABI parity are not package goals.
+Caller-controlled lists are preflighted before conversion into owned Rust
+vectors. This includes in-memory file tables, schema collections, Cubism target
+names, and ACL decoder output; file counts, UTF-8/byte totals, and ACL
+frame/curve/value limits are checked before their elements are copied. Core
+also rejects request-declared ACL work beyond those limits before invoking the
+Python callback at all.
+
+This package is beta while the separately maintained .NET implementation remains
+an optional format oracle. GUI support and further C ABI parity are not package goals.
 
 ## Local development
 
 With Rust 1.88+, Python 3.9+, and Maturin installed:
 
 ```shell
-cd rust/crates/assetstudio-python
+cd crates/assetstudio-python
 python -m venv .venv
 source .venv/bin/activate
 maturin develop --locked
@@ -281,7 +296,7 @@ publication.
 To reproduce the dependency-locked release wheel locally:
 
 ```shell
-cd rust/crates/assetstudio-python
+cd crates/assetstudio-python
 maturin build --release --locked --compatibility pypi --out dist
 python -m pip install --force-reinstall --no-deps dist/*.whl
 python -I tests/python_api.py

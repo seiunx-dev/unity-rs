@@ -111,6 +111,29 @@ fn inspect_directory_continues_and_returns_partial_failure() {
     assert!(!root.path().join("ASExtract").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn inspect_streams_a_non_utf8_failure_path_without_a_lossy_temporary() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = TestDirectory::new("inspect-non-utf8");
+    let input = root.path().join("input");
+    fs::create_dir(&input).unwrap();
+    let name = OsString::from_vec(vec![b'b', b'a', b'd', b'-', 0xff, b'.', b'g', b'z']);
+    fs::write(input.join(name), [0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+
+    let result = cli(root.path(), ["inspect".into(), input.into_os_string()]);
+    assert_eq!(result.status.code(), Some(3));
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains(r"inspect error for "), "stdout: {stdout}");
+    assert!(stdout.contains(r"bad-\u{fffd}.gz"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("inspect summary: 0 succeeded, 1 failed"),
+        "stdout: {stdout}"
+    );
+}
+
 #[test]
 fn usage_runtime_and_help_have_stable_exit_codes() {
     let root = TestDirectory::new("exit-codes");
@@ -256,6 +279,22 @@ fn unity_version_overrides_a_stripped_serialized_file_version() {
         let result = cli(root.path(), arguments);
         assert_eq!(result.status.code(), Some(2), "expected a usage error");
     }
+}
+
+#[test]
+fn oversized_unknown_option_is_summarized_without_echoing_it() {
+    let root = TestDirectory::new("bounded-argv-diagnostic");
+    let oversized = format!("--{}", "é".repeat(33));
+    assert_eq!(oversized.len(), 68);
+
+    let result = cli(root.path(), [oversized.clone().into()]);
+    assert_eq!(result.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("<argument of 68 encoded bytes>"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains(&oversized), "stderr: {stderr}");
 }
 
 fn cli<I>(current_directory: &Path, arguments: I) -> Output

@@ -10,6 +10,10 @@ use std::path::Path;
 use crate::Result;
 use crate::acl::AclDecoder;
 use crate::animation_clip::{AnimationClip, AnimationClipReadLimits, read_animation_clip};
+use crate::animation_component::{
+    AnimationComponentReadLimits, AnimatorOverrideController, LegacyAnimationComponent,
+    read_animator_override_controller, read_legacy_animation_component,
+};
 use crate::animation_graph::{AnimationGraphLimits, build_animation_graph};
 use crate::animator_controller::{
     AnimatorController, AnimatorControllerReadLimits, read_animator_controller,
@@ -53,14 +57,18 @@ use crate::project_settings::{
 use crate::scene_hierarchy::{
     SceneHierarchy, SceneHierarchyLimits, SceneObjectKey, build_scene_hierarchy,
 };
-use crate::serialized::ObjectInfo;
+use crate::serialized::{
+    AssetBundleMetadata, ContainerMetadataReadLimits, ObjectInfo, PreloadDataMetadata,
+    ResourceManagerMetadata,
+};
 use crate::shader::{ShaderReadLimits, read_shader};
 use crate::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, read_audio_clip_asset, read_font,
     read_movie_texture, read_video_clip,
 };
 use crate::source::Region;
-use crate::sprite::{SpriteReadLimits, decode_sprite_rgba8, read_sprite};
+use crate::sprite::{Sprite, SpriteReadLimits, decode_sprite_rgba8, read_sprite};
+use crate::sprite_atlas::{SpriteAtlas, SpriteAtlasReadLimits, read_sprite_atlas};
 use crate::texture::{RgbaImage, TextureReadLimits, read_texture2d};
 use crate::texture_array::{TextureArrayReadLimits, read_texture2d_array};
 
@@ -204,12 +212,8 @@ impl Studio {
     /// ASCII-insensitive resource-path semantics.
     #[must_use]
     pub fn resource_by_path(&self, requested_path: &str) -> Option<StudioResource<'_>> {
-        let loaded = self.collection.resource(requested_path)?;
-        let index = self
-            .collection
-            .resources
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate, loaded))?;
+        let index = self.collection.resource_index_by_path(requested_path)?;
+        let loaded = self.collection.resources.get(index)?;
         Some(StudioResource { index, loaded })
     }
 
@@ -496,6 +500,9 @@ impl Studio {
         format: crate::image_export::ImageFormat,
         texture_limits: crate::scene_textures::SceneTextureLimits,
     ) -> Result<ModelObj> {
+        let maximum = usize::try_from(maximum_output_bytes).map_err(|_| {
+            crate::Error::invalid_data("model OBJ output limit does not fit this platform")
+        })?;
         let hierarchy = self.scene_hierarchy(SceneHierarchyLimits::default())?;
         let model = build_model_ir(&self.collection, &hierarchy, ModelIrLimits::default())?;
         let textures = crate::scene_textures::SceneTextureSet::from_model(
@@ -504,24 +511,26 @@ impl Studio {
             format,
             texture_limits,
         )?;
-        let mut obj = Vec::new();
-        crate::obj_scene::write_model_ir_obj(
+        let mut obj = LimitedBuffer::new(maximum, "scene OBJ");
+        let obj_result = crate::obj_scene::write_model_ir_obj(
             &model,
             Some(material_library_name),
             &mut obj,
             maximum_output_bytes,
-        )?;
-        let mut material_library = Vec::new();
-        crate::obj_scene::write_model_ir_mtl(
+        );
+        obj.finish(obj_result)?;
+        let mut material_library = LimitedBuffer::new(maximum, "scene material library");
+        let material_library_result = crate::obj_scene::write_model_ir_mtl(
             &model,
             &textures,
             &mut material_library,
             maximum_output_bytes,
-        )?;
+        );
+        material_library.finish(material_library_result)?;
         Ok(ModelObj {
-            obj,
-            material_library_name: material_library_name.to_owned(),
-            material_library,
+            obj: obj.bytes,
+            material_library_name: copy_string(material_library_name, "material library name")?,
+            material_library: material_library.bytes,
             textures,
         })
     }
@@ -942,6 +951,52 @@ impl StudioObject<'_> {
         read_animation_clip(&self.loaded().file, self.object_index, limits)
     }
 
+    /// Reads the stable references from one legacy Unity `Animation` component.
+    pub fn read_legacy_animation(
+        &self,
+        limits: AnimationComponentReadLimits,
+    ) -> Result<LegacyAnimationComponent> {
+        read_legacy_animation_component(&self.loaded().file, self.object_index, limits)
+    }
+
+    /// Reads one bounded Unity `AnimatorOverrideController` reference table.
+    pub fn read_animator_override_controller(
+        &self,
+        limits: AnimationComponentReadLimits,
+    ) -> Result<AnimatorOverrideController> {
+        read_animator_override_controller(&self.loaded().file, self.object_index, limits)
+    }
+
+    /// Reads one bounded Unity `AssetBundle` preload and container table.
+    pub fn read_asset_bundle(
+        &self,
+        limits: ContainerMetadataReadLimits,
+    ) -> Result<AssetBundleMetadata> {
+        self.loaded()
+            .file
+            .read_asset_bundle_metadata(self.object_index, limits)
+    }
+
+    /// Reads one bounded Unity `ResourceManager` container table.
+    pub fn read_resource_manager(
+        &self,
+        limits: ContainerMetadataReadLimits,
+    ) -> Result<ResourceManagerMetadata> {
+        self.loaded()
+            .file
+            .read_resource_manager_metadata(self.object_index, limits)
+    }
+
+    /// Reads one bounded Unity `PreloadData` object-reference table.
+    pub fn read_preload_data(
+        &self,
+        limits: ContainerMetadataReadLimits,
+    ) -> Result<PreloadDataMetadata> {
+        self.loaded()
+            .file
+            .read_preload_data_metadata(self.object_index, limits)
+    }
+
     /// Reads one complete, bounded Unity or Tuanjie `AnimatorController`.
     pub fn read_animator_controller(
         &self,
@@ -1077,6 +1132,21 @@ impl StudioObject<'_> {
             limits,
         )?;
         texture.decode_mip0_layers_rgba8(limits)
+    }
+
+    /// Reads one complete, bounded Unity `SpriteAtlas` metadata table.
+    ///
+    /// Composite GUID keys retain their serialized byte order. Render-data
+    /// entries are returned in the deterministic key order used by the
+    /// low-level lookup implementation.
+    pub fn read_sprite_atlas(&self, limits: SpriteAtlasReadLimits) -> Result<SpriteAtlas> {
+        read_sprite_atlas(&self.loaded().file, self.object_index, limits)
+    }
+
+    /// Reads one complete, bounded Unity `Sprite` metadata object without
+    /// resolving or decoding its texture references.
+    pub fn read_sprite(&self, limits: SpriteReadLimits) -> Result<Sprite> {
+        read_sprite(&self.loaded().file, self.object_index, limits)
     }
 
     /// Resolves and decodes one `Sprite` to display-order RGBA8 pixels.
@@ -1236,12 +1306,35 @@ impl Write for LimitedBuffer {
     }
 }
 
+fn copy_string(value: &str, field: &'static str) -> Result<String> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|error| crate::Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    output.push_str(value);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use crate::loader::{AssetCollection, LoadedResource};
     use crate::source::Region;
 
-    use super::Studio;
+    use super::{LimitedBuffer, Studio, copy_string};
+
+    #[test]
+    fn high_level_materializers_use_a_bounded_fallible_buffer() {
+        let mut output = LimitedBuffer::new(4, "test output");
+        output.write_all(b"four").unwrap();
+        output.finish(Ok(())).unwrap();
+        assert_eq!(output.bytes, b"four");
+
+        assert!(output.write_all(b"!").is_err());
+        assert!(output.finish(Ok(())).is_err());
+        assert_eq!(copy_string("model.mtl", "test name").unwrap(), "model.mtl");
+    }
 
     #[test]
     fn high_level_api_lists_finds_and_reads_without_an_abi_layer() {

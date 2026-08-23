@@ -26,7 +26,7 @@
     "build:debug": "napi build --platform -- --locked",
     "test": "node tests/node_api.cjs && npm run test:types",
     "test:types": "tsc --project tests/tsconfig.json",
-    "test:package": "node tests/package_contents.cjs"
+    "test:package": "node tests/package_contents.cjs && node tests/installed_package.cjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.8.6",

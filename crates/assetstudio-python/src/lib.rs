@@ -11,6 +11,7 @@ use assetstudio_core::acl::{
     AclDecoderInputLimits,
 };
 use assetstudio_core::animation_clip::AnimationClipReadLimits;
+use assetstudio_core::animation_component::{AnimationClipOverride, AnimationComponentReadLimits};
 use assetstudio_core::animator_controller::AnimatorControllerReadLimits;
 use assetstudio_core::avatar::AvatarReadLimits;
 use assetstudio_core::bundle::OodleDecoder;
@@ -39,13 +40,14 @@ use assetstudio_core::monobehaviour::{MonoBehaviourReadLimits, MonoScript};
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::{SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey};
 use assetstudio_core::scene_textures::{SceneTexture, SceneTextureLimits, SceneTextureSkip};
-use assetstudio_core::serialized::{TypeTree, TypeTreeNode};
+use assetstudio_core::serialized::{ContainerMetadataReadLimits, TypeTree, TypeTreeNode};
 use assetstudio_core::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
     write_direct_wav,
 };
 use assetstudio_core::source::Region;
-use assetstudio_core::sprite::SpriteReadLimits;
+use assetstudio_core::sprite::{Sprite, SpriteMeshType, SpritePackingMode, SpriteReadLimits};
+use assetstudio_core::sprite_atlas::SpriteAtlasReadLimits;
 use assetstudio_core::studio::{Studio, StudioFile, StudioObject, StudioResource};
 use assetstudio_core::texture::TextureReadLimits;
 use assetstudio_core::texture_array::TextureArrayReadLimits;
@@ -55,13 +57,18 @@ use pyo3::exceptions::{
     PyKeyError, PyMemoryError, PyNotImplementedError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 
-const MAXIMUM_MEMORY_FILE_NAME_BYTES: usize = 1024 * 1024;
-const MAXIMUM_TOTAL_MEMORY_FILE_NAME_BYTES: usize = 64 * 1024 * 1024;
 const MAXIMUM_SCHEMA_NODES: usize = 1_000_000;
 const MAXIMUM_SCHEMA_STRING_BYTES: usize = 256 * 1024 * 1024;
 const MAXIMUM_METADATA_PAGE_ITEMS: usize = 1_000_000;
+
+type PyObjectReference = (i32, i64);
+type PyAnimationClipOverride = (PyObjectReference, PyObjectReference);
+type PyAssetBundleContainerEntry = (String, usize, usize, PyObjectReference);
+type PyResourceManagerContainerEntry = (String, PyObjectReference);
+type PySpriteTriangle = ((f32, f32), (f32, f32), (f32, f32));
+type PyMonoBehaviourSchemaNode = (String, String, u32, bool);
 
 struct PythonOodleDecoder {
     callback: Py<PyAny>,
@@ -69,6 +76,7 @@ struct PythonOodleDecoder {
 
 struct PythonAclDecoder {
     callback: Py<PyAny>,
+    limits: AclDecodeLimits,
 }
 
 impl AclDecoder for PythonAclDecoder {
@@ -97,21 +105,99 @@ impl AclDecoder for PythonAclDecoder {
                 .map_err(|error| {
                     Error::invalid_data(format!("Python ACL decoder raised an error: {error}"))
                 })?;
-            let (times, binding_indices, values, following_curve_offset) = result
-                .extract::<(Vec<f32>, Vec<u32>, Vec<f32>, u32)>(py)
-                .map_err(|error| {
-                    Error::invalid_data(format!(
-                        "Python ACL decoder must return (times, binding_indices, values, following_curve_offset): {error}"
-                    ))
-                })?;
-            Ok(AclDecodedClip {
-                times,
-                binding_indices,
-                values,
-                following_curve_offset,
+            extract_python_acl_output(result.bind(py), request, self.limits).map_err(|error| {
+                Error::invalid_data(format!(
+                    "Python ACL decoder must return (times, binding_indices, values, following_curve_offset): {error}"
+                ))
             })
         })
     }
+}
+
+fn extract_python_acl_output(
+    result: &Bound<'_, PyAny>,
+    request: &AclDecodeRequest<'_>,
+    limits: AclDecodeLimits,
+) -> PyResult<AclDecodedClip> {
+    let tuple = result.cast::<PyTuple>()?;
+    if tuple.len() != 4 {
+        return Err(PyTypeError::new_err(
+            "ACL decoder output tuple must contain four values",
+        ));
+    }
+    let times = tuple.get_item(0)?.cast_into::<PyList>()?;
+    let binding_indices = tuple.get_item(1)?.cast_into::<PyList>()?;
+    let values = tuple.get_item(2)?.cast_into::<PyList>()?;
+    let following_curve_offset = tuple.get_item(3)?.extract::<u32>()?;
+
+    let expected_frames = usize::try_from(request.frame_count)
+        .map_err(|_| PyValueError::new_err("ACL frame count does not fit this platform"))?;
+    if expected_frames > limits.maximum_frames {
+        return Err(PyValueError::new_err(format!(
+            "ACL frame count {expected_frames} exceeds limit {}",
+            limits.maximum_frames
+        )));
+    }
+    if times.len() != expected_frames {
+        return Err(PyValueError::new_err(format!(
+            "ACL decoder returned {} times for {expected_frames} declared frames",
+            times.len()
+        )));
+    }
+    let curve_count = binding_indices.len();
+    if curve_count > limits.maximum_curves {
+        return Err(PyValueError::new_err(format!(
+            "ACL decoder returned {curve_count} curves, exceeding limit {}",
+            limits.maximum_curves
+        )));
+    }
+    if let Some(declared) = request.declared_curve_count {
+        let declared = usize::try_from(declared)
+            .map_err(|_| PyValueError::new_err("ACL curve count does not fit this platform"))?;
+        if curve_count != declared {
+            return Err(PyValueError::new_err(format!(
+                "ACL decoder returned {curve_count} curves for {declared} declared curves"
+            )));
+        }
+    }
+    let expected_values = expected_frames
+        .checked_mul(curve_count)
+        .ok_or_else(|| PyValueError::new_err("ACL decoded value count overflowed"))?;
+    if expected_values > limits.maximum_values {
+        return Err(PyValueError::new_err(format!(
+            "ACL decoder output requires {expected_values} values, exceeding limit {}",
+            limits.maximum_values
+        )));
+    }
+    if values.len() != expected_values {
+        return Err(PyValueError::new_err(format!(
+            "ACL decoder returned {} values; {expected_values} are required",
+            values.len()
+        )));
+    }
+
+    Ok(AclDecodedClip {
+        times: copy_python_f32_list(&times, "ACL decoder times")?,
+        binding_indices: copy_python_u32_list(&binding_indices, "ACL decoder binding indices")?,
+        values: copy_python_f32_list(&values, "ACL decoder values")?,
+        following_curve_offset,
+    })
+}
+
+fn copy_python_f32_list(values: &Bound<'_, PyList>, field: &'static str) -> PyResult<Vec<f32>> {
+    let mut copied = reserve_metadata(values.len(), field)?;
+    for value in values.iter() {
+        copied.push(value.extract()?);
+    }
+    Ok(copied)
+}
+
+fn copy_python_u32_list(values: &Bound<'_, PyList>, field: &'static str) -> PyResult<Vec<u32>> {
+    let mut copied = reserve_metadata(values.len(), field)?;
+    for value in values.iter() {
+        copied.push(value.extract()?);
+    }
+    Ok(copied)
 }
 
 impl OodleDecoder for PythonOodleDecoder {
@@ -225,6 +311,375 @@ struct PyAnimationClip {
     streaming_size: Option<u32>,
     #[pyo3(get)]
     streaming_path: Option<String>,
+}
+
+/// Stable references from one legacy Unity `Animation` component.
+#[pyclass(name = "LegacyAnimation", frozen, get_all)]
+#[derive(Debug)]
+struct PyLegacyAnimation {
+    path_id: i64,
+    game_object: PyObjectReference,
+    enabled: u8,
+    default_clip: PyObjectReference,
+    clips: Vec<PyObjectReference>,
+    trailing_bytes: u64,
+}
+
+/// Stable controller and clip substitutions from `AnimatorOverrideController`.
+#[pyclass(name = "AnimatorOverrideController", frozen, get_all)]
+#[derive(Debug)]
+struct PyAnimatorOverrideController {
+    path_id: i64,
+    name: String,
+    controller: PyObjectReference,
+    clip_overrides: Vec<PyAnimationClipOverride>,
+    trailing_bytes: u64,
+}
+
+/// Bounded preload and named-container metadata from one Unity `AssetBundle`.
+#[pyclass(name = "AssetBundle", frozen, get_all)]
+#[derive(Debug)]
+struct PyAssetBundle {
+    path_id: i64,
+    name: String,
+    object_name: String,
+    asset_bundle_name: Option<String>,
+    preload_table: Vec<PyObjectReference>,
+    container: Vec<PyAssetBundleContainerEntry>,
+    dependencies: Vec<String>,
+    is_streamed_scene_asset_bundle: bool,
+}
+
+/// Bounded named-container metadata from one Unity `ResourceManager`.
+#[pyclass(name = "ResourceManager", frozen, get_all)]
+#[derive(Debug)]
+struct PyResourceManager {
+    path_id: i64,
+    container: Vec<PyResourceManagerContainerEntry>,
+}
+
+/// Bounded object-reference metadata from one Unity `PreloadData`.
+#[pyclass(name = "PreloadData", frozen, get_all)]
+#[derive(Debug)]
+struct PyPreloadData {
+    path_id: i64,
+    name: String,
+    assets: Vec<PyObjectReference>,
+}
+
+/// Serialized composite key used by a `SpriteAtlas` render-data entry.
+#[pyclass(name = "SpriteAtlasRenderDataKey", frozen)]
+#[derive(Debug)]
+struct PySpriteAtlasRenderDataKey {
+    guid_bytes: [u8; 16],
+    value: i64,
+}
+
+#[pymethods]
+impl PySpriteAtlasRenderDataKey {
+    /// Returns the GUID in Unity's original serialized byte order.
+    #[getter]
+    fn guid_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.guid_bytes)
+    }
+
+    #[getter]
+    const fn value(&self) -> i64 {
+        self.value
+    }
+}
+
+/// One optional secondary texture named by a `SpriteAtlas` entry.
+#[pyclass(name = "SpriteAtlasSecondaryTexture", frozen, get_all)]
+#[derive(Debug)]
+struct PySpriteAtlasSecondaryTexture {
+    texture: PyObjectReference,
+    name: String,
+}
+
+/// Complete crop, texture and packing metadata for one atlas key.
+#[pyclass(name = "SpriteAtlasRenderData", frozen)]
+#[derive(Debug)]
+struct PySpriteAtlasRenderData {
+    key: Py<PySpriteAtlasRenderDataKey>,
+    #[pyo3(get)]
+    texture: PyObjectReference,
+    #[pyo3(get)]
+    alpha_texture: PyObjectReference,
+    #[pyo3(get)]
+    texture_rect: (f32, f32, f32, f32),
+    #[pyo3(get)]
+    texture_rect_offset: (f32, f32),
+    #[pyo3(get)]
+    atlas_rect_offset: (f32, f32),
+    #[pyo3(get)]
+    uv_transform: (f32, f32, f32, f32),
+    #[pyo3(get)]
+    downscale_multiplier: f32,
+    #[pyo3(get)]
+    settings_raw: u32,
+    #[pyo3(get)]
+    packed: bool,
+    #[pyo3(get)]
+    packing_mode: u8,
+    #[pyo3(get)]
+    packing_rotation: u8,
+    #[pyo3(get)]
+    mesh_type: u8,
+    secondary_textures: Option<Vec<Py<PySpriteAtlasSecondaryTexture>>>,
+}
+
+#[pymethods]
+impl PySpriteAtlasRenderData {
+    #[getter]
+    fn key(&self, py: Python<'_>) -> Py<PySpriteAtlasRenderDataKey> {
+        self.key.clone_ref(py)
+    }
+
+    #[getter]
+    fn secondary_textures(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Option<Vec<Py<PySpriteAtlasSecondaryTexture>>>> {
+        self.secondary_textures
+            .as_deref()
+            .map(|textures| clone_python_references(py, textures, "SpriteAtlas secondary textures"))
+            .transpose()
+    }
+}
+
+/// Complete, bounded metadata from one Unity `SpriteAtlas` object.
+#[pyclass(name = "SpriteAtlas", frozen)]
+#[derive(Debug)]
+struct PySpriteAtlas {
+    #[pyo3(get)]
+    path_id: i64,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    packed_sprites: Vec<PyObjectReference>,
+    #[pyo3(get)]
+    packed_sprite_names: Vec<String>,
+    render_data_entries: Vec<Py<PySpriteAtlasRenderData>>,
+    #[pyo3(get)]
+    tag: String,
+    #[pyo3(get)]
+    is_variant: bool,
+}
+
+#[pymethods]
+impl PySpriteAtlas {
+    #[getter]
+    fn render_data_entries(&self, py: Python<'_>) -> PyResult<Vec<Py<PySpriteAtlasRenderData>>> {
+        clone_python_references(
+            py,
+            &self.render_data_entries,
+            "SpriteAtlas render-data entries",
+        )
+    }
+}
+
+/// Raw and decoded packing bits stored in one `SpriteRenderData` object.
+#[pyclass(name = "SpriteSettings", frozen)]
+#[derive(Debug)]
+struct PySpriteSettings {
+    raw: u32,
+    packed: bool,
+    packing_mode_tight: bool,
+    packing_rotation: u8,
+    mesh_type_tight: bool,
+}
+
+#[pymethods]
+impl PySpriteSettings {
+    #[getter]
+    const fn raw(&self) -> u32 {
+        self.raw
+    }
+
+    #[getter]
+    const fn packed(&self) -> bool {
+        self.packed
+    }
+
+    #[getter]
+    const fn packing_mode(&self) -> &'static str {
+        if self.packing_mode_tight {
+            "tight"
+        } else {
+            "rectangle"
+        }
+    }
+
+    #[getter]
+    const fn packing_rotation(&self) -> u8 {
+        self.packing_rotation
+    }
+
+    #[getter]
+    const fn mesh_type(&self) -> &'static str {
+        if self.mesh_type_tight {
+            "tight"
+        } else {
+            "full_rect"
+        }
+    }
+}
+
+/// Caller-configurable budgets for metadata-only `Sprite` parsing.
+#[pyclass(name = "SpriteMetadataLimits", frozen, skip_from_py_object)]
+#[derive(Debug, Clone, Copy)]
+struct PySpriteMetadataLimits {
+    entries: usize,
+    string_bytes: usize,
+    total_string_bytes: usize,
+    mesh_bytes: u64,
+}
+
+#[pymethods]
+impl PySpriteMetadataLimits {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        maximum_entries=1_000_000,
+        maximum_string_bytes=16_777_216,
+        maximum_total_string_bytes=33_554_432,
+        maximum_mesh_bytes=536_870_912
+    ))]
+    const fn new(
+        maximum_entries: usize,
+        maximum_string_bytes: usize,
+        maximum_total_string_bytes: usize,
+        maximum_mesh_bytes: u64,
+    ) -> Self {
+        Self {
+            entries: maximum_entries,
+            string_bytes: maximum_string_bytes,
+            total_string_bytes: maximum_total_string_bytes,
+            mesh_bytes: maximum_mesh_bytes,
+        }
+    }
+
+    #[getter]
+    const fn maximum_entries(&self) -> usize {
+        self.entries
+    }
+
+    #[getter]
+    const fn maximum_string_bytes(&self) -> usize {
+        self.string_bytes
+    }
+
+    #[getter]
+    const fn maximum_total_string_bytes(&self) -> usize {
+        self.total_string_bytes
+    }
+
+    #[getter]
+    const fn maximum_mesh_bytes(&self) -> u64 {
+        self.mesh_bytes
+    }
+}
+
+impl From<PySpriteMetadataLimits> for SpriteReadLimits {
+    fn from(value: PySpriteMetadataLimits) -> Self {
+        Self {
+            maximum_string_bytes: value.string_bytes,
+            maximum_total_string_bytes: value.total_string_bytes,
+            maximum_array_elements: value.entries,
+            maximum_mesh_bytes: value.mesh_bytes,
+            ..Self::default()
+        }
+    }
+}
+
+#[pyclass(name = "SpriteSecondaryTexture", frozen, get_all)]
+#[derive(Debug)]
+struct PySpriteSecondaryTexture {
+    texture: PyObjectReference,
+    name: String,
+}
+
+/// Complete resident render metadata stored directly on one `Sprite`.
+#[pyclass(name = "SpriteRenderData", frozen)]
+#[derive(Debug)]
+struct PySpriteRenderData {
+    #[pyo3(get)]
+    texture: PyObjectReference,
+    #[pyo3(get)]
+    alpha_texture: PyObjectReference,
+    secondary_textures: Vec<Py<PySpriteSecondaryTexture>>,
+    #[pyo3(get)]
+    texture_rect: (f32, f32, f32, f32),
+    #[pyo3(get)]
+    texture_rect_offset: (f32, f32),
+    #[pyo3(get)]
+    atlas_rect_offset: (f32, f32),
+    settings: Py<PySpriteSettings>,
+    #[pyo3(get)]
+    uv_transform: (f32, f32, f32, f32),
+    #[pyo3(get)]
+    downscale_multiplier: f32,
+    #[pyo3(get)]
+    mesh_triangles: Vec<PySpriteTriangle>,
+}
+
+#[pymethods]
+impl PySpriteRenderData {
+    #[getter]
+    fn secondary_textures(&self, py: Python<'_>) -> PyResult<Vec<Py<PySpriteSecondaryTexture>>> {
+        clone_python_references(py, &self.secondary_textures, "Sprite secondary textures")
+    }
+
+    #[getter]
+    fn settings(&self, py: Python<'_>) -> Py<PySpriteSettings> {
+        self.settings.clone_ref(py)
+    }
+}
+
+/// Complete, bounded metadata from one Unity `Sprite` object.
+#[pyclass(name = "SpriteMetadata", frozen)]
+#[derive(Debug)]
+struct PySpriteMetadata {
+    #[pyo3(get)]
+    object_index: usize,
+    #[pyo3(get)]
+    path_id: i64,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    rect: (f32, f32, f32, f32),
+    #[pyo3(get)]
+    offset: (f32, f32),
+    #[pyo3(get)]
+    border: (f32, f32, f32, f32),
+    #[pyo3(get)]
+    pixels_to_units: f32,
+    #[pyo3(get)]
+    pivot: (f32, f32),
+    #[pyo3(get)]
+    extrude: u32,
+    #[pyo3(get)]
+    is_polygon: bool,
+    render_data_key: Option<Py<PySpriteAtlasRenderDataKey>>,
+    #[pyo3(get)]
+    atlas_tags: Vec<String>,
+    #[pyo3(get)]
+    sprite_atlas: PyObjectReference,
+    render_data: Py<PySpriteRenderData>,
+}
+
+#[pymethods]
+impl PySpriteMetadata {
+    #[getter]
+    fn render_data_key(&self, py: Python<'_>) -> Option<Py<PySpriteAtlasRenderDataKey>> {
+        self.render_data_key.as_ref().map(|key| key.clone_ref(py))
+    }
+
+    #[getter]
+    fn render_data(&self, py: Python<'_>) -> Py<PySpriteRenderData> {
+        self.render_data.clone_ref(py)
+    }
 }
 
 /// Validated metadata from one source-bound ACL 2.x `compressed_tracks` blob.
@@ -367,85 +822,69 @@ impl PyMonoBehaviourSchema {
         unity_version=None
     ))]
     fn new(
+        py: Python<'_>,
         assembly_name: String,
         class_name: String,
-        nodes: Vec<(String, String, u32, bool)>,
+        nodes: &Bound<'_, PyList>,
         namespace: Option<String>,
         unity_version: Option<String>,
     ) -> PyResult<Self> {
         let namespace = namespace.unwrap_or_default();
-        if nodes.is_empty() {
-            return Err(PyValueError::new_err(
-                "MonoBehaviour schema must contain a root node",
-            ));
-        }
-        if nodes.len() > MAXIMUM_SCHEMA_NODES {
-            return Err(PyValueError::new_err(format!(
-                "MonoBehaviour schema has {} nodes; maximum is {MAXIMUM_SCHEMA_NODES}",
-                nodes.len()
-            )));
-        }
-        let mut total_string_bytes = checked_schema_string_bytes(
+        let initial_string_bytes = checked_schema_string_bytes(
             [&assembly_name, &namespace, &class_name]
                 .into_iter()
                 .map(String::as_str),
         )?;
-        let mut tree_nodes = Vec::new();
-        tree_nodes.try_reserve_exact(nodes.len()).map_err(|error| {
-            PyMemoryError::new_err(format!(
-                "cannot allocate MonoBehaviour schema nodes: {error}"
-            ))
-        })?;
-        for (index, (type_name, field_name, level, align)) in nodes.into_iter().enumerate() {
-            total_string_bytes = total_string_bytes
-                .checked_add(type_name.len())
-                .and_then(|value| value.checked_add(field_name.len()))
-                .ok_or_else(|| PyValueError::new_err("MonoBehaviour schema strings overflowed"))?;
-            if total_string_bytes > MAXIMUM_SCHEMA_STRING_BYTES {
-                return Err(PyValueError::new_err(format!(
-                    "MonoBehaviour schema strings exceed {MAXIMUM_SCHEMA_STRING_BYTES} bytes"
-                )));
+        let nodes = extract_schema_nodes(nodes, initial_string_bytes)?;
+        py.detach(move || {
+            let mut tree_nodes = Vec::new();
+            tree_nodes.try_reserve_exact(nodes.len()).map_err(|error| {
+                PyMemoryError::new_err(format!(
+                    "cannot allocate MonoBehaviour schema nodes: {error}"
+                ))
+            })?;
+            for (index, (type_name, field_name, level, align)) in nodes.into_iter().enumerate() {
+                tree_nodes.push(TypeTreeNode {
+                    type_name,
+                    field_name,
+                    byte_size: -1,
+                    index: i32::try_from(index).map_err(|_| {
+                        PyValueError::new_err("MonoBehaviour schema node index exceeds i32")
+                    })?,
+                    type_flags: 0,
+                    version: 1,
+                    meta_flags: if align { 0x4000 } else { 0 },
+                    level,
+                    type_string_offset: None,
+                    name_string_offset: None,
+                    reference_type_hash: 0,
+                });
             }
-            tree_nodes.push(TypeTreeNode {
-                type_name,
-                field_name,
-                byte_size: -1,
-                index: i32::try_from(index).map_err(|_| {
-                    PyValueError::new_err("MonoBehaviour schema node index exceeds i32")
-                })?,
-                type_flags: 0,
-                version: 1,
-                meta_flags: if align { 0x4000 } else { 0 },
-                level,
-                type_string_offset: None,
-                name_string_offset: None,
-                reference_type_hash: 0,
-            });
-        }
-        let node_count = tree_nodes.len();
-        let mut registry = MonoBehaviourSchemaRegistry::new();
-        registry
-            .push(MonoBehaviourSchemaEntry {
-                assembly_name: try_copy_string(&assembly_name, "schema assembly name")?,
-                namespace: try_copy_string(&namespace, "schema namespace")?,
-                class_name: try_copy_string(&class_name, "schema class name")?,
-                unity_version: try_copy_optional_string(
-                    unity_version.as_deref(),
-                    "schema Unity version",
-                )?,
-                tree: TypeTree {
-                    nodes: tree_nodes,
-                    string_buffer: Vec::new(),
-                },
+            let node_count = tree_nodes.len();
+            let mut registry = MonoBehaviourSchemaRegistry::new();
+            registry
+                .push(MonoBehaviourSchemaEntry {
+                    assembly_name: try_copy_string(&assembly_name, "schema assembly name")?,
+                    namespace: try_copy_string(&namespace, "schema namespace")?,
+                    class_name: try_copy_string(&class_name, "schema class name")?,
+                    unity_version: try_copy_optional_string(
+                        unity_version.as_deref(),
+                        "schema Unity version",
+                    )?,
+                    tree: TypeTree {
+                        nodes: tree_nodes,
+                        string_buffer: Vec::new(),
+                    },
+                })
+                .map_err(core_error)?;
+            Ok(Self {
+                assembly_name,
+                namespace,
+                class_name,
+                unity_version,
+                node_count,
+                registry: Arc::new(registry),
             })
-            .map_err(core_error)?;
-        Ok(Self {
-            assembly_name,
-            namespace,
-            class_name,
-            unity_version,
-            node_count,
-            registry: Arc::new(registry),
         })
     }
 
@@ -520,15 +959,11 @@ struct PyMonoBehaviourSchemas {
 #[pymethods]
 impl PyMonoBehaviourSchemas {
     #[new]
-    fn new(py: Python<'_>, schemas: Vec<Py<PyMonoBehaviourSchema>>) -> PyResult<Self> {
-        let mut entries = Vec::new();
-        entries.try_reserve_exact(schemas.len()).map_err(|error| {
-            PyMemoryError::new_err(format!(
-                "cannot allocate MonoBehaviour schema collection: {error}"
-            ))
-        })?;
-        for schema in schemas {
-            let schema = schema.borrow(py);
+    fn new(schemas: &Bound<'_, PyList>) -> PyResult<Self> {
+        let mut entries =
+            reserve_metadata(schemas.len(), "MonoBehaviour schema collection entries")?;
+        for schema in schemas.iter() {
+            let schema: PyRef<'_, PyMonoBehaviourSchema> = schema.extract()?;
             entries.push(PythonSchemaProviderEntry {
                 unity_version: try_copy_optional_string(
                     schema.unity_version.as_deref(),
@@ -743,11 +1178,14 @@ struct PyCubismMotionTargets {
 impl PyCubismMotionTargets {
     #[new]
     #[pyo3(signature = (*, parameters=None, parts=None))]
-    fn new(parameters: Option<Vec<String>>, parts: Option<Vec<String>>) -> Self {
-        Self {
-            parameters: parameters.unwrap_or_default(),
-            parts: parts.unwrap_or_default(),
-        }
+    fn new(
+        parameters: Option<&Bound<'_, PyList>>,
+        parts: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            parameters: copy_python_string_list(parameters, "Cubism parameter names")?,
+            parts: copy_python_string_list(parts, "Cubism part names")?,
+        })
     }
 }
 
@@ -1207,11 +1645,15 @@ struct PyExtractionLimits {
     expanded_bytes: u64,
     output_bytes: u64,
     path_bytes: usize,
+    total_path_bytes: usize,
 }
 
 #[pymethods]
 impl PyExtractionLimits {
     #[new]
+    // PyO3 exposes these as named-only policy fields; grouping them would make
+    // the Python constructor less explicit without reducing the public surface.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         *,
         maximum_input_files=1_000_000,
@@ -1220,7 +1662,8 @@ impl PyExtractionLimits {
         maximum_single_entry_bytes=536_870_912,
         maximum_expanded_bytes=4_294_967_296,
         maximum_output_bytes=4_294_967_296,
-        maximum_path_bytes=32_767
+        maximum_path_bytes=32_767,
+        maximum_total_path_bytes=67_108_864
     ))]
     const fn new(
         maximum_input_files: usize,
@@ -1230,6 +1673,7 @@ impl PyExtractionLimits {
         maximum_expanded_bytes: u64,
         maximum_output_bytes: u64,
         maximum_path_bytes: usize,
+        maximum_total_path_bytes: usize,
     ) -> Self {
         Self {
             input_files: maximum_input_files,
@@ -1239,6 +1683,7 @@ impl PyExtractionLimits {
             expanded_bytes: maximum_expanded_bytes,
             output_bytes: maximum_output_bytes,
             path_bytes: maximum_path_bytes,
+            total_path_bytes: maximum_total_path_bytes,
         }
     }
 
@@ -1275,6 +1720,11 @@ impl PyExtractionLimits {
     #[getter]
     const fn maximum_path_bytes(&self) -> usize {
         self.path_bytes
+    }
+
+    #[getter]
+    const fn maximum_total_path_bytes(&self) -> usize {
+        self.total_path_bytes
     }
 }
 
@@ -1342,6 +1792,7 @@ impl From<PyExtractionLimits> for ExtractionLimits {
             maximum_expanded_bytes: value.expanded_bytes,
             maximum_output_bytes: value.output_bytes,
             maximum_path_bytes: value.path_bytes,
+            maximum_total_path_bytes: value.total_path_bytes,
             compression: CompressionLimits {
                 maximum_input_bytes: value.single_entry_bytes,
                 maximum_output_bytes: value.single_entry_bytes,
@@ -1816,6 +2267,8 @@ impl PyAssetStudio {
         maximum_input_files=1_000_000,
         maximum_input_directories=1_000_000,
         maximum_directory_entries=2_000_000,
+        maximum_path_bytes=1_048_576,
+        maximum_total_path_bytes=67_108_864,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
         unity_cn_key=None
@@ -1830,6 +2283,8 @@ impl PyAssetStudio {
         maximum_input_files: usize,
         maximum_input_directories: usize,
         maximum_directory_entries: usize,
+        maximum_path_bytes: usize,
+        maximum_total_path_bytes: usize,
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
         unity_cn_key: Option<Py<PyAny>>,
@@ -1841,6 +2296,8 @@ impl PyAssetStudio {
                 maximum_input_files,
                 maximum_input_directories,
                 maximum_directory_entries,
+                maximum_path_bytes,
+                maximum_total_path_bytes,
                 ..AssetLoadLimits::default()
             },
             unity_version_override,
@@ -1861,19 +2318,36 @@ impl PyAssetStudio {
         name="memory.assets",
         unity_version=None,
         maximum_bytes=4_294_967_296,
+        maximum_path_bytes=1_048_576,
+        maximum_total_path_bytes=67_108_864,
         oodle_decoder=None
     ))]
+    // PyO3 keyword arguments are the Python signature, so they cannot be
+    // grouped into a struct without changing the public API.
+    #[allow(clippy::too_many_arguments)]
     fn from_bytes(
         py: Python<'_>,
         data: &Bound<'_, PyBytes>,
         name: &str,
         unity_version: Option<String>,
         maximum_bytes: u64,
+        maximum_path_bytes: usize,
+        maximum_total_path_bytes: usize,
         oodle_decoder: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let bytes = copy_python_input(data.as_bytes(), maximum_bytes)?;
-        let name = try_copy_string(name, "in-memory input name")?;
+        let name = copy_python_input_name(
+            name,
+            maximum_path_bytes,
+            maximum_total_path_bytes,
+            "in-memory input name",
+        )?;
         let options = AssetLoadOptions {
+            limits: AssetLoadLimits {
+                maximum_path_bytes,
+                maximum_total_path_bytes,
+                ..AssetLoadLimits::default()
+            },
             unity_version_override: parse_unity_version_override(unity_version)?,
             oodle_decoder: python_oodle_decoder(py, oodle_decoder)?,
             ..AssetLoadOptions::default()
@@ -1894,6 +2368,8 @@ impl PyAssetStudio {
         maximum_files=100_000,
         maximum_file_bytes=536_870_912,
         maximum_total_bytes=4_294_967_296,
+        maximum_path_bytes=1_048_576,
+        maximum_total_path_bytes=67_108_864,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
         unity_cn_key=None
@@ -1903,27 +2379,32 @@ impl PyAssetStudio {
     #[allow(clippy::too_many_arguments)]
     fn from_memory_files(
         py: Python<'_>,
-        files: Vec<(String, Py<PyBytes>)>,
+        files: &Bound<'_, PyList>,
         unity_version: Option<String>,
         maximum_files: usize,
         maximum_file_bytes: u64,
         maximum_total_bytes: u64,
+        maximum_path_bytes: usize,
+        maximum_total_path_bytes: usize,
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
         unity_cn_key: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let inputs = copy_python_files(
-            py,
             files,
             maximum_files,
             maximum_file_bytes,
             maximum_total_bytes,
+            maximum_path_bytes,
+            maximum_total_path_bytes,
         )?;
         let options = AssetLoadOptions {
             limits: AssetLoadLimits {
                 maximum_input_files: maximum_files,
                 maximum_expanded_bytes: maximum_total_bytes,
                 maximum_single_entry_bytes: maximum_file_bytes,
+                maximum_path_bytes,
+                maximum_total_path_bytes,
                 ..AssetLoadLimits::default()
             },
             unity_version_override: parse_unity_version_override(unity_version)?,
@@ -2183,7 +2664,10 @@ impl PyAssetStudio {
             return Err(PyTypeError::new_err("acl_decoder must be callable"));
         }
         let bytes = py.detach(|| {
-            let decoder = acl_decoder.map(|callback| PythonAclDecoder { callback });
+            let decoder = acl_decoder.map(|callback| PythonAclDecoder {
+                callback,
+                limits: AclDecodeLimits::default(),
+            });
             self.studio
                 .read_fbx_binary_with_acl_decoder(
                     maximum_bytes,
@@ -2210,7 +2694,10 @@ impl PyAssetStudio {
             return Err(PyTypeError::new_err("acl_decoder must be callable"));
         }
         let bytes = py.detach(|| {
-            let decoder = acl_decoder.map(|callback| PythonAclDecoder { callback });
+            let decoder = acl_decoder.map(|callback| PythonAclDecoder {
+                callback,
+                limits: AclDecodeLimits::default(),
+            });
             self.studio
                 .read_fbx_with_acl_decoder(
                     maximum_bytes,
@@ -2269,7 +2756,10 @@ impl PyAssetStudio {
         }
         let bytes = py
             .detach(|| {
-                let decoder = acl_decoder.map(|callback| PythonAclDecoder { callback });
+                let decoder = acl_decoder.map(|callback| PythonAclDecoder {
+                    callback,
+                    limits: AclDecodeLimits::default(),
+                });
                 self.studio.read_game_object_fbx_with_acl_decoder(
                     SceneObjectKey {
                         file_index,
@@ -2403,23 +2893,22 @@ impl PyAssetStudio {
         maximum_bytes: u64,
         texture_limits: Option<PyRef<'_, PyModelTextureLimits>>,
     ) -> PyResult<PyTexturedFbx> {
+        let maximum = usize::try_from(maximum_bytes)
+            .map_err(|_| PyValueError::new_err("maximum_bytes does not fit this platform"))?;
         let texture_format = parse_image_format(texture_format)?;
         let texture_limits = texture_limits.map_or_else(SceneTextureLimits::default, |limits| {
             SceneTextureLimits::from(*limits)
         });
-        let (fbx, textures) = py
-            .detach(|| {
-                let mut fbx = Vec::new();
-                self.studio
-                    .write_fbx_with_textures(
-                        &mut fbx,
-                        maximum_bytes,
-                        texture_format,
-                        texture_limits,
-                    )
-                    .map(|(_, textures)| (fbx, textures))
+        let (fbx, textures) = py.detach(|| {
+            materialize_python_output(maximum, "ASCII FBX with textures", |output| {
+                self.studio.write_fbx_with_textures(
+                    output,
+                    maximum_bytes,
+                    texture_format,
+                    texture_limits,
+                )
             })
-            .map_err(core_error)?;
+        })?;
         let texture_files = model_files(py, textures.textures)?;
         let skipped = skipped_textures(textures.skipped)?;
         Ok(PyTexturedFbx {
@@ -2518,6 +3007,211 @@ impl PyAssetStudio {
             streaming_offset: streaming.map(|value| value.offset),
             streaming_size: streaming.map(|value| value.size),
             streaming_path,
+        })
+    }
+
+    /// Parses the stable `GameObject`, default clip, and ordered clip table
+    /// from one legacy Unity `Animation` component.
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=268_435_456))]
+    fn read_legacy_animation(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_bytes: u64,
+    ) -> PyResult<PyLegacyAnimation> {
+        let limits = animation_component_limits(maximum_bytes)?;
+        let animation = py.detach(|| {
+            self.object(file_index, path_id)?
+                .read_legacy_animation(limits)
+                .map_err(core_error)
+        })?;
+        let mut clips = reserve_metadata(
+            animation.clips.len(),
+            "Python legacy Animation clip references",
+        )?;
+        for reference in animation.clips {
+            clips.push(object_reference_tuple(reference));
+        }
+        Ok(PyLegacyAnimation {
+            path_id: animation.path_id,
+            game_object: object_reference_tuple(animation.behaviour.component.game_object),
+            enabled: animation.behaviour.enabled,
+            default_clip: object_reference_tuple(animation.default_clip),
+            clips,
+            trailing_bytes: animation.trailing_bytes,
+        })
+    }
+
+    /// Parses one bounded `AnimatorOverrideController` controller reference
+    /// and ordered `(original, replacement)` clip table.
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=268_435_456))]
+    fn read_animator_override_controller(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_bytes: u64,
+    ) -> PyResult<PyAnimatorOverrideController> {
+        let limits = animation_component_limits(maximum_bytes)?;
+        let controller = py.detach(|| {
+            self.object(file_index, path_id)?
+                .read_animator_override_controller(limits)
+                .map_err(core_error)
+        })?;
+        let mut clip_overrides = reserve_metadata(
+            controller.clips.len(),
+            "Python AnimatorOverrideController clip overrides",
+        )?;
+        for pair in controller.clips {
+            clip_overrides.push((
+                object_reference_tuple(pair.original_clip),
+                object_reference_tuple(pair.override_clip),
+            ));
+        }
+        Ok(PyAnimatorOverrideController {
+            path_id: controller.path_id,
+            name: controller.name,
+            controller: object_reference_tuple(controller.controller),
+            clip_overrides,
+            trailing_bytes: controller.trailing_bytes,
+        })
+    }
+
+    /// Parses one bounded Unity `AssetBundle` preload and named-container table.
+    #[pyo3(signature = (
+        file_index,
+        path_id,
+        *,
+        maximum_entries=1_000_000,
+        maximum_string_bytes=16_777_216,
+        maximum_total_string_bytes=67_108_864
+    ))]
+    fn read_asset_bundle(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_entries: usize,
+        maximum_string_bytes: usize,
+        maximum_total_string_bytes: usize,
+    ) -> PyResult<PyAssetBundle> {
+        let limits = container_metadata_limits(
+            maximum_entries,
+            maximum_string_bytes,
+            maximum_total_string_bytes,
+        );
+        let (path_id, bundle) = py.detach(|| {
+            let object = self.object(file_index, path_id)?;
+            let path_id = object.path_id();
+            object
+                .read_asset_bundle(limits)
+                .map(|bundle| (path_id, bundle))
+                .map_err(core_error)
+        })?;
+        let mut preload_table = reserve_metadata(
+            bundle.preload_table.len(),
+            "Python AssetBundle preload references",
+        )?;
+        for reference in bundle.preload_table {
+            preload_table.push(object_reference_tuple(reference));
+        }
+        let mut container = reserve_metadata(
+            bundle.container.len(),
+            "Python AssetBundle container entries",
+        )?;
+        for entry in bundle.container {
+            container.push((
+                entry.key,
+                entry.preload_index,
+                entry.preload_size,
+                object_reference_tuple(entry.asset),
+            ));
+        }
+        Ok(PyAssetBundle {
+            path_id,
+            name: bundle.name,
+            object_name: bundle.object_name,
+            asset_bundle_name: bundle.asset_bundle_name,
+            preload_table,
+            container,
+            dependencies: bundle.dependencies,
+            is_streamed_scene_asset_bundle: bundle.is_streamed_scene_asset_bundle,
+        })
+    }
+
+    /// Parses one bounded Unity `ResourceManager` named-container table.
+    #[pyo3(signature = (
+        file_index,
+        path_id,
+        *,
+        maximum_entries=1_000_000,
+        maximum_string_bytes=16_777_216,
+        maximum_total_string_bytes=67_108_864
+    ))]
+    fn read_resource_manager(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_entries: usize,
+        maximum_string_bytes: usize,
+        maximum_total_string_bytes: usize,
+    ) -> PyResult<PyResourceManager> {
+        let limits = container_metadata_limits(
+            maximum_entries,
+            maximum_string_bytes,
+            maximum_total_string_bytes,
+        );
+        let (path_id, manager) = py.detach(|| {
+            let object = self.object(file_index, path_id)?;
+            let path_id = object.path_id();
+            object
+                .read_resource_manager(limits)
+                .map(|manager| (path_id, manager))
+                .map_err(core_error)
+        })?;
+        let mut container = reserve_metadata(
+            manager.container.len(),
+            "Python ResourceManager container entries",
+        )?;
+        for entry in manager.container {
+            container.push((entry.key, object_reference_tuple(entry.asset)));
+        }
+        Ok(PyResourceManager { path_id, container })
+    }
+
+    /// Parses one bounded Unity `PreloadData` object-reference table.
+    #[pyo3(signature = (file_index, path_id, *, maximum_entries=1_000_000))]
+    fn read_preload_data(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_entries: usize,
+    ) -> PyResult<PyPreloadData> {
+        let limits = container_metadata_limits(
+            maximum_entries,
+            ContainerMetadataReadLimits::default().maximum_string_bytes,
+            ContainerMetadataReadLimits::default().maximum_total_string_bytes,
+        );
+        let (path_id, preload) = py.detach(|| {
+            let object = self.object(file_index, path_id)?;
+            let path_id = object.path_id();
+            object
+                .read_preload_data(limits)
+                .map(|preload| (path_id, preload))
+                .map_err(core_error)
+        })?;
+        let mut assets =
+            reserve_metadata(preload.assets.len(), "Python PreloadData asset references")?;
+        for reference in preload.assets {
+            assets.push(object_reference_tuple(reference));
+        }
+        Ok(PyPreloadData {
+            path_id,
+            name: preload.name,
+            assets,
         })
     }
 
@@ -2684,20 +3378,24 @@ impl PyAssetStudio {
                 .ok_or_else(|| {
                     PyValueError::new_err("AnimationClip does not contain ACL tracks")
                 })?;
-            acl.decode_with(
-                &PythonAclDecoder { callback: decoder },
-                AclDecodeLimits {
-                    input: AclDecoderInputLimits {
-                        compressed_tracks: AclCompressedTracksLimits {
-                            maximum_compressed_bytes: maximum_bytes,
-                            ..AclCompressedTracksLimits::default()
-                        },
-                        maximum_decoder_map_entries: 2_000_000,
-                        maximum_materialized_bytes: maximum_bytes,
+            let decode_limits = AclDecodeLimits {
+                input: AclDecoderInputLimits {
+                    compressed_tracks: AclCompressedTracksLimits {
+                        maximum_compressed_bytes: maximum_bytes,
+                        ..AclCompressedTracksLimits::default()
                     },
-                    maximum_values,
-                    ..AclDecodeLimits::default()
+                    maximum_decoder_map_entries: 2_000_000,
+                    maximum_materialized_bytes: maximum_bytes,
                 },
+                maximum_values,
+                ..AclDecodeLimits::default()
+            };
+            acl.decode_with(
+                &PythonAclDecoder {
+                    callback: decoder,
+                    limits: decode_limits,
+                },
+                decode_limits,
             )
             .map_err(core_error)
         })?;
@@ -2985,6 +3683,144 @@ impl PyAssetStudio {
         Ok(output)
     }
 
+    /// Parses one complete, bounded Unity `SpriteAtlas` metadata table.
+    #[pyo3(signature = (
+        file_index,
+        path_id,
+        *,
+        maximum_entries=1_000_000,
+        maximum_string_bytes=16_777_216,
+        maximum_total_string_bytes=33_554_432
+    ))]
+    fn read_sprite_atlas(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_entries: usize,
+        maximum_string_bytes: usize,
+        maximum_total_string_bytes: usize,
+    ) -> PyResult<PySpriteAtlas> {
+        let limits = SpriteAtlasReadLimits {
+            maximum_string_bytes,
+            maximum_total_string_bytes,
+            maximum_packed_sprites: maximum_entries,
+            maximum_packed_sprite_names: maximum_entries,
+            maximum_render_data_entries: maximum_entries,
+            maximum_secondary_textures: maximum_entries,
+        };
+        let atlas = py.detach(|| {
+            self.object(file_index, path_id)?
+                .read_sprite_atlas(limits)
+                .map_err(core_error)
+        })?;
+
+        let mut packed_sprites = reserve_metadata(
+            atlas.packed_sprites.len(),
+            "Python SpriteAtlas packed sprite references",
+        )?;
+        for reference in atlas.packed_sprites {
+            packed_sprites.push(object_reference_tuple(reference));
+        }
+
+        let mut render_data_entries = reserve_metadata(
+            atlas.render_data_entries.len(),
+            "Python SpriteAtlas render-data entries",
+        )?;
+        for entry in atlas.render_data_entries {
+            let key = Py::new(
+                py,
+                PySpriteAtlasRenderDataKey {
+                    guid_bytes: entry.key.guid_bytes,
+                    value: entry.key.value,
+                },
+            )?;
+            let settings = entry.data.settings;
+            let secondary_textures = entry
+                .data
+                .secondary_textures
+                .map(|textures| {
+                    let mut output =
+                        reserve_metadata(textures.len(), "Python SpriteAtlas secondary textures")?;
+                    for texture in textures {
+                        output.push(Py::new(
+                            py,
+                            PySpriteAtlasSecondaryTexture {
+                                texture: object_reference_tuple(texture.texture),
+                                name: texture.name,
+                            },
+                        )?);
+                    }
+                    Ok::<_, PyErr>(output)
+                })
+                .transpose()?;
+            render_data_entries.push(Py::new(
+                py,
+                PySpriteAtlasRenderData {
+                    key,
+                    texture: object_reference_tuple(entry.data.texture),
+                    alpha_texture: object_reference_tuple(entry.data.alpha_texture),
+                    texture_rect: (
+                        entry.data.texture_rect.x,
+                        entry.data.texture_rect.y,
+                        entry.data.texture_rect.width,
+                        entry.data.texture_rect.height,
+                    ),
+                    texture_rect_offset: (
+                        entry.data.texture_rect_offset.x,
+                        entry.data.texture_rect_offset.y,
+                    ),
+                    atlas_rect_offset: (
+                        entry.data.atlas_rect_offset.x,
+                        entry.data.atlas_rect_offset.y,
+                    ),
+                    uv_transform: (
+                        entry.data.uv_transform.x,
+                        entry.data.uv_transform.y,
+                        entry.data.uv_transform.z,
+                        entry.data.uv_transform.w,
+                    ),
+                    downscale_multiplier: entry.data.downscale_multiplier,
+                    settings_raw: settings.raw,
+                    packed: settings.packed(),
+                    packing_mode: settings.packing_mode(),
+                    packing_rotation: settings.packing_rotation(),
+                    mesh_type: settings.mesh_type(),
+                    secondary_textures,
+                },
+            )?);
+        }
+
+        Ok(PySpriteAtlas {
+            path_id: atlas.path_id,
+            name: atlas.name,
+            packed_sprites,
+            packed_sprite_names: atlas.packed_sprite_names,
+            render_data_entries,
+            tag: atlas.tag,
+            is_variant: atlas.is_variant,
+        })
+    }
+
+    /// Parses one complete, bounded Unity `Sprite` without resolving or
+    /// decoding its texture references.
+    #[pyo3(signature = (file_index, path_id, *, limits=None))]
+    fn read_sprite_metadata(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        limits: Option<PyRef<'_, PySpriteMetadataLimits>>,
+    ) -> PyResult<PySpriteMetadata> {
+        let limits = limits.map_or_else(SpriteReadLimits::default, |limits| (*limits).into());
+        let sprite = py.detach(|| {
+            self.object(file_index, path_id)?
+                .read_sprite(limits)
+                .map_err(core_error)
+        })?;
+        convert_sprite_metadata(py, sprite)
+    }
+
     #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
     fn read_sprite(
         &self,
@@ -3243,14 +4079,10 @@ impl PyAssetStudio {
                 .read_cubism_expression(limits)
                 .map_err(core_error)
         })?;
-        let mut json = Vec::new();
-        json.try_reserve(maximum_output_bytes.min(64 * 1024))
-            .map_err(|error| {
-                PyMemoryError::new_err(format!("cannot allocate Cubism expression JSON: {error}"))
+        let json =
+            materialize_python_bytes(maximum_output_bytes, "Cubism expression JSON", |output| {
+                expression.write_exp3_json(output, output_limit)
             })?;
-        expression
-            .write_exp3_json(&mut json, output_limit)
-            .map_err(core_error)?;
         let mut parameters = Vec::new();
         parameters
             .try_reserve(expression.parameters.len())
@@ -3372,19 +4204,17 @@ impl PyAssetStudio {
                 .read_cubism_physics(limits)
                 .map_err(core_error)
         })?;
-        let mut json = Vec::new();
-        json.try_reserve(maximum_output_bytes.min(64 * 1024))
-            .map_err(|error| {
-                PyMemoryError::new_err(format!("cannot allocate Cubism physics JSON: {error}"))
-            })?;
         // The physics document is a float document; Python has only doubles,
         // so the width changes at this boundary in both directions.
         #[expect(
             clippy::cast_possible_truncation,
             reason = "physics3.json's fps field is a float"
         )]
-        rig.write_physics3_json(motion_fps as f32, &mut json, output_limit)
-            .map_err(core_error)?;
+        let motion_fps = motion_fps as f32;
+        let json =
+            materialize_python_bytes(maximum_output_bytes, "Cubism physics JSON", |output| {
+                rig.write_physics3_json(motion_fps, output, output_limit)
+            })?;
         let input_count = checked_element_count(
             rig.sub_rigs.iter().map(|value| value.inputs.len()),
             "physics inputs",
@@ -3439,19 +4269,15 @@ impl PyAssetStudio {
                 .read_cubism_fade_motion(limits)
                 .map_err(core_error)
         })?;
-        let mut json = Vec::new();
-        json.try_reserve(maximum_output_bytes.min(64 * 1024))
-            .map_err(|error| {
-                PyMemoryError::new_err(format!("cannot allocate Cubism motion JSON: {error}"))
+        let json =
+            materialize_python_bytes(maximum_output_bytes, "Cubism motion JSON", |output| {
+                motion.write_motion3_json(
+                    &CubismMotionTargetNames::default(),
+                    force_bezier,
+                    output,
+                    output_limit,
+                )
             })?;
-        motion
-            .write_motion3_json(
-                &CubismMotionTargetNames::default(),
-                force_bezier,
-                &mut json,
-                output_limit,
-            )
-            .map_err(core_error)?;
         let keyframe_count = checked_element_count(
             motion.curves.iter().map(|curve| curve.keyframes.len()),
             "motion keyframes",
@@ -3541,7 +4367,10 @@ impl PyAssetStudio {
                 .read_cubism_clip_motion_with_acl_decoder(
                     &targets,
                     limits,
-                    &PythonAclDecoder { callback: decoder },
+                    &PythonAclDecoder {
+                        callback: decoder,
+                        limits: AclDecodeLimits::default(),
+                    },
                 )
                 .map_err(core_error)
         })?;
@@ -3652,7 +4481,10 @@ impl PyAssetStudio {
         let schema_provider = schemas.map(|schemas| Arc::clone(&schemas.provider));
         let set = py
             .detach(move || {
-                let decoder = acl_decoder.map(|callback| PythonAclDecoder { callback });
+                let decoder = acl_decoder.map(|callback| PythonAclDecoder {
+                    callback,
+                    limits: AclDecodeLimits::default(),
+                });
                 let provider = schema_provider
                     .as_deref()
                     .map(|value| value as &dyn MonoBehaviourSchemaProvider);
@@ -3693,14 +4525,9 @@ fn python_cubism_clip_motion(
     maximum_output_bytes: usize,
     output_limit: u64,
 ) -> PyResult<PyCubismClipMotion> {
-    let mut json = Vec::new();
-    json.try_reserve(maximum_output_bytes.min(64 * 1024))
-        .map_err(|error| {
-            PyMemoryError::new_err(format!("cannot allocate Cubism clip JSON: {error}"))
-        })?;
-    motion
-        .write_motion3_json(force_bezier, &mut json, output_limit)
-        .map_err(core_error)?;
+    let json = materialize_python_bytes(maximum_output_bytes, "Cubism clip JSON", |output| {
+        motion.write_motion3_json(force_bezier, output, output_limit)
+    })?;
     let keyframe_count = checked_element_count(
         motion.curves.iter().map(|curve| curve.keyframes.len()),
         "clip-motion keyframes",
@@ -3800,20 +4627,27 @@ fn parse_unity_cn_key(py: Python<'_>, value: Option<Py<PyAny>>) -> PyResult<Opti
         return Ok(None);
     };
     let bound = value.bind(py);
-    let bytes = if let Ok(text) = bound.extract::<String>() {
-        text.into_bytes()
+    let key = if let Ok(text) = bound.cast::<PyString>() {
+        let text = text.to_owned();
+        let text = text.to_cow()?;
+        copy_unity_cn_key(text.as_bytes())?
+    } else if let Ok(bytes) = bound.cast::<PyBytes>() {
+        copy_unity_cn_key(bytes.as_bytes())?
     } else {
-        bound.extract::<Vec<u8>>().map_err(|_| {
-            PyValueError::new_err("unity_cn_key must be 16 bytes or a 16-byte string")
-        })?
+        return Err(PyValueError::new_err(
+            "unity_cn_key must be 16 bytes or a 16-byte string",
+        ));
     };
-    let key: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+    Ok(Some(UnityCnKey::new(key)))
+}
+
+fn copy_unity_cn_key(bytes: &[u8]) -> PyResult<[u8; 16]> {
+    bytes.try_into().map_err(|_| {
         PyValueError::new_err(format!(
             "unity_cn_key must be exactly 16 bytes; got {}",
             bytes.len()
         ))
-    })?;
-    Ok(Some(UnityCnKey::new(key)))
+    })
 }
 
 const fn failure_policy(skip_unreadable_inputs: bool) -> LoadFailurePolicy {
@@ -3867,40 +4701,52 @@ fn copy_python_input(input: &[u8], maximum_bytes: u64) -> PyResult<Vec<u8>> {
 }
 
 fn copy_python_files(
-    py: Python<'_>,
-    files: Vec<(String, Py<PyBytes>)>,
+    files: &Bound<'_, PyList>,
     maximum_files: usize,
     maximum_file_bytes: u64,
     maximum_total_bytes: u64,
+    maximum_path_bytes: usize,
+    maximum_total_path_bytes: usize,
 ) -> PyResult<Vec<(String, Region)>> {
-    if files.len() > maximum_files {
+    let file_count = files.len();
+    if file_count > maximum_files {
         return Err(PyValueError::new_err(format!(
-            "memory input has {} files, exceeding limit {maximum_files}",
-            files.len()
+            "memory input has {file_count} files, exceeding limit {maximum_files}"
         )));
     }
     let mut inputs = Vec::new();
-    inputs.try_reserve_exact(files.len()).map_err(|error| {
+    inputs.try_reserve_exact(file_count).map_err(|error| {
         PyMemoryError::new_err(format!("cannot allocate memory input table: {error}"))
     })?;
     let mut total_bytes = 0_u64;
     let mut total_name_bytes = 0_usize;
-    for (name, data) in files {
-        if name.len() > MAXIMUM_MEMORY_FILE_NAME_BYTES {
+    for (index, file) in files.iter().enumerate() {
+        let tuple = file
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err(format!("memory input {index} must be a tuple")))?;
+        if tuple.len() != 2 {
+            return Err(PyTypeError::new_err(format!(
+                "memory input {index} must contain a name and bytes"
+            )));
+        }
+        let name_object = tuple.get_item(0)?.cast_into::<PyString>()?;
+        let data = tuple.get_item(1)?.cast_into::<PyBytes>()?;
+        let name = name_object.to_cow()?;
+        if name.len() > maximum_path_bytes {
             return Err(PyValueError::new_err(format!(
-                "memory input name has {} bytes, exceeding limit {MAXIMUM_MEMORY_FILE_NAME_BYTES}",
+                "memory input name has {} bytes, exceeding limit {maximum_path_bytes}",
                 name.len()
             )));
         }
         total_name_bytes = total_name_bytes
             .checked_add(name.len())
             .ok_or_else(|| PyValueError::new_err("memory input filename byte count overflowed"))?;
-        if total_name_bytes > MAXIMUM_TOTAL_MEMORY_FILE_NAME_BYTES {
+        if total_name_bytes > maximum_total_path_bytes {
             return Err(PyValueError::new_err(format!(
-                "memory input names exceed {MAXIMUM_TOTAL_MEMORY_FILE_NAME_BYTES} bytes"
+                "memory input names total {total_name_bytes} bytes, exceeding limit {maximum_total_path_bytes}"
             )));
         }
-        let source = data.bind(py).as_bytes();
+        let source = data.as_bytes();
         let length = u64::try_from(source.len())
             .map_err(|_| PyValueError::new_err("memory input length does not fit u64"))?;
         if length > maximum_file_bytes {
@@ -3917,11 +4763,32 @@ fn copy_python_files(
             )));
         }
         inputs.push((
-            name,
+            try_copy_string(name.as_ref(), "memory input name")?,
             Region::from_bytes(copy_python_input(source, maximum_file_bytes)?),
         ));
     }
     Ok(inputs)
+}
+
+fn copy_python_input_name(
+    value: &str,
+    maximum_path_bytes: usize,
+    maximum_total_path_bytes: usize,
+    field: &'static str,
+) -> PyResult<String> {
+    if value.len() > maximum_path_bytes {
+        return Err(PyValueError::new_err(format!(
+            "{field} has {} bytes, exceeding path limit {maximum_path_bytes}",
+            value.len()
+        )));
+    }
+    if value.len() > maximum_total_path_bytes {
+        return Err(PyValueError::new_err(format!(
+            "{field} has {} bytes, exceeding total path limit {maximum_total_path_bytes}",
+            value.len()
+        )));
+    }
+    try_copy_string(value, field)
 }
 
 fn try_copy_optional_string(value: Option<&str>, field: &'static str) -> PyResult<Option<String>> {
@@ -4076,8 +4943,82 @@ fn try_clone_extraction_failures(
     Ok(output)
 }
 
+#[cfg(windows)]
+fn for_each_path_char_lossy(
+    value: &std::ffi::OsStr,
+    mut visitor: impl FnMut(char) -> PyResult<()>,
+) -> PyResult<()> {
+    use std::char::decode_utf16;
+    use std::os::windows::ffi::OsStrExt;
+
+    for character in decode_utf16(value.encode_wide()) {
+        visitor(character.unwrap_or(char::REPLACEMENT_CHARACTER))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn for_each_path_char_lossy(
+    value: &std::ffi::OsStr,
+    mut visitor: impl FnMut(char) -> PyResult<()>,
+) -> PyResult<()> {
+    let mut input = value.as_encoded_bytes();
+    while !input.is_empty() {
+        match std::str::from_utf8(input) {
+            Ok(valid) => {
+                for character in valid.chars() {
+                    visitor(character)?;
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let valid_length = error.valid_up_to();
+                if valid_length != 0 {
+                    let valid = std::str::from_utf8(&input[..valid_length]).map_err(|_| {
+                        PyValueError::new_err("valid filesystem UTF-8 prefix could not be decoded")
+                    })?;
+                    for character in valid.chars() {
+                        visitor(character)?;
+                    }
+                }
+                visitor(char::REPLACEMENT_CHARACTER)?;
+                let invalid_length = error
+                    .error_len()
+                    .unwrap_or_else(|| input.len() - valid_length);
+                input = &input[valid_length + invalid_length..];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_lossy_utf8_length(value: &std::ffi::OsStr, field: &'static str) -> PyResult<usize> {
+    let mut length = 0_usize;
+    for_each_path_char_lossy(value, |character| {
+        length = length.checked_add(character.len_utf8()).ok_or_else(|| {
+            PyValueError::new_err(format!("{field} replacement length overflowed"))
+        })?;
+        Ok(())
+    })?;
+    Ok(length)
+}
+
 fn try_path_string(path: &std::path::Path, field: &'static str) -> PyResult<String> {
-    try_copy_string(path.to_string_lossy().as_ref(), field)
+    let value = path.as_os_str();
+    let utf8_length = path_lossy_utf8_length(value, field)?;
+    let mut copy = String::new();
+    copy.try_reserve_exact(utf8_length)
+        .map_err(|error| PyMemoryError::new_err(format!("cannot allocate {field}: {error}")))?;
+    for_each_path_char_lossy(value, |character| {
+        copy.push(character);
+        Ok(())
+    })?;
+    if copy.len() != utf8_length {
+        return Err(PyValueError::new_err(format!(
+            "{field} changed while converting the filesystem path"
+        )));
+    }
+    Ok(copy)
 }
 
 fn core_error(error: Error) -> PyErr {
@@ -4099,6 +5040,112 @@ fn python_bytes<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyByt
         output.copy_from_slice(bytes);
         Ok(())
     })
+}
+
+struct BoundedPythonOutput {
+    bytes: Vec<u8>,
+    maximum: usize,
+    field: &'static str,
+    allocation_failed: bool,
+    limit_exceeded: bool,
+}
+
+impl BoundedPythonOutput {
+    const fn new(maximum: usize, field: &'static str) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            field,
+            allocation_failed: false,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl io::Write for BoundedPythonOutput {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.len().checked_add(input.len()) else {
+            self.limit_exceeded = true;
+            return Err(io::Error::other(format!(
+                "{} length overflowed",
+                self.field
+            )));
+        };
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(io::Error::other(format!(
+                "{} exceeds {} bytes",
+                self.field, self.maximum
+            )));
+        }
+        if let Err(error) = self.bytes.try_reserve(input.len()) {
+            self.allocation_failed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("cannot allocate {}: {error}", self.field),
+            ));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn materialize_python_output<T>(
+    maximum: usize,
+    field: &'static str,
+    write: impl FnOnce(&mut BoundedPythonOutput) -> assetstudio_core::Result<(u64, T)>,
+) -> PyResult<(Vec<u8>, T)> {
+    let mut output = BoundedPythonOutput::new(maximum, field);
+    let write_result = write(&mut output);
+    if output.allocation_failed {
+        return Err(PyMemoryError::new_err(format!("cannot allocate {field}")));
+    }
+    if output.limit_exceeded {
+        return Err(PyValueError::new_err(format!(
+            "{field} exceeds {maximum} bytes"
+        )));
+    }
+    let (written, value) = write_result.map_err(python_writer_error)?;
+    let actual = u64::try_from(output.bytes.len())
+        .map_err(|_| PyValueError::new_err(format!("{field} length does not fit u64")))?;
+    if written != actual {
+        return Err(PyValueError::new_err(format!(
+            "{field} writer reported {written} bytes but produced {actual}"
+        )));
+    }
+    Ok((output.bytes, value))
+}
+
+fn materialize_python_bytes(
+    maximum: usize,
+    field: &'static str,
+    write: impl FnOnce(&mut BoundedPythonOutput) -> assetstudio_core::Result<u64>,
+) -> PyResult<Vec<u8>> {
+    materialize_python_output(maximum, field, |output| {
+        write(output).map(|written| (written, ()))
+    })
+    .map(|(bytes, ())| bytes)
+}
+
+fn python_writer_error(error: Error) -> PyErr {
+    match error {
+        Error::Io(error) if is_output_limit_error(&error) => {
+            PyValueError::new_err(error.to_string())
+        }
+        error => core_error(error),
+    }
+}
+
+fn is_output_limit_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WriteZero {
+        return true;
+    }
+    let message = error.to_string();
+    message.contains("exceeds") && (message.contains(" byte") || message.contains(" bytes"))
 }
 
 fn python_allocation_error(field: &str, error: impl std::fmt::Display) -> assetstudio_core::Error {
@@ -4129,6 +5176,71 @@ fn checked_schema_string_bytes<'a>(values: impl Iterator<Item = &'a str>) -> PyR
         )));
     }
     Ok(total)
+}
+
+fn extract_schema_nodes(
+    nodes: &Bound<'_, PyList>,
+    mut total_string_bytes: usize,
+) -> PyResult<Vec<PyMonoBehaviourSchemaNode>> {
+    let node_count = nodes.len();
+    if node_count == 0 {
+        return Err(PyValueError::new_err(
+            "MonoBehaviour schema must contain a root node",
+        ));
+    }
+    if node_count > MAXIMUM_SCHEMA_NODES {
+        return Err(PyValueError::new_err(format!(
+            "MonoBehaviour schema has {node_count} nodes; maximum is {MAXIMUM_SCHEMA_NODES}"
+        )));
+    }
+
+    let mut extracted = reserve_metadata(node_count, "MonoBehaviour schema input nodes")?;
+    for (index, node) in nodes.iter().enumerate() {
+        let tuple = node.cast::<PyTuple>().map_err(|_| {
+            PyTypeError::new_err(format!("MonoBehaviour schema node {index} must be a tuple"))
+        })?;
+        if tuple.len() != 4 {
+            return Err(PyTypeError::new_err(format!(
+                "MonoBehaviour schema node {index} must contain four values"
+            )));
+        }
+        let type_name_object = tuple.get_item(0)?.cast_into::<PyString>()?;
+        let field_name_object = tuple.get_item(1)?.cast_into::<PyString>()?;
+        let type_name = type_name_object.to_cow()?;
+        let field_name = field_name_object.to_cow()?;
+        total_string_bytes = total_string_bytes
+            .checked_add(type_name.len())
+            .and_then(|value| value.checked_add(field_name.len()))
+            .ok_or_else(|| PyValueError::new_err("MonoBehaviour schema strings overflowed"))?;
+        if total_string_bytes > MAXIMUM_SCHEMA_STRING_BYTES {
+            return Err(PyValueError::new_err(format!(
+                "MonoBehaviour schema strings exceed {MAXIMUM_SCHEMA_STRING_BYTES} bytes"
+            )));
+        }
+        extracted.push((
+            try_copy_string(type_name.as_ref(), "schema node type name")?,
+            try_copy_string(field_name.as_ref(), "schema node field name")?,
+            tuple.get_item(2)?.extract()?,
+            tuple.get_item(3)?.extract()?,
+        ));
+    }
+    Ok(extracted)
+}
+
+fn copy_python_string_list(
+    values: Option<&Bound<'_, PyList>>,
+    field: &'static str,
+) -> PyResult<Vec<String>> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    let mut copied = reserve_metadata(values.len(), field)?;
+    for value in values.iter() {
+        let value = value.cast_into::<PyString>()?;
+        let value = value.to_cow()?;
+        copied.push(try_copy_string(value.as_ref(), field)?);
+    }
+    Ok(copied)
 }
 
 fn clone_python_references<T>(
@@ -4420,15 +5532,31 @@ const fn object_key_tuple(key: SceneObjectKey) -> (usize, i64) {
     (key.file_index, key.path_id)
 }
 
+const MAXIMUM_OPTION_DIAGNOSTIC_BYTES: usize = 64;
+
+fn unsupported_option(field: &str, value: &str) -> PyErr {
+    if value.len() <= MAXIMUM_OPTION_DIAGNOSTIC_BYTES {
+        PyValueError::new_err(format!("unsupported {field} {value:?}"))
+    } else {
+        PyValueError::new_err(format!(
+            "unsupported {field} value of {} UTF-8 bytes",
+            value.len()
+        ))
+    }
+}
+
 fn parse_export_mode(value: &str) -> PyResult<ExportMode> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(ExportMode::Auto),
-        "raw" => Ok(ExportMode::Raw),
-        "typetree_json" | "json" => Ok(ExportMode::TypeTreeJson),
-        "dump_text" | "dump" => Ok(ExportMode::DumpText),
-        _ => Err(PyValueError::new_err(format!(
-            "unsupported export mode {value:?}"
-        ))),
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(ExportMode::Auto)
+    } else if value.eq_ignore_ascii_case("raw") {
+        Ok(ExportMode::Raw)
+    } else if value.eq_ignore_ascii_case("typetree_json") || value.eq_ignore_ascii_case("json") {
+        Ok(ExportMode::TypeTreeJson)
+    } else if value.eq_ignore_ascii_case("dump_text") || value.eq_ignore_ascii_case("dump") {
+        Ok(ExportMode::DumpText)
+    } else {
+        Err(unsupported_option("export mode", value))
     }
 }
 
@@ -4467,27 +5595,37 @@ fn copy_strings(source: &[String], field: &str) -> PyResult<Vec<String>> {
 }
 
 fn parse_image_format(value: &str) -> PyResult<ImageFormat> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" => Ok(ImageFormat::Jpeg),
-        "png" => Ok(ImageFormat::Png),
-        "bmp" => Ok(ImageFormat::Bmp),
-        "tga" => Ok(ImageFormat::Tga),
-        "webp" => Ok(ImageFormat::Webp),
-        "raw_rgba" | "raw-rgba" | "rgba" => Ok(ImageFormat::RawRgba),
-        _ => Err(PyValueError::new_err(format!(
-            "unsupported image format {value:?}"
-        ))),
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("jpg") || value.eq_ignore_ascii_case("jpeg") {
+        Ok(ImageFormat::Jpeg)
+    } else if value.eq_ignore_ascii_case("png") {
+        Ok(ImageFormat::Png)
+    } else if value.eq_ignore_ascii_case("bmp") {
+        Ok(ImageFormat::Bmp)
+    } else if value.eq_ignore_ascii_case("tga") {
+        Ok(ImageFormat::Tga)
+    } else if value.eq_ignore_ascii_case("webp") {
+        Ok(ImageFormat::Webp)
+    } else if value.eq_ignore_ascii_case("raw_rgba")
+        || value.eq_ignore_ascii_case("raw-rgba")
+        || value.eq_ignore_ascii_case("rgba")
+    {
+        Ok(ImageFormat::RawRgba)
+    } else {
+        Err(unsupported_option("image format", value))
     }
 }
 
 fn parse_audio_format(value: &str) -> PyResult<AudioExportFormat> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(AudioExportFormat::Auto),
-        "raw" | "none" => Ok(AudioExportFormat::Raw),
-        "wav" | "wave" => Ok(AudioExportFormat::Wav),
-        _ => Err(PyValueError::new_err(format!(
-            "unsupported audio format {value:?}"
-        ))),
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(AudioExportFormat::Auto)
+    } else if value.eq_ignore_ascii_case("raw") || value.eq_ignore_ascii_case("none") {
+        Ok(AudioExportFormat::Raw)
+    } else if value.eq_ignore_ascii_case("wav") || value.eq_ignore_ascii_case("wave") {
+        Ok(AudioExportFormat::Wav)
+    } else {
+        Err(unsupported_option("audio format", value))
     }
 }
 
@@ -4496,6 +5634,146 @@ fn simple_asset_limits(maximum_bytes: u64) -> SimpleAssetReadLimits {
         maximum_payload_bytes: maximum_bytes,
         ..SimpleAssetReadLimits::default()
     }
+}
+
+fn animation_component_limits(maximum_bytes: u64) -> PyResult<AnimationComponentReadLimits> {
+    let maximum_usize = usize::try_from(maximum_bytes)
+        .map_err(|_| PyValueError::new_err("maximum_bytes does not fit this platform"))?;
+    let maximum_clips = maximum_usize / std::mem::size_of::<AnimationClipOverride>();
+    Ok(AnimationComponentReadLimits {
+        maximum_object_bytes: maximum_bytes,
+        maximum_string_bytes: maximum_usize,
+        maximum_clips: maximum_clips.min(AnimationComponentReadLimits::default().maximum_clips),
+        maximum_reference_bytes: maximum_bytes,
+    })
+}
+
+const fn container_metadata_limits(
+    maximum_entries: usize,
+    maximum_string_bytes: usize,
+    maximum_total_string_bytes: usize,
+) -> ContainerMetadataReadLimits {
+    ContainerMetadataReadLimits {
+        maximum_preload_references: maximum_entries,
+        maximum_container_entries: maximum_entries,
+        maximum_dependencies: maximum_entries,
+        maximum_class_version_entries: maximum_entries,
+        maximum_string_bytes,
+        maximum_total_string_bytes,
+    }
+}
+
+const fn object_reference_tuple(
+    reference: assetstudio_core::serialized::ObjectReference,
+) -> PyObjectReference {
+    (reference.file_id, reference.path_id)
+}
+
+const fn sprite_object_reference_tuple(
+    reference: assetstudio_core::sprite::ObjectReference,
+) -> PyObjectReference {
+    (reference.file_id, reference.path_id)
+}
+
+fn convert_sprite_metadata(py: Python<'_>, sprite: Sprite) -> PyResult<PySpriteMetadata> {
+    let Sprite {
+        object_index,
+        path_id,
+        name,
+        rect,
+        offset,
+        border,
+        pixels_to_units,
+        pivot,
+        extrude,
+        is_polygon,
+        render_data_key,
+        atlas_tags,
+        sprite_atlas,
+        render_data,
+    } = sprite;
+    let key = render_data_key
+        .map(|(guid_bytes, value)| Py::new(py, PySpriteAtlasRenderDataKey { guid_bytes, value }))
+        .transpose()?;
+    let assetstudio_core::sprite::SpriteRenderData {
+        texture,
+        alpha_texture,
+        secondary_textures,
+        texture_rect,
+        texture_rect_offset,
+        atlas_rect_offset,
+        settings,
+        uv_transform,
+        downscale_multiplier,
+        mesh_triangles,
+    } = render_data;
+    let mut python_secondary =
+        reserve_metadata(secondary_textures.len(), "Python Sprite secondary textures")?;
+    for secondary in secondary_textures {
+        python_secondary.push(Py::new(
+            py,
+            PySpriteSecondaryTexture {
+                texture: sprite_object_reference_tuple(secondary.texture),
+                name: secondary.name,
+            },
+        )?);
+    }
+    let mut python_triangles =
+        reserve_metadata(mesh_triangles.len(), "Python Sprite mesh triangles")?;
+    for [first, second, third] in mesh_triangles {
+        python_triangles.push(((first.x, first.y), (second.x, second.y), (third.x, third.y)));
+    }
+    let python_settings = Py::new(
+        py,
+        PySpriteSettings {
+            raw: settings.raw,
+            packed: settings.packed,
+            packing_mode_tight: settings.packing_mode == SpritePackingMode::Tight,
+            packing_rotation: settings.packing_rotation,
+            mesh_type_tight: settings.mesh_type == SpriteMeshType::Tight,
+        },
+    )?;
+    let python_render_data = Py::new(
+        py,
+        PySpriteRenderData {
+            texture: sprite_object_reference_tuple(texture),
+            alpha_texture: sprite_object_reference_tuple(alpha_texture),
+            secondary_textures: python_secondary,
+            texture_rect: (
+                texture_rect.x,
+                texture_rect.y,
+                texture_rect.width,
+                texture_rect.height,
+            ),
+            texture_rect_offset: (texture_rect_offset.x, texture_rect_offset.y),
+            atlas_rect_offset: (atlas_rect_offset.x, atlas_rect_offset.y),
+            settings: python_settings,
+            uv_transform: (
+                uv_transform.x,
+                uv_transform.y,
+                uv_transform.z,
+                uv_transform.w,
+            ),
+            downscale_multiplier,
+            mesh_triangles: python_triangles,
+        },
+    )?;
+    Ok(PySpriteMetadata {
+        object_index,
+        path_id,
+        name,
+        rect: (rect.x, rect.y, rect.width, rect.height),
+        offset: (offset.x, offset.y),
+        border: (border.x, border.y, border.z, border.w),
+        pixels_to_units,
+        pivot: (pivot.x, pivot.y),
+        extrude,
+        is_polygon,
+        render_data_key: key,
+        atlas_tags,
+        sprite_atlas: sprite_object_reference_tuple(sprite_atlas),
+        render_data: python_render_data,
+    })
 }
 
 fn materialize_binary_asset(
@@ -4690,6 +5968,20 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyObjectInfo>()?;
     module.add_class::<PyResourceInfo>()?;
     module.add_class::<PyAnimationClip>()?;
+    module.add_class::<PyLegacyAnimation>()?;
+    module.add_class::<PyAnimatorOverrideController>()?;
+    module.add_class::<PyAssetBundle>()?;
+    module.add_class::<PyResourceManager>()?;
+    module.add_class::<PyPreloadData>()?;
+    module.add_class::<PySpriteAtlasRenderDataKey>()?;
+    module.add_class::<PySpriteAtlasSecondaryTexture>()?;
+    module.add_class::<PySpriteAtlasRenderData>()?;
+    module.add_class::<PySpriteAtlas>()?;
+    module.add_class::<PySpriteSettings>()?;
+    module.add_class::<PySpriteMetadataLimits>()?;
+    module.add_class::<PySpriteSecondaryTexture>()?;
+    module.add_class::<PySpriteRenderData>()?;
+    module.add_class::<PySpriteMetadata>()?;
     module.add_class::<PyAclCompressedTracks>()?;
     module.add_class::<PyAclDecodedClip>()?;
     module.add_class::<PyAnimatorController>()?;

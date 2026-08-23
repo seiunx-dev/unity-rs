@@ -13,7 +13,9 @@ from assetstudio import (
     AclDecodedClip,
     AclDecoder,
     AnimationClip,
+    AnimatorOverrideController,
     AnimatorController,
+    AssetBundle,
     AssetStudio,
     Avatar,
     AudioClip,
@@ -32,6 +34,7 @@ from assetstudio import (
     ExtractionReport,
     FbxCandidate,
     FileInfo,
+    LegacyAnimation,
     Live2dPackageSet,
     Material,
     ModelObj,
@@ -43,10 +46,21 @@ from assetstudio import (
     ObjectInfo,
     OodleDecoder,
     PlayerSettings,
+    PreloadData,
     ResourceInfo,
+    ResourceManager,
     RgbaImage,
     SceneLimits,
     SceneNode,
+    SpriteAtlas,
+    SpriteAtlasRenderData,
+    SpriteAtlasRenderDataKey,
+    SpriteAtlasSecondaryTexture,
+    SpriteMetadata,
+    SpriteMetadataLimits,
+    SpriteRenderData,
+    SpriteSecondaryTexture,
+    SpriteSettings,
     TexturedFbx,
     extract,
 )
@@ -87,10 +101,22 @@ def consume_public_api(
     schemas: MonoBehaviourSchemas,
 ) -> None:
     path = Path("fixture.assets")
-    opened: AssetStudio = AssetStudio(path, oodle_decoder=oodle_decoder)
-    memory: AssetStudio = AssetStudio.from_bytes(b"", oodle_decoder=oodle_decoder)
+    opened: AssetStudio = AssetStudio(
+        path,
+        maximum_path_bytes=1_048_576,
+        maximum_total_path_bytes=67_108_864,
+        oodle_decoder=oodle_decoder,
+    )
+    memory: AssetStudio = AssetStudio.from_bytes(
+        b"",
+        maximum_path_bytes=1_048_576,
+        maximum_total_path_bytes=67_108_864,
+        oodle_decoder=oodle_decoder,
+    )
     memory_files: AssetStudio = AssetStudio.from_memory_files(
         [("fixture.assets", b"")],
+        maximum_path_bytes=1_048_576,
+        maximum_total_path_bytes=67_108_864,
         oodle_decoder=oodle_decoder,
     )
 
@@ -100,6 +126,12 @@ def consume_public_api(
     files: list[FileInfo] = studio.files()
     objects: list[ObjectInfo] = studio.objects()
     resources: list[ResourceInfo] = studio.resources()
+    file_iterator = studio.iter_files()
+    object_iterator = studio.iter_objects()
+    resource_iterator = studio.iter_resources()
+    file_page: list[FileInfo] = studio.file_page()
+    object_page: list[ObjectInfo] = studio.object_page(0)
+    resource_page: list[ResourceInfo] = studio.resource_page()
     scene_limits = SceneLimits(maximum_game_objects=100_000)
     model_texture_limits = ModelTextureLimits(
         maximum_textures=128,
@@ -112,11 +144,13 @@ def consume_public_api(
 
     resource: bytes = studio.read_resource(0)
     resource_range: bytes = studio.read_resource_range(0, 0, 1)
+    resource_by_path: bytes = studio.read_resource_by_path("fixture.resS")
     raw: bytes = studio.read_raw(0, 1)
     text: bytes = studio.read_text(0, 1)
     shader: bytes = studio.read_shader(0, 1)
     mesh: bytes = studio.read_mesh_obj(0, 1)
     static_fbx: bytes = studio.read_static_fbx()
+    static_binary_fbx: bytes = studio.read_static_fbx_binary()
     animated_fbx: bytes = studio.read_fbx(acl_decoder=acl_decoder)
     binary_fbx: bytes = studio.read_fbx_binary(acl_decoder=acl_decoder)
     branch_fbx: bytes = studio.read_game_object_fbx(0, 1, acl_decoder=acl_decoder)
@@ -128,12 +162,35 @@ def consume_public_api(
     )
 
     animation: AnimationClip = studio.read_animation_clip(0, 1)
+    legacy_animation: LegacyAnimation = studio.read_legacy_animation(0, 1)
+    override_controller: AnimatorOverrideController = (
+        studio.read_animator_override_controller(0, 1)
+    )
+    asset_bundle: AssetBundle = studio.read_asset_bundle(0, 1)
+    resource_manager: ResourceManager = studio.read_resource_manager(0, 1)
+    preload_data: PreloadData = studio.read_preload_data(0, 1)
     acl_header: AclCompressedTracks = studio.inspect_acl_tracks(0, 1)
+    acl_decoder_input: tuple[bytes, list[int]] = studio.read_acl_decoder_input(0, 1)
     acl_values: AclDecodedClip = studio.decode_acl_tracks(0, 1, acl_decoder)
     controller: AnimatorController = studio.read_animator_controller(0, 1)
     avatar: Avatar = studio.read_avatar(0, 1)
     rgba: RgbaImage = studio.read_texture(0, 1)
     array: list[RgbaImage] = studio.read_texture_array(0, 1)
+    atlas: SpriteAtlas = studio.read_sprite_atlas(0, 1)
+    atlas_entry: SpriteAtlasRenderData = atlas.render_data_entries[0]
+    atlas_key: SpriteAtlasRenderDataKey = atlas_entry.key
+    atlas_secondary: Optional[list[SpriteAtlasSecondaryTexture]] = (
+        atlas_entry.secondary_textures
+    )
+    sprite_metadata_limits = SpriteMetadataLimits(maximum_entries=1_000)
+    sprite_metadata: SpriteMetadata = studio.read_sprite_metadata(
+        0, 1, limits=sprite_metadata_limits
+    )
+    sprite_render_data: SpriteRenderData = sprite_metadata.render_data
+    sprite_settings: SpriteSettings = sprite_render_data.settings
+    sprite_secondary: list[SpriteSecondaryTexture] = (
+        sprite_render_data.secondary_textures
+    )
     sprite: RgbaImage = studio.read_sprite(0, 1)
     audio: AudioClip = studio.read_audio_clip(0, 1)
     font: BinaryAsset = studio.read_font(0, 1)
@@ -147,6 +204,8 @@ def consume_public_api(
     mono_registry: MonoBehaviourJson = studio.read_mono_behaviour_json_with_schemas(
         0, 1, schemas
     )
+    type_tree_json: str = studio.read_type_tree_json(0, 1)
+    type_tree_dump: str = studio.read_type_tree_dump(0, 1)
 
     expression: CubismExpression = studio.read_cubism_expression(0, 1)
     pose: CubismPosePart = studio.read_cubism_pose_part(0, 1)
@@ -167,7 +226,7 @@ def consume_public_api(
     extraction_report: ExtractionReport = extract(
         path,
         path,
-        limits=ExtractionLimits(),
+        limits=ExtractionLimits(maximum_total_path_bytes=67_108_864),
         oodle_decoder=oodle_decoder,
     )
 
@@ -181,28 +240,51 @@ def consume_public_api(
         files,
         objects,
         resources,
+        file_iterator,
+        object_iterator,
+        resource_iterator,
+        file_page,
+        object_page,
+        resource_page,
         scene,
         candidates,
         animator_candidates,
         resource,
         resource_range,
+        resource_by_path,
         raw,
         text,
         shader,
         mesh,
         static_fbx,
+        static_binary_fbx,
         animated_fbx,
         binary_fbx,
         branch_fbx,
         model_obj,
         textured_fbx,
         animation,
+        legacy_animation,
+        override_controller,
+        asset_bundle,
+        resource_manager,
+        preload_data,
         acl_header,
+        acl_decoder_input,
         acl_values,
         controller,
         avatar,
         rgba,
         array,
+        atlas,
+        atlas_entry,
+        atlas_key,
+        atlas_secondary,
+        sprite_metadata,
+        sprite_metadata_limits,
+        sprite_render_data,
+        sprite_settings,
+        sprite_secondary,
         sprite,
         audio,
         font,
@@ -214,6 +296,8 @@ def consume_public_api(
         player,
         mono,
         mono_registry,
+        type_tree_json,
+        type_tree_dump,
         expression,
         pose,
         display,

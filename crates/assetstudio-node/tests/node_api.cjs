@@ -6,6 +6,8 @@ const os = require('node:os')
 const path = require('node:path')
 const addon = require('../index.js')
 
+assert.deepStrictEqual(Object.keys(addon).sort(), ['AssetStudio'])
+
 function u32(value) {
   const output = Buffer.alloc(4)
   output.writeUInt32LE(value)
@@ -88,6 +90,81 @@ function syntheticTextAsset() {
   return finishV22Asset(49, payload)
 }
 
+function syntheticLegacyAnimation() {
+  let payload = Buffer.concat([pptr(31), Buffer.from([1])])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    pptr(70),
+    i32(2),
+    pptr(71),
+    pptr(72),
+    Buffer.from([0xaa, 0xbb]),
+  ])
+  return finishV22Asset(111, payload)
+}
+
+function syntheticAnimatorOverrideController() {
+  return finishV22Asset(
+    221,
+    Buffer.concat([
+      alignedString('node override controller'),
+      pptr(90),
+      i32(2),
+      pptr(71),
+      pptr(73),
+      pptr(72),
+      pptr(74),
+      Buffer.from([0xcc]),
+    ]),
+  )
+}
+
+function syntheticContainerMetadataObjects() {
+  const assetBundle = Buffer.concat([
+    alignedString('root'),
+    i32(2),
+    pptr(11),
+    pptr(12),
+    i32(2),
+    alignedString('bundle/first'),
+    i32(0),
+    i32(1),
+    pptr(11),
+    alignedString('bundle/second'),
+    i32(1),
+    i32(1),
+    pptr(12),
+    i32(0),
+    i32(0),
+    pptr(0),
+    u32(0),
+    alignedString('node-bundle'),
+    i32(2),
+    alignedString('shared-a'),
+    alignedString('shared-b'),
+    Buffer.from([0]),
+  ])
+  const resourceManager = Buffer.concat([
+    i32(2),
+    alignedString('resource/first'),
+    pptr(21),
+    alignedString('resource/second'),
+    pptr(22),
+  ])
+  const preloadData = Buffer.concat([
+    alignedString('node-preload'),
+    i32(2),
+    pptr(31),
+    pptr(32),
+  ])
+  return finishV22Objects([
+    { classId: 142, pathId: 7, payload: assetBundle },
+    { classId: 147, pathId: 8, payload: resourceManager },
+    { classId: 150, pathId: 9, payload: preloadData },
+  ])
+}
+
 function syntheticGameObject() {
   return finishV22Asset(
     1,
@@ -131,6 +208,24 @@ function syntheticMovieTexture() {
     Buffer.from('OggS'),
   ])
   return finishV22Asset(152, payload, '2018.4.36f1')
+}
+
+// Unity before 2.6 stores raw signed PCM16. Core can wrap it in a verified WAV
+// without an external codec, which exercises a different path from simply
+// copying an existing RIFF payload.
+function syntheticLegacyPcm() {
+  return finishV22Asset(
+    83,
+    Buffer.concat([
+      alignedString('node-legacy-pcm'),
+      i32(2), // one channel: the legacy field stores channels << 1
+      f32(0),
+      i32(22_050),
+      i32(4),
+      Buffer.from([1, 2, 3, 4]),
+    ]),
+    '2.5.0f1',
+  )
 }
 
 function syntheticTexture2d() {
@@ -209,6 +304,228 @@ function texture2dPayload(name, width, height, pixels) {
     i32(pixels.length),
     pixels,
   ])
+}
+
+function spriteAtlasRenderData(
+  guidBytes,
+  value,
+  texturePathId,
+  alphaTexturePathId,
+  rectangle,
+  textureOffset,
+  atlasOffset,
+  uvTransform,
+  downscale,
+  settings,
+  secondaryTextures,
+) {
+  let payload = Buffer.concat([
+    guidBytes,
+    i64(value),
+    pptr(texturePathId),
+    pptr(alphaTexturePathId),
+    f32s(rectangle),
+    f32s(textureOffset),
+    f32s(atlasOffset),
+    f32s(uvTransform),
+    f32(downscale),
+    u32(settings),
+    i32(secondaryTextures.length),
+  ])
+  for (const secondary of secondaryTextures) {
+    payload = Buffer.concat([
+      payload,
+      pptr(secondary.pathId),
+      alignedString(secondary.name),
+    ])
+  }
+  return align(payload, 4)
+}
+
+function syntheticSpriteAtlas() {
+  const higherKey = Buffer.concat([Buffer.from([1]), Buffer.alloc(15)])
+  const lowerKey = Buffer.alloc(16)
+  const payload = Buffer.concat([
+    alignedString('node atlas'),
+    i32(1),
+    pptr(7),
+    i32(1),
+    alignedString('node sprite'),
+    i32(2),
+    // Deliberately serialize the higher key first. Core returns map entries in
+    // deterministic raw-key order, and the binding must preserve that order.
+    spriteAtlasRenderData(
+      higherKey,
+      9,
+      11,
+      0,
+      [1, 2, 3, 4],
+      [5, 6],
+      [7, 8],
+      [9, 10, 11, 12],
+      0.5,
+      79,
+      [{ pathId: 99, name: 'mask' }],
+    ),
+    spriteAtlasRenderData(
+      lowerKey,
+      -5,
+      10,
+      12,
+      [0, 0, 1, 1],
+      [0, 0],
+      [0, 0],
+      [0, 0, 1, 1],
+      1,
+      2,
+      [],
+    ),
+    alignedString('node-tag'),
+    Buffer.from([1]),
+  ])
+  return finishV22Objects([
+    { classId: 687_078_895, pathId: 9, payload: align(payload, 4) },
+  ])
+}
+
+function syntheticSpriteMetadata() {
+  let payload = Buffer.concat([
+    alignedString('node sprite'),
+    f32s([1, 2, 3, 4]),
+    f32s([5, 6]),
+    f32s([7, 8, 9, 10]),
+    f32s([100, 0.25, 0.75]),
+    u32(3),
+    Buffer.from([1]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    Buffer.from(Array.from({ length: 16 }, (_, index) => index)),
+    i64(-5),
+    i32(1),
+    alignedString('tag'),
+    pptr(9),
+    pptr(8),
+    pptr(10),
+    i32(1),
+    pptr(12),
+    alignedString('mask'),
+    i32(0),
+    i32(0),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    u32(0),
+    i32(1),
+    Buffer.from([0, 0, 0, 3]),
+    i32(0),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    i32(0),
+    f32s([11, 12, 13, 14]),
+    f32s([15, 16, 17, 18]),
+    u32(79),
+    f32s([19, 20, 21, 22, 0.5]),
+  ])
+  return finishV22Asset(213, payload)
+}
+
+function syntheticTightSpriteMetadata() {
+  let payload = Buffer.concat([
+    alignedString('node tight sprite'),
+    f32s([0, 0, 2, 2]),
+    f32s([0, 0]),
+    f32s([0, 0, 0, 0]),
+    f32s([1, 0.5, 0.5]),
+    u32(0),
+    Buffer.from([0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    Buffer.alloc(16),
+    i64(0),
+    i32(0),
+    pptr(0),
+    pptr(8),
+    pptr(0),
+    i32(0),
+    i32(1),
+    u32(0),
+    u32(3),
+    i32(0),
+    u32(0),
+    u32(0),
+    u32(3),
+    f32s([0, 0, 0, 0, 0, 0]),
+    i32(6),
+    Buffer.from([0, 0, 1, 0, 2, 0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    u32(3),
+    i32(1),
+    Buffer.from([0, 0, 0, 3]),
+    i32(36),
+    f32s([-1, -1, 0, 1.1, -1, 0, -1, 1.1, 0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    i32(0),
+    f32s([0, 0, 2, 2]),
+    f32s([0, 0, 0, 0]),
+    u32(0),
+    f32s([0, 0, 1, 1, 1]),
+  ])
+  return finishV22Asset(213, payload)
+}
+
+function syntheticTuanjieAvatar() {
+  const emptySkeleton = () => Buffer.concat([i32(0), i32(0), i32(0)])
+  const animationXform = () => Buffer.alloc(10 * 4)
+  let payload = Buffer.concat([
+    alignedString('node-tuanjie-avatar'),
+    u32(0),
+    emptySkeleton(),
+    i32(0),
+    i32(0),
+    i32(0),
+    animationXform(),
+    emptySkeleton(),
+    i32(0),
+    i32(0),
+    i32(0),
+    i32(0),
+    i32(0),
+    f32s([1, 0.5, 0.5, 0.5, 0.5, 0.05, 0.05, 0]),
+    Buffer.from([0, 0, 0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    i32(0),
+    i32(0),
+    i32(-1),
+    animationXform(),
+    emptySkeleton(),
+    i32(0),
+    i32(0),
+    i32(1),
+    u32(0xfeedbeef),
+    alignedString('Root/Hips'),
+    i32(0),
+    i32(0),
+    f32s([0.5, 0.5, 0.5, 0.5, 0.05, 0.05, 0, 1]),
+    alignedString('Hips'),
+    Buffer.from([1, 0, 1]),
+  ])
+  return finishV22Asset(90, align(payload, 4), '2022.3.55t4')
 }
 
 function materialPayload(texturePathId) {
@@ -410,6 +727,308 @@ function finishV22Objects(objects, version = '2022.3.62f1') {
     Buffer.alloc(dataOffset - 48 - metadata.length),
     data,
   ])
+}
+
+function finishV22TypedObjects(types, objects, externals = [], version = '2022.3.62f1') {
+  let metadata = Buffer.concat([
+    Buffer.from(`${version}\0`, 'ascii'),
+    i32(13),
+    Buffer.from([1]), // type trees are enabled; individual types may be stripped
+    i32(types.length),
+    ...types.map(live2dTypeRecord),
+  ])
+  let data = Buffer.alloc(0)
+  const records = []
+  for (const object of objects) {
+    data = align(data, 4)
+    records.push({
+      pathId: object.pathId,
+      offset: data.length,
+      size: object.payload.length,
+      typeIndex: object.typeIndex,
+    })
+    data = Buffer.concat([data, object.payload])
+  }
+  metadata = Buffer.concat([metadata, i32(records.length)])
+  for (const record of records) {
+    metadata = align(Buffer.concat([Buffer.alloc(48), metadata]), 4).subarray(48)
+    metadata = Buffer.concat([
+      metadata,
+      i64(record.pathId),
+      i64(record.offset),
+      u32(record.size),
+      i32(record.typeIndex),
+    ])
+  }
+  metadata = Buffer.concat([metadata, i32(0), i32(externals.length)])
+  for (const external of externals) {
+    metadata = Buffer.concat([
+      metadata,
+      Buffer.from([0]),
+      Buffer.alloc(16),
+      i32(0),
+      Buffer.from(`${external}\0`, 'utf8'),
+    ])
+  }
+  metadata = Buffer.concat([metadata, i32(0), Buffer.from([0])])
+  const dataOffset = Math.ceil((48 + metadata.length) / 16) * 16
+  const header = Buffer.alloc(48)
+  header.writeUInt32BE(22, 8)
+  header.writeUInt32BE(metadata.length, 20)
+  header.writeBigInt64BE(BigInt(dataOffset + data.length), 24)
+  header.writeBigInt64BE(BigInt(dataOffset), 32)
+  return Buffer.concat([
+    header,
+    metadata,
+    Buffer.alloc(dataOffset - 48 - metadata.length),
+    data,
+  ])
+}
+
+function live2dTypeRecord(type) {
+  const chunks = [
+    i32(type.classId),
+    Buffer.from([0, 0xff, 0xff]),
+  ]
+  if (type.classId === 114) {
+    chunks.push(Buffer.alloc(16, type.scriptHash ?? 0))
+  }
+  chunks.push(Buffer.alloc(16, 0x42))
+  chunks.push(type.nodes == null ? Buffer.alloc(8) : live2dBlobTree(type.nodes))
+  chunks.push(i32(0)) // v21+ type dependencies
+  return Buffer.concat(chunks)
+}
+
+function live2dBlobTree(nodes) {
+  const strings = []
+  const records = []
+  let stringBytes = 0
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index]
+    const typeBytes = Buffer.from(`${node.type}\0`, 'utf8')
+    const nameBytes = Buffer.from(`${node.name}\0`, 'utf8')
+    const typeOffset = stringBytes
+    stringBytes += typeBytes.length
+    const nameOffset = stringBytes
+    stringBytes += nameBytes.length
+    strings.push(typeBytes, nameBytes)
+    records.push(Buffer.concat([
+      Buffer.from([1, 0, node.level, 0]),
+      u32(typeOffset),
+      u32(nameOffset),
+      i32(-1),
+      i32(index),
+      i32(node.align ? 0x4000 : 0),
+      Buffer.alloc(8),
+    ]))
+  }
+  return Buffer.concat([
+    i32(nodes.length),
+    i32(stringBytes),
+    ...records,
+    ...strings,
+  ])
+}
+
+function live2dReferenceNodes(pointerType, pointerName) {
+  return [
+    ...cubismMonoBehaviourNodes(),
+    ...cubismPptrNodes(pointerName, pointerType, 1),
+  ]
+}
+
+function live2dPptr(fileId, pathId) {
+  return Buffer.concat([i32(fileId), i64(pathId)])
+}
+
+function live2dGameObject(name, components) {
+  return Buffer.concat([
+    i32(components.length),
+    ...components.map(([fileId, pathId]) => live2dPptr(fileId, pathId)),
+    i32(0),
+    Buffer.alloc(4), // Tuanjie editor-info flag and absolute alignment
+    alignedString(name),
+  ])
+}
+
+function live2dTransform(gameObject, children, father) {
+  return Buffer.concat([
+    live2dPptr(...gameObject),
+    f32s([0, 0, 0, 1, 0, 0, 0, 1, 1, 1]),
+    i32(children.length),
+    ...children.map(([fileId, pathId]) => live2dPptr(fileId, pathId)),
+    live2dPptr(...father),
+  ])
+}
+
+function live2dMonoBehaviourPrefix(gameObject, script, name) {
+  let payload = Buffer.concat([
+    live2dPptr(...gameObject),
+    Buffer.from([1]),
+  ])
+  payload = align(payload, 4)
+  return Buffer.concat([
+    payload,
+    live2dPptr(...script),
+    alignedString(name),
+  ])
+}
+
+function live2dMonoBehaviour(gameObject, script, name, field) {
+  return Buffer.concat([
+    live2dMonoBehaviourPrefix(gameObject, script, name),
+    live2dPptr(...field),
+  ])
+}
+
+function live2dMocBehaviour(gameObject, script) {
+  return Buffer.concat([
+    live2dMonoBehaviourPrefix(gameObject, script, 'node-moc'),
+    i32(5),
+    Buffer.from('MOC3\x09', 'binary'),
+  ])
+}
+
+function live2dMonoScript(className) {
+  return Buffer.concat([
+    alignedString('Cubism script'),
+    i32(0),
+    Buffer.alloc(16, 0x55),
+    alignedString(className),
+    alignedString('Live2D.Cubism.Core'),
+    alignedString('Live2D.Cubism.dll'),
+  ])
+}
+
+function live2dAnimator() {
+  let payload = Buffer.concat([live2dPptr(0, 1), Buffer.from([1])])
+  payload = align(payload, 4)
+  return Buffer.concat([payload, live2dPptr(0, 0), live2dPptr(0, 31)])
+}
+
+function live2dAnimatorController() {
+  let payload = Buffer.concat([
+    alignedString('node live2d controller'),
+    u32(0),
+    ...Array.from({ length: 9 }, () => i32(0)),
+    i32(1),
+    u32(0xdeadbeef),
+    alignedString('Hero'),
+    i32(1),
+    live2dPptr(0, 41),
+    i32(0),
+    i32(0),
+    i32(0),
+    Buffer.from([1]),
+  ])
+  return align(payload, 4)
+}
+
+function live2dSchemas() {
+  const schema = (className, pointerType, pointerName) => ({
+    assemblyName: 'Live2D.Cubism.dll',
+    namespace: 'Live2D.Cubism.Core',
+    className,
+    nodes: live2dReferenceNodes(pointerType, pointerName).map((node) => ({
+      typeName: node.type,
+      fieldName: node.name,
+      level: node.level,
+      align: node.align ?? false,
+    })),
+  })
+  return [
+    schema('CubismModel', 'CubismMoc', '_moc'),
+    schema('CubismRenderer', 'Texture2D', '_mainTexture'),
+  ]
+}
+
+function syntheticStrippedAclLive2dPackage() {
+  const modelTypes = [
+    { classId: 1 },
+    { classId: 4 },
+    { classId: 114, scriptHash: 0x20 },
+    { classId: 114, scriptHash: 0x21 },
+    { classId: 114, scriptHash: 0x30 },
+    { classId: 115 },
+    { classId: 95 },
+    { classId: 91 },
+    { classId: 74 },
+  ]
+  const modelObjects = [
+    {
+      typeIndex: 0,
+      pathId: 1,
+      payload: live2dGameObject('Hero', [[0, 10], [0, 20], [0, 50]]),
+    },
+    {
+      typeIndex: 1,
+      pathId: 10,
+      payload: live2dTransform([0, 1], [[0, 11]], [0, 0]),
+    },
+    {
+      typeIndex: 2,
+      pathId: 20,
+      payload: live2dMonoBehaviour([0, 1], [0, 100], '', [0, 30]),
+    },
+    {
+      typeIndex: 0,
+      pathId: 2,
+      payload: live2dGameObject('Drawables', [[0, 11], [0, 21]]),
+    },
+    {
+      typeIndex: 1,
+      pathId: 11,
+      payload: live2dTransform([0, 2], [], [0, 10]),
+    },
+    {
+      typeIndex: 3,
+      pathId: 21,
+      payload: live2dMonoBehaviour([0, 2], [0, 101], '', [1, 40]),
+    },
+    {
+      typeIndex: 4,
+      pathId: 30,
+      payload: live2dMocBehaviour([0, 1], [0, 102]),
+    },
+    { typeIndex: 5, pathId: 100, payload: live2dMonoScript('CubismModel') },
+    { typeIndex: 5, pathId: 101, payload: live2dMonoScript('CubismRenderer') },
+    { typeIndex: 5, pathId: 102, payload: live2dMonoScript('CubismMoc') },
+    { typeIndex: 5, pathId: 103, payload: live2dMonoScript('CubismRenderController') },
+    { typeIndex: 6, pathId: 50, payload: live2dAnimator() },
+    { typeIndex: 7, pathId: 31, payload: live2dAnimatorController() },
+    {
+      typeIndex: 8,
+      pathId: 41,
+      payload: cubismAclAnimationClipPayload({
+        frameCount: 2,
+        curveCount: 1,
+        bindingScript: 103,
+      }),
+    },
+  ]
+  const model = finishV22TypedObjects(
+    modelTypes,
+    modelObjects,
+    ['archive:/textures.assets'],
+    '2022.3.55t4',
+  )
+  const texture = finishV22TypedObjects(
+    [{ classId: 28 }],
+    [{
+      typeIndex: 0,
+      pathId: 40,
+      payload: texture2dPayload(
+        'face',
+        1,
+        1,
+        Buffer.from([9, 8, 7, 255]),
+      ),
+    }],
+  )
+  return [
+    { name: 'model.assets', data: model },
+    { name: 'textures.assets', data: texture },
+  ]
 }
 
 function syntheticTexturedModel() {
@@ -815,15 +1434,15 @@ function fnv1a32(bytes) {
 // A structurally valid, empty ACL 2.x `compressed_tracks` container. The
 // decoder payload is irrelevant to this bridge test; Core validates the size,
 // tag, version, algorithm, track shape and hash before JavaScript sees it.
-function syntheticAclTracks() {
+function syntheticAclTracks(numTracks = 0, numSamplesPerTrack = 0) {
   const tracks = Buffer.alloc(32)
   tracks.writeUInt32LE(tracks.length, 0)
   tracks.writeUInt32LE(0xac11ac11, 8)
   tracks.writeUInt16LE(10, 12)
   tracks.writeUInt8(0, 14) // uniformly sampled algorithm
   tracks.writeUInt8(0, 15) // float1f tracks
-  tracks.writeUInt32LE(0, 16)
-  tracks.writeUInt32LE(0, 20)
+  tracks.writeUInt32LE(numTracks, 16)
+  tracks.writeUInt32LE(numSamplesPerTrack, 20)
   tracks.writeFloatLE(30, 24)
   tracks.writeUInt32LE(0, 28)
   tracks.writeUInt32LE(fnv1a32(tracks.subarray(8)), 4)
@@ -833,19 +1452,36 @@ function syntheticAclTracks() {
 // Tuanjie 2022.3.55t4 stores the muscle block in little-endian m_AnimData and
 // adds ACL tracks, a declared curve count, and the fast-sample flag.
 function syntheticCubismAclAnimationClip() {
-  const tracks = syntheticAclTracks()
+  return finishV22Asset(74, cubismAclAnimationClipPayload(), '2022.3.55t4')
+}
+
+function cubismAclAnimationClipPayload(options = {}) {
+  const frameCount = options.frameCount ?? 0
+  const curveCount = options.curveCount ?? 0
+  const bindingScript = options.bindingScript ?? 0
+  const tracks = syntheticAclTracks(curveCount, frameCount)
   const acl = Buffer.concat([
-    u32(0), // frame count
+    u32(frameCount),
     u32(0), // bone count
     f32(30),
-    u32(0), // declared curve count
+    u32(curveCount),
     i32(tracks.length),
     tracks,
     i32(0), // decoder map
     Buffer.from([1]), // fast sample mode, not aligned before 2022.3.61
   ])
   const embedded = emptyCubismMuscle(acl)
-  const payload = align(Buffer.concat([
+  const genericBindings = bindingScript === 0
+    ? i32(0)
+    : Buffer.concat([
+      i32(1),
+      u32(0), // no transform-path hash; resolve through the script
+      u32(0),
+      live2dPptr(0, bindingScript),
+      i32(114),
+      Buffer.from([0, 0, 0, 0]),
+    ])
+  return align(Buffer.concat([
     alignedString('node-acl-motion'),
     Buffer.from([0, 1, 1]),
     Buffer.alloc(1),
@@ -859,12 +1495,53 @@ function syntheticCubismAclAnimationClip() {
     i64(0),
     u32(0),
     alignedString(''), // StreamingInfo
-    i32(0), // generic bindings
+    genericBindings,
     i32(0), // PPtr curve mapping
     Buffer.from([1, 0, 0, 0]),
     i32(0), // events
   ]), 4)
-  return finishV22Asset(74, payload, '2022.3.55t4')
+}
+
+// One transform-only model whose Animator selects the ACL clip above. It is
+// deliberately free of renderer-specific Tuanjie fields: FBX must still carry
+// the hierarchy and take, and the callback invocation proves the clip reached
+// the ACL projection path rather than merely exercising the method shell.
+function syntheticAclFbxModel() {
+  const gameObject = Buffer.concat([
+    i32(2),
+    pptr(11),
+    pptr(21),
+    i32(0),
+    Buffer.alloc(4), // Tuanjie editor-info flag plus absolute alignment
+    alignedString('node acl model'),
+  ])
+  let animator = Buffer.concat([pptr(1), Buffer.from([1])])
+  animator = align(animator, 4)
+  animator = Buffer.concat([animator, pptr(0), pptr(31)])
+
+  let controller = Buffer.concat([
+    alignedString('node acl controller'),
+    u32(0),
+    ...Array.from({ length: 9 }, () => i32(0)),
+    i32(1),
+    u32(0xdeadbeef),
+    alignedString('node acl model'),
+    i32(1),
+    pptr(41),
+    i32(0),
+    i32(0),
+    i32(0),
+    Buffer.from([1]),
+  ])
+  controller = align(controller, 4)
+
+  return finishV22Objects([
+    { classId: 1, pathId: 1, payload: gameObject },
+    { classId: 4, pathId: 11, payload: modelTransform() },
+    { classId: 95, pathId: 21, payload: animator },
+    { classId: 91, pathId: 31, payload: controller },
+    { classId: 74, pathId: 41, payload: cubismAclAnimationClipPayload() },
+  ], '2022.3.55t4')
 }
 
 function syntheticTypeTreeIntAsset() {
@@ -1057,6 +1734,22 @@ async function testAsyncWorkers() {
   assert.equal(asyncStudio.fileCount, 1)
   assert.deepEqual(await asyncStudio.readTextAsync(0, 7n), Buffer.from('hello node'))
   assert.deepEqual(await asyncStudio.readRawAsync(0, 7n), studio.readRaw(0, 7n))
+  const configuredAsyncStudio = await addon.AssetStudio.fromBufferAsync(
+    input,
+    'async-options.assets',
+    input.length,
+    { unityVersion: '2022.3.62f1', maximumPathBytes: 1024 * 1024 },
+  )
+  assert.equal(configuredAsyncStudio.fileCount, 1)
+  await assert.rejects(
+    addon.AssetStudio.fromBufferAsync(
+      input,
+      'async-options.assets',
+      input.length,
+      { maximumPathBytes: 1 },
+    ),
+    /asset path/i,
+  )
   await assert.rejects(asyncStudio.readTextAsync(0, 7n, 9), /limit|exceed/i)
   await assert.rejects(asyncStudio.readShaderAsync(0, 7n), /Shader|class ID/i)
   await assert.rejects(asyncStudio.readMeshObjAsync(0, 7n), /Mesh|class ID/i)
@@ -1099,6 +1792,15 @@ async function testAsyncWorkers() {
     const pathStudio = await addon.AssetStudio.openAsync(fixturePath)
     assert.equal(pathStudio.fileCount, 1)
     assert.deepEqual(await pathStudio.readTextAsync(0, 7n), Buffer.from('hello node'))
+    const configuredPathStudio = await addon.AssetStudio.openAsync(fixturePath, {
+      unityVersion: '2022.3.62f1',
+      maximumPathBytes: 1024 * 1024,
+    })
+    assert.equal(configuredPathStudio.fileCount, 1)
+    await assert.rejects(
+      addon.AssetStudio.openAsync(fixturePath, { maximumPathBytes: 1 }),
+      /asset path/i,
+    )
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }
@@ -1132,9 +1834,9 @@ testAsyncWorkers().catch((error) => {
   }
 }
 
-// Font, MovieTexture and VideoClip had no Node binding at all: a caller could
-// only reach them through `export`. Checked against what the payload declares
-// rather than against bytes this project produced.
+// Font, MovieTexture and VideoClip had no Node binding at all, while AudioClip
+// originally exposed only the source container. These checks use what the
+// payload declares rather than bytes this project produced.
 {
   const fontStudio = addon.AssetStudio.fromBuffers([
     { name: 'font.assets', data: syntheticFont() },
@@ -1151,8 +1853,38 @@ testAsyncWorkers().catch((error) => {
   assert.strictEqual(movie.name, 'node-movie')
   assert.ok(movie.data.equals(Buffer.from('OggS')))
 
+  const audioStudio = addon.AssetStudio.fromBuffers([
+    { name: 'legacy-pcm.assets', data: syntheticLegacyPcm() },
+  ])
+  const compatibilityRaw = audioStudio.readAudio(0, 7n)
+  assert.strictEqual(compatibilityRaw.name, 'node-legacy-pcm')
+  assert.strictEqual(compatibilityRaw.extension, '.AudioClip')
+  assert.strictEqual(compatibilityRaw.payloadKind, 'audio_raw')
+  assert.strictEqual(compatibilityRaw.isDirectWav, true)
+  assert.deepStrictEqual(compatibilityRaw.data, Buffer.from([1, 2, 3, 4]))
+
+  const wav = audioStudio.readAudioClip(0, 7n)
+  assert.strictEqual(wav.name, 'node-legacy-pcm')
+  assert.strictEqual(wav.extension, '.wav')
+  assert.strictEqual(wav.payloadKind, 'audio_wav')
+  assert.strictEqual(wav.isDirectWav, true)
+  assert.strictEqual(wav.data.length, 48)
+  assert.deepStrictEqual(wav.data.subarray(0, 12), Buffer.from('RIFF(\0\0\0WAVE', 'binary'))
+  assert.deepStrictEqual(wav.data.subarray(20, 24), Buffer.from([1, 0, 1, 0]))
+  assert.strictEqual(wav.data.readUInt32LE(24), 22_050)
+  assert.deepStrictEqual(wav.data.subarray(36, 44), Buffer.from('data\x04\0\0\0', 'binary'))
+  assert.deepStrictEqual(wav.data.subarray(44), Buffer.from([1, 2, 3, 4]))
+
+  const explicitRaw = audioStudio.readAudioClip(0, 7n, 'raw')
+  assert.strictEqual(explicitRaw.payloadKind, 'audio_raw')
+  assert.strictEqual(explicitRaw.extension, '.AudioClip')
+  assert.deepStrictEqual(explicitRaw.data, Buffer.from([1, 2, 3, 4]))
+  assert.throws(() => audioStudio.readAudioClip(0, 7n, 'flac'), /unsupported audio format/i)
+  assert.throws(() => audioStudio.readAudioClip(0, 7n, 'wav', 47), /exceeding maximumBytes/i)
+
   // Reading one kind as another must fail rather than return something.
   assert.throws(() => fontStudio.readMovieTexture(0, 7n))
+  assert.throws(() => fontStudio.readAudioClip(0, 7n))
 }
 
 // The Cubism document readers, which had no Node binding: a caller could
@@ -1202,6 +1934,30 @@ testAsyncWorkers().catch((error) => {
   assert.strictEqual(display.displayName, 'Head angle')
   assert.strictEqual(display.effectiveName, 'Head angle')
 
+  const clip = cubismStudio.readAnimationClipInfo(2, 7n)
+  assert.strictEqual(clip.pathId, 7n)
+  assert.strictEqual(clip.name, 'node-motion')
+  assert.strictEqual(clip.sampleRate, 60)
+  assert.strictEqual(clip.wrapMode, 2)
+  assert.strictEqual(clip.legacy, false)
+  assert.strictEqual(clip.compressed, true)
+  assert.strictEqual(clip.useHighQualityCurve, true)
+  assert.strictEqual(clip.rotationCurveCount, 0)
+  assert.strictEqual(clip.eulerCurveCount, 0)
+  assert.strictEqual(clip.positionCurveCount, 0)
+  assert.strictEqual(clip.scaleCurveCount, 0)
+  assert.strictEqual(clip.floatCurveCount, 0)
+  assert.strictEqual(clip.pptrCurveCount, 0)
+  assert.strictEqual(clip.muscleClipSize, 0)
+  assert.strictEqual(clip.hasMuscleClip, true)
+  assert.strictEqual(clip.streamedCurveCount, 0)
+  assert.strictEqual(clip.denseCurveCount, 0)
+  assert.strictEqual(clip.constantValueCount, 0)
+  assert.strictEqual(clip.hasAcl, false)
+  assert.strictEqual(clip.aclFrameCount, undefined)
+  assert.strictEqual(clip.hasStreamingInfo, false)
+  assert.strictEqual(clip.streamingPath, undefined)
+
   const motion = cubismStudio.readCubismClipMotion(
     2,
     7n,
@@ -1222,10 +1978,31 @@ testAsyncWorkers().catch((error) => {
   assert.strictEqual(motionDocument.Meta.Fps, 60)
   assert.deepStrictEqual(motionDocument.Curves, [])
 
+  const tooManyTargets = new Array(1_000_001)
+  let targetElementRead = false
+  Object.defineProperty(tooManyTargets, 0, {
+    get() {
+      targetElementRead = true
+      throw new Error('Cubism target read before target count check')
+    },
+  })
+  assert.throws(
+    () =>
+      cubismStudio.readCubismClipMotion(
+        2,
+        7n,
+        { parameters: tooManyTargets, parts: [] },
+        false,
+      ),
+    /motion targets.*exceeding limit/i,
+  )
+  assert.equal(targetElementRead, false)
+
   assert.throws(() => cubismStudio.readCubismPosePart(1, 11n))
   assert.throws(() => cubismStudio.readCubismDisplayInfo(0, 11n))
   assert.throws(() => cubismStudio.readCubismClipMotion(0, 11n))
   assert.throws(() => cubismStudio.readCubismClipMotion(2, 7n, undefined, false, 1))
+  assert.throws(() => cubismStudio.readAnimationClipInfo(2, 7n, 1))
 }
 
 console.log('node api: additional readers ok')
@@ -1284,6 +2061,31 @@ console.log('node api: settings and version override ok')
   assert.equal(multi.objectPage(1)[0].classId, 115)
   // The total budget is enforced across the inputs, not per input.
   assert.throws(() => addon.AssetStudio.fromBuffers(inputs, 16), /exceeding limit/i)
+  assert.throws(
+    () => addon.AssetStudio.fromBuffers(
+      inputs,
+      undefined,
+      { maximumInputFiles: 1 },
+    ),
+    /files.*exceeding limit/i,
+  )
+
+  // Reject the table length before napi-rs can walk or materialize its
+  // elements. A sparse array makes the order observable without allocating a
+  // million input objects.
+  const tooManyInputs = new Array(1_000_001)
+  let inputElementRead = false
+  Object.defineProperty(tooManyInputs, 0, {
+    get() {
+      inputElementRead = true
+      throw new Error('fromBuffers read an element before checking its count')
+    },
+  })
+  assert.throws(
+    () => addon.AssetStudio.fromBuffers(tooManyInputs),
+    /files.*exceeding limit/i,
+  )
+  assert.equal(inputElementRead, false)
 }
 
 // Scene assembly across the loaded files.
@@ -1334,6 +2136,151 @@ console.log('node api: multi-buffer, resource range and scene ok')
     // A second run without overwrite must not clobber what the first wrote.
     const again = exportStudio.export(outputDirectory)
     assert.equal(again.exported.length, 0)
+
+    const configuredRoot = path.join(outputDirectory, 'configured')
+    const configured = exportStudio.exportWithOptions(configuredRoot, {
+      mode: ' RaW ',
+      filenameFormat: ' PaTh_Id ',
+      imageFormat: ' BmP ',
+      jpegQuality: 100,
+      audioFormat: ' RaW ',
+      overwriteExisting: false,
+      restoreTextAssetExtension: false,
+      prettyJson: false,
+      maximumObjects: 1,
+      maximumTotalOutputBytes: 1024,
+      maximumRawObjectBytes: 1024,
+      maximumTypeTreeJsonBytes: 1024,
+      maximumTypeTreeDumpBytes: 1024,
+      maximumTextAssetBytes: 1024,
+      maximumSimpleAssetBytes: 1024,
+      maximumAudioOutputBytes: 1024,
+      maximumTextureOutputBytes: 1024,
+      maximumTextureArrayOutputBytes: 1024,
+      maximumTextureArrayBundleBytes: 1024,
+      maximumSpriteOutputBytes: 1024,
+      maximumShaderOutputBytes: 1024,
+      maximumMonobehaviourJsonBytes: 1024,
+      maximumMeshObjectBytes: 1024,
+      maximumMeshOutputBytes: 1024,
+    })
+    assert.equal(configured.failures.length, 0)
+    assert.equal(configured.exported.length, 1)
+    assert.equal(configured.exported[0].payloadKind, 'raw')
+    assert.equal(path.basename(configured.exported[0].outputPath), '7.dat')
+
+    for (const field of [
+      'maximumTotalOutputBytes',
+      'maximumRawObjectBytes',
+      'maximumTypeTreeJsonBytes',
+      'maximumTypeTreeDumpBytes',
+      'maximumTextAssetBytes',
+      'maximumSimpleAssetBytes',
+      'maximumAudioOutputBytes',
+      'maximumTextureOutputBytes',
+      'maximumTextureArrayOutputBytes',
+      'maximumTextureArrayBundleBytes',
+      'maximumSpriteOutputBytes',
+      'maximumShaderOutputBytes',
+      'maximumMonobehaviourJsonBytes',
+      'maximumMeshObjectBytes',
+      'maximumMeshOutputBytes',
+    ]) {
+      assert.throws(
+        () => exportStudio.exportWithOptions(path.join(outputDirectory, 'invalid'), {
+          [field]: -1,
+        }),
+        new RegExp(`${field} must be non-negative`, 'i'),
+      )
+    }
+    assert.throws(
+      () => exportStudio.exportWithOptions(path.join(outputDirectory, 'bad-mode'), {
+        mode: 'mystery',
+      }),
+      /unsupported export mode/i,
+    )
+    assert.throws(
+      () => exportStudio.exportWithOptions(path.join(outputDirectory, 'bad-name'), {
+        filenameFormat: 'mystery',
+      }),
+      /unsupported filename format/i,
+    )
+    assert.throws(
+      () => exportStudio.exportWithOptions(path.join(outputDirectory, 'bad-image'), {
+        imageFormat: 'mystery',
+      }),
+      /unsupported image format/i,
+    )
+    assert.throws(
+      () => exportStudio.exportWithOptions(path.join(outputDirectory, 'bad-audio'), {
+        audioFormat: 'mystery',
+      }),
+      /unsupported audio format/i,
+    )
+    const oversizedChoice = 'é'.repeat(2048)
+    for (const [field, option] of [
+      ['export mode', { mode: oversizedChoice }],
+      ['filename format', { filenameFormat: oversizedChoice }],
+      ['image format', { imageFormat: oversizedChoice }],
+      ['audio format', { audioFormat: oversizedChoice }],
+    ]) {
+      assert.throws(
+        () => exportStudio.exportWithOptions(
+          path.join(outputDirectory, `oversized-${field.replace(' ', '-')}`),
+          option,
+        ),
+        (error) => {
+          assert.match(
+            error.message,
+            new RegExp(`unsupported ${field} value of 4096 UTF-8 bytes`, 'i'),
+          )
+          assert.equal(error.message.includes(oversizedChoice), false)
+          return true
+        },
+      )
+    }
+    assert.throws(
+      () => exportStudio.exportWithOptions(path.join(outputDirectory, 'bad-quality'), {
+        jpegQuality: 0,
+      }),
+      /jpegQuality.*1 through 100/i,
+    )
+
+    const textureStudio = addon.AssetStudio.fromBuffers([
+      { name: 'texture.assets', data: syntheticTexture2d() },
+    ])
+    const webp = textureStudio.exportWithOptions(
+      path.join(outputDirectory, 'webp'),
+      { imageFormat: 'webp' },
+    )
+    assert.equal(webp.failures.length, 0)
+    assert.equal(webp.exported.length, 1)
+    assert.match(webp.exported[0].outputPath, /\.webp$/)
+    const webpBytes = fs.readFileSync(webp.exported[0].outputPath)
+    assert.deepStrictEqual(webpBytes.subarray(0, 4), Buffer.from('RIFF'))
+    assert.deepStrictEqual(webpBytes.subarray(8, 12), Buffer.from('WEBP'))
+
+    const audioStudio = addon.AssetStudio.fromBuffers([
+      { name: 'legacy-pcm.assets', data: syntheticLegacyPcm() },
+    ])
+    const rawAudio = audioStudio.exportWithOptions(
+      path.join(outputDirectory, 'raw-audio'),
+      { audioFormat: 'raw' },
+    )
+    assert.equal(rawAudio.failures.length, 0)
+    assert.equal(rawAudio.exported.length, 1)
+    assert.match(rawAudio.exported[0].outputPath, /\.AudioClip$/)
+    assert.deepStrictEqual(
+      fs.readFileSync(rawAudio.exported[0].outputPath),
+      Buffer.from([1, 2, 3, 4]),
+    )
+    const limitedWav = audioStudio.exportWithOptions(
+      path.join(outputDirectory, 'limited-wav'),
+      { audioFormat: 'wav', maximumAudioOutputBytes: 47 },
+    )
+    assert.equal(limitedWav.exported.length, 0)
+    assert.equal(limitedWav.failures.length, 1)
+    assert.match(limitedWav.failures[0].error, /exceeding limit/i)
 
     // Extraction of a plain file copies it through unchanged.
     const source = path.join(outputDirectory, 'input.assets')
@@ -1399,6 +2346,256 @@ console.log('node api: export, extract and fbx ok')
   assert.throws(() => emptyStudio.readAnimatorController(0, objects[0].pathId))
 }
 
+// Stable component references and container tables use real object layouts,
+// not method-existence smoke. This catches field order, nested PPtr mapping,
+// BigInt width and caller budgets in the generated Node-API marshalling path.
+{
+  const legacyStudio = addon.AssetStudio.fromBuffers([
+    { name: 'legacy-animation.assets', data: syntheticLegacyAnimation() },
+  ])
+  assert.deepStrictEqual(legacyStudio.readLegacyAnimation(0, 7n), {
+    pathId: 7n,
+    gameObject: { fileId: 0, pathId: 31n },
+    enabled: 1,
+    defaultClip: { fileId: 0, pathId: 70n },
+    clips: [
+      { fileId: 0, pathId: 71n },
+      { fileId: 0, pathId: 72n },
+    ],
+    trailingBytes: 2n,
+  })
+  assert.throws(() => legacyStudio.readLegacyAnimation(0, 7n, 1))
+
+  const overrideStudio = addon.AssetStudio.fromBuffers([
+    {
+      name: 'animator-override.assets',
+      data: syntheticAnimatorOverrideController(),
+    },
+  ])
+  assert.deepStrictEqual(
+    overrideStudio.readAnimatorOverrideController(0, 7n),
+    {
+      pathId: 7n,
+      name: 'node override controller',
+      controller: { fileId: 0, pathId: 90n },
+      clipOverrides: [
+        {
+          originalClip: { fileId: 0, pathId: 71n },
+          overrideClip: { fileId: 0, pathId: 73n },
+        },
+        {
+          originalClip: { fileId: 0, pathId: 72n },
+          overrideClip: { fileId: 0, pathId: 74n },
+        },
+      ],
+      trailingBytes: 1n,
+    },
+  )
+  assert.throws(() =>
+    overrideStudio.readAnimatorOverrideController(0, 7n, 1),
+  )
+
+  const containerStudio = addon.AssetStudio.fromBuffers([
+    { name: 'container-metadata.assets', data: syntheticContainerMetadataObjects() },
+  ])
+  assert.deepStrictEqual(containerStudio.readAssetBundle(0, 7n), {
+    pathId: 7n,
+    name: 'node-bundle',
+    objectName: 'root',
+    assetBundleName: 'node-bundle',
+    preloadTable: [
+      { fileId: 0, pathId: 11n },
+      { fileId: 0, pathId: 12n },
+    ],
+    container: [
+      {
+        key: 'bundle/first',
+        preloadIndex: 0,
+        preloadSize: 1,
+        asset: { fileId: 0, pathId: 11n },
+      },
+      {
+        key: 'bundle/second',
+        preloadIndex: 1,
+        preloadSize: 1,
+        asset: { fileId: 0, pathId: 12n },
+      },
+    ],
+    dependencies: ['shared-a', 'shared-b'],
+    isStreamedSceneAssetBundle: false,
+  })
+  assert.deepStrictEqual(containerStudio.readResourceManager(0, 8n), {
+    pathId: 8n,
+    container: [
+      { key: 'resource/first', asset: { fileId: 0, pathId: 21n } },
+      { key: 'resource/second', asset: { fileId: 0, pathId: 22n } },
+    ],
+  })
+  assert.deepStrictEqual(containerStudio.readPreloadData(0, 9n), {
+    pathId: 9n,
+    name: 'node-preload',
+    assets: [
+      { fileId: 0, pathId: 31n },
+      { fileId: 0, pathId: 32n },
+    ],
+  })
+  assert.throws(() => containerStudio.readAssetBundle(0, 7n, 1))
+  assert.throws(() => containerStudio.readAssetBundle(0, 7n, undefined, undefined, 1))
+  assert.throws(() => containerStudio.readResourceManager(0, 8n, 1))
+  assert.throws(() => containerStudio.readPreloadData(0, 9n, 1))
+}
+
+{
+  const atlasStudio = addon.AssetStudio.fromBuffers([
+    { name: 'sprite-atlas.assets', data: syntheticSpriteAtlas() },
+  ])
+  assert.deepStrictEqual(atlasStudio.readSpriteAtlas(0, 9n), {
+    pathId: 9n,
+    name: 'node atlas',
+    packedSprites: [{ fileId: 0, pathId: 7n }],
+    packedSpriteNames: ['node sprite'],
+    renderDataEntries: [
+      {
+        key: { guidBytes: Buffer.alloc(16), value: -5n },
+        texture: { fileId: 0, pathId: 10n },
+        alphaTexture: { fileId: 0, pathId: 12n },
+        textureRect: { x: 0, y: 0, width: 1, height: 1 },
+        textureRectOffset: { x: 0, y: 0 },
+        atlasRectOffset: { x: 0, y: 0 },
+        uvTransform: { x: 0, y: 0, z: 1, w: 1 },
+        downscaleMultiplier: 1,
+        settings: {
+          raw: 2,
+          packed: false,
+          packingMode: 1,
+          packingRotation: 0,
+          meshType: 0,
+        },
+        secondaryTextures: [],
+      },
+      {
+        key: {
+          guidBytes: Buffer.concat([Buffer.from([1]), Buffer.alloc(15)]),
+          value: 9n,
+        },
+        texture: { fileId: 0, pathId: 11n },
+        alphaTexture: { fileId: 0, pathId: 0n },
+        textureRect: { x: 1, y: 2, width: 3, height: 4 },
+        textureRectOffset: { x: 5, y: 6 },
+        atlasRectOffset: { x: 7, y: 8 },
+        uvTransform: { x: 9, y: 10, z: 11, w: 12 },
+        downscaleMultiplier: 0.5,
+        settings: {
+          raw: 79,
+          packed: true,
+          packingMode: 1,
+          packingRotation: 3,
+          meshType: 1,
+        },
+        secondaryTextures: [
+          {
+            texture: { fileId: 0, pathId: 99n },
+            name: 'mask',
+          },
+        ],
+      },
+    ],
+    tag: 'node-tag',
+    isVariant: true,
+  })
+  assert.throws(() => atlasStudio.readSpriteAtlas(0, 9n, 0))
+  assert.throws(() => atlasStudio.readSpriteAtlas(0, 9n, undefined, 5))
+  assert.throws(() =>
+    atlasStudio.readSpriteAtlas(0, 9n, undefined, undefined, 12),
+  )
+}
+
+{
+  const spriteStudio = addon.AssetStudio.fromBuffers([
+    { name: 'sprite.assets', data: syntheticSpriteMetadata() },
+  ])
+  assert.deepStrictEqual(spriteStudio.readSpriteMetadata(0, 7n), {
+    objectIndex: 0,
+    pathId: 7n,
+    name: 'node sprite',
+    rect: { x: 1, y: 2, width: 3, height: 4 },
+    offset: { x: 5, y: 6 },
+    border: { x: 7, y: 8, z: 9, w: 10 },
+    pixelsToUnits: 100,
+    pivot: { x: 0.25, y: 0.75 },
+    extrude: 3,
+    isPolygon: true,
+    renderDataKey: {
+      guidBytes: Buffer.from(Array.from({ length: 16 }, (_, index) => index)),
+      value: -5n,
+    },
+    atlasTags: ['tag'],
+    spriteAtlas: { fileId: 0, pathId: 9n },
+    renderData: {
+      texture: { fileId: 0, pathId: 8n },
+      alphaTexture: { fileId: 0, pathId: 10n },
+      secondaryTextures: [
+        { texture: { fileId: 0, pathId: 12n }, name: 'mask' },
+      ],
+      textureRect: { x: 11, y: 12, width: 13, height: 14 },
+      textureRectOffset: { x: 15, y: 16 },
+      atlasRectOffset: { x: 17, y: 18 },
+      settings: {
+        raw: 79,
+        packed: true,
+        packingMode: 'rectangle',
+        packingRotation: 3,
+        meshType: 'tight',
+      },
+      uvTransform: { x: 19, y: 20, z: 21, w: 22 },
+      downscaleMultiplier: 0.5,
+      meshTriangles: [],
+    },
+  })
+  for (const limits of [
+    { maximumEntries: 0 },
+    { maximumStringBytes: 5 },
+    { maximumTotalStringBytes: 5 },
+    { maximumMeshBytes: 0 },
+  ]) {
+    assert.throws(() => spriteStudio.readSpriteMetadata(0, 7n, limits))
+  }
+
+  const tightStudio = addon.AssetStudio.fromBuffers([
+    { name: 'tight-sprite.assets', data: syntheticTightSpriteMetadata() },
+  ])
+  const tight = tightStudio.readSpriteMetadata(0, 7n)
+  assert.strictEqual(tight.renderData.settings.packingMode, 'tight')
+  assert.strictEqual(tight.renderData.settings.meshType, 'full_rect')
+  assert.strictEqual(tight.renderData.meshTriangles.length, 1)
+  assert.deepStrictEqual(Object.keys(tight.renderData.meshTriangles[0]), [
+    'first',
+    'second',
+    'third',
+  ])
+}
+
+{
+  const avatarStudio = addon.AssetStudio.fromBuffers([
+    { name: 'tuanjie-avatar.assets', data: syntheticTuanjieAvatar() },
+  ])
+  assert.deepStrictEqual(avatarStudio.readAvatar(0, 7n), {
+    pathId: 7n,
+    name: 'node-tuanjie-avatar',
+    declaredSize: 0,
+    declaredAvatarSize: 0,
+    skeletonNodeCount: 0,
+    humanSkeletonNodeCount: 0,
+    pathCount: 1,
+    paths: [{ hash: 0xfeedbeef, path: 'Root/Hips' }],
+    hasHumanDescription: true,
+    humanBoneCount: 0,
+    skeletonBoneCount: 0,
+    rootMotionBoneName: 'Hips',
+  })
+  assert.throws(() => avatarStudio.readAvatar(0, 7n, 1))
+}
+
 console.log('node api: animation and live2d discovery ok')
 
 // Animated FBX and Live2D materialization on a collection that has neither.
@@ -1426,11 +2623,34 @@ console.log('node api: animation and live2d discovery ok')
       unityVersion: '2022.3.62f1',
       skipUnreadableInputs: true,
       maximumInputFiles: 8,
+      maximumPathBytes: 1024 * 1024,
+      maximumTotalPathBytes: 64 * 1024 * 1024,
     })
     assert.equal(opened.fileCount, 1)
     assert.deepEqual(opened.readText(0, 7n), Buffer.from('hello node'))
     // Omitting the options entirely is the same as opening plainly.
     assert.equal(addon.AssetStudio.openWith(fixture).fileCount, 1)
+    // Memory inputs carry the same Core load options. The arguments are
+    // appended after the established byte limit so older calls are unchanged.
+    const memoryOpened = addon.AssetStudio.fromBuffer(
+      syntheticTextAsset(),
+      'memory-options.assets',
+      undefined,
+      {
+        unityVersion: '2022.3.62f1',
+        maximumPathBytes: 1024 * 1024,
+      },
+    )
+    assert.equal(memoryOpened.fileCount, 1)
+    assert.throws(
+      () => addon.AssetStudio.fromBuffer(
+        syntheticTextAsset(),
+        'memory-options.assets',
+        undefined,
+        { maximumPathBytes: 1 },
+      ),
+      /asset path/i,
+    )
     // A key is 16 bytes, and a wrong length is refused rather than padded.
     assert.throws(
       () => addon.AssetStudio.openWith(fixture, { unityCnKey: Buffer.alloc(8) }),
@@ -1439,6 +2659,14 @@ console.log('node api: animation and live2d discovery ok')
     assert.throws(
       () => addon.AssetStudio.openWith(fixture, { unityVersion: 'not-a-version' }),
       /unsupported Unity version/,
+    )
+    assert.throws(
+      () => addon.AssetStudio.openWith(fixture, { maximumPathBytes: 1 }),
+      /asset path/i,
+    )
+    assert.throws(
+      () => addon.AssetStudio.openWith(fixture, { maximumTotalPathBytes: 1 }),
+      /traversal paths total/i,
     )
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
@@ -1489,6 +2717,45 @@ console.log('node api: textured fbx and acl inspection ok')
       ]),
     /root node/i,
   )
+  const tooManySchemas = new Array(100_001)
+  let schemaElementRead = false
+  Object.defineProperty(tooManySchemas, 0, {
+    get() {
+      schemaElementRead = true
+      throw new Error('schema element read before collection count check')
+    },
+  })
+  assert.throws(
+    () =>
+      schemaStudio.readMonoBehaviourJsonWithSchemas(
+        0,
+        objects[0].pathId,
+        tooManySchemas,
+      ),
+    /schema collection.*exceeding limit/i,
+  )
+  assert.equal(schemaElementRead, false)
+
+  const tooManyNodes = new Array(100_001)
+  let nodeElementRead = false
+  Object.defineProperty(tooManyNodes, 0, {
+    get() {
+      nodeElementRead = true
+      throw new Error('schema node read before node count check')
+    },
+  })
+  assert.throws(
+    () =>
+      schemaStudio.readMonoBehaviourJsonWithSchemas(0, objects[0].pathId, [
+        {
+          assemblyName: 'A.dll',
+          className: 'A',
+          nodes: tooManyNodes,
+        },
+      ]),
+    /nodes.*maximum/i,
+  )
+  assert.equal(nodeElementRead, false)
   // A TextAsset is not a MonoBehaviour, so the read is refused rather than
   // producing an object shaped by the schema.
   assert.throws(() =>
@@ -1508,6 +2775,19 @@ console.log('node api: textured fbx and acl inspection ok')
     { name: 'expression.assets', data: syntheticCubismExpression() },
   ])
   const behaviour = embedded.objectPage(0)[0]
+  const direct = embedded.readMonoBehaviourJson(0, behaviour.pathId)
+  assert.strictEqual(direct.source, 'embedded')
+  assert.strictEqual(JSON.parse(direct.json.toString('utf8')).m_Name, 'node-expression')
+  assert.throws(
+    () =>
+      embedded.readMonoBehaviourJson(
+        0,
+        behaviour.pathId,
+        false,
+        direct.json.length - 1,
+      ),
+    /limit|exceed/i,
+  )
   const read = embedded.readMonoBehaviourJsonWithSchemas(0, behaviour.pathId, [
     {
       assemblyName: 'Nothing.dll',
@@ -1517,9 +2797,192 @@ console.log('node api: textured fbx and acl inspection ok')
   ])
   assert.strictEqual(read.source, 'embedded')
   assert.strictEqual(JSON.parse(read.json.toString('utf8')).m_Name, 'node-expression')
+  assert.throws(() =>
+    schemaStudio.readMonoBehaviourJson(0, objects[0].pathId),
+  )
 }
 
 console.log('node api: monobehaviour schemas ok')
+
+// Complete Live2D package adapters. The model and renderer trees are stripped
+// from this fixture, and its only motion is ACL-compressed, so neither half can
+// be faked by a method-existence check: schemas must recover the PPtrs and the
+// callback must produce the motion document.
+async function testLive2dPackageAdapters() {
+  const embedded = addon.AssetStudio.fromBuffers([
+    { name: 'expression.assets', data: syntheticCubismExpression() },
+  ])
+  const embeddedBehaviour = embedded.objectPage(0)[0]
+  const embeddedRead = await embedded.readMonoBehaviourJsonAsync(
+    0,
+    embeddedBehaviour.pathId,
+  )
+  assert.strictEqual(embeddedRead.source, 'embedded')
+  assert.strictEqual(
+    JSON.parse(embeddedRead.json.toString('utf8')).m_Name,
+    'node-expression',
+  )
+  await assert.rejects(
+    embedded.readMonoBehaviourJsonAsync(
+      0,
+      embeddedBehaviour.pathId,
+      false,
+      embeddedRead.json.length - 1,
+    ),
+    /limit|exceed/i,
+  )
+
+  const studio = addon.AssetStudio.fromBuffers(syntheticStrippedAclLive2dPackage())
+  const strippedBehaviour = studio
+    .objectPage(0)
+    .find(({ classId }) => classId === 114)
+  assert.ok(strippedBehaviour)
+  assert.throws(
+    () => studio.readMonoBehaviourJson(0, strippedBehaviour.pathId),
+    /type tree|schema/i,
+  )
+  await assert.rejects(
+    studio.readMonoBehaviourJsonAsync(0, strippedBehaviour.pathId),
+    /type tree|schema/i,
+  )
+  const withoutSchemas = studio.readLive2DPackages()
+  assert.deepStrictEqual(withoutSchemas.packages, [])
+  assert.ok(
+    withoutSchemas.diagnostics.some(
+      ({ kind }) => kind === 'MissingEmbeddedTypeTree',
+    ),
+  )
+
+  const schemas = live2dSchemas()
+  const schemaRead = await studio.readMonoBehaviourJsonWithSchemasAsync(
+    0,
+    strippedBehaviour.pathId,
+    schemas,
+  )
+  assert.strictEqual(schemaRead.source, 'schema')
+  assert.ok(JSON.parse(schemaRead.json.toString('utf8'))._moc)
+  const schemaOnly = studio.readLive2DPackagesWithSchemas(
+    schemas,
+    1024 * 1024,
+    4 * 1024 * 1024,
+  )
+  assert.strictEqual(schemaOnly.packages.length, 1)
+  assert.strictEqual(schemaOnly.packages[0].name, 'Hero')
+  const schemaFiles = new Map(
+    schemaOnly.packages[0].files.map(({ fileName, data }) => [fileName, data]),
+  )
+  assert.deepStrictEqual(schemaFiles.get('Hero.moc3'), Buffer.from('MOC3\x09', 'binary'))
+  assert.ok(schemaFiles.get('Hero.model3.json').includes(Buffer.from('textures/face.png')))
+  assert.deepStrictEqual(
+    schemaFiles.get('textures/face.png').subarray(0, 8),
+    Buffer.from('\x89PNG\r\n\x1a\n', 'binary'),
+  )
+  // Without an ACL decoder the package survives but the animation says why it
+  // was omitted instead of silently pretending to be complete.
+  assert.ok(schemaOnly.diagnostics.some(({ kind }) => kind === 'MotionReadFailed'))
+  assert.ok(!schemaFiles.has('motions/node-acl-motion.motion3.json'))
+
+  assert.throws(
+    () => studio.readLive2DPackagesWithSchemas(schemas, 4, 4 * 1024 * 1024),
+    /limit|exceed/i,
+  )
+  assert.throws(
+    () => studio.readLive2DPackagesWithSchemas(schemas, -1, 1024),
+    /maximumFileBytes must be non-negative/i,
+  )
+  assert.throws(
+    () => studio.readLive2DPackagesWithSchemas(schemas, 1024, -1),
+    /maximumTotalBytes must be non-negative/i,
+  )
+
+  let calls = 0
+  const decoded = await studio.readLive2DPackagesWithAclDecoder(
+    (request) => {
+      calls += 1
+      assert.strictEqual(request.frameCount, 2)
+      assert.strictEqual(request.boneCount, 0)
+      assert.strictEqual(request.sampleRate, 30)
+      assert.strictEqual(request.declaredCurveCount, 1)
+      assert.strictEqual(request.useFastSampleMode, true)
+      assert.strictEqual(request.compressedTracks.length, 32)
+      assert.strictEqual(request.compressedTracks.readUInt32LE(8), 0xac11ac11)
+      assert.deepStrictEqual(request.decoderMap, [])
+      return {
+        times: [0, 1 / 30],
+        bindingIndices: [0],
+        values: [0.25, 0.75],
+        followingCurveOffset: 1,
+      }
+    },
+    schemas,
+    1024 * 1024,
+    4 * 1024 * 1024,
+  )
+  assert.strictEqual(calls, 1)
+  assert.strictEqual(decoded.packages.length, 1)
+  assert.deepStrictEqual(decoded.diagnostics, [])
+  const decodedFiles = new Map(
+    decoded.packages[0].files.map(({ fileName, data }) => [fileName, data]),
+  )
+  const motion = decodedFiles.get('motions/node-acl-motion.motion3.json')
+  assert.ok(motion)
+  assert.strictEqual(JSON.parse(motion.toString('utf8')).Meta.Fps, 60)
+  const manifest = JSON.parse(decodedFiles.get('Hero.model3.json').toString('utf8'))
+  assert.deepStrictEqual(
+    manifest.FileReferences.Motions['node-acl-motion'],
+    [{ File: 'motions/node-acl-motion.motion3.json' }],
+  )
+
+  let invalidCalls = 0
+  const malformed = await studio.readLive2DPackagesWithAclDecoder(
+      () => {
+        invalidCalls += 1
+        return {
+        times: [0],
+        bindingIndices: [0],
+        values: [0.25],
+        followingCurveOffset: 1,
+        }
+      },
+      schemas,
+      1024 * 1024,
+      4 * 1024 * 1024,
+  )
+  assert.strictEqual(invalidCalls, 1)
+  assert.strictEqual(malformed.packages.length, 1)
+  assert.ok(
+    malformed.diagnostics.some(
+      ({ kind, detail }) =>
+        kind === 'MotionReadFailed'
+        && /returned 1 times|2 declared frames/i.test(detail),
+    ),
+  )
+  assert.ok(
+    !malformed.packages[0].files.some(
+      ({ fileName }) => fileName.endsWith('.motion3.json'),
+    ),
+  )
+
+  let unresolvedCalls = 0
+  const unresolved = await studio.readLive2DPackagesWithAclDecoder(() => {
+    unresolvedCalls += 1
+    return {
+      times: [],
+      bindingIndices: [],
+      values: [],
+      followingCurveOffset: 0,
+    }
+  })
+  assert.strictEqual(unresolvedCalls, 0)
+  assert.deepStrictEqual(unresolved.packages, [])
+  assert.ok(unresolved.diagnostics.length > 0)
+  console.log('node api: Live2D schema and ACL package adapters ok')
+}
+
+testLive2dPackageAdapters().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
 
 // Oodle decoder injection. Core ships no Oodle decoder, so a bundle marked
 // with it is unreadable until the caller supplies one.
@@ -1571,6 +3034,26 @@ async function testAclInjection() {
     'tuanjie-acl.assets',
     aclInput.length,
   )
+  const clip = aclStudio.readAnimationClipInfo(0, 7n)
+  assert.strictEqual(clip.pathId, 7n)
+  assert.strictEqual(clip.name, 'node-acl-motion')
+  assert.strictEqual(clip.hasMuscleClip, true)
+  assert.ok(clip.muscleClipSize > 0)
+  assert.strictEqual(clip.streamedCurveCount, 0)
+  assert.strictEqual(clip.denseCurveCount, 0)
+  assert.strictEqual(clip.constantValueCount, 0)
+  assert.strictEqual(clip.hasAcl, true)
+  assert.strictEqual(clip.aclFrameCount, 0)
+  assert.strictEqual(clip.aclBoneCount, 0)
+  assert.strictEqual(clip.aclSampleRate, 30)
+  assert.strictEqual(clip.aclCurveCount, 0)
+  assert.strictEqual(clip.aclTrackByteCount, 32n)
+  assert.strictEqual(clip.aclDecoderCount, 0)
+  assert.strictEqual(clip.aclUseFastSampleMode, true)
+  assert.strictEqual(clip.hasStreamingInfo, true)
+  assert.strictEqual(clip.streamingOffset, 0n)
+  assert.strictEqual(clip.streamingSize, 0)
+  assert.strictEqual(clip.streamingPath, '')
   let motionCalls = 0
   const motion = await aclStudio.readCubismClipMotionWithAclDecoder(
     0,
@@ -1611,6 +3094,116 @@ async function testAclInjection() {
       followingCurveOffset: 0,
     })),
     /returned 1 times|0 declared frames/i,
+  )
+  let aclLengthGetterTouched = false
+  const invalidTimes = []
+  Object.defineProperty(invalidTimes, 0, {
+    get() {
+      aclLengthGetterTouched = true
+      throw new Error('ACL time element was converted before its length')
+    },
+  })
+  await assert.rejects(
+    aclStudio.readCubismClipMotionWithAclDecoder(0, 7n, () => ({
+      times: invalidTimes,
+      bindingIndices: [],
+      values: [],
+      followingCurveOffset: 0,
+    })),
+    /returned 1 times|0 declared frames/i,
+  )
+  assert.strictEqual(aclLengthGetterTouched, false)
+
+  const aclFbxInput = syntheticAclFbxModel()
+  const aclFbxStudio = addon.AssetStudio.fromBuffer(
+    aclFbxInput,
+    'acl-fbx.assets',
+    aclFbxInput.length,
+  )
+  let fbxCalls = 0
+  const aclFbx = await aclFbxStudio.readFbxWithAclDecoder((request) => {
+    fbxCalls += 1
+    assert.strictEqual(request.frameCount, 0)
+    assert.strictEqual(request.declaredCurveCount, 0)
+    assert.strictEqual(request.compressedTracks.length, 32)
+    return {
+      times: [],
+      bindingIndices: [],
+      values: [],
+      followingCurveOffset: 0,
+    }
+  }, 1024 * 1024)
+  assert.strictEqual(fbxCalls, 1)
+  assert.ok(aclFbx.includes(Buffer.from('node acl model')))
+  assert.ok(aclFbx.includes(Buffer.from('node-acl-motion')))
+
+  let binaryCalls = 0
+  const binaryFbx = await aclFbxStudio.readFbxBinaryWithAclDecoder((request) => {
+    binaryCalls += 1
+    assert.strictEqual(request.compressedTracks.length, 32)
+    return {
+      times: [],
+      bindingIndices: [],
+      values: [],
+      followingCurveOffset: 0,
+    }
+  }, 1024 * 1024)
+  assert.strictEqual(binaryCalls, 1)
+  assert.deepStrictEqual(
+    binaryFbx.subarray(0, 23),
+    Buffer.from('Kaydara FBX Binary  \0\x1a\0', 'binary'),
+  )
+  assert.ok(binaryFbx.includes(Buffer.from('node acl model')))
+  assert.ok(binaryFbx.includes(Buffer.from('node-acl-motion')))
+
+  let selectedCalls = 0
+  const selectedFbx = await aclFbxStudio.readGameObjectFbxWithAclDecoder(
+    0,
+    1n,
+    (request) => {
+      selectedCalls += 1
+      assert.strictEqual(request.declaredCurveCount, 0)
+      return {
+        times: [],
+        bindingIndices: [],
+        values: [],
+        followingCurveOffset: 0,
+      }
+    },
+    true,
+    1024 * 1024,
+  )
+  assert.strictEqual(selectedCalls, 1)
+  assert.ok(selectedFbx.includes(Buffer.from('node acl model')))
+  assert.ok(selectedFbx.includes(Buffer.from('node-acl-motion')))
+
+  let disabledCalls = 0
+  const staticSelected = await aclFbxStudio.readGameObjectFbxWithAclDecoder(
+    0,
+    1n,
+    () => {
+      disabledCalls += 1
+      return {
+        times: [],
+        bindingIndices: [],
+        values: [],
+        followingCurveOffset: 0,
+      }
+    },
+    false,
+    1024 * 1024,
+  )
+  assert.strictEqual(disabledCalls, 0)
+  assert.ok(staticSelected.includes(Buffer.from('node acl model')))
+  assert.ok(!staticSelected.includes(Buffer.from('node-acl-motion')))
+  await assert.rejects(
+    aclFbxStudio.readFbxBinaryWithAclDecoder(() => ({
+      times: [],
+      bindingIndices: [],
+      values: [],
+      followingCurveOffset: 0,
+    }), 1),
+    /limit|exceed/i,
   )
 
   const barren = addon.AssetStudio.fromBuffers([

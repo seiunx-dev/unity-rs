@@ -416,6 +416,7 @@ impl AclClip {
             use_fast_sample_mode: self.use_fast_sample_mode,
             input: &input,
         };
+        crate::acl::validate_decode_request(&request, limits)?;
         let output = decoder.decode(&request)?;
         crate::acl::validate_decoded_clip(&output, &request, limits)?;
         Ok(output)
