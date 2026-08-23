@@ -59,6 +59,8 @@ OPUS_VARIANTS = {
 
 MPEG_NAME = "mpeg-layer3-tone.mp3"
 MPEG_TONE = "sine=frequency=440:sample_rate=44100:duration=0.3"
+MPEG_MULTISTREAM_NAME = "fsb5-mpeg-layer3-6ch.fsb"
+MPEG_MULTISTREAM_PAIRS = ((330, 440), (550, 660), (770, 880))
 
 
 def run(command: list[str]) -> None:
@@ -137,6 +139,91 @@ def generate_mpeg(work: Path) -> None:
     print(f"wrote {MPEG_NAME}: {(FIXTURES / MPEG_NAME).stat().st_size} bytes")
 
 
+def mpeg_layer3_frames(data: bytes) -> list[bytes]:
+    """Splits a headerless MPEG Layer III stream into complete frames."""
+    mpeg1_layer3_bitrates = (
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+    )
+    mpeg1_rates = (44_100, 48_000, 32_000)
+    frames: list[bytes] = []
+    offset = 0
+    while offset < len(data):
+        if offset + 4 > len(data):
+            raise ValueError("MPEG fixture ends inside a frame header")
+        word = int.from_bytes(data[offset : offset + 4], "big")
+        if word >> 21 != 0x7FF or (word >> 19) & 0x03 != 3:
+            raise ValueError(f"MPEG fixture has a non-MPEG-1 sync at {offset}")
+        if (word >> 17) & 0x03 != 1:
+            raise ValueError(f"MPEG fixture has a non-Layer-III frame at {offset}")
+        bitrate = mpeg1_layer3_bitrates[(word >> 12) & 0x0F]
+        rate_index = (word >> 10) & 0x03
+        if bitrate == 0 or rate_index >= len(mpeg1_rates):
+            raise ValueError(f"MPEG fixture has a reserved header at {offset}")
+        sample_rate = mpeg1_rates[rate_index]
+        padding = (word >> 9) & 1
+        length = 144 * bitrate * 1000 // sample_rate + padding
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"MPEG fixture frame at {offset} is truncated")
+        frames.append(data[offset:end])
+        offset = end
+    return frames
+
+
+def generate_multistream_mpeg(work: Path) -> None:
+    """Builds a six-channel FSB5 from three independently encoded stereo streams."""
+    streams: list[list[bytes]] = []
+    for index, (left, right) in enumerate(MPEG_MULTISTREAM_PAIRS):
+        raw = work / f"mpeg-pair-{index}.wav"
+        encoded = work / f"mpeg-pair-{index}.mp3"
+        run(
+            [
+                "ffmpeg", "-v", "error", "-y",
+                "-f", "lavfi", "-i",
+                f"sine=frequency={left}:sample_rate=44100:duration=0.3",
+                "-f", "lavfi", "-i",
+                f"sine=frequency={right}:sample_rate=44100:duration=0.3",
+                "-filter_complex", "[0:a][1:a]amerge=inputs=2[a]",
+                "-map", "[a]", "-ac", "2", str(raw),
+            ]
+        )
+        run(
+            [
+                "lame", "--quiet", "-b", "128", "--cbr", "-m", "s",
+                "--nores", "-t", str(raw), str(encoded),
+            ]
+        )
+        streams.append(mpeg_layer3_frames(encoded.read_bytes()))
+
+    frame_count = len(streams[0])
+    if frame_count == 0 or any(len(stream) != frame_count for stream in streams):
+        raise ValueError("multistream MPEG encoders produced different frame counts")
+    data = bytearray()
+    for frames in zip(*streams):
+        interleave = (len(frames[0]) + 15) & ~15
+        for frame in frames:
+            if (len(frame) + 15) & ~15 != interleave:
+                raise ValueError("multistream MPEG frames have different padded spans")
+            data.extend(frame)
+            data.extend(b"\0" * (interleave - len(frame)))
+
+    header = bytearray(0x3C)
+    header[:4] = b"FSB5"
+    header[4:8] = (1).to_bytes(4, "little")
+    header[8:12] = (1).to_bytes(4, "little")
+    header[12:16] = (8).to_bytes(4, "little")
+    header[20:24] = len(data).to_bytes(4, "little")
+    header[24:28] = (11).to_bytes(4, "little")
+    # Compact channel code 2 is six channels; rate code 8 is 44.1 kHz.
+    sample_mode = (frame_count * 1152 << 34) | (2 << 5) | (8 << 1)
+    output = header + sample_mode.to_bytes(8, "little") + data
+    (FIXTURES / MPEG_MULTISTREAM_NAME).write_bytes(output)
+    print(
+        f"wrote {MPEG_MULTISTREAM_NAME}: {frame_count} frames per stream, "
+        f"{len(output)} bytes"
+    )
+
+
 def main() -> None:
     for tool in ("ffmpeg", "lame"):
         if subprocess.run(["which", tool], capture_output=True).returncode != 0:
@@ -146,6 +233,7 @@ def main() -> None:
         for name, options in OPUS_VARIANTS.items():
             generate_opus(name, options, work)
         generate_mpeg(work)
+        generate_multistream_mpeg(work)
 
 
 if __name__ == "__main__":
