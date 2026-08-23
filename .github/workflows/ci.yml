@@ -283,7 +283,10 @@ jobs:
           chmod +x "$HOME/.local/bin/vgmstream-cli"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Verify the oracle runs
-        run: vgmstream-cli -h > /dev/null
+        # vgmstream uses exit 1 for both of its successful information modes.
+        # Parse the pinned version output instead of treating that documented
+        # status as an execution failure or hiding arbitrary errors with `|| true`.
+        run: python3 -c "import json, os, subprocess; result = subprocess.run(['vgmstream-cli', '-V'], check=False, capture_output=True, text=True); assert result.returncode == 1, result; assert json.loads(result.stdout)['version'] == os.environ['VGMSTREAM_VERSION']"
       - name: Compare decoded PCM against vgmstream
         run: cargo +1.88.0 test -p assetstudio-core --lib --locked -- --ignored
 
