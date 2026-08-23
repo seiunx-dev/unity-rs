@@ -173,45 +173,53 @@ impl<R: Read + Seek> EndianReader<R> {
     /// Reads a UTF-8, nul-terminated string, mirroring .NET's replacement
     /// behavior for malformed UTF-8.
     pub fn read_c_string(&mut self, max_length: usize) -> Result<String> {
-        let mut bytes = Vec::with_capacity(max_length.min(256));
-        let available = usize::try_from(
-            self.remaining()?
-                .min(u64::try_from(max_length).unwrap_or(u64::MAX)),
-        )
-        .expect("available string bytes are bounded by usize");
-        while bytes.len() < available {
-            let byte = self.read_u8()?;
-            if byte == 0 {
-                break;
-            }
-            bytes.push(byte);
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        let (bytes, _) = self.read_c_string_bytes(max_length)?;
+        utf8_with_replacement(bytes, "C string")
     }
 
     /// Reads a nul-terminated UTF-8 string and rejects EOF or a length-limit
     /// hit before the terminator.
     pub fn read_c_string_required(&mut self, max_length: usize, field: &str) -> Result<String> {
-        let mut bytes = Vec::with_capacity(max_length.min(256));
-        let available = usize::try_from(
-            self.remaining()?
-                .min(u64::try_from(max_length).unwrap_or(u64::MAX)),
-        )
-        .expect("available string bytes are bounded by usize");
-        while bytes.len() < available {
-            let byte = self.read_u8()?;
-            if byte == 0 {
-                return Ok(String::from_utf8_lossy(&bytes).into_owned());
-            }
-            bytes.push(byte);
+        let (bytes, terminated) = self.read_c_string_bytes(max_length)?;
+        if terminated {
+            return utf8_with_replacement(bytes, field);
         }
         Err(Error::invalid_data(format!(
             "{field} is not nul-terminated within {max_length} bytes"
         )))
     }
 
+    fn read_c_string_bytes(&mut self, max_length: usize) -> Result<(Vec<u8>, bool)> {
+        let available = usize::try_from(
+            self.remaining()?
+                .min(u64::try_from(max_length).unwrap_or(u64::MAX)),
+        )
+        .map_err(|_| Error::invalid_data("available string length does not fit this platform"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(available.min(256))
+            .map_err(|error| Error::invalid_data(format!("cannot allocate C string: {error}")))?;
+        while bytes.len() < available {
+            let byte = self.read_u8()?;
+            if byte == 0 {
+                return Ok((bytes, true));
+            }
+            if bytes.len() == bytes.capacity() {
+                let additional = bytes
+                    .capacity()
+                    .max(256)
+                    .min(available.saturating_sub(bytes.len()));
+                bytes.try_reserve_exact(additional).map_err(|error| {
+                    Error::invalid_data(format!("cannot grow C string: {error}"))
+                })?;
+            }
+            bytes.push(byte);
+        }
+        Ok((bytes, false))
+    }
+
     pub fn read_utf8(&mut self, length: usize) -> Result<String> {
-        Ok(String::from_utf8_lossy(&self.read_bytes(length)?).into_owned())
+        utf8_with_replacement(self.read_bytes(length)?, "UTF-8 string")
     }
 
     pub fn read_aligned_string(&mut self) -> Result<String> {
@@ -246,6 +254,69 @@ impl<R: Read + Seek> EndianReader<R> {
         }
         self.set_position(target)
     }
+}
+
+fn utf8_with_replacement(bytes: Vec<u8>, field: &str) -> Result<String> {
+    let error = match String::from_utf8(bytes) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    let bytes = error.into_bytes();
+    let mut remaining = bytes.as_slice();
+    let mut output_length = 0_usize;
+    loop {
+        match std::str::from_utf8(remaining) {
+            Ok(value) => {
+                output_length = output_length
+                    .checked_add(value.len())
+                    .ok_or_else(|| Error::invalid_data(format!("{field} length overflowed")))?;
+                break;
+            }
+            Err(error) => {
+                output_length = output_length
+                    .checked_add(error.valid_up_to())
+                    .and_then(|length| length.checked_add('\u{fffd}'.len_utf8()))
+                    .ok_or_else(|| Error::invalid_data(format!("{field} length overflowed")))?;
+                let Some(invalid_length) = error.error_len() else {
+                    break;
+                };
+                remaining = &remaining[error.valid_up_to() + invalid_length..];
+            }
+        }
+    }
+
+    let mut output = String::new();
+    output.try_reserve_exact(output_length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate {field} replacement text: {error}"))
+    })?;
+    remaining = bytes.as_slice();
+    loop {
+        match std::str::from_utf8(remaining) {
+            Ok(value) => {
+                output.push_str(value);
+                break;
+            }
+            Err(error) => {
+                let valid =
+                    std::str::from_utf8(&remaining[..error.valid_up_to()]).map_err(|_| {
+                        Error::invalid_data(format!("{field} UTF-8 prefix validation disagrees"))
+                    })?;
+                output.push_str(valid);
+                output.push('\u{fffd}');
+                let Some(invalid_length) = error.error_len() else {
+                    break;
+                };
+                remaining = &remaining[error.valid_up_to() + invalid_length..];
+            }
+        }
+    }
+    if output.len() != output_length {
+        return Err(Error::invalid_data(format!(
+            "{field} replacement length changed from {output_length} to {} bytes",
+            output.len()
+        )));
+    }
+    Ok(output)
 }
 
 pub(crate) fn checked_length(value: i32, field: &str) -> Result<usize> {
@@ -295,6 +366,53 @@ mod tests {
         reader.align(4).unwrap();
         assert_eq!(reader.read_aligned_string().unwrap(), "foo");
         assert_eq!(reader.position().unwrap(), 12);
+    }
+
+    #[test]
+    fn strings_grow_fallibly_and_match_standard_utf8_replacement() {
+        let mut terminated = vec![b'x'; 4096];
+        terminated.push(0);
+        let mut reader = EndianReader::new(Cursor::new(terminated), Endian::Little);
+        assert_eq!(
+            reader
+                .read_c_string_required(4097, "long string")
+                .unwrap()
+                .len(),
+            4096
+        );
+
+        let invalid = [b'a', 0xff, 0xc0, 0xaf, 0xe2, 0x82];
+        let expected = String::from_utf8_lossy(&invalid);
+        let mut reader = EndianReader::new(Cursor::new(invalid), Endian::Little);
+        assert_eq!(reader.read_utf8(invalid.len()).unwrap(), expected);
+
+        let mut terminated_invalid = invalid.to_vec();
+        terminated_invalid.push(0);
+        let mut reader = EndianReader::new(Cursor::new(terminated_invalid), Endian::Little);
+        assert_eq!(
+            reader.read_c_string_required(32, "invalid string").unwrap(),
+            expected
+        );
+
+        let all_invalid = vec![0xff; 1024];
+        let mut reader = EndianReader::new(Cursor::new(&all_invalid), Endian::Little);
+        let replacement = reader.read_utf8(all_invalid.len()).unwrap();
+        assert_eq!(replacement.chars().count(), all_invalid.len());
+        assert_eq!(replacement.len(), all_invalid.len() * '\u{fffd}'.len_utf8());
+    }
+
+    #[test]
+    fn required_c_strings_reject_missing_terminators_at_the_exact_limit() {
+        let mut reader = EndianReader::new(Cursor::new(b"abcd\0"), Endian::Little);
+        let error = reader.read_c_string_required(4, "fixture").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not nul-terminated within 4 bytes")
+        );
+
+        let mut reader = EndianReader::new(Cursor::new(b"abcd"), Endian::Little);
+        assert_eq!(reader.read_c_string(4).unwrap(), "abcd");
     }
 
     #[test]

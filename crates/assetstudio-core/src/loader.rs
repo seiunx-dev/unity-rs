@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use crate::bundle::{
 use crate::compression::{CompressionLimits, ZipContainer, decompress_brotli, decompress_gzip};
 use crate::endian::{Endian, EndianReader};
 use crate::file_type::{FileType, HEADER_SCAN_LENGTH, detect_file_type};
+use crate::filesystem_text::{copy_os_str_with_replacement, lossy_os_str_utf8_length};
 use crate::legacy_bundle::LegacyBundle;
 use crate::monobehaviour::{MONO_SCRIPT_CLASS_ID, MonoBehaviourReadLimits, read_mono_script};
 use crate::object_name::{
@@ -26,6 +27,11 @@ use crate::unity_version::UnityVersion;
 use crate::web_file::{WebFile, WebParseLimits};
 use crate::{Error, Result};
 
+/// Default maximum UTF-8 byte length of one root label or discovered nested path.
+pub const DEFAULT_MAXIMUM_LOAD_PATH_BYTES: usize = 1024 * 1024;
+/// Default cumulative UTF-8 bytes charged for root labels and discovered nested paths.
+pub const DEFAULT_MAXIMUM_TOTAL_LOAD_PATH_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssetLoadLimits {
     pub maximum_input_files: usize,
@@ -35,12 +41,20 @@ pub struct AssetLoadLimits {
     pub maximum_discovered_files: usize,
     pub maximum_expanded_bytes: u64,
     pub maximum_single_entry_bytes: u64,
+    /// Maximum UTF-8 byte length of one caller label or fully qualified nested path.
+    pub maximum_path_bytes: usize,
+    /// Maximum cumulative UTF-8 bytes of paths discovered during one load.
+    ///
+    /// Moving the same path through a gzip or Brotli wrapper is not charged again.
+    pub maximum_total_path_bytes: usize,
     pub maximum_container_assignments: usize,
     pub maximum_object_name_assignments: usize,
     pub maximum_total_object_name_bytes: usize,
     /// Maximum combined serialized-file and object entries in the collection-wide `PPtr`
     /// lookup index.
     pub maximum_reference_index_entries: usize,
+    /// Maximum combined full-path and portable-name entries in the resource lookup index.
+    pub maximum_resource_index_entries: usize,
     pub container_metadata: ContainerMetadataReadLimits,
     pub object_names: ObjectNameReadLimits,
     pub compression: CompressionLimits,
@@ -56,10 +70,13 @@ impl Default for AssetLoadLimits {
             maximum_discovered_files: 1_000_000,
             maximum_expanded_bytes: 4 * 1024 * 1024 * 1024,
             maximum_single_entry_bytes: 512 * 1024 * 1024,
+            maximum_path_bytes: DEFAULT_MAXIMUM_LOAD_PATH_BYTES,
+            maximum_total_path_bytes: DEFAULT_MAXIMUM_TOTAL_LOAD_PATH_BYTES,
             maximum_container_assignments: 10_000_000,
             maximum_object_name_assignments: 1_000_000,
             maximum_total_object_name_bytes: 256 * 1024 * 1024,
             maximum_reference_index_entries: 10_000_000,
+            maximum_resource_index_entries: 2_000_000,
             container_metadata: ContainerMetadataReadLimits::default(),
             object_names: ObjectNameReadLimits::default(),
             compression: CompressionLimits::default(),
@@ -143,15 +160,45 @@ pub struct LoadedResource {
     pub region: Region,
 }
 
+/// Owned, deliberately unindexed contents of an [`AssetCollection`].
+///
+/// These tables may be freely changed before they are passed back to
+/// [`AssetCollection::from_parts`]. Derived object metadata and lookup indexes
+/// are intentionally absent and must be resolved or rebuilt on the new
+/// collection.
 #[derive(Debug, Default, Clone)]
-pub struct AssetCollection {
+pub struct AssetCollectionParts {
     pub serialized_files: Vec<LoadedSerializedFile>,
     pub resources: Vec<LoadedResource>,
+    pub diagnostics: Vec<LoadDiagnostic>,
+}
+
+/// A loaded, indexed set of serialized files and external resources.
+///
+/// The two indexed tables are exposed as read-only slices. Low-level callers
+/// that need different contents consume the collection through
+/// [`Self::into_parts`], change the unindexed parts, and build a new collection
+/// with [`Self::from_parts`] before explicitly resolving metadata or rebuilding
+/// indexes. This prevents safe external mutation from silently invalidating
+/// first-match lookup order without forcing a clone of every loaded region.
+///
+/// ```compile_fail
+/// use assetstudio_core::loader::AssetCollection;
+///
+/// let mut collection = AssetCollection::default();
+/// collection.serialized_files.clear();
+/// collection.resources.clear();
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct AssetCollection {
+    pub(crate) serialized_files: Vec<LoadedSerializedFile>,
+    pub(crate) resources: Vec<LoadedResource>,
     /// Inputs skipped under [`LoadFailurePolicy::SkipInput`], in discovery
     /// order. Always empty under [`LoadFailurePolicy::Abort`].
     pub diagnostics: Vec<LoadDiagnostic>,
     pub(crate) object_metadata: BTreeMap<(usize, i64), LoadedObjectMetadata>,
     reference_index: Option<AssetReferenceIndex>,
+    resource_index: Option<AssetResourceIndex>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,12 +216,32 @@ struct AssetReferenceIndex {
 }
 
 #[derive(Debug, Default, Clone)]
+struct AssetResourceIndex {
+    /// Resource indices sorted by normalized full path, then discovery order.
+    by_full_path: Vec<usize>,
+    /// Resource indices sorted by portable file name, then discovery order.
+    by_portable_name: Vec<usize>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct LoadedObjectMetadata {
     pub name: Option<String>,
     pub container: Option<Arc<str>>,
 }
 
 impl AssetCollection {
+    /// Returns serialized files in stable discovery order.
+    #[must_use]
+    pub fn serialized_files(&self) -> &[LoadedSerializedFile] {
+        &self.serialized_files
+    }
+
+    /// Returns external resources in stable discovery order.
+    #[must_use]
+    pub fn resources(&self) -> &[LoadedResource] {
+        &self.resources
+    }
+
     /// Builds a collection from already parsed files and resources.
     ///
     /// Container metadata is intentionally empty for this low-level constructor; normal `load*`
@@ -184,12 +251,47 @@ impl AssetCollection {
         serialized_files: Vec<LoadedSerializedFile>,
         resources: Vec<LoadedResource>,
     ) -> Self {
-        Self {
+        Self::from_parts(AssetCollectionParts {
             serialized_files,
             resources,
             diagnostics: Vec::new(),
+        })
+    }
+
+    /// Builds an unindexed collection from owned parts.
+    ///
+    /// Object metadata and lookup indexes are derived state and start empty.
+    /// Call [`Self::resolve_object_metadata`], [`Self::rebuild_reference_index`]
+    /// or [`Self::rebuild_resource_index`] as appropriate before repeated
+    /// lookups.
+    #[must_use]
+    pub fn from_parts(parts: AssetCollectionParts) -> Self {
+        let AssetCollectionParts {
+            serialized_files,
+            resources,
+            diagnostics,
+        } = parts;
+        Self {
+            serialized_files,
+            resources,
+            diagnostics,
             object_metadata: BTreeMap::new(),
             reference_index: None,
+            resource_index: None,
+        }
+    }
+
+    /// Consumes this collection and returns its owned, unindexed contents.
+    ///
+    /// Derived object metadata and lookup indexes are intentionally discarded;
+    /// reconstructing through [`Self::from_parts`] cannot carry a stale index
+    /// across table mutation.
+    #[must_use]
+    pub fn into_parts(self) -> AssetCollectionParts {
+        AssetCollectionParts {
+            serialized_files: self.serialized_files,
+            resources: self.resources,
+            diagnostics: self.diagnostics,
         }
     }
 
@@ -226,8 +328,9 @@ impl AssetCollection {
         } = options;
         let mut collection = Self::default();
         let mut budget = AssetLoadBudget::default();
+        let path = LoadPath::from_owned(path.into(), &limits, &mut budget)?;
         collection.load_root_with_policy(
-            path.into(),
+            path,
             region,
             &RootLoadSettings {
                 limits: &limits,
@@ -276,6 +379,7 @@ impl AssetCollection {
                     limits.maximum_input_files
                 )));
             }
+            let label = LoadPath::from_owned(label, &limits, &mut budget)?;
             collection.load_root_with_policy(label, region, &settings, &mut budget)?;
         }
         collection.rebuild_object_metadata(&limits)?;
@@ -317,7 +421,7 @@ impl AssetCollection {
         let inputs = if metadata.is_file() {
             prepare_single_file_input(path, &limits, &mut budget)?
         } else if metadata.is_dir() {
-            let files = collect_regular_files(path, &limits)?;
+            let files = collect_regular_files(path, &limits, &mut budget)?;
             prepare_directory_inputs(files, &limits, &mut budget)?
         } else {
             return Err(Error::invalid_data(format!(
@@ -344,7 +448,7 @@ impl AssetCollection {
     #[allow(clippy::too_many_lines)]
     fn load_root(
         &mut self,
-        path: String,
+        path: LoadPath,
         region: Region,
         settings: &RootLoadSettings<'_>,
         budget: &mut AssetLoadBudget,
@@ -393,7 +497,7 @@ impl AssetCollection {
                         },
                     )?;
                     self.serialized_files.push(LoadedSerializedFile {
-                        path: input.path,
+                        path: input.path.into_string(),
                         file,
                     });
                 }
@@ -404,9 +508,13 @@ impl AssetCollection {
                         .checked_sub(detection.data_offset)
                         .ok_or_else(|| Error::invalid_data("bundle offset exceeds its input"))?;
                     let bundle_region = input.region.subregion(detection.data_offset, length)?;
+                    let bundle_defaults = BundleParseLimits::default();
                     let bundle_limits = BundleParseLimits {
+                        max_path_length: limits
+                            .maximum_path_bytes
+                            .min(bundle_defaults.max_path_length),
                         max_entry_read_size: limits.maximum_single_entry_bytes,
-                        ..BundleParseLimits::default()
+                        ..bundle_defaults
                     };
                     let common = BundleHeader::read(&mut EndianReader::new(
                         bundle_region.cursor(),
@@ -436,7 +544,7 @@ impl AssetCollection {
                             let region = Region::from_bytes(bundle.read_entry(index)?);
                             charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
                             pending.push_back(PendingInput {
-                                path: nested_path(&input.path, &entry.path),
+                                path: nested_path(&input.path, &entry.path, limits, budget)?,
                                 region,
                                 depth: input.depth + 1,
                                 unity_version_hint: unity_version_hint.clone(),
@@ -452,7 +560,7 @@ impl AssetCollection {
                             let region = Region::from_bytes(bundle.read_entry(index)?);
                             charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
                             pending.push_back(PendingInput {
-                                path: nested_path(&input.path, &entry.path),
+                                path: nested_path(&input.path, &entry.path, limits, budget)?,
                                 region,
                                 depth: input.depth + 1,
                                 unity_version_hint: unity_version_hint.clone(),
@@ -466,15 +574,19 @@ impl AssetCollection {
                     }
                 }
                 FileType::WebFile => {
+                    let web_defaults = WebParseLimits::default();
                     let web_limits = WebParseLimits {
+                        max_path_length: limits
+                            .maximum_path_bytes
+                            .min(web_defaults.max_path_length),
                         max_entry_read_size: limits.maximum_single_entry_bytes,
-                        ..WebParseLimits::default()
+                        ..web_defaults
                     };
                     let web = WebFile::open_with_limits(input.region, web_limits)?;
                     for index in 0..web.entries.len() {
                         let entry = &web.entries[index];
                         pending.push_back(PendingInput {
-                            path: nested_path(&input.path, &entry.path),
+                            path: nested_path(&input.path, &entry.path, limits, budget)?,
                             region: web.entry_region(index)?,
                             depth: input.depth + 1,
                             unity_version_hint: input.unity_version_hint.clone(),
@@ -509,13 +621,19 @@ impl AssetCollection {
                     });
                 }
                 FileType::ZipFile => {
-                    let archive = ZipContainer::open(&input.region, limits.compression)?;
+                    let compression = CompressionLimits {
+                        maximum_zip_path_bytes: limits
+                            .maximum_path_bytes
+                            .min(limits.compression.maximum_zip_path_bytes),
+                        ..limits.compression
+                    };
+                    let archive = ZipContainer::open(&input.region, compression)?;
                     for index in 0..archive.entries.len() {
                         let entry = &archive.entries[index];
                         let region = archive.read_entry(index)?;
                         charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
                         pending.push_back(PendingInput {
-                            path: nested_path(&input.path, &entry.path),
+                            path: nested_path(&input.path, &entry.path, limits, budget)?,
                             region,
                             depth: input.depth + 1,
                             unity_version_hint: input.unity_version_hint.clone(),
@@ -523,7 +641,7 @@ impl AssetCollection {
                     }
                 }
                 FileType::ResourceFile => self.resources.push(LoadedResource {
-                    path: input.path,
+                    path: input.path.into_string(),
                     region: input.region,
                 }),
             }
@@ -534,13 +652,8 @@ impl AssetCollection {
 
     #[must_use]
     pub fn resource(&self, requested_path: &str) -> Option<&LoadedResource> {
-        let normalized_request = normalize_resource_path(requested_path);
-        self.resources.iter().find(|resource| {
-            let normalized_resource = normalize_resource_path(&resource.path);
-            normalized_resource.eq_ignore_ascii_case(&normalized_request)
-                || portable_file_name(&normalized_resource)
-                    .eq_ignore_ascii_case(portable_file_name(&normalized_request))
-        })
+        self.resource_index_by_path(requested_path)
+            .and_then(|index| self.resources.get(index))
     }
 
     #[must_use]
@@ -560,9 +673,9 @@ impl AssetCollection {
     /// Rebuilds the collection-wide `PPtr` lookup index from the currently exposed file tables.
     ///
     /// The low-level [`Self::from_loaded_parts`] constructor intentionally starts without an
-    /// index so it can retain its infallible API. Call this method after construction (and after
-    /// directly mutating `serialized_files`) to enable indexed reference lookup. A failed rebuild
-    /// leaves the collection in the safe linear-lookup mode.
+    /// index so it can retain its infallible API. Call this method after construction to enable
+    /// indexed reference lookup. A failed rebuild leaves the collection in the safe linear-lookup
+    /// mode.
     pub fn rebuild_reference_index(&mut self, limits: AssetLoadLimits) -> Result<()> {
         match AssetReferenceIndex::build(&self.serialized_files, &limits) {
             Ok(index) => {
@@ -576,10 +689,27 @@ impl AssetCollection {
         }
     }
 
+    /// Rebuilds the resource full-path and portable-name lookup index.
+    ///
+    /// [`Self::from_loaded_parts`] intentionally starts without one. A failed rebuild leaves
+    /// resource lookup in the allocation-free linear fallback mode.
+    pub fn rebuild_resource_index(&mut self, limits: AssetLoadLimits) -> Result<()> {
+        match AssetResourceIndex::build(&self.resources, &limits) {
+            Ok(index) => {
+                self.resource_index = Some(index);
+                Ok(())
+            }
+            Err(error) => {
+                self.resource_index = None;
+                Err(error)
+            }
+        }
+    }
+
     /// Loads one root, honouring the configured failure policy.
     fn load_root_with_policy(
         &mut self,
-        label: String,
+        label: LoadPath,
         region: Region,
         settings: &RootLoadSettings<'_>,
         budget: &mut AssetLoadBudget,
@@ -589,14 +719,22 @@ impl AssetCollection {
         // root started so a skipped one leaves nothing behind.
         let serialized_files = self.serialized_files.len();
         let resources = self.resources.len();
-        let result = self.load_root(label.clone(), region, settings, budget);
+        let diagnostic_path = if settings.failure_policy == LoadFailurePolicy::SkipInput {
+            Some(label.try_copy_string()?)
+        } else {
+            None
+        };
+        let result = self.load_root(label, region, settings, budget);
         if let Err(error) = result {
             if settings.failure_policy == LoadFailurePolicy::Abort {
                 return Err(error);
             }
             self.serialized_files.truncate(serialized_files);
             self.resources.truncate(resources);
-            self.record_skipped_input(label, &error)?;
+            self.record_skipped_input(
+                diagnostic_path.expect("skip policy prepared a diagnostic path"),
+                &error,
+            )?;
         }
         Ok(())
     }
@@ -620,6 +758,7 @@ impl AssetCollection {
 
     fn rebuild_object_metadata(&mut self, limits: &AssetLoadLimits) -> Result<()> {
         self.rebuild_reference_index(*limits)?;
+        self.rebuild_resource_index(*limits)?;
         let mut metadata = BTreeMap::new();
         let mut pending_names = PendingObjectNames::default();
         let mut assignment_count = 0_usize;
@@ -812,6 +951,21 @@ impl AssetCollection {
             .iter()
             .position(|object| object.path_id == path_id)
     }
+
+    pub(crate) fn resource_index_by_path(&self, requested_path: &str) -> Option<usize> {
+        if let Some(index) = &self.resource_index
+            && let Some(resource_index) = index.find(&self.resources, requested_path)
+            && self
+                .resources
+                .get(resource_index)
+                .is_some_and(|resource| resource_path_matches(&resource.path, requested_path))
+        {
+            return Some(resource_index);
+        }
+        self.resources
+            .iter()
+            .position(|resource| resource_path_matches(&resource.path, requested_path))
+    }
 }
 
 impl AssetReferenceIndex {
@@ -883,6 +1037,96 @@ impl AssetReferenceIndex {
             objects_by_file,
         })
     }
+}
+
+impl AssetResourceIndex {
+    fn build(resources: &[LoadedResource], limits: &AssetLoadLimits) -> Result<Self> {
+        let entry_count = resources
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| Error::invalid_data("resource lookup index entry count overflowed"))?;
+        if entry_count > limits.maximum_resource_index_entries {
+            return Err(Error::invalid_data(format!(
+                "resource lookup index needs {entry_count} entries, exceeding limit {}",
+                limits.maximum_resource_index_entries
+            )));
+        }
+
+        let mut by_full_path = Vec::new();
+        by_full_path
+            .try_reserve_exact(resources.len())
+            .map_err(|error| {
+                Error::invalid_data(format!("cannot allocate resource full-path index: {error}"))
+            })?;
+        by_full_path.extend(0..resources.len());
+        by_full_path.sort_unstable_by(|left, right| {
+            compare_normalized_resource_paths(&resources[*left].path, &resources[*right].path)
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut by_portable_name = Vec::new();
+        by_portable_name
+            .try_reserve_exact(resources.len())
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate resource portable-name index: {error}"
+                ))
+            })?;
+        by_portable_name.extend(0..resources.len());
+        by_portable_name.sort_unstable_by(|left, right| {
+            compare_ascii_case_insensitive(
+                portable_file_name(&resources[*left].path),
+                portable_file_name(&resources[*right].path),
+            )
+            .then_with(|| left.cmp(right))
+        });
+
+        Ok(Self {
+            by_full_path,
+            by_portable_name,
+        })
+    }
+
+    fn find(&self, resources: &[LoadedResource], requested_path: &str) -> Option<usize> {
+        let full = first_resource_index(
+            &self.by_full_path,
+            resources,
+            requested_path,
+            compare_normalized_resource_paths,
+        );
+        let requested_name = portable_file_name(requested_path);
+        let portable = first_resource_index(
+            &self.by_portable_name,
+            resources,
+            requested_name,
+            |candidate, requested| {
+                compare_ascii_case_insensitive(portable_file_name(candidate), requested)
+            },
+        );
+        match (full, portable) {
+            (Some(full), Some(portable)) => Some(full.min(portable)),
+            (Some(index), None) | (None, Some(index)) => Some(index),
+            (None, None) => None,
+        }
+    }
+}
+
+fn first_resource_index(
+    entries: &[usize],
+    resources: &[LoadedResource],
+    requested: &str,
+    compare: impl Fn(&str, &str) -> Ordering,
+) -> Option<usize> {
+    let start = entries.partition_point(|resource_index| {
+        resources
+            .get(*resource_index)
+            .is_some_and(|resource| compare(&resource.path, requested) == Ordering::Less)
+    });
+    let resource_index = *entries.get(start)?;
+    resources
+        .get(resource_index)
+        .filter(|resource| compare(&resource.path, requested) == Ordering::Equal)
+        .map(|_| resource_index)
 }
 
 type ObjectMetadataKey = (usize, i64);
@@ -1044,64 +1288,224 @@ fn charge_container_assignment(count: &mut usize, limits: &AssetLoadLimits) -> R
 struct AssetLoadBudget {
     discovered_files: usize,
     expanded_bytes: u64,
+    path_bytes: usize,
+    input_directories: usize,
+    directory_entries: usize,
+}
+
+impl AssetLoadBudget {
+    fn charge_path(&mut self, length: usize, limits: &AssetLoadLimits) -> Result<()> {
+        if length > limits.maximum_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "asset path has {length} UTF-8 bytes, exceeding limit {}",
+                limits.maximum_path_bytes
+            )));
+        }
+        let total = self
+            .path_bytes
+            .checked_add(length)
+            .ok_or_else(|| Error::invalid_data("asset path byte count overflowed"))?;
+        if total > limits.maximum_total_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "asset traversal paths total {total} UTF-8 bytes, exceeding limit {}",
+                limits.maximum_total_path_bytes
+            )));
+        }
+        self.path_bytes = total;
+        Ok(())
+    }
+
+    fn charge_input_directory(&mut self, limits: &AssetLoadLimits) -> Result<()> {
+        self.input_directories = self
+            .input_directories
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("directory count overflowed"))?;
+        if self.input_directories > limits.maximum_input_directories {
+            return Err(Error::invalid_data(format!(
+                "directory traversal exceeds {} directories",
+                limits.maximum_input_directories
+            )));
+        }
+        Ok(())
+    }
+
+    fn charge_directory_entry(&mut self, limits: &AssetLoadLimits) -> Result<()> {
+        self.directory_entries = self
+            .directory_entries
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("directory entry count overflowed"))?;
+        if self.directory_entries > limits.maximum_directory_entries {
+            return Err(Error::invalid_data(format!(
+                "directory traversal exceeds {} entries",
+                limits.maximum_directory_entries
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LoadPath(String);
+
+impl LoadPath {
+    fn from_owned(
+        value: String,
+        limits: &AssetLoadLimits,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
+        budget.charge_path(value.len(), limits)?;
+        Ok(Self(value))
+    }
+
+    fn from_path(
+        value: &Path,
+        limits: &AssetLoadLimits,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
+        let utf8_length = lossy_os_str_utf8_length(value.as_os_str())?;
+        budget.charge_path(utf8_length, limits)?;
+        Ok(Self(copy_os_str_with_replacement(
+            value.as_os_str(),
+            utf8_length,
+            "asset path",
+        )?))
+    }
+
+    fn from_precharged_path(
+        value: &Path,
+        limits: &AssetLoadLimits,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
+        let charged_length = filesystem_path_byte_length(value);
+        let utf8_length = lossy_os_str_utf8_length(value.as_os_str())?;
+        if utf8_length > limits.maximum_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "asset path has {} UTF-8 bytes, exceeding limit {}",
+                utf8_length, limits.maximum_path_bytes
+            )));
+        }
+        if utf8_length > charged_length {
+            budget.charge_path(utf8_length - charged_length, limits)?;
+        }
+        Ok(Self(copy_os_str_with_replacement(
+            value.as_os_str(),
+            utf8_length,
+            "asset path",
+        )?))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_string(self) -> String {
+        self.0
+    }
+
+    fn try_copy_string(&self) -> Result<String> {
+        let mut copy = String::new();
+        copy.try_reserve_exact(self.0.len()).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate load diagnostic path: {error}"))
+        })?;
+        copy.push_str(&self.0);
+        Ok(copy)
+    }
 }
 
 #[derive(Debug)]
 struct PendingInput {
-    path: String,
+    path: LoadPath,
     region: Region,
     depth: usize,
     unity_version_hint: Option<crate::unity_version::UnityVersion>,
 }
 
-fn collect_regular_files(root: &Path, limits: &AssetLoadLimits) -> Result<Vec<PathBuf>> {
-    if limits.maximum_input_directories == 0 {
+fn filesystem_path_byte_length(path: &Path) -> usize {
+    path.as_os_str().as_encoded_bytes().len()
+}
+
+fn copy_filesystem_path(
+    path: &Path,
+    limits: &AssetLoadLimits,
+    budget: &mut AssetLoadBudget,
+) -> Result<PathBuf> {
+    let length = filesystem_path_byte_length(path);
+    budget.charge_path(length, limits)?;
+    let mut copy = PathBuf::new();
+    copy.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate filesystem path: {error}"))
+    })?;
+    copy.push(path);
+    Ok(copy)
+}
+
+fn join_filesystem_path(
+    parent: &Path,
+    child: &std::ffi::OsStr,
+    limits: &AssetLoadLimits,
+    budget: &mut AssetLoadBudget,
+) -> Result<PathBuf> {
+    let parent_bytes = parent.as_os_str().as_encoded_bytes();
+    let child_length = child.as_encoded_bytes().len();
+    let separator_length =
+        usize::from(!parent_bytes.is_empty() && !matches!(parent_bytes.last(), Some(b'/' | b'\\')));
+    let length = parent_bytes
+        .len()
+        .checked_add(separator_length)
+        .and_then(|length| length.checked_add(child_length))
+        .ok_or_else(|| Error::invalid_data("filesystem path length overflowed"))?;
+    budget.charge_path(length, limits)?;
+    let mut path = PathBuf::new();
+    path.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate filesystem child path: {error}"))
+    })?;
+    path.push(parent);
+    path.push(child);
+    if filesystem_path_byte_length(&path) > length {
         return Err(Error::invalid_data(
-            "directory traversal exceeds 0 directories",
+            "filesystem path grew beyond its checked encoded length",
         ));
     }
+    Ok(path)
+}
+
+fn collect_regular_files(
+    root: &Path,
+    limits: &AssetLoadLimits,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<PathBuf>> {
+    budget.charge_input_directory(limits)?;
     let mut pending_directories = Vec::new();
     pending_directories.try_reserve(1).map_err(|error| {
         Error::invalid_data(format!("cannot allocate directory queue: {error}"))
     })?;
-    pending_directories.push(root.to_owned());
+    pending_directories.push(copy_filesystem_path(root, limits, budget)?);
     let mut files = Vec::new();
-    let mut directory_count = 1_usize;
-    let mut entry_count = 0_usize;
     while let Some(directory) = pending_directories.pop() {
         let mut children = Vec::new();
-        for child in fs::read_dir(directory)? {
-            entry_count = entry_count
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid_data("directory entry count overflowed"))?;
-            if entry_count > limits.maximum_directory_entries {
-                return Err(Error::invalid_data(format!(
-                    "directory traversal exceeds {} entries",
-                    limits.maximum_directory_entries
-                )));
+        for child in fs::read_dir(&directory)? {
+            budget.charge_directory_entry(limits)?;
+            let child = child?;
+            let file_type = child.file_type()?;
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
             }
             children.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!("cannot allocate directory entries: {error}"))
             })?;
-            children.push(child?);
+            children.push((
+                join_filesystem_path(&directory, &child.file_name(), limits, budget)?,
+                file_type,
+            ));
         }
-        children.sort_unstable_by_key(fs::DirEntry::file_name);
-        for child in children.into_iter().rev() {
-            let file_type = child.file_type()?;
+        children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for (child, file_type) in children.into_iter().rev() {
             if file_type.is_dir() {
-                directory_count = directory_count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::invalid_data("directory count overflowed"))?;
-                if directory_count > limits.maximum_input_directories {
-                    return Err(Error::invalid_data(format!(
-                        "directory traversal exceeds {} directories",
-                        limits.maximum_input_directories
-                    )));
-                }
+                budget.charge_input_directory(limits)?;
                 pending_directories.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot grow directory queue: {error}"))
                 })?;
-                pending_directories.push(child.path());
+                pending_directories.push(child);
             } else if file_type.is_file() {
                 if files.len() >= limits.maximum_input_files {
                     return Err(Error::invalid_data(format!(
@@ -1112,7 +1516,7 @@ fn collect_regular_files(root: &Path, limits: &AssetLoadLimits) -> Result<Vec<Pa
                 files.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot grow input file list: {error}"))
                 })?;
-                files.push(child.path());
+                files.push(child);
             }
         }
     }
@@ -1168,29 +1572,57 @@ fn prepare_directory_inputs(
     files: Vec<PathBuf>,
     limits: &AssetLoadLimits,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<(String, Region)>> {
-    let mut regular_files = BTreeSet::new();
-    let mut split_groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+) -> Result<Vec<(LoadPath, Region)>> {
+    let mut regular_files = Vec::new();
+    let mut split_files = Vec::new();
     for file in files {
-        if let Some(base) = split_base_path(&file) {
-            split_groups.entry(base).or_default().push(file);
+        if file
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.starts_with("split"))
+        {
+            split_files.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow split input table: {error}"))
+            })?;
+            split_files.push(file);
         } else {
-            regular_files.insert(file);
+            regular_files.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow regular input table: {error}"))
+            })?;
+            regular_files.push(file);
         }
     }
 
     let mut inputs = Vec::new();
     inputs
-        .try_reserve_exact(regular_files.len().saturating_add(split_groups.len()))
+        .try_reserve_exact(regular_files.len().saturating_add(split_files.len()))
         .map_err(|error| Error::invalid_data(format!("cannot allocate input table: {error}")))?;
-    for file in &regular_files {
-        inputs.push((
-            file.to_string_lossy().into_owned(),
-            Region::from_file(file)?,
-        ));
-    }
-    for (base, segment_paths) in split_groups {
-        if regular_files.contains(&base) {
+    let mut split_files = split_files.into_iter().peekable();
+    while let Some(path) = split_files.next() {
+        let base = split_base_path(&path).ok_or_else(|| {
+            Error::invalid_data(format!(
+                "invalid Unity split segment path: {}",
+                path.display()
+            ))
+        })?;
+        let mut segment_paths = Vec::new();
+        segment_paths.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate split path table: {error}"))
+        })?;
+        segment_paths.push(path);
+        while let Some(next) = split_files.peek() {
+            if split_base_path(next).as_ref() != Some(&base) {
+                break;
+            }
+            let next = split_files
+                .next()
+                .expect("peeked split segment remains available");
+            segment_paths.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow split path table: {error}"))
+            })?;
+            segment_paths.push(next);
+        }
+        if regular_files.binary_search(&base).is_ok() {
             continue;
         }
         let mut segments = Vec::new();
@@ -1208,7 +1640,14 @@ fn prepare_directory_inputs(
             })?;
             segments.push((segment.index, path));
         }
-        inputs.push(open_split_group(&base, segments, limits, budget)?);
+        budget.charge_path(filesystem_path_byte_length(&base), limits)?;
+        inputs.push(open_split_group(&base, segments, limits, budget, true)?);
+    }
+    for file in regular_files {
+        inputs.push((
+            LoadPath::from_precharged_path(&file, limits, budget)?,
+            Region::from_file(&file)?,
+        ));
     }
     inputs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(inputs)
@@ -1242,7 +1681,8 @@ const STREAMED_EXTENSIONS: [&str; 2] = ["ress", "resource"];
 fn companion_resource_inputs(
     path: &Path,
     limits: &AssetLoadLimits,
-) -> Result<Vec<(String, Region)>> {
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<(LoadPath, Region)>> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Ok(Vec::new());
     };
@@ -1250,10 +1690,12 @@ fn companion_resource_inputs(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    budget.charge_input_directory(limits)?;
     let prefix = format!("{name}.");
     let stem = path.file_stem().and_then(|stem| stem.to_str());
     let mut companions = Vec::new();
     for entry in fs::read_dir(parent)? {
+        budget.charge_directory_entry(limits)?;
         let entry = entry?;
         // Every directory entry is inspected for every input, so this loop is
         // quadratic in the size of the directory -- a game data folder is tens
@@ -1277,7 +1719,9 @@ fn companion_resource_inputs(
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| {
-                    STREAMED_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                    STREAMED_EXTENSIONS
+                        .iter()
+                        .any(|expected| extension.eq_ignore_ascii_case(expected))
                 });
             if !shares_stem {
                 continue;
@@ -1286,7 +1730,7 @@ fn companion_resource_inputs(
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let candidate = parent.join(candidate_name);
+        let candidate = join_filesystem_path(parent, &candidate_file_name, limits, budget)?;
         if companions.len() >= limits.maximum_input_files {
             return Err(Error::invalid_data(format!(
                 "companion resource files for {name} exceed {} inputs",
@@ -1294,7 +1738,7 @@ fn companion_resource_inputs(
             )));
         }
         companions.push((
-            candidate.to_string_lossy().into_owned(),
+            LoadPath::from_precharged_path(&candidate, limits, budget)?,
             Region::from_file(&candidate)?,
         ));
     }
@@ -1308,18 +1752,18 @@ fn prepare_single_file_input(
     path: &Path,
     limits: &AssetLoadLimits,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<(String, Region)>> {
+) -> Result<Vec<(LoadPath, Region)>> {
     let Some(base) = split_base_path(path) else {
         let mut inputs = vec![(
-            path.to_string_lossy().into_owned(),
+            LoadPath::from_path(path, limits, budget)?,
             Region::from_file(path)?,
         )];
-        inputs.extend(companion_resource_inputs(path, limits)?);
+        inputs.extend(companion_resource_inputs(path, limits, budget)?);
         return Ok(inputs);
     };
     if base.is_file() {
         return Ok(vec![(
-            base.to_string_lossy().into_owned(),
+            LoadPath::from_path(&base, limits, budget)?,
             Region::from_file(&base)?,
         )]);
     }
@@ -1342,12 +1786,14 @@ fn prepare_single_file_input(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut segments = Vec::new();
+    budget.charge_input_directory(limits)?;
     for entry in fs::read_dir(parent)? {
+        budget.charge_directory_entry(limits)?;
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let candidate = entry.path();
+        let candidate = join_filesystem_path(parent, &entry.file_name(), limits, budget)?;
         if candidate.with_extension("").file_name() != Some(base_name) {
             continue;
         }
@@ -1367,6 +1813,7 @@ fn prepare_single_file_input(
         segments,
         limits,
         budget,
+        false,
     )?])
 }
 
@@ -1375,7 +1822,8 @@ fn open_split_group(
     mut segments: Vec<(usize, PathBuf)>,
     limits: &AssetLoadLimits,
     budget: &mut AssetLoadBudget,
-) -> Result<(String, Region)> {
+    base_is_precharged: bool,
+) -> Result<(LoadPath, Region)> {
     if segments.is_empty() {
         return Err(Error::invalid_data(format!(
             "Unity split group has no segments: {}",
@@ -1407,6 +1855,11 @@ fn open_split_group(
             )));
         }
     }
+    let load_path = if base_is_precharged {
+        LoadPath::from_precharged_path(base, limits, budget)?
+    } else {
+        LoadPath::from_path(base, limits, budget)?
+    };
 
     let remaining_budget = limits
         .maximum_expanded_bytes
@@ -1435,7 +1888,7 @@ fn open_split_group(
         .expanded_bytes
         .checked_add(region.len())
         .ok_or_else(|| Error::invalid_data("split source byte budget overflowed"))?;
-    Ok((base.to_string_lossy().into_owned(), region))
+    Ok((load_path, region))
 }
 
 fn detect_region(region: &Region) -> Result<crate::file_type::FileDetection> {
@@ -1470,14 +1923,59 @@ fn charge_expansion(length: u64, limits: &AssetLoadLimits, expanded_bytes: &mut 
     Ok(())
 }
 
-fn nested_path(parent: &str, child: &str) -> String {
-    format!("{parent}::{}", child.replace('\\', "/"))
+fn nested_path(
+    parent: &LoadPath,
+    child: &str,
+    limits: &AssetLoadLimits,
+    budget: &mut AssetLoadBudget,
+) -> Result<LoadPath> {
+    let length = parent
+        .as_str()
+        .len()
+        .checked_add(2)
+        .and_then(|length| length.checked_add(child.len()))
+        .ok_or_else(|| Error::invalid_data("nested asset path length overflowed"))?;
+    budget.charge_path(length, limits)?;
+    let mut path = String::new();
+    path.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate nested asset path: {error}"))
+    })?;
+    path.push_str(parent.as_str());
+    path.push_str("::");
+    for character in child.chars() {
+        path.push(if character == '\\' { '/' } else { character });
+    }
+    debug_assert_eq!(path.len(), length);
+    Ok(LoadPath(path))
 }
 
-fn normalize_resource_path(path: &str) -> String {
-    path.replace('\\', "/")
-        .trim_start_matches("archive:/")
-        .to_owned()
+fn resource_path_matches(candidate: &str, requested: &str) -> bool {
+    compare_normalized_resource_paths(candidate, requested) == Ordering::Equal
+        || portable_file_name(candidate).eq_ignore_ascii_case(portable_file_name(requested))
+}
+
+fn compare_normalized_resource_paths(left: &str, right: &str) -> Ordering {
+    normalized_resource_path_bytes(left).cmp(normalized_resource_path_bytes(right))
+}
+
+fn normalized_resource_path_bytes(path: &str) -> impl Iterator<Item = u8> + '_ {
+    strip_archive_prefix(path).bytes().map(|byte| {
+        if byte == b'\\' {
+            b'/'
+        } else {
+            byte.to_ascii_lowercase()
+        }
+    })
+}
+
+fn strip_archive_prefix(mut path: &str) -> &str {
+    while path.len() >= 9
+        && path.as_bytes()[..8] == *b"archive:"
+        && matches!(path.as_bytes()[8], b'/' | b'\\')
+    {
+        path = &path[9..];
+    }
+    path
 }
 
 fn portable_file_name(path: &str) -> &str {
@@ -1506,7 +2004,8 @@ mod tests {
     use crate::unity_version::UnityVersion;
 
     use super::{
-        AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy, LoadedSerializedFile,
+        AssetCollection, AssetLoadBudget, AssetLoadLimits, AssetLoadOptions, LoadDiagnostic,
+        LoadFailurePolicy, LoadPath, LoadedResource, LoadedSerializedFile,
     };
 
     #[test]
@@ -1527,6 +2026,9 @@ mod tests {
         fs::write(root.join("resources.assets.resource"), b"also streamed").unwrap();
         // The stem form, which is where a player build keeps its audio.
         fs::write(root.join("resources.resource"), b"stem companion").unwrap();
+        // Extension matching is ASCII-insensitive without allocating a
+        // lowercase copy for every directory entry.
+        fs::write(root.join("resources.ReSS"), b"mixed-case stem companion").unwrap();
         // Shares the stem but is not streamed data, so it is not a companion.
         fs::write(root.join("resources.txt"), b"not streamed data").unwrap();
         // Shares neither, so it is not a companion either.
@@ -1549,7 +2051,8 @@ mod tests {
             "the companions beside the input were not loaded: {names:?}"
         );
         assert!(
-            names.contains(&"resources.resource".to_owned()),
+            names.contains(&"resources.resource".to_owned())
+                && names.contains(&"resources.ReSS".to_owned()),
             "the stem-named companion was not loaded: {names:?}"
         );
         assert!(
@@ -1563,6 +2066,18 @@ mod tests {
                 .is_some(),
             "the companion should resolve by the name an asset refers to it by"
         );
+        let limits = AssetLoadLimits {
+            maximum_directory_entries: 1,
+            ..AssetLoadLimits::default()
+        };
+        let error = AssetCollection::load_path_with_limits(&input, limits).unwrap_err();
+        assert!(error.to_string().contains("exceeds 1 entries"));
+        let limits = AssetLoadLimits {
+            maximum_input_directories: 0,
+            ..AssetLoadLimits::default()
+        };
+        let error = AssetCollection::load_path_with_limits(&input, limits).unwrap_err();
+        assert!(error.to_string().contains("exceeds 0 directories"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1608,7 +2123,256 @@ mod tests {
             ..AssetLoadLimits::default()
         };
         assert!(AssetCollection::load_path_with_limits(&root, limits).is_err());
+
+        // The filesystem path budget is consumed as each directory entry is
+        // discovered, not after every PathBuf has already been collected.
+        let mut budget = super::AssetLoadBudget::default();
+        let limits = AssetLoadLimits {
+            maximum_total_path_bytes: super::filesystem_path_byte_length(&root),
+            ..AssetLoadLimits::default()
+        };
+        let error = super::collect_regular_files(&root, &limits, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("asset traversal paths total"));
+        assert_eq!(budget.directory_entries, 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounds_root_and_nested_path_bytes_across_one_load() {
+        let limits = AssetLoadLimits {
+            maximum_path_bytes: 4,
+            ..AssetLoadLimits::default()
+        };
+        let error = AssetCollection::load_with_limits(
+            "12345",
+            Region::from_bytes(b"resource".to_vec()),
+            limits,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("5 UTF-8 bytes"));
+
+        let limits = AssetLoadLimits {
+            maximum_path_bytes: 6,
+            maximum_total_path_bytes: 7,
+            ..AssetLoadLimits::default()
+        };
+        let collection = AssetCollection::load_with_limits(
+            "r",
+            Region::from_bytes(web_file(&[("a\\b", b"payload")])),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(collection.resources.len(), 1);
+        assert_eq!(collection.resources[0].path, "r::a/b");
+
+        let limits = AssetLoadLimits {
+            maximum_path_bytes: 6,
+            maximum_total_path_bytes: 6,
+            ..AssetLoadLimits::default()
+        };
+        let error = AssetCollection::load_with_limits(
+            "r",
+            Region::from_bytes(web_file(&[("a\\b", b"payload")])),
+            limits,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("paths total 7 UTF-8 bytes"));
+
+        let limits = AssetLoadLimits {
+            maximum_path_bytes: 4,
+            maximum_total_path_bytes: 4,
+            ..AssetLoadLimits::default()
+        };
+        let error = AssetCollection::load_regions_with_options(
+            [
+                ("abc".to_owned(), Region::from_bytes(b"a".to_vec())),
+                ("de".to_owned(), Region::from_bytes(b"b".to_vec())),
+            ],
+            AssetLoadOptions {
+                limits,
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("paths total 5 UTF-8 bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streams_non_utf8_filesystem_paths_before_committing_load_budgets() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'a', 0xff]));
+        let per_path_limits = AssetLoadLimits {
+            maximum_path_bytes: 3,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::default();
+        let error = LoadPath::from_path(&path, &per_path_limits, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("has 4 UTF-8 bytes"), "{error}");
+        assert_eq!(budget.path_bytes, 0);
+
+        let cumulative_limits = AssetLoadLimits {
+            maximum_path_bytes: 4,
+            maximum_total_path_bytes: 3,
+            ..AssetLoadLimits::default()
+        };
+        let error = LoadPath::from_path(&path, &cumulative_limits, &mut budget).unwrap_err();
+        assert!(
+            error.to_string().contains("paths total 4 UTF-8 bytes"),
+            "{error}"
+        );
+        assert_eq!(budget.path_bytes, 0);
+
+        budget.charge_path(2, &cumulative_limits).unwrap();
+        let error =
+            LoadPath::from_precharged_path(&path, &cumulative_limits, &mut budget).unwrap_err();
+        assert!(
+            error.to_string().contains("paths total 4 UTF-8 bytes"),
+            "{error}"
+        );
+        assert_eq!(budget.path_bytes, 2);
+
+        let exact_limits = AssetLoadLimits {
+            maximum_path_bytes: 4,
+            maximum_total_path_bytes: 4,
+            ..AssetLoadLimits::default()
+        };
+        let mut exact_budget = AssetLoadBudget::default();
+        exact_budget.charge_path(2, &exact_limits).unwrap();
+        let label =
+            LoadPath::from_precharged_path(&path, &exact_limits, &mut exact_budget).unwrap();
+        assert_eq!(label.as_str(), "a\u{fffd}");
+        assert_eq!(exact_budget.path_bytes, 4);
+
+        // Darwin's filesystem conversion rejects an arbitrary invalid byte
+        // sequence with EILSEQ before Rust can open it. Linux accepts these
+        // names, so its CI run additionally exercises the complete file path.
+        #[cfg(target_os = "linux")]
+        {
+            let root = temporary_directory("non-utf8-load-path");
+            let input = root.join(OsString::from_vec(vec![
+                b'a', 0xff, b'.', b'r', b'e', b's', b'S',
+            ]));
+            fs::write(&input, b"resource payload").unwrap();
+            let expected = input.to_string_lossy().into_owned();
+            let collection = AssetCollection::load_path(&input).unwrap();
+            assert_eq!(collection.resources.len(), 1);
+            assert_eq!(collection.resources[0].path, expected);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn indexes_resource_paths_without_changing_first_match_or_stale_table_semantics() {
+        let resources = [
+            "bundle::other/foo.resS",
+            "archive:/exact/foo.resS",
+            "archive:\\folder\\bar.resS",
+        ]
+        .into_iter()
+        .map(|path| LoadedResource {
+            path: path.to_owned(),
+            region: Region::from_bytes(path.as_bytes().to_vec()),
+        })
+        .collect();
+        let mut collection = AssetCollection::from_loaded_parts(Vec::new(), resources);
+        assert!(collection.resource_index.is_none());
+        collection
+            .rebuild_resource_index(AssetLoadLimits::default())
+            .unwrap();
+        assert!(collection.resource_index.is_some());
+
+        // Resource zero only matches by portable name while resource one is
+        // an exact normalized path match. The managed/legacy contract walks
+        // discovery order and accepts either condition, so zero still wins.
+        assert_eq!(collection.resource_index_by_path("EXACT/FOO.RESS"), Some(0));
+        assert_eq!(
+            collection.resource_index_by_path("folder/bar.ress"),
+            Some(2)
+        );
+
+        // The tables are public for low-level callers. A stale index must not
+        // return the old object, miss a newly matching path, or panic after a
+        // reorder/removal.
+        collection.resources[0].path = "renamed.resS".to_owned();
+        assert_eq!(collection.resource_index_by_path("renamed.resS"), Some(0));
+        assert_eq!(collection.resource_index_by_path("foo.resS"), Some(1));
+        collection.resources.swap(0, 2);
+        assert_eq!(collection.resource_index_by_path("bar.resS"), Some(0));
+        collection.resources.clear();
+        assert_eq!(collection.resource_index_by_path("bar.resS"), None);
+    }
+
+    #[test]
+    fn builds_resource_index_transactionally_with_a_combined_entry_budget() {
+        let resources = ["a.resS", "b.resS"]
+            .into_iter()
+            .map(|path| LoadedResource {
+                path: path.to_owned(),
+                region: Region::from_bytes(Vec::new()),
+            })
+            .collect();
+        let mut collection = AssetCollection::from_loaded_parts(Vec::new(), resources);
+        let limits = AssetLoadLimits {
+            maximum_resource_index_entries: 3,
+            ..AssetLoadLimits::default()
+        };
+        let error = collection.rebuild_resource_index(limits).unwrap_err();
+        assert!(error.to_string().contains("needs 4 entries"));
+        assert!(collection.resource_index.is_none());
+        assert_eq!(collection.resource_index_by_path("B.RESS"), Some(1));
+
+        let loaded = AssetCollection::load_regions_with_options(
+            [
+                ("a.resS".to_owned(), Region::from_bytes(b"a".to_vec())),
+                ("b.resS".to_owned(), Region::from_bytes(b"b".to_vec())),
+            ],
+            AssetLoadOptions::default(),
+        )
+        .unwrap();
+        assert!(loaded.resource_index.is_some());
+        assert_eq!(loaded.resource_index_by_path("B.RESS"), Some(1));
+    }
+
+    #[test]
+    fn round_trips_owned_parts_without_carrying_derived_indexes() {
+        let mut collection = AssetCollection::from_loaded_parts(
+            Vec::new(),
+            vec![LoadedResource {
+                path: "old.resS".to_owned(),
+                region: Region::from_bytes(b"payload".to_vec()),
+            }],
+        );
+        collection.diagnostics.push(LoadDiagnostic {
+            path: "skipped.assets".to_owned(),
+            message: "unsupported fixture".to_owned(),
+        });
+        collection
+            .rebuild_resource_index(AssetLoadLimits::default())
+            .unwrap();
+        assert!(collection.resource_index.is_some());
+
+        let mut parts = collection.into_parts();
+        parts.resources[0].path = "new.resS".to_owned();
+        let mut rebuilt = AssetCollection::from_parts(parts);
+
+        assert!(rebuilt.reference_index.is_none());
+        assert!(rebuilt.resource_index.is_none());
+        assert!(rebuilt.object_metadata.is_empty());
+        assert!(rebuilt.serialized_files().is_empty());
+        assert_eq!(rebuilt.resources()[0].path, "new.resS");
+        assert_eq!(rebuilt.diagnostics.len(), 1);
+        assert_eq!(rebuilt.diagnostics[0].path, "skipped.assets");
+        assert_eq!(rebuilt.resource_index_by_path("NEW.RESS"), Some(0));
+
+        rebuilt
+            .rebuild_resource_index(AssetLoadLimits::default())
+            .unwrap();
+        assert!(rebuilt.resource_index.is_some());
+        assert_eq!(rebuilt.resource_index_by_path("NEW.RESS"), Some(0));
     }
 
     #[test]

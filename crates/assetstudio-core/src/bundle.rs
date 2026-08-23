@@ -976,7 +976,7 @@ fn parse_blocks_info(
         let size = non_negative_i64(reader.read_i64()?, "UnityFS entry size")?;
         let flags = reader.read_u32()?;
         let path = reader.read_c_string_required(limits.max_path_length, "UnityFS path")?;
-        let file_name = portable_file_name(&path).to_owned();
+        let file_name = copy_portable_file_name(&path, "UnityFS file name")?;
         entries.push(BundleEntry {
             offset,
             size,
@@ -1003,8 +1003,14 @@ fn non_negative_i64(value: i64, field: &str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::invalid_data(format!("{field} cannot be negative")))
 }
 
-fn portable_file_name(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
+fn copy_portable_file_name(path: &str, field: &str) -> Result<String> {
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let mut copied = String::new();
+    copied
+        .try_reserve_exact(file_name.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    copied.push_str(file_name);
+    Ok(copied)
 }
 
 #[cfg(test)]
@@ -1143,6 +1149,33 @@ mod tests {
         assert_eq!(bundle.entries[0].path, "folder/data.bin");
         assert_eq!(bundle.entries[0].file_name, "data.bin");
         assert_eq!(bundle.read_entry(0).unwrap(), PAYLOAD);
+    }
+
+    #[test]
+    fn copies_a_unicode_file_name_after_a_windows_separator() {
+        let path = "folder\\目录\\表.bin";
+        let blocks_info = make_blocks_info_record_with_path(
+            u64::try_from(PAYLOAD.len()).unwrap(),
+            u32::try_from(PAYLOAD.len()).unwrap(),
+            u32::try_from(PAYLOAD.len()).unwrap(),
+            CompressionType::None,
+            path.as_bytes(),
+        );
+        let (_, _, entries) =
+            parse_blocks_info(&blocks_info, BundleParseLimits::default()).unwrap();
+
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].file_name, "表.bin");
+        assert!(
+            parse_blocks_info(
+                &blocks_info,
+                BundleParseLimits {
+                    max_path_length: 4,
+                    ..BundleParseLimits::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1583,6 +1616,22 @@ mod tests {
         compressed_size: u32,
         compression: CompressionType,
     ) -> Vec<u8> {
+        make_blocks_info_record_with_path(
+            node_size,
+            uncompressed_size,
+            compressed_size,
+            compression,
+            b"folder/data.bin",
+        )
+    }
+
+    fn make_blocks_info_record_with_path(
+        node_size: u64,
+        uncompressed_size: u32,
+        compressed_size: u32,
+        compression: CompressionType,
+        path: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = vec![0_u8; 16];
         bytes.extend_from_slice(&1_i32.to_be_bytes());
         bytes.extend_from_slice(&uncompressed_size.to_be_bytes());
@@ -1592,7 +1641,8 @@ mod tests {
         bytes.extend_from_slice(&0_i64.to_be_bytes());
         bytes.extend_from_slice(&i64::try_from(node_size).unwrap().to_be_bytes());
         bytes.extend_from_slice(&0_u32.to_be_bytes());
-        bytes.extend_from_slice(b"folder/data.bin\0");
+        bytes.extend_from_slice(path);
+        bytes.push(0);
         bytes
     }
 

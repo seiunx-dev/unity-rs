@@ -57,6 +57,34 @@ pub struct MonoBehaviourSchemaEntry {
     pub tree: TypeTree,
 }
 
+/// Limits for one external `MonoBehaviour` schema document.
+///
+/// The document is trusted layout data, but it is still caller-controlled
+/// input at the Rust/CLI boundary. These limits keep parsing it from becoming
+/// an unbounded allocation path before any asset is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonoBehaviourSchemaDocumentLimits {
+    pub maximum_document_bytes: usize,
+    pub maximum_entries: usize,
+    pub maximum_nodes_per_entry: usize,
+    pub maximum_total_nodes: usize,
+    pub maximum_string_bytes: usize,
+    pub maximum_total_string_bytes: usize,
+}
+
+impl Default for MonoBehaviourSchemaDocumentLimits {
+    fn default() -> Self {
+        Self {
+            maximum_document_bytes: 256 * 1024 * 1024,
+            maximum_entries: 100_000,
+            maximum_nodes_per_entry: 100_000,
+            maximum_total_nodes: 1_000_000,
+            maximum_string_bytes: 16 * 1024 * 1024,
+            maximum_total_string_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MonoBehaviourSchemaRegistry {
     entries: Vec<MonoBehaviourSchemaEntry>,
@@ -139,6 +167,22 @@ impl MonoBehaviourSchemaRegistry {
     /// reconstructed tree wants them, since a schema describes a layout rather
     /// than a region of a file.
     pub fn from_json(document: &[u8]) -> Result<Self> {
+        Self::from_json_with_limits(document, MonoBehaviourSchemaDocumentLimits::default())
+    }
+
+    /// Loads one generated schema document under explicit structural and
+    /// decoded-string budgets.
+    pub fn from_json_with_limits(
+        document: &[u8],
+        limits: MonoBehaviourSchemaDocumentLimits,
+    ) -> Result<Self> {
+        if document.len() > limits.maximum_document_bytes {
+            return Err(Error::invalid_data(format!(
+                "MonoBehaviour schema document is {} bytes, exceeding limit {}",
+                document.len(),
+                limits.maximum_document_bytes
+            )));
+        }
         let parsed: serde_json::Value = serde_json::from_slice(document).map_err(|error| {
             Error::invalid_data(format!(
                 "MonoBehaviour schema document is not JSON: {error}"
@@ -156,27 +200,34 @@ impl MonoBehaviourSchemaRegistry {
             .ok_or_else(|| {
                 Error::invalid_data("MonoBehaviour schema document has no entries array")
             })?;
+        if entries.len() > limits.maximum_entries {
+            return Err(Error::invalid_data(format!(
+                "MonoBehaviour schema document has {} entries, exceeding limit {}",
+                entries.len(),
+                limits.maximum_entries
+            )));
+        }
         let mut registry = Self::new();
+        let mut budget = SchemaDocumentBudget::default();
         for (index, entry) in entries.iter().enumerate() {
-            registry.push(schema_entry_from_json(entry, index)?)?;
+            registry.push(schema_entry_from_json(entry, index, limits, &mut budget)?)?;
         }
         Ok(registry)
     }
 }
 
+#[derive(Debug, Default)]
+struct SchemaDocumentBudget {
+    nodes: usize,
+    string_bytes: usize,
+}
+
 fn schema_entry_from_json(
     entry: &serde_json::Value,
     index: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &mut SchemaDocumentBudget,
 ) -> Result<MonoBehaviourSchemaEntry> {
-    let text = |field: &str| -> Result<String> {
-        entry
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                Error::invalid_data(format!("MonoBehaviour schema entry {index} has no {field}"))
-            })
-    };
     let nodes = entry
         .get("nodes")
         .and_then(serde_json::Value::as_array)
@@ -188,12 +239,31 @@ fn schema_entry_from_json(
             "MonoBehaviour schema entry {index} has an empty node list, which describes nothing"
         )));
     }
+    if nodes.len() > limits.maximum_nodes_per_entry {
+        return Err(Error::invalid_data(format!(
+            "MonoBehaviour schema entry {index} has {} nodes, exceeding per-entry limit {}",
+            nodes.len(),
+            limits.maximum_nodes_per_entry
+        )));
+    }
+    budget.nodes = budget
+        .nodes
+        .checked_add(nodes.len())
+        .ok_or_else(|| Error::invalid_data("MonoBehaviour schema node count overflowed"))?;
+    if budget.nodes > limits.maximum_total_nodes {
+        return Err(Error::invalid_data(format!(
+            "MonoBehaviour schema document has {} nodes, exceeding total limit {}",
+            budget.nodes, limits.maximum_total_nodes
+        )));
+    }
     let mut tree_nodes = Vec::new();
     tree_nodes
         .try_reserve_exact(nodes.len())
         .map_err(|error| Error::invalid_data(format!("cannot allocate schema nodes: {error}")))?;
     for (position, node) in nodes.iter().enumerate() {
-        tree_nodes.push(schema_node_from_json(node, index, position)?);
+        tree_nodes.push(schema_node_from_json(
+            node, index, position, limits, budget,
+        )?);
     }
     if tree_nodes[0].level != 0 {
         return Err(Error::invalid_data(format!(
@@ -214,10 +284,15 @@ fn schema_entry_from_json(
         Some(serde_json::Value::String(version)) => {
             UnityVersion::from_str(version).map_err(|error| {
                 Error::invalid_data(format!(
-                    "MonoBehaviour schema entry {index} has invalid unity_version {version:?}: {error}"
+                    "MonoBehaviour schema entry {index} has invalid unity_version: {error}"
                 ))
             })?;
-            Some(version.to_owned())
+            Some(copy_schema_document_string(
+                version,
+                "MonoBehaviour schema unity_version",
+                limits,
+                budget,
+            )?)
         }
         Some(_) => {
             return Err(Error::invalid_data(format!(
@@ -226,13 +301,10 @@ fn schema_entry_from_json(
         }
     };
     Ok(MonoBehaviourSchemaEntry {
-        assembly_name: text("assembly")?,
-        namespace: entry
-            .get("namespace")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        class_name: text("class")?,
+        assembly_name: required_schema_document_string(entry, "assembly", index, limits, budget)?,
+        namespace: optional_schema_document_string(entry, "namespace", index, limits, budget)?
+            .unwrap_or_default(),
+        class_name: required_schema_document_string(entry, "class", index, limits, budget)?,
         unity_version,
         tree: TypeTree {
             nodes: tree_nodes,
@@ -247,6 +319,8 @@ fn schema_node_from_json(
     node: &serde_json::Value,
     entry: usize,
     position: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &mut SchemaDocumentBudget,
 ) -> Result<TypeTreeNode> {
     let integer = |field: &str, default: i64| -> Result<i64> {
         match node.get(field) {
@@ -257,16 +331,6 @@ fn schema_node_from_json(
                 ))
             }),
         }
-    };
-    let text = |field: &str| -> Result<String> {
-        node.get(field)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                Error::invalid_data(format!(
-                    "MonoBehaviour schema entry {entry} node {position} has no {field}"
-                ))
-            })
     };
     let level = integer("level", -1)?;
     let level = u32::try_from(level).map_err(|_| {
@@ -282,8 +346,8 @@ fn schema_node_from_json(
         })
     };
     Ok(TypeTreeNode {
-        type_name: text("type")?,
-        field_name: text("name")?,
+        type_name: required_schema_node_string(node, "type", entry, position, limits, budget)?,
+        field_name: required_schema_node_string(node, "name", entry, position, limits, budget)?,
         byte_size: narrow(integer("byte_size", -1)?, "byte_size")?,
         index: narrow(integer("index", 0)?, "index")?,
         type_flags: narrow(integer("type_flags", 0)?, "type_flags")?,
@@ -294,6 +358,88 @@ fn schema_node_from_json(
         name_string_offset: None,
         reference_type_hash: 0,
     })
+}
+
+fn required_schema_document_string(
+    entry: &serde_json::Value,
+    field: &str,
+    index: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &mut SchemaDocumentBudget,
+) -> Result<String> {
+    optional_schema_document_string(entry, field, index, limits, budget)?.ok_or_else(|| {
+        Error::invalid_data(format!("MonoBehaviour schema entry {index} has no {field}"))
+    })
+}
+
+fn optional_schema_document_string(
+    entry: &serde_json::Value,
+    field: &str,
+    index: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &mut SchemaDocumentBudget,
+) -> Result<Option<String>> {
+    let Some(value) = entry.get(field) else {
+        return Ok(None);
+    };
+    let value = value.as_str().ok_or_else(|| {
+        Error::invalid_data(format!(
+            "MonoBehaviour schema entry {index} {field} is not a string"
+        ))
+    })?;
+    copy_schema_document_string(value, "MonoBehaviour schema entry string", limits, budget)
+        .map(Some)
+}
+
+fn required_schema_node_string(
+    node: &serde_json::Value,
+    field: &str,
+    entry: usize,
+    position: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &mut SchemaDocumentBudget,
+) -> Result<String> {
+    let value = node
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "MonoBehaviour schema entry {entry} node {position} has no {field}"
+            ))
+        })?;
+    copy_schema_document_string(value, "MonoBehaviour schema node string", limits, budget)
+}
+
+fn copy_schema_document_string(
+    value: &str,
+    field: &str,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &mut SchemaDocumentBudget,
+) -> Result<String> {
+    if value.len() > limits.maximum_string_bytes {
+        return Err(Error::invalid_data(format!(
+            "{field} is {} bytes, exceeding limit {}",
+            value.len(),
+            limits.maximum_string_bytes
+        )));
+    }
+    let total = budget
+        .string_bytes
+        .checked_add(value.len())
+        .ok_or_else(|| Error::invalid_data("MonoBehaviour schema string budget overflowed"))?;
+    if total > limits.maximum_total_string_bytes {
+        return Err(Error::invalid_data(format!(
+            "MonoBehaviour schema strings total {total} bytes, exceeding limit {}",
+            limits.maximum_total_string_bytes
+        )));
+    }
+    let mut copied = String::new();
+    copied
+        .try_reserve_exact(value.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    copied.push_str(value);
+    budget.string_bytes = total;
+    Ok(copied)
 }
 
 impl MonoBehaviourSchemaProvider for MonoBehaviourSchemaRegistry {
@@ -561,8 +707,9 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry, MonoBehaviourSchemaSource,
-        read_mono_behaviour_json_with_provider, read_mono_behaviour_value_with_provider,
+        MonoBehaviourSchemaDocumentLimits, MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry,
+        MonoBehaviourSchemaSource, read_mono_behaviour_json_with_provider,
+        read_mono_behaviour_value_with_provider,
     };
     use crate::monobehaviour::{
         MONO_BEHAVIOUR_CLASS_ID, MONO_SCRIPT_CLASS_ID, MonoBehaviourReadLimits,
@@ -805,6 +952,92 @@ mod tests {
   expected {expected:?}, got {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn schema_document_enforces_input_structure_and_decoded_string_budgets() {
+        let defaults = MonoBehaviourSchemaDocumentLimits::default();
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            SCHEMA_DOCUMENT.as_bytes(),
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_document_bytes: SCHEMA_DOCUMENT.len() - 1,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("document is"), "{error}");
+
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            SCHEMA_DOCUMENT.as_bytes(),
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_entries: 0,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("entries"), "{error}");
+
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            SCHEMA_DOCUMENT.as_bytes(),
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_nodes_per_entry: 1,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("per-entry"), "{error}");
+
+        let two_trees = br#"{"version":1,"entries":[
+            {"assembly":"A","class":"C","nodes":[{"level":0,"type":"T","name":"N"}]},
+            {"assembly":"B","class":"D","nodes":[{"level":0,"type":"U","name":"M"}]}
+        ]}"#;
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            two_trees,
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_nodes_per_entry: 1,
+                maximum_total_nodes: 1,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("total limit 1"), "{error}");
+
+        let unicode = br#"{"version":1,"entries":[{"assembly":"\u4e16","class":"C","nodes":[{"level":0,"type":"T","name":"N"}]}]}"#;
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            unicode,
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_string_bytes: 2,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("3 bytes"), "{error}");
+
+        let one_tree = br#"{"version":1,"entries":[{"assembly":"A","class":"C","nodes":[{"level":0,"type":"T","name":"N"}]}]}"#;
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            one_tree,
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_total_string_bytes: 3,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("strings total 4"), "{error}");
+        MonoBehaviourSchemaRegistry::from_json_with_limits(
+            one_tree,
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_total_string_bytes: 4,
+                ..defaults
+            },
+        )
+        .unwrap();
+
+        let non_string_namespace = br#"{"version":1,"entries":[{"assembly":"A","namespace":42,"class":"C","nodes":[{"level":0,"type":"T","name":"N"}]}]}"#;
+        let error = MonoBehaviourSchemaRegistry::from_json(non_string_namespace).unwrap_err();
+        assert!(
+            error.to_string().contains("namespace is not a string"),
+            "{error}"
+        );
     }
 
     #[test]

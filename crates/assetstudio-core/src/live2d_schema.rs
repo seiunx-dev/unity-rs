@@ -183,7 +183,9 @@ pub fn project_cubism_expression(
         fade_out_time,
         parameters: projected,
     };
-    expression.write_exp3_json(&mut io::sink(), limits.maximum_output_bytes)?;
+    crate::error::output_validation(
+        expression.write_exp3_json(&mut io::sink(), limits.maximum_output_bytes),
+    )?;
     Ok(expression)
 }
 

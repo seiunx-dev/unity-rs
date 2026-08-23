@@ -20,6 +20,7 @@
 //! * Vertex indices accumulate across the whole file, since OBJ numbers them
 //!   per file rather than per group.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 
 use crate::fbx_scene_ascii::{Matrix4, build_global_matrices};
@@ -89,12 +90,28 @@ struct ObjGroup<'a> {
     mesh: &'a Mesh,
     transform: Option<Matrix4>,
     /// One material key per submesh slot, `None` where the slot is unresolved.
-    materials: Vec<Option<SceneObjectKey>>,
+    materials: &'a [Option<SceneObjectKey>],
 }
 
 fn build_groups(model: &ModelIr) -> Result<Vec<ObjGroup<'_>>> {
     let matrices = build_global_matrices(model)?;
+    let group_count = model.nodes.iter().try_fold(0_usize, |total, node| {
+        if !node.export_content {
+            return Ok(total);
+        }
+        let renderable = node
+            .renderers
+            .iter()
+            .filter(|renderer| renderer.mesh.is_some())
+            .count();
+        total
+            .checked_add(renderable)
+            .ok_or_else(|| Error::invalid_data("OBJ group count overflowed"))
+    })?;
     let mut groups = Vec::new();
+    groups.try_reserve_exact(group_count).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate OBJ render groups: {error}"))
+    })?;
     for (node_index, node) in model.nodes.iter().enumerate() {
         if !node.export_content {
             continue;
@@ -110,7 +127,7 @@ fn build_groups(model: &ModelIr) -> Result<Vec<ObjGroup<'_>>> {
                 name: &node.name,
                 mesh: &mesh.mesh,
                 transform: matrices.get(node_index).copied().flatten(),
-                materials: renderer.materials.clone(),
+                materials: &renderer.materials,
             });
         }
     }
@@ -197,24 +214,30 @@ fn write_mtl_inner<W: Write>(
     groups: &[ObjGroup<'_>],
     textures: &SceneTextureSet,
     output: &mut W,
-) -> io::Result<()> {
-    let mut written: Vec<String> = Vec::new();
+) -> Result<()> {
+    let material_slots = groups.iter().try_fold(0_usize, |total, group| {
+        total
+            .checked_add(group.mesh.sub_meshes.len())
+            .ok_or_else(|| Error::invalid_data("OBJ material slot count overflowed"))
+    })?;
+    let mut written = HashSet::new();
+    written.try_reserve(material_slots).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate written OBJ materials: {error}"))
+    })?;
     for group in groups {
         for slot in 0..group.mesh.sub_meshes.len() {
-            let name = MaterialName(group, slot).to_string();
-            if written.contains(&name) {
+            let key = group.materials.get(slot).copied().flatten();
+            if !written.insert(key) {
                 continue;
             }
-            let key = group.materials.get(slot).copied().flatten();
             let material = key
                 .and_then(|key| model.material(key))
                 .map(|entry| &entry.material);
-            write!(output, "newmtl {name}\r\n")?;
+            write!(output, "newmtl {}\r\n", MaterialName(group, slot))?;
             write_material_body(material, output)?;
             if let Some(key) = key {
                 write_material_maps(textures, key, output)?;
             }
-            written.push(name);
         }
     }
     Ok(())
@@ -406,7 +429,7 @@ impl std::fmt::Display for MaterialName<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjName, write_model_ir_mtl, write_model_ir_obj};
+    use super::{ObjName, build_groups, write_model_ir_mtl, write_model_ir_obj};
     use crate::material::{
         Material, MaterialPropertySheet, MaterialTextureEnvironment, NamedMaterialProperty,
     };
@@ -613,6 +636,29 @@ mod tests {
         assert!(text.contains("Kd 0.5 0.25 0.125\r\n"), "{text}");
         assert!(text.contains("d 0.75\r\n"), "{text}");
         assert!(text.contains("map_Kd Body.png\r\n"));
+    }
+
+    #[test]
+    fn borrows_material_slots_and_writes_each_material_once() {
+        let mut model = model([0.0, 0.0, 0.0]);
+        let duplicate = model.nodes[0].renderers[0].clone();
+        model.nodes[0].renderers.push(duplicate);
+
+        let groups = build_groups(&model).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(std::ptr::eq(
+            groups[0].materials,
+            model.nodes[0].renderers[0].materials.as_slice()
+        ));
+        assert!(std::ptr::eq(
+            groups[1].materials,
+            model.nodes[0].renderers[1].materials.as_slice()
+        ));
+
+        let mut output = Vec::new();
+        write_model_ir_mtl(&model, &texture_set(), &mut output, 64 * 1024).unwrap();
+        let text = std::str::from_utf8(&output).unwrap();
+        assert_eq!(text.matches("newmtl material_0_61\r\n").count(), 1);
     }
 
     #[test]

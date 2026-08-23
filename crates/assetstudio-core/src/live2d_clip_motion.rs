@@ -266,7 +266,11 @@ pub fn project_cubism_clip_motion_with_acl_decoder(
         curves: builder.curves,
         events,
     };
-    motion.write_motion3_json(false, &mut std::io::sink(), limits.maximum_output_bytes)?;
+    crate::error::output_validation(motion.write_motion3_json(
+        false,
+        &mut std::io::sink(),
+        limits.maximum_output_bytes,
+    ))?;
     Ok(motion)
 }
 

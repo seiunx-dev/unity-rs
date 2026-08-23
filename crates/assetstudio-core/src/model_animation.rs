@@ -133,7 +133,7 @@ pub fn build_model_animations_with_acl_decoder(
             .ok_or_else(|| Error::invalid_data("animation string byte budget is exhausted"))?,
     )?;
     let selections = select_clips(graph, model, limits.maximum_clips)?;
-    let mut state = AnimationBuildState::new(limits, paths, blend_shapes.total_string_bytes);
+    let mut state = AnimationBuildState::new(limits, paths, blend_shapes.total_string_bytes)?;
     for selection in selections {
         let file = collection
             .serialized_files
@@ -264,12 +264,12 @@ impl AnimationBuildState {
         limits: ModelAnimationLimits,
         paths: ModelPathIndex,
         blend_shape_string_bytes: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let total_string_bytes = paths
             .total_string_bytes
             .checked_add(blend_shape_string_bytes)
-            .expect("blend-shape index was built within the remaining string budget");
-        Self {
+            .ok_or_else(|| Error::invalid_data("animation string byte budget overflowed"))?;
+        Ok(Self {
             limits,
             paths,
             clips: Vec::new(),
@@ -279,7 +279,7 @@ impl AnimationBuildState {
             total_streamed_words: 0,
             total_sample_values: 0,
             total_string_bytes,
-        }
+        })
     }
 
     fn push_clip(
@@ -1924,12 +1924,27 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        BindingLayout, BlendShapeIndex, CurveBuildContext, ExplicitCurveSlices,
-        ModelAnimationLimits, ModelPathIndex, MuscleBuildContext, append_bound_sample,
-        append_compressed_quaternion_keys, blend_shape_crc32, convert_explicit_blend_shapes,
-        convert_explicit_curve_slices, convert_muscle_clip, convert_muscle_clip_with_acl,
-        join_legacy_path, select_clips, unity_crc32,
+        AnimationBuildState, BindingLayout, BlendShapeIndex, CurveBuildContext,
+        ExplicitCurveSlices, ModelAnimationLimits, ModelPathIndex, MuscleBuildContext,
+        append_bound_sample, append_compressed_quaternion_keys, blend_shape_crc32,
+        convert_explicit_blend_shapes, convert_explicit_curve_slices, convert_muscle_clip,
+        convert_muscle_clip_with_acl, join_legacy_path, select_clips, unity_crc32,
     };
+
+    #[test]
+    fn animation_state_rejects_combined_string_budget_overflow() {
+        let paths = ModelPathIndex {
+            entries: Vec::new(),
+            hash_nodes: HashMap::new(),
+            total_string_bytes: usize::MAX,
+        };
+        let result = AnimationBuildState::new(ModelAnimationLimits::default(), paths, 1);
+        assert!(matches!(
+            result,
+            Err(crate::Error::InvalidData(message))
+                if message.contains("animation string byte budget overflowed")
+        ));
+    }
 
     #[test]
     fn selects_only_animation_bindings_owned_by_the_selected_model() {

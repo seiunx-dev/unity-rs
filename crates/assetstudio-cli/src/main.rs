@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 
@@ -26,7 +27,9 @@ use assetstudio_core::fbx_binary_scene::write_model_ir_fbx_binary_full;
 use assetstudio_core::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
 use assetstudio_core::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
 use assetstudio_core::live2d_package::{Live2dPackage, Live2dPackageLimits, build_live2d_packages};
-use assetstudio_core::loader::{AssetCollection, AssetLoadOptions, LoadFailurePolicy};
+use assetstudio_core::loader::{
+    AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy,
+};
 use assetstudio_core::model_animation::{
     ModelAnimationLimits, ModelAnimationSet, build_model_animations,
 };
@@ -34,7 +37,9 @@ use assetstudio_core::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
 };
 use assetstudio_core::model_ir::{ModelIrLimits, build_model_ir, build_model_ir_for_game_object};
-use assetstudio_core::mono_schema::{MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry};
+use assetstudio_core::mono_schema::{
+    MonoBehaviourSchemaDocumentLimits, MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry,
+};
 use assetstudio_core::monobehaviour::MONO_BEHAVIOUR_CLASS_ID;
 use assetstudio_core::obj_scene::{write_model_ir_mtl, write_model_ir_obj};
 use assetstudio_core::scene_hierarchy::{
@@ -48,9 +53,6 @@ use assetstudio_core::unity_version::UnityVersion;
 use assetstudio_core::web_file::WebFile;
 use assetstudio_core::{Error, Result};
 
-const MAX_DIRECTORY_FILES: usize = 1_000_000;
-const MAX_DIRECTORIES: usize = 1_000_000;
-const MAX_DIRECTORY_ENTRIES: usize = 2_000_000;
 const MAX_COMPRESSION_DEPTH: usize = 16;
 const MAX_SCENE_OUTPUT_DEPTH: usize = 4_096;
 const MAX_SCENE_OUTPUT_NODES: usize = 1_000_000;
@@ -68,7 +70,13 @@ const MAX_FBX_BATCH_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_LIVE2D_PACKAGE_OUTPUTS: usize = 100_000;
 const MAX_LIVE2D_PACKAGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_LIVE2D_PACKAGE_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_MONO_SCHEMA_DOCUMENTS: usize = 1_024;
+const MONO_SCHEMA_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_LIVE2D_PACKAGE_IMAGE_WORKING_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CLI_ARGUMENTS: usize = 65_536;
+const MAX_CLI_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_CLI_ARGUMENT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CLI_ARGUMENT_DIAGNOSTIC_BYTES: usize = 64;
 const EXIT_RUNTIME_ERROR: u8 = 1;
 const EXIT_USAGE_ERROR: u8 = 2;
 const EXIT_PARTIAL_FAILURE: u8 = 3;
@@ -106,6 +114,82 @@ impl From<io::Error> for CliError {
 
 type CliResult<T> = std::result::Result<T, CliError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliArgumentLimits {
+    arguments: usize,
+    argument_bytes: usize,
+    total_bytes: usize,
+}
+
+impl Default for CliArgumentLimits {
+    fn default() -> Self {
+        Self {
+            arguments: MAX_CLI_ARGUMENTS,
+            argument_bytes: MAX_CLI_ARGUMENT_BYTES,
+            total_bytes: MAX_CLI_ARGUMENT_TOTAL_BYTES,
+        }
+    }
+}
+
+struct CliArgumentDisplay<'a>(&'a OsStr);
+
+impl fmt::Display for CliArgumentDisplay<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let length = self.0.as_encoded_bytes().len();
+        if length <= MAX_CLI_ARGUMENT_DIAGNOSTIC_BYTES {
+            write!(formatter, "{}", LossyOsStr(self.0))
+        } else {
+            write!(formatter, "<argument of {length} encoded bytes>")
+        }
+    }
+}
+
+fn collect_cli_arguments(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> CliResult<Vec<OsString>> {
+    collect_cli_arguments_with_limits(arguments, CliArgumentLimits::default())
+}
+
+fn collect_cli_arguments_with_limits(
+    arguments: impl IntoIterator<Item = OsString>,
+    limits: CliArgumentLimits,
+) -> CliResult<Vec<OsString>> {
+    let mut output = Vec::new();
+    let mut total_bytes = 0_usize;
+    for argument in arguments {
+        if output.len() >= limits.arguments {
+            return Err(CliError::Usage(format!(
+                "received more than {} command-line arguments",
+                limits.arguments
+            )));
+        }
+        let bytes = argument.as_encoded_bytes().len();
+        if bytes > limits.argument_bytes {
+            return Err(CliError::Usage(format!(
+                "command-line argument {bytes} bytes long exceeds the {} byte per-argument limit",
+                limits.argument_bytes
+            )));
+        }
+        let next_total = total_bytes.checked_add(bytes).ok_or_else(|| {
+            CliError::Usage("command-line argument byte count overflowed".to_owned())
+        })?;
+        if next_total > limits.total_bytes {
+            return Err(CliError::Usage(format!(
+                "command-line arguments total {next_total} bytes, exceeding the {} byte limit",
+                limits.total_bytes
+            )));
+        }
+        output.try_reserve(1).map_err(|error| {
+            CliError::Runtime(Error::invalid_data(format!(
+                "cannot grow command-line argument table: {error}"
+            )))
+        })?;
+        output.push(argument);
+        total_bytes = next_total;
+    }
+    Ok(output)
+}
+
 fn main() -> ExitCode {
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
@@ -139,7 +223,7 @@ fn main() -> ExitCode {
 }
 
 fn run(output: &mut impl Write) -> CliResult<()> {
-    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    let arguments = collect_cli_arguments(env::args_os().skip(1))?;
     run_with_arguments(&arguments, output)
 }
 
@@ -199,24 +283,150 @@ impl LoadOptions {
             }
             return Ok(None);
         }
+        if self.mono_schemas.len() > MAX_MONO_SCHEMA_DOCUMENTS {
+            return Err(CliError::Usage(format!(
+                "received {} --mono-schema documents, exceeding limit {MAX_MONO_SCHEMA_DOCUMENTS}",
+                self.mono_schemas.len()
+            )));
+        }
         let mut registry = MonoBehaviourSchemaRegistry::new();
         registry.set_overrides_embedded_tree(self.mono_schema_override);
+        let limits = MonoBehaviourSchemaDocumentLimits::default();
+        let mut budget = MonoSchemaDocumentBudget::default();
         for path in &self.mono_schemas {
-            let document = fs::read(path).map_err(|error| {
-                CliError::Usage(format!(
-                    "--mono-schema {}: {error}",
-                    escape_text(&path.display().to_string())
-                ))
+            let path_label = EscapedOsStr(path.as_os_str());
+            let remaining = budget.remaining(limits)?;
+            let file = File::open(path)
+                .map_err(|error| CliError::Usage(format!("--mono-schema {path_label}: {error}")))?;
+            let document = read_bounded_schema_document(file, remaining.maximum_document_bytes)
+                .map_err(|error| CliError::Usage(format!("--mono-schema {path_label}: {error}")))?;
+            let loaded = MonoBehaviourSchemaRegistry::from_json_with_limits(&document, remaining)
+                .map_err(|error| {
+                CliError::Usage(format!("--mono-schema {path_label}: {error}"))
             })?;
-            let loaded = MonoBehaviourSchemaRegistry::from_json(&document).map_err(|error| {
-                CliError::Usage(format!(
-                    "--mono-schema {}: {error}",
-                    escape_text(&path.display().to_string())
-                ))
-            })?;
+            budget.charge(document.len(), &loaded)?;
             registry.extend(loaded)?;
         }
         Ok(Some(registry))
+    }
+}
+
+#[derive(Debug, Default)]
+struct MonoSchemaDocumentBudget {
+    document_bytes: usize,
+    entries: usize,
+    nodes: usize,
+    string_bytes: usize,
+}
+
+impl MonoSchemaDocumentBudget {
+    fn remaining(
+        &self,
+        limits: MonoBehaviourSchemaDocumentLimits,
+    ) -> CliResult<MonoBehaviourSchemaDocumentLimits> {
+        Ok(MonoBehaviourSchemaDocumentLimits {
+            maximum_document_bytes: remaining_schema_budget(
+                limits.maximum_document_bytes,
+                self.document_bytes,
+                "document bytes",
+            )?,
+            maximum_entries: remaining_schema_budget(
+                limits.maximum_entries,
+                self.entries,
+                "entries",
+            )?,
+            maximum_nodes_per_entry: limits.maximum_nodes_per_entry,
+            maximum_total_nodes: remaining_schema_budget(
+                limits.maximum_total_nodes,
+                self.nodes,
+                "nodes",
+            )?,
+            maximum_string_bytes: limits.maximum_string_bytes,
+            maximum_total_string_bytes: remaining_schema_budget(
+                limits.maximum_total_string_bytes,
+                self.string_bytes,
+                "string bytes",
+            )?,
+        })
+    }
+
+    fn charge(
+        &mut self,
+        document_bytes: usize,
+        registry: &MonoBehaviourSchemaRegistry,
+    ) -> CliResult<()> {
+        self.document_bytes =
+            checked_schema_budget_add(self.document_bytes, document_bytes, "document bytes")?;
+        self.entries =
+            checked_schema_budget_add(self.entries, registry.entries().len(), "entry count")?;
+        for entry in registry.entries() {
+            self.nodes =
+                checked_schema_budget_add(self.nodes, entry.tree.nodes.len(), "node count")?;
+            for string in [
+                entry.assembly_name.as_str(),
+                entry.namespace.as_str(),
+                entry.class_name.as_str(),
+                entry.unity_version.as_deref().unwrap_or_default(),
+            ] {
+                self.string_bytes =
+                    checked_schema_budget_add(self.string_bytes, string.len(), "string bytes")?;
+            }
+            for node in &entry.tree.nodes {
+                self.string_bytes = checked_schema_budget_add(
+                    self.string_bytes,
+                    node.type_name.len(),
+                    "string bytes",
+                )?;
+                self.string_bytes = checked_schema_budget_add(
+                    self.string_bytes,
+                    node.field_name.len(),
+                    "string bytes",
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn remaining_schema_budget(maximum: usize, used: usize, field: &str) -> CliResult<usize> {
+    maximum.checked_sub(used).ok_or_else(|| {
+        CliError::Usage(format!(
+            "MonoBehaviour schema {field} already exceed the configured limit"
+        ))
+    })
+}
+
+fn checked_schema_budget_add(left: usize, right: usize, field: &str) -> CliResult<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| CliError::Usage(format!("MonoBehaviour schema {field} overflowed")))
+}
+
+fn read_bounded_schema_document(
+    mut reader: impl Read,
+    maximum_document_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    let mut document = Vec::new();
+    let mut buffer = [0_u8; MONO_SCHEMA_READ_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(document);
+        }
+        let end = document
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| io::Error::other("MonoBehaviour schema document size overflowed"))?;
+        if end > maximum_document_bytes {
+            return Err(io::Error::other(format!(
+                "MonoBehaviour schema documents exceed the {maximum_document_bytes} byte total limit"
+            )));
+        }
+        document.try_reserve(read).map_err(|error| {
+            io::Error::other(format!(
+                "cannot allocate MonoBehaviour schema document: {error}"
+            ))
+        })?;
+        document.extend_from_slice(&buffer[..read]);
     }
 }
 
@@ -251,8 +461,59 @@ impl LoadFlag {
 /// These apply to every command that opens a collection, so handling them once
 /// here keeps each command parser unaware of them and makes the flags work with
 /// the legacy `<input> -m <mode>` spellings too.
+fn copy_cli_argument(value: &OsStr, field: &str) -> CliResult<OsString> {
+    let mut copy = OsString::new();
+    copy.try_reserve_exact(value.as_encoded_bytes().len())
+        .map_err(|error| {
+            CliError::Runtime(Error::invalid_data(format!(
+                "cannot allocate {field}: {error}"
+            )))
+        })?;
+    copy.push(value);
+    Ok(copy)
+}
+
+fn copy_cli_path(value: &OsStr, field: &str) -> CliResult<PathBuf> {
+    copy_path_argument(value, field).map_err(CliError::from)
+}
+
+fn copy_path_argument(value: &OsStr, field: &str) -> Result<PathBuf> {
+    let mut copy = PathBuf::new();
+    copy.try_reserve_exact(value.as_encoded_bytes().len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    copy.push(value);
+    Ok(copy)
+}
+
+fn positional_path_table(command_name: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    paths.try_reserve_exact(2).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate {command_name} positional path table: {error}"
+        ))
+    })?;
+    Ok(paths)
+}
+
+fn push_positional_path(paths: &mut Vec<PathBuf>, value: &OsStr, command_name: &str) -> Result<()> {
+    if paths.len() >= 2 {
+        return Err(Error::invalid_data(format!(
+            "{command_name} accepts exactly two positional paths"
+        )));
+    }
+    paths.push(copy_path_argument(value, "command-line path")?);
+    Ok(())
+}
+
 fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadOptions)> {
     let mut remaining = Vec::new();
+    remaining
+        .try_reserve_exact(arguments.len())
+        .map_err(|error| {
+            CliError::Runtime(Error::invalid_data(format!(
+                "cannot allocate filtered command-line argument table: {error}"
+            )))
+        })?;
     let mut load = LoadOptions::default();
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
@@ -269,7 +530,10 @@ fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadO
             load.mono_schema_override = true;
             continue;
         } else {
-            remaining.push(argument.clone());
+            remaining.push(copy_cli_argument(
+                argument,
+                "filtered command-line argument",
+            )?);
             continue;
         };
         let name = flag.name();
@@ -290,13 +554,27 @@ fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadO
                 }
                 load.unity_version = Some(UnityVersion::from_str(value).map_err(|error| {
                     CliError::Usage(format!(
-                        "{name} value {value:?} is not a Unity version: {error}"
+                        "{name} value {} is not a Unity version: {error}",
+                        CliArgumentDisplay(OsStr::new(value))
                     ))
                 })?);
             }
             // Repeatable: a game's classes are spread over several assemblies,
             // and one document per assembly is the shape a generator produces.
-            LoadFlag::MonoSchema => load.mono_schemas.push(PathBuf::from(value)),
+            LoadFlag::MonoSchema => {
+                if load.mono_schemas.len() >= MAX_MONO_SCHEMA_DOCUMENTS {
+                    return Err(CliError::Usage(format!(
+                        "received more than {MAX_MONO_SCHEMA_DOCUMENTS} --mono-schema documents"
+                    )));
+                }
+                let path = copy_cli_path(value, "MonoBehaviour schema path")?;
+                load.mono_schemas.try_reserve(1).map_err(|error| {
+                    CliError::Runtime(Error::invalid_data(format!(
+                        "cannot grow MonoBehaviour schema path table: {error}"
+                    )))
+                })?;
+                load.mono_schemas.push(path);
+            }
         }
     }
     Ok((remaining, load))
@@ -331,7 +609,7 @@ fn parse_cli_arguments(arguments: &[OsString]) -> CliResult<CliCommand> {
         }
         return Err(CliError::Usage(format!(
             "unexpected argument after --help: {}",
-            arguments[1].to_string_lossy()
+            CliArgumentDisplay(&arguments[1])
         )));
     }
 
@@ -366,7 +644,7 @@ fn parse_cli_arguments(arguments: &[OsString]) -> CliResult<CliCommand> {
             .map_err(|error| CliError::Usage(error.to_string())),
         Some(value) if value.starts_with('-') => Err(CliError::Usage(format!(
             "unknown option: {} (try --help)",
-            command.to_string_lossy()
+            CliArgumentDisplay(command)
         ))),
         _ => parse_bare_or_legacy_arguments(arguments),
     }
@@ -396,16 +674,16 @@ fn parse_read_command(
             "{name} input path begins with '-'; pass it after --"
         )));
     }
-    Ok(constructor(PathBuf::from(path)))
+    Ok(constructor(copy_cli_path(path, "read-only input path")?))
 }
 
 fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliCommand> {
-    let input = PathBuf::from(&arguments[0]);
+    let input = copy_cli_path(&arguments[0], "legacy input path")?;
     if arguments.len() == 1 {
         return Ok(CliCommand::Inspect(input));
     }
 
-    let mut mode: Option<String> = None;
+    let mut mode: Option<&str> = None;
     let mut output = None;
     let mut overwrite_existing = false;
     let mut restore_text_asset_extension = true;
@@ -416,9 +694,12 @@ fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliComman
             Some("-m" | "--mode") => {
                 index += 1;
                 let value = arguments.get(index).ok_or_else(|| {
-                    CliError::Usage(format!("{} requires a value", argument.to_string_lossy()))
+                    CliError::Usage(format!("{} requires a value", CliArgumentDisplay(argument)))
                 })?;
-                if mode.replace(value.to_string_lossy().into_owned()).is_some() {
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| CliError::Usage("legacy mode must be valid UTF-8".to_owned()))?;
+                if mode.replace(value).is_some() {
                     return Err(CliError::Usage(
                         "legacy mode may only be specified once".to_owned(),
                     ));
@@ -427,9 +708,12 @@ fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliComman
             Some("-o" | "--output") => {
                 index += 1;
                 let value = arguments.get(index).ok_or_else(|| {
-                    CliError::Usage(format!("{} requires a value", argument.to_string_lossy()))
+                    CliError::Usage(format!("{} requires a value", CliArgumentDisplay(argument)))
                 })?;
-                if output.replace(PathBuf::from(value)).is_some() {
+                if output
+                    .replace(copy_cli_path(value, "legacy output path")?)
+                    .is_some()
+                {
                     return Err(CliError::Usage(
                         "legacy output may only be specified once".to_owned(),
                     ));
@@ -440,66 +724,128 @@ fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliComman
             _ => {
                 return Err(CliError::Usage(format!(
                     "unsupported legacy argument: {}",
-                    argument.to_string_lossy()
+                    CliArgumentDisplay(argument)
                 )));
             }
         }
         index += 1;
     }
 
-    let mode = mode.as_deref().unwrap_or(if output.is_some() {
+    let mode = mode.unwrap_or(if output.is_some() {
         "export"
     } else {
         "inspect"
     });
-    match mode.to_ascii_lowercase().as_str() {
-        "inspect" if output.is_none() && !overwrite_existing && restore_text_asset_extension => {
+    dispatch_legacy_mode(
+        input,
+        mode,
+        output,
+        overwrite_existing,
+        restore_text_asset_extension,
+    )
+}
+
+fn dispatch_legacy_mode(
+    input: PathBuf,
+    mode: &str,
+    output: Option<PathBuf>,
+    overwrite_existing: bool,
+    restore_text_asset_extension: bool,
+) -> CliResult<CliCommand> {
+    let read_only = mode.eq_ignore_ascii_case("inspect") || mode.eq_ignore_ascii_case("info");
+    if read_only && output.is_none() && !overwrite_existing && restore_text_asset_extension {
+        return if mode.eq_ignore_ascii_case("inspect") {
             Ok(CliCommand::Inspect(input))
-        }
-        "info" if output.is_none() && !overwrite_existing && restore_text_asset_extension => {
+        } else {
             Ok(CliCommand::Info(input))
-        }
-        "inspect" | "info" => Err(CliError::Usage(format!(
-            "legacy {mode} mode is read-only and does not accept export options"
-        ))),
-        "extract" => parse_legacy_extract(
+        };
+    }
+    if read_only {
+        return Err(CliError::Usage(format!(
+            "legacy {} mode is read-only and does not accept export options",
+            CliArgumentDisplay(OsStr::new(mode))
+        )));
+    }
+    if mode.eq_ignore_ascii_case("extract") {
+        return parse_legacy_extract(
             input,
             output,
             overwrite_existing,
             restore_text_asset_extension,
-        ),
-        "animator" | "splitobjects" => parse_legacy_fbx_batch(input, output, mode),
-        "export" | "raw" | "exportraw" | "dump" => {
-            let output = output.ok_or_else(|| {
-                CliError::Usage(
-                    "legacy write modes require -o/--output; implicit ASExport creation is disabled"
-                        .to_owned(),
-                )
-            })?;
-            let mut options = ExportOptions {
-                overwrite_existing,
-                restore_text_asset_extension,
-                ..ExportOptions::default()
-            };
-            options.mode = match mode.to_ascii_lowercase().as_str() {
-                "export" => ExportMode::Auto,
-                "raw" | "exportraw" => ExportMode::Raw,
-                "dump" => ExportMode::DumpText,
-                _ => unreachable!("matched legacy export modes"),
-            };
-            Ok(CliCommand::Export(ExportCommand {
-                input,
-                output,
-                options,
-                // The legacy spellings never took a class filter, and adding
-                // one to them would be inventing a command that never existed.
-                classes: Vec::new(),
-            }))
-        }
-        _ => Err(CliError::Usage(format!(
-            "legacy mode {mode:?} is not implemented by the native CLI"
-        ))),
+        );
     }
+    if mode.eq_ignore_ascii_case("l2d") || mode.eq_ignore_ascii_case("live2d") {
+        return parse_legacy_live2d(
+            input,
+            output,
+            overwrite_existing,
+            restore_text_asset_extension,
+        );
+    }
+    if mode.eq_ignore_ascii_case("animator") || mode.eq_ignore_ascii_case("splitobjects") {
+        return parse_legacy_fbx_batch(input, output, mode);
+    }
+    let export_mode = if mode.eq_ignore_ascii_case("export") {
+        Some(ExportMode::Auto)
+    } else if mode.eq_ignore_ascii_case("raw") || mode.eq_ignore_ascii_case("exportraw") {
+        Some(ExportMode::Raw)
+    } else if mode.eq_ignore_ascii_case("dump") {
+        Some(ExportMode::DumpText)
+    } else {
+        None
+    };
+    if let Some(export_mode) = export_mode {
+        let output = output.ok_or_else(|| {
+            CliError::Usage(
+                "legacy write modes require -o/--output; implicit ASExport creation is disabled"
+                    .to_owned(),
+            )
+        })?;
+        let options = ExportOptions {
+            mode: export_mode,
+            overwrite_existing,
+            restore_text_asset_extension,
+            ..ExportOptions::default()
+        };
+        return Ok(CliCommand::Export(ExportCommand {
+            input,
+            output,
+            options,
+            // The legacy spellings never took a class filter, and adding one
+            // to them would be inventing a command that never existed.
+            classes: Vec::new(),
+        }));
+    }
+    Err(CliError::Usage(format!(
+        "legacy mode {} is not implemented by the native CLI",
+        CliArgumentDisplay(OsStr::new(mode))
+    )))
+}
+
+fn parse_legacy_live2d(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    overwrite_existing: bool,
+    restore_text_asset_extension: bool,
+) -> CliResult<CliCommand> {
+    let output = output.ok_or_else(|| {
+        CliError::Usage(
+            "legacy Live2D mode requires -o/--output; implicit ASExport creation is disabled"
+                .to_owned(),
+        )
+    })?;
+    if overwrite_existing {
+        return Err(CliError::Usage(
+            "legacy Live2D overwrite is not supported; existing packages are never overwritten"
+                .to_owned(),
+        ));
+    }
+    if !restore_text_asset_extension {
+        return Err(CliError::Usage(
+            "--not-restore-extension is not valid for Live2D mode".to_owned(),
+        ));
+    }
+    Ok(CliCommand::Live2dPackage(Live2dCommand { input, output }))
 }
 
 fn parse_legacy_fbx_batch(
@@ -571,6 +917,8 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          assetstudio extract <file-or-directory> <output-directory> [--overwrite]\n  \
          assetstudio live2d <file-or-directory> <output-directory>\n  \
          assetstudio live2d-package <file-or-directory> <output-directory>\n\n\
+         Invocation limits: {MAX_CLI_ARGUMENTS} arguments, {MAX_CLI_ARGUMENT_BYTES} encoded\n  \
+         bytes per argument, and {MAX_CLI_ARGUMENT_TOTAL_BYTES} encoded bytes in total.\n\n\
          Read-only commands:\n  inspect  Show container and serialized-file structure\n  \
          info     Summarize serialized files, Unity versions, and class counts\n  \
          list     List every discovered serialized object\n  \
@@ -592,8 +940,9 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          Transform or blend-shape samples.\n  \
          Material textures are decoded and written beside the FBX, which references\n  \
          them by file name.\n  \
-         FBX options:\n  --maximum-output-bytes <N>  N must be a positive integer no greater\n  \
-         than 536870912; the default is 16777216 bytes\n  \
+         FBX options:\n  --maximum-output-bytes <N>  Maximum bytes newly published by this command,\n  \
+         including the model, companion MTL, and textures; N must be a positive\n  \
+         integer no greater than 536870912; the default is 16777216 bytes\n  \
          --no-textures                 Write the model without its textures\n  \
          --texture-format <FORMAT>     jpg|jpeg|png|bmp|tga|webp|raw-rgba; the default is png\n  \
          --binary                      Write FBX 7.4's binary encoding instead of its text one\n  \
@@ -621,7 +970,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          live2d-package exports verified MOC, texture PNG, model3.json, expression, motion,\n  \
          physics, pose, and display-info files when embedded or supplied schemas are available.\n\n\
          Legacy compatibility:\n  assetstudio <input> -m info\n  \
-         assetstudio <input> -m <export|exportRaw|dump|extract|animator|splitObjects> -o <output>\n  \
+         assetstudio <input> -m <export|exportRaw|dump|extract|l2d|live2d|animator|splitObjects> -o <output>\n  \
          Implicit ASExport/ASExtract directories are never created. Legacy Animator and\n  \
          SplitObjects modes require an explicit output directory.\n\n\
          The default export mode prefers TextAsset bytes and TypeTree JSON, with raw \
@@ -708,7 +1057,7 @@ fn parse_live2d_arguments(arguments: &[OsString]) -> Result<Live2dCommand> {
 }
 
 fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<FbxCommand> {
-    let mut positional = Vec::new();
+    let mut positional = positional_path_table(command_name)?;
     let mut maximum_output_bytes = DEFAULT_FBX_OUTPUT_BYTES;
     let mut saw_maximum = false;
     let mut textures = true;
@@ -766,10 +1115,10 @@ fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<F
         {
             return Err(Error::invalid_data(format!(
                 "unknown {command_name} option: {}",
-                argument.to_string_lossy()
+                CliArgumentDisplay(argument)
             )));
         } else {
-            positional.push(PathBuf::from(argument));
+            push_positional_path(&mut positional, argument, command_name)?;
         }
         index += 1;
     }
@@ -806,7 +1155,7 @@ fn parse_fbx_batch_arguments(
     } else {
         FbxBatchMode::SplitObjects
     };
-    let mut positional = Vec::new();
+    let mut positional = positional_path_table(command_name)?;
     let mut maximum_file_bytes = DEFAULT_FBX_OUTPUT_BYTES;
     let mut include_animations = mode == FbxBatchMode::Animator;
     let mut textures = true;
@@ -849,10 +1198,10 @@ fn parse_fbx_batch_arguments(
         {
             return Err(Error::invalid_data(format!(
                 "unknown {command_name} option: {}",
-                argument.to_string_lossy()
+                CliArgumentDisplay(argument)
             )));
         } else {
-            positional.push(PathBuf::from(argument));
+            push_positional_path(&mut positional, argument, command_name)?;
         }
         index += 1;
     }
@@ -880,7 +1229,7 @@ fn parse_live2d_write_arguments(
     command_name: &str,
     arguments: &[OsString],
 ) -> Result<Live2dCommand> {
-    let mut positional = Vec::new();
+    let mut positional = positional_path_table(command_name)?;
     let mut parse_options = true;
     for argument in arguments {
         if parse_options && argument == "--" {
@@ -892,10 +1241,10 @@ fn parse_live2d_write_arguments(
         {
             return Err(Error::invalid_data(format!(
                 "unknown {command_name} option: {}",
-                argument.to_string_lossy()
+                CliArgumentDisplay(argument)
             )));
         } else {
-            positional.push(PathBuf::from(argument));
+            push_positional_path(&mut positional, argument, command_name)?;
         }
     }
     if positional.len() != 2 {
@@ -911,7 +1260,7 @@ fn parse_live2d_write_arguments(
 
 fn parse_extract_arguments(arguments: &[OsString]) -> Result<ExtractCommand> {
     let mut options = ExtractionOptions::default();
-    let mut positional = Vec::new();
+    let mut positional = positional_path_table("extract")?;
     let mut parse_options = true;
     for argument in arguments {
         if parse_options && argument == "--" {
@@ -925,10 +1274,10 @@ fn parse_extract_arguments(arguments: &[OsString]) -> Result<ExtractCommand> {
         {
             return Err(Error::invalid_data(format!(
                 "unknown extract option: {}",
-                argument.to_string_lossy()
+                CliArgumentDisplay(argument)
             )));
         } else {
-            positional.push(PathBuf::from(argument));
+            push_positional_path(&mut positional, argument, "extract")?;
         }
     }
     if positional.len() != 2 {
@@ -946,7 +1295,7 @@ fn parse_extract_arguments(arguments: &[OsString]) -> Result<ExtractCommand> {
 fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
     let mut options = ExportOptions::default();
     let mut classes = Vec::new();
-    let mut positional = Vec::new();
+    let mut positional = positional_path_table("export")?;
     let mut parse_options = true;
     let mut index = 0;
 
@@ -999,7 +1348,7 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
             let value = arguments
                 .get(index)
                 .ok_or_else(|| Error::invalid_data("--class requires a class ID"))?;
-            classes.push(parse_class_id(value)?);
+            push_class_filter(&mut classes, value)?;
         } else if parse_options
             && argument
                 .to_str()
@@ -1007,10 +1356,10 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
         {
             return Err(Error::invalid_data(format!(
                 "unknown export option: {}",
-                argument.to_string_lossy()
+                CliArgumentDisplay(argument)
             )));
         } else {
-            positional.push(PathBuf::from(argument));
+            push_positional_path(&mut positional, argument, "export")?;
         }
         index += 1;
     }
@@ -1041,9 +1390,18 @@ fn parse_class_id(value: &OsString) -> Result<i32> {
         .ok_or_else(|| {
             Error::invalid_data(format!(
                 "invalid class ID: {} (expected a number, as `list` prints)",
-                value.to_string_lossy()
+                CliArgumentDisplay(value)
             ))
         })
+}
+
+fn push_class_filter(classes: &mut Vec<i32>, value: &OsString) -> Result<()> {
+    let class_id = parse_class_id(value)?;
+    classes.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow export class filter table: {error}"))
+    })?;
+    classes.push(class_id);
+    Ok(())
 }
 
 fn parse_export_mode(value: &OsString) -> Result<ExportMode> {
@@ -1054,7 +1412,7 @@ fn parse_export_mode(value: &OsString) -> Result<ExportMode> {
         Some("dump-text") => Ok(ExportMode::DumpText),
         _ => Err(Error::invalid_data(format!(
             "invalid export mode: {} (expected auto, raw, typetree-json, or dump-text)",
-            value.to_string_lossy()
+            CliArgumentDisplay(value)
         ))),
     }
 }
@@ -1066,7 +1424,7 @@ fn parse_filename_format(value: &OsString) -> Result<FilenameFormat> {
         Some("path-id") => Ok(FilenameFormat::PathId),
         _ => Err(Error::invalid_data(format!(
             "invalid filename format: {} (expected asset-name, asset-name-path-id, or path-id)",
-            value.to_string_lossy()
+            CliArgumentDisplay(value)
         ))),
     }
 }
@@ -1081,7 +1439,7 @@ fn parse_image_format(value: &OsString) -> Result<ImageFormat> {
         Some("raw-rgba" | "raw_rgba" | "rgba") => Ok(ImageFormat::RawRgba),
         _ => Err(Error::invalid_data(format!(
             "invalid image format: {} (expected jpg, jpeg, png, bmp, tga, webp, or raw-rgba)",
-            value.to_string_lossy()
+            CliArgumentDisplay(value)
         ))),
     }
 }
@@ -1092,7 +1450,8 @@ fn parse_jpeg_quality(value: &OsString) -> Result<u8> {
         .ok_or_else(|| Error::invalid_data("JPEG quality must be valid UTF-8"))?;
     let quality = text.parse::<u8>().map_err(|_| {
         Error::invalid_data(format!(
-            "invalid JPEG quality {text:?} (expected an integer from 1 through 100)"
+            "invalid JPEG quality {} (expected an integer from 1 through 100)",
+            CliArgumentDisplay(value)
         ))
     })?;
     if !(1..=100).contains(&quality) {
@@ -1110,7 +1469,7 @@ fn parse_audio_format(value: &OsString) -> Result<AudioExportFormat> {
         Some("wav" | "wave") => Ok(AudioExportFormat::Wav),
         _ => Err(Error::invalid_data(format!(
             "invalid audio format: {} (expected auto, raw, none, wav, or wave)",
-            value.to_string_lossy()
+            CliArgumentDisplay(value)
         ))),
     }
 }
@@ -1230,11 +1589,19 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
     temporary.file_mut().flush()?;
     temporary.file_mut().sync_all()?;
     temporary.close()?;
-    temporary.persist_no_clobber(&command.output)?;
     // The FBX references its textures by file name, so they only resolve once
-    // they sit beside it. Written after the model so a failed model export
-    // leaves no orphaned images.
-    let written_textures = textures.write_to_directory(&parent)?;
+    // they sit beside it. Publish the model last: a texture batch is
+    // transactional, and a late model collision rolls its newly written files
+    // back rather than leaving an incomplete multi-file export.
+    let publication = publish_fbx_with_textures(
+        &mut temporary,
+        &command.output,
+        &textures,
+        0,
+        0,
+        written,
+        command.maximum_output_bytes,
+    )?;
     writeln!(
         output,
         "exported {} FBX 7.4 ({written} bytes, {} animation clips) -> {}",
@@ -1242,7 +1609,12 @@ fn export_fbx(command: &FbxCommand, load: &LoadOptions, output: &mut impl Write)
         animations.clips.len(),
         command.output.display()
     )?;
-    report_model_textures(command.textures, &textures, written_textures.len(), output)?;
+    report_model_textures(
+        command.textures,
+        &textures,
+        publication.written_textures.len(),
+        output,
+    )?;
     skipped_input_result("FBX export", &collection)
 }
 
@@ -1266,31 +1638,52 @@ fn export_obj(command: &ObjCommand, load: &LoadOptions, output: &mut impl Write)
     let mtl_name = obj_material_library_name(&command.output)?;
     let mtl_path = parent.join(&mtl_name);
 
-    let mut temporary = FbxTemporaryFile::create(&parent)?;
+    let mut obj_temporary = FbxTemporaryFile::create(&parent)?;
     let written = write_model_ir_obj(
         &model,
         Some(mtl_name.as_str()),
-        temporary.file_mut(),
+        obj_temporary.file_mut(),
         command.maximum_output_bytes,
     )?;
-    temporary.file_mut().flush()?;
-    temporary.file_mut().sync_all()?;
-    temporary.close()?;
-    temporary.persist_no_clobber(&command.output)?;
+    obj_temporary.file_mut().flush()?;
+    obj_temporary.file_mut().sync_all()?;
+    obj_temporary.close()?;
 
-    let mut temporary = FbxTemporaryFile::create(&parent)?;
+    let mut mtl_temporary = FbxTemporaryFile::create(&parent)?;
     let mtl_written = write_model_ir_mtl(
         &model,
         &textures,
-        temporary.file_mut(),
+        mtl_temporary.file_mut(),
         command.maximum_output_bytes,
     )?;
-    temporary.file_mut().flush()?;
-    temporary.file_mut().sync_all()?;
-    temporary.close()?;
-    temporary.persist_no_clobber(&mtl_path)?;
+    mtl_temporary.file_mut().flush()?;
+    mtl_temporary.file_mut().sync_all()?;
+    mtl_temporary.close()?;
 
     let written_textures = textures.write_to_directory(&parent)?;
+    let prepared = (|| {
+        let texture_bytes = published_file_bytes(&written_textures, "OBJ texture")?;
+        let total_output_bytes = written
+            .checked_add(mtl_written)
+            .and_then(|value| value.checked_add(texture_bytes))
+            .ok_or_else(|| Error::invalid_data("OBJ output byte count overflowed"))?;
+        if total_output_bytes > command.maximum_output_bytes {
+            return Err(Error::invalid_data(format!(
+                "OBJ output exceeds the {} byte total output limit",
+                command.maximum_output_bytes
+            )));
+        }
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        return Err(rollback_model_publication(error, &written_textures, None).into());
+    }
+    if let Err(error) = mtl_temporary.persist_no_clobber(&mtl_path) {
+        return Err(rollback_model_publication(error, &written_textures, None).into());
+    }
+    if let Err(error) = obj_temporary.persist_no_clobber(&command.output) {
+        return Err(rollback_model_publication(error, &written_textures, Some(&mtl_path)).into());
+    }
     writeln!(
         output,
         "exported Wavefront OBJ ({written} bytes) -> {}",
@@ -1317,6 +1710,104 @@ fn obj_material_library_name(destination: &Path) -> Result<String> {
             ))
         })?;
     Ok(format!("{stem}.mtl"))
+}
+
+fn rollback_model_publication(
+    error: Error,
+    textures: &[PathBuf],
+    material_library: Option<&Path>,
+) -> Error {
+    let mut cleanup_error = None;
+    if let Some(path) = material_library
+        && let Err(cleanup) = fs::remove_file(path)
+        && cleanup.kind() != io::ErrorKind::NotFound
+    {
+        cleanup_error = Some(cleanup);
+    }
+    for path in textures.iter().rev() {
+        if let Err(cleanup) = fs::remove_file(path)
+            && cleanup.kind() != io::ErrorKind::NotFound
+            && cleanup_error.is_none()
+        {
+            cleanup_error = Some(cleanup);
+        }
+    }
+    match cleanup_error {
+        None => error,
+        Some(cleanup) => Error::invalid_data(format!(
+            "{error}; additionally failed to roll back model export files: {cleanup}"
+        )),
+    }
+}
+
+fn published_file_bytes(paths: &[PathBuf], output_kind: &str) -> Result<u64> {
+    paths.iter().try_fold(0_u64, |total, path| {
+        total
+            .checked_add(fs::metadata(path)?.len())
+            .ok_or_else(|| Error::invalid_data(format!("{output_kind} byte count overflowed")))
+    })
+}
+
+/// Publishes one complete texture set before its referring FBX.
+///
+/// Any error after the texture batch succeeds removes only files created by
+/// this call; files skipped because they already existed never enter
+/// `written_textures`. The aggregate byte budget is checked against those
+/// actual new files before the referring FBX reaches its commit point.
+#[derive(Debug)]
+struct FbxPublication {
+    written_textures: Vec<PathBuf>,
+    total_texture_files: usize,
+    written_bytes: u64,
+    total_output_bytes: u64,
+}
+
+fn publish_fbx_with_textures(
+    temporary: &mut FbxTemporaryFile,
+    destination: &Path,
+    textures: &SceneTextureSet,
+    existing_texture_files: usize,
+    previous_output_bytes: u64,
+    model_bytes: u64,
+    maximum_total_output_bytes: u64,
+) -> Result<FbxPublication> {
+    let directory = destination
+        .parent()
+        .ok_or_else(|| Error::invalid_data("FBX destination has no parent directory"))?;
+    let written_textures = textures.write_to_directory(directory)?;
+    let prepared = (|| {
+        let total_texture_files = existing_texture_files
+            .checked_add(written_textures.len())
+            .ok_or_else(|| Error::invalid_data("FBX batch texture count overflowed"))?;
+        let texture_bytes = published_file_bytes(&written_textures, "FBX texture")?;
+        let written_bytes = model_bytes
+            .checked_add(texture_bytes)
+            .ok_or_else(|| Error::invalid_data("FBX output byte count overflowed"))?;
+        let total_output_bytes = previous_output_bytes
+            .checked_add(written_bytes)
+            .ok_or_else(|| Error::invalid_data("FBX batch byte count overflowed"))?;
+        if total_output_bytes > maximum_total_output_bytes {
+            return Err(Error::invalid_data(format!(
+                "FBX output exceeds the {maximum_total_output_bytes} byte total output limit"
+            )));
+        }
+        Ok((total_texture_files, written_bytes, total_output_bytes))
+    })();
+    let (total_texture_files, written_bytes, total_output_bytes) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(rollback_model_publication(error, &written_textures, None));
+        }
+    };
+    if let Err(error) = temporary.persist_no_clobber(destination) {
+        return Err(rollback_model_publication(error, &written_textures, None));
+    }
+    Ok(FbxPublication {
+        written_textures,
+        total_texture_files,
+        written_bytes,
+        total_output_bytes,
+    })
 }
 
 /// Reports what happened to the model's textures.
@@ -1411,10 +1902,8 @@ fn export_fbx_batch(
             &mut texture_names,
             &mut texture_files,
         ) {
-            Ok(written) => {
-                total_bytes = total_bytes.checked_add(written).ok_or_else(|| {
-                    CliError::Runtime(Error::invalid_data("FBX batch byte count overflowed"))
-                })?;
+            Ok((written, next_total_bytes)) => {
+                total_bytes = next_total_bytes;
                 succeeded = succeeded.checked_add(1).ok_or_else(|| {
                     CliError::Runtime(Error::invalid_data("FBX batch success count overflowed"))
                 })?;
@@ -1462,7 +1951,7 @@ fn write_fbx_batch_candidate(
     previously_written: u64,
     texture_names: &mut SceneTextureNames,
     texture_files: &mut usize,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     let model = build_model_ir_for_game_object(
         collection,
         hierarchy,
@@ -1528,28 +2017,31 @@ fn write_fbx_batch_candidate(
     temporary.file_mut().flush()?;
     temporary.file_mut().sync_all()?;
     temporary.close()?;
-    temporary.persist_no_clobber(destination)?;
-    let directory = destination
-        .parent()
-        .ok_or_else(|| Error::invalid_data("FBX batch destination has no parent"))?;
-    *texture_files = texture_files
-        .checked_add(textures.write_to_directory(directory)?.len())
-        .ok_or_else(|| Error::invalid_data("FBX batch texture count overflowed"))?;
-    Ok(written)
+    let publication = publish_fbx_with_textures(
+        &mut temporary,
+        destination,
+        &textures,
+        *texture_files,
+        previously_written,
+        written,
+        MAX_FBX_BATCH_TOTAL_BYTES,
+    )?;
+    *texture_files = publication.total_texture_files;
+    Ok((publication.written_bytes, publication.total_output_bytes))
 }
 
 fn allocate_fbx_batch_name(
     candidate: &ModelExportCandidate,
     names: &mut HashSet<String>,
 ) -> Result<String> {
-    let base = sanitize_live2d_base_name(&candidate.name);
+    let base = sanitize_live2d_base_name(&candidate.name)?;
     for suffix in 0_u64..=MAX_FBX_TEMPORARY_ATTEMPTS {
         let value = if suffix == 0 {
             fallible_fbx_name(&base)?
         } else {
             fallible_fbx_suffixed_name(&base, suffix)?
         };
-        let portable = value.to_ascii_lowercase();
+        let portable = fallible_lowercase(&value, "FBX portable output name")?;
         if !names.contains(&portable) {
             names.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!("cannot grow FBX output-name index: {error}"))
@@ -1565,11 +2057,15 @@ fn allocate_fbx_batch_name(
 }
 
 fn fallible_fbx_name(base: &str) -> Result<String> {
+    fallible_copy_string(base, "FBX output name")
+}
+
+fn fallible_copy_string(value: &str, field: &'static str) -> Result<String> {
     let mut output = String::new();
-    output.try_reserve_exact(base.len()).map_err(|error| {
-        Error::invalid_data(format!("cannot allocate FBX output name: {error}"))
-    })?;
-    output.push_str(base);
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    output.push_str(value);
     Ok(output)
 }
 
@@ -1596,58 +2092,154 @@ fn prepare_fbx_output_parent(destination: &Path) -> Result<PathBuf> {
         ))
     })?;
     let parent = if raw_parent.as_os_str().is_empty() {
-        PathBuf::from(".")
+        Path::new(".")
     } else {
-        raw_parent.to_owned()
+        raw_parent
     };
-    let mut missing = Vec::new();
-    let mut current = parent.as_path();
-    loop {
-        let candidate = current;
-        match fs::symlink_metadata(candidate) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
+    ensure_secure_cli_output_directory(parent, "FBX")
+}
+
+fn lexical_cli_output_path(path: &Path, output_kind: &str) -> Result<PathBuf> {
+    let current_directory = (!path.is_absolute()).then(env::current_dir).transpose()?;
+    let capacity = current_directory
+        .as_ref()
+        .map_or(0, |directory| {
+            directory.as_os_str().as_encoded_bytes().len()
+        })
+        .checked_add(path.as_os_str().as_encoded_bytes().len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| Error::invalid_data(format!("{output_kind} output path overflowed")))?;
+    let mut joined = PathBuf::new();
+    joined.try_reserve_exact(capacity).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate {output_kind} output path: {error}"
+        ))
+    })?;
+    if let Some(directory) = current_directory {
+        joined.push(directory);
+    }
+    joined.push(path);
+
+    let mut normalized = PathBuf::new();
+    normalized
+        .try_reserve_exact(joined.as_os_str().as_encoded_bytes().len())
+        .map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate normalized {output_kind} output path: {error}"
+            ))
+        })?;
+    for component in joined.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
                     return Err(Error::invalid_data(format!(
-                        "refusing FBX output through symbolic link: {}",
-                        candidate.display()
+                        "{output_kind} output path escapes the filesystem root: {}",
+                        path.display()
                     )));
                 }
-                if !metadata.is_dir() {
-                    return Err(Error::invalid_data(format!(
-                        "FBX output ancestor is not a directory: {}",
-                        candidate.display()
-                    )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn is_trusted_cli_output_alias(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let expected = if path == Path::new("/var") {
+            Some(Path::new("/private/var"))
+        } else if path == Path::new("/tmp") {
+            Some(Path::new("/private/tmp"))
+        } else {
+            None
+        };
+        expected
+            .is_some_and(|expected| fs::canonicalize(path).is_ok_and(|target| target == expected))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn ensure_secure_cli_output_directory(path: &Path, output_kind: &str) -> Result<PathBuf> {
+    let normalized = lexical_cli_output_path(path, output_kind)?;
+    let mut current = PathBuf::new();
+    current
+        .try_reserve_exact(normalized.as_os_str().as_encoded_bytes().len())
+        .map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate secure {output_kind} output path: {error}"
+            ))
+        })?;
+    for component in normalized.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if is_trusted_cli_output_alias(&current) {
+                    continue;
                 }
-                fs::canonicalize(candidate)?;
-                break;
+                return Err(Error::invalid_data(format!(
+                    "refusing symbolic-link in {output_kind} output path: {}",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(Error::invalid_data(format!(
+                    "{output_kind} output path component is not a directory: {}",
+                    current.display()
+                )));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(candidate.to_owned());
-                current = candidate.parent().ok_or_else(|| {
-                    Error::invalid_data(format!(
-                        "FBX output has no existing directory anchor: {}",
-                        destination.display()
-                    ))
-                })?;
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let metadata = fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Error::invalid_data(format!(
+                        "{output_kind} output path component became unsafe: {}",
+                        current.display()
+                    )));
+                }
             }
             Err(error) => return Err(error.into()),
         }
     }
-    for directory in missing.iter().rev() {
-        match fs::create_dir(directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+    Ok(normalized)
+}
+
+/// Creates the destination link and treats that link as the commit point.
+///
+/// Removing the temporary name is cleanup, not publication. A failed cleanup
+/// therefore leaves `false` for the owner's `Drop` implementation to retry,
+/// but it must not turn an already visible destination into a reported error.
+fn persist_temporary_hard_link(
+    temporary: &Path,
+    destination: &Path,
+    output_kind: &str,
+    remove_temporary: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<bool> {
+    match fs::hard_link(temporary, destination) {
+        Ok(()) => Ok(remove_temporary(temporary).is_ok()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(Error::invalid_data(format!(
+                "refusing to overwrite existing {output_kind} output: {}",
+                destination.display()
+            )))
         }
-        let metadata = fs::symlink_metadata(directory)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(Error::invalid_data(format!(
-                "FBX output directory became unsafe while creating it: {}",
-                directory.display()
-            )));
-        }
+        Err(error) => Err(error.into()),
     }
-    Ok(parent)
 }
 
 struct FbxTemporaryFile {
@@ -1692,20 +2284,10 @@ impl FbxTemporaryFile {
     }
 
     fn persist_no_clobber(&mut self, destination: &Path) -> Result<()> {
-        match fs::hard_link(&self.path, destination) {
-            Ok(()) => {
-                fs::remove_file(&self.path)?;
-                self.persisted = true;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Err(Error::invalid_data(format!(
-                    "refusing to overwrite existing FBX output: {}",
-                    destination.display()
-                )))
-            }
-            Err(error) => Err(error.into()),
-        }
+        self.persisted = persist_temporary_hard_link(&self.path, destination, "FBX", |path| {
+            fs::remove_file(path)
+        })?;
+        Ok(())
     }
 }
 
@@ -1779,7 +2361,6 @@ struct Live2dExportState {
     temporary_sequence: u64,
     output_ready: bool,
     models_found: usize,
-    scheduled_bytes: u64,
     exported: usize,
     exported_bytes: u64,
     failures: usize,
@@ -1829,7 +2410,7 @@ fn export_live2d(
 
 fn collect_live2d_candidates(collection: &AssetCollection) -> CliResult<Vec<Live2dCandidate>> {
     let mut candidates = Vec::new();
-    for (file_index, loaded) in collection.serialized_files.iter().enumerate() {
+    for (file_index, loaded) in collection.serialized_files().iter().enumerate() {
         for (object_index, object) in loaded.file.objects.iter().enumerate() {
             if object.class_id != MONO_BEHAVIOUR_CLASS_ID {
                 continue;
@@ -1840,6 +2421,9 @@ fn collect_live2d_candidates(collection: &AssetCollection) -> CliResult<Vec<Live
                 ))
                 .into());
             }
+            candidates.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow Live2D candidate table: {error}"))
+            })?;
             candidates.push(Live2dCandidate {
                 file_index,
                 object_index,
@@ -1847,8 +2431,8 @@ fn collect_live2d_candidates(collection: &AssetCollection) -> CliResult<Vec<Live
         }
     }
     candidates.sort_unstable_by(|left, right| {
-        let left_file = &collection.serialized_files[left.file_index];
-        let right_file = &collection.serialized_files[right.file_index];
+        let left_file = &collection.serialized_files()[left.file_index];
+        let right_file = &collection.serialized_files()[right.file_index];
         left_file
             .path
             .cmp(&right_file.path)
@@ -1871,7 +2455,7 @@ fn export_live2d_candidate(
     state: &mut Live2dExportState,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let loaded = &collection.serialized_files[candidate.file_index];
+    let loaded = &collection.serialized_files()[candidate.file_index];
     let object = &loaded.file.objects[candidate.object_index];
     let model = match try_read_cubism_moc(
         collection,
@@ -1892,24 +2476,28 @@ fn export_live2d_candidate(
             );
         }
     };
-    if let Err(error) = charge_live2d_model(state, model.model_data.len()) {
-        return report_live2d_failure(
-            state,
-            &loaded.path,
-            object.path_id,
-            object.class_id,
-            &error.to_string(),
-            output,
-        );
-    }
+    let next_exported_bytes = match charge_live2d_model(state, model.model_data.len()) {
+        Ok(next) => next,
+        Err(error) => {
+            return report_live2d_failure(
+                state,
+                &loaded.path,
+                object.path_id,
+                object.class_id,
+                &error.to_string(),
+                output,
+            );
+        }
+    };
 
     if !state.output_ready {
-        fs::create_dir_all(output_directory)?;
+        create_live2d_output_root(output_directory)?;
         state.output_ready = true;
     }
+    let base_name = sanitize_live2d_base_name(&model.name)?;
     let output_path = allocate_live2d_output_path(
         output_directory,
-        &sanitize_live2d_base_name(&model.name),
+        &base_name,
         object.path_id,
         candidate,
         &mut state.claimed_paths,
@@ -1924,9 +2512,7 @@ fn export_live2d_candidate(
             state.exported = state.exported.checked_add(1).ok_or_else(|| {
                 CliError::Runtime(Error::invalid_data("Live2D export count overflowed"))
             })?;
-            state.exported_bytes = state.exported_bytes.checked_add(written).ok_or_else(|| {
-                CliError::Runtime(Error::invalid_data("Live2D exported byte count overflowed"))
-            })?;
+            state.exported_bytes = next_exported_bytes;
             writeln!(
                 output,
                 "exported {}::{} (CubismMoc, {written} bytes) -> {}",
@@ -1947,7 +2533,7 @@ fn export_live2d_candidate(
     }
 }
 
-fn charge_live2d_model(state: &mut Live2dExportState, model_bytes: u64) -> Result<()> {
+fn charge_live2d_model(state: &mut Live2dExportState, model_bytes: u64) -> Result<u64> {
     state.models_found = state
         .models_found
         .checked_add(1)
@@ -1958,7 +2544,7 @@ fn charge_live2d_model(state: &mut Live2dExportState, model_bytes: u64) -> Resul
         )));
     }
     let next_bytes = state
-        .scheduled_bytes
+        .exported_bytes
         .checked_add(model_bytes)
         .ok_or_else(|| Error::invalid_data("Live2D output byte count overflowed"))?;
     if next_bytes > MAX_LIVE2D_TOTAL_OUTPUT_BYTES {
@@ -1966,8 +2552,7 @@ fn charge_live2d_model(state: &mut Live2dExportState, model_bytes: u64) -> Resul
             "Live2D output exceeds {MAX_LIVE2D_TOTAL_OUTPUT_BYTES} total bytes"
         )));
     }
-    state.scheduled_bytes = next_bytes;
-    Ok(())
+    Ok(next_bytes)
 }
 
 fn report_live2d_failure(
@@ -1990,8 +2575,12 @@ fn report_live2d_failure(
     Ok(())
 }
 
-fn sanitize_live2d_base_name(value: &str) -> String {
-    let mut sanitized = String::with_capacity(value.len().min(MAX_LIVE2D_BASE_NAME_BYTES));
+fn sanitize_live2d_base_name(value: &str) -> Result<String> {
+    let maximum = value.len().min(MAX_LIVE2D_BASE_NAME_BYTES);
+    let mut sanitized = String::new();
+    sanitized.try_reserve_exact(maximum).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate Live2D base name: {error}"))
+    })?;
     for character in value.chars() {
         let replacement = if character.is_control()
             || matches!(
@@ -2007,7 +2596,14 @@ fn sanitize_live2d_base_name(value: &str) -> String {
         }
         sanitized.push(replacement);
     }
-    let mut base_name = sanitized.trim_matches([' ', '.']).to_owned();
+    let trimmed = sanitized.trim_matches([' ', '.']);
+    let mut base_name = String::new();
+    base_name
+        .try_reserve_exact(trimmed.len())
+        .map_err(|error| {
+            Error::invalid_data(format!("cannot allocate Live2D base name: {error}"))
+        })?;
+    base_name.push_str(trimmed);
     if base_name
         .get(base_name.len().saturating_sub(5)..)
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".moc3"))
@@ -2017,9 +2613,16 @@ fn sanitize_live2d_base_name(value: &str) -> String {
         base_name.truncate(trimmed_length);
     }
     if base_name.is_empty() || base_name == "." || base_name == ".." {
-        "unnamed".to_owned()
-    } else {
+        base_name.clear();
         base_name
+            .try_reserve_exact("unnamed".len())
+            .map_err(|error| {
+                Error::invalid_data(format!("cannot allocate Live2D fallback name: {error}"))
+            })?;
+        base_name.push_str("unnamed");
+        Ok(base_name)
+    } else {
+        Ok(base_name)
     }
 }
 
@@ -2030,22 +2633,62 @@ fn allocate_live2d_output_path(
     candidate: Live2dCandidate,
     claimed_paths: &mut HashSet<String>,
 ) -> Result<PathBuf> {
-    let candidates = [
-        format!("{base_name}.moc3"),
-        format!("{base_name} @{path_id}.moc3"),
-        format!(
-            "{base_name} @{path_id} f{:04}o{}.moc3",
-            candidate.file_index, candidate.object_index
-        ),
-    ];
-    for file_name in candidates {
-        if claimed_paths.insert(file_name.to_lowercase()) {
+    for variant in 0..3 {
+        let file_name = fallible_live2d_output_name(base_name, path_id, candidate, variant)?;
+        let portable = fallible_lowercase(&file_name, "Live2D portable output name")?;
+        if !claimed_paths.contains(&portable) {
+            claimed_paths.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow Live2D output-name index: {error}"))
+            })?;
+            claimed_paths.insert(portable);
             return Ok(output_directory.join(file_name));
         }
     }
     Err(Error::invalid_data(format!(
         "cannot create a unique Live2D output name for path ID {path_id}"
     )))
+}
+
+fn fallible_live2d_output_name(
+    base_name: &str,
+    path_id: i64,
+    candidate: Live2dCandidate,
+    variant: usize,
+) -> Result<String> {
+    let mut output = String::new();
+    output
+        .try_reserve(base_name.len().saturating_add(80))
+        .map_err(|error| {
+            Error::invalid_data(format!("cannot allocate Live2D output name: {error}"))
+        })?;
+    match variant {
+        0 => write!(output, "{base_name}.moc3"),
+        1 => write!(output, "{base_name} @{path_id}.moc3"),
+        2 => write!(
+            output,
+            "{base_name} @{path_id} f{:04}o{}.moc3",
+            candidate.file_index, candidate.object_index
+        ),
+        _ => return Err(Error::invalid_data("unknown Live2D output-name variant")),
+    }
+    .map_err(|error| Error::invalid_data(format!("cannot format Live2D output name: {error}")))?;
+    Ok(output)
+}
+
+fn fallible_lowercase(value: &str, field: &'static str) -> Result<String> {
+    let length = value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .try_fold(0_usize, |length, character| {
+            length.checked_add(character.len_utf8())
+        })
+        .ok_or_else(|| Error::invalid_data(format!("{field} length overflowed")))?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    output.extend(value.chars().flat_map(char::to_lowercase));
+    Ok(output)
 }
 
 fn atomic_write_cubism_moc(
@@ -2123,20 +2766,10 @@ impl Live2dTemporaryFile {
     }
 
     fn persist_no_clobber(&mut self, destination: &Path) -> Result<()> {
-        match fs::hard_link(&self.path, destination) {
-            Ok(()) => {
-                fs::remove_file(&self.path)?;
-                self.persisted = true;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Err(Error::invalid_data(format!(
-                    "refusing to overwrite existing Live2D output: {}",
-                    destination.display()
-                )))
-            }
-            Err(error) => Err(error.into()),
-        }
+        self.persisted = persist_temporary_hard_link(&self.path, destination, "Live2D", |path| {
+            fs::remove_file(path)
+        })?;
+        Ok(())
     }
 }
 
@@ -2189,7 +2822,7 @@ fn export_live2d_packages(
     }
     for package in set.packages {
         if !state.output_ready {
-            create_live2d_package_output_root(output_directory)?;
+            create_live2d_output_root(output_directory)?;
             state.output_ready = true;
         }
         match write_live2d_package_atomic(output_directory, &package, &mut state) {
@@ -2261,56 +2894,8 @@ fn live2d_package_limits() -> Live2dPackageLimits {
     }
 }
 
-fn create_live2d_package_output_root(output_directory: &Path) -> Result<()> {
-    let absolute = if output_directory.is_absolute() {
-        output_directory.to_path_buf()
-    } else {
-        env::current_dir()?.join(output_directory)
-    };
-    let mut missing = Vec::new();
-    let mut candidate = Some(absolute.as_path());
-    while let Some(path) = candidate {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Error::invalid_data(format!(
-                    "refusing symbolic-link in Live2D package output path: {}",
-                    path.display()
-                )));
-            }
-            Ok(metadata) if metadata.is_dir() => break,
-            Ok(_) => {
-                return Err(Error::invalid_data(format!(
-                    "Live2D package output path component is not a directory: {}",
-                    path.display()
-                )));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(path.to_path_buf());
-                candidate = path.parent();
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if candidate.is_none() {
-        return Err(Error::invalid_data(format!(
-            "Live2D package output path has no existing directory ancestor: {}",
-            output_directory.display()
-        )));
-    }
-    for path in missing.iter().rev() {
-        match fs::create_dir(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(Error::invalid_data(format!(
-                "Live2D package output path component is not a real directory: {}",
-                path.display()
-            )));
-        }
-    }
+fn create_live2d_output_root(output_directory: &Path) -> Result<()> {
+    ensure_secure_cli_output_directory(output_directory, "Live2D")?;
     Ok(())
 }
 
@@ -2410,8 +2995,11 @@ fn write_live2d_package_atomic(
     sync_directory(temporary.path())?;
     temporary.persist_no_clobber(&destination)?;
     sync_directory(output_root)?;
-    publication_lock.release()?;
-    sync_directory(output_root)?;
+    if publication_lock.release_after_commit() {
+        // The package rename was already durably synced above. Persisting the
+        // lock cleanup is best effort and cannot reverse that commit.
+        let _ = sync_directory(output_root);
+    }
     Ok(package_bytes)
 }
 
@@ -2503,11 +3091,12 @@ impl Live2dTemporaryDirectory {
             *sequence = sequence.checked_add(1).ok_or_else(|| {
                 Error::invalid_data("Live2D package temporary-directory counter overflowed")
             })?;
+            let base_name = sanitize_live2d_base_name(name)?;
             let path = root.join(format!(
                 ".assetstudio-live2d-package-{}-{}-{}.tmp",
                 std::process::id(),
                 sequence,
-                sanitize_live2d_base_name(name)
+                base_name
             ));
             match fs::create_dir(&path) {
                 Ok(()) => {
@@ -2552,9 +3141,9 @@ struct Live2dPublicationLock {
 
 impl Live2dPublicationLock {
     fn acquire(root: &Path, name: &str) -> Result<Self> {
+        let base_name = sanitize_live2d_base_name(name)?;
         let path = root.join(format!(
-            ".assetstudio-live2d-package-publish-{}.lock",
-            sanitize_live2d_base_name(name)
+            ".assetstudio-live2d-package-publish-{base_name}.lock"
         ));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => Ok(Self {
@@ -2571,10 +3160,16 @@ impl Live2dPublicationLock {
         }
     }
 
-    fn release(&mut self) -> Result<()> {
+    fn release_after_commit(&mut self) -> bool {
+        self.release_after_commit_with(|path| fs::remove_file(path))
+    }
+
+    fn release_after_commit_with(
+        &mut self,
+        remove_lock: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> bool {
         self.file.take();
-        fs::remove_file(&self.path)?;
-        Ok(())
+        remove_lock(&self.path).is_ok()
     }
 }
 
@@ -2625,8 +3220,8 @@ fn load_asset_collection(
             ..AssetLoadOptions::default()
         },
     )?;
-    if collection.serialized_files.is_empty()
-        && collection.resources.is_empty()
+    if collection.serialized_files().is_empty()
+        && collection.resources().is_empty()
         && let Some(first) = collection.diagnostics.first()
     {
         return Err(Error::invalid_data(format!(
@@ -2680,7 +3275,7 @@ fn inspect_path(path: &Path, output: &mut impl Write) -> CliResult<()> {
             writeln!(
                 output,
                 "  inspect error for {}: {error}",
-                escape_text(&file.to_string_lossy())
+                EscapedOsStr(file.as_os_str())
             )?;
         }
     }
@@ -2708,27 +3303,26 @@ fn report_collection(
     let collection = load_asset_collection(path, load, output)?;
     let mut total_objects = 0_usize;
     let mut total_object_bytes = 0_u64;
-    let mut class_counts = BTreeMap::<i32, usize>::new();
-    let mut unity_versions = BTreeMap::<String, usize>::new();
+    let mut class_counts = HashMap::<i32, usize>::new();
+    let mut unity_versions = HashMap::<String, usize>::new();
 
     writeln!(output, "{}", path.display())?;
     writeln!(
         output,
         "  serialized files: {}",
-        collection.serialized_files.len()
+        collection.serialized_files().len()
     )?;
-    writeln!(output, "  resources: {}", collection.resources.len())?;
+    writeln!(output, "  resources: {}", collection.resources().len())?;
 
-    for loaded in &collection.serialized_files {
+    for loaded in collection.serialized_files() {
         total_objects = total_objects
             .checked_add(loaded.file.objects.len())
             .ok_or_else(|| Error::invalid_data("serialized object count overflowed"))?;
-        let version_count = unity_versions
-            .entry(loaded.file.unity_version_string.clone())
-            .or_default();
-        *version_count = version_count
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_data("Unity version count overflowed"))?;
+        increment_string_count(
+            &mut unity_versions,
+            &loaded.file.unity_version_string,
+            "Unity version",
+        )?;
 
         if include_objects {
             writeln!(output, "  {}", escape_text(&loaded.path))?;
@@ -2753,10 +3347,7 @@ fn report_collection(
             total_object_bytes = total_object_bytes
                 .checked_add(object.byte_size)
                 .ok_or_else(|| Error::invalid_data("serialized object byte total overflowed"))?;
-            let class_count = class_counts.entry(object.class_id).or_default();
-            *class_count = class_count
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid_data("serialized class count overflowed"))?;
+            increment_class_count(&mut class_counts, object.class_id)?;
             if include_objects {
                 writeln!(
                     output,
@@ -2777,7 +3368,7 @@ fn report_collection(
     if unity_versions.is_empty() {
         writeln!(output, "    none")?;
     } else {
-        for (version, count) in unity_versions {
+        for (version, count) in sorted_map_entries(unity_versions, "Unity version summary")? {
             writeln!(output, "    {}: {count} file(s)", escape_text(&version))?;
         }
     }
@@ -2785,7 +3376,7 @@ fn report_collection(
     if class_counts.is_empty() {
         writeln!(output, "    none")?;
     } else {
-        for (class_id, count) in class_counts {
+        for (class_id, count) in sorted_map_entries(class_counts, "class summary")? {
             writeln!(
                 output,
                 "    {class_id}{}: {count}",
@@ -2796,6 +3387,51 @@ fn report_collection(
     skipped_input_result("info/list", &collection)
 }
 
+fn increment_class_count(counts: &mut HashMap<i32, usize>, class_id: i32) -> Result<()> {
+    if let Some(count) = counts.get_mut(&class_id) {
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("serialized class count overflowed"))?;
+        return Ok(());
+    }
+    counts.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow serialized class summary: {error}"))
+    })?;
+    counts.insert(class_id, 1);
+    Ok(())
+}
+
+fn increment_string_count(
+    counts: &mut HashMap<String, usize>,
+    value: &str,
+    field: &'static str,
+) -> Result<()> {
+    if let Some(count) = counts.get_mut(value) {
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data(format!("{field} count overflowed")))?;
+        return Ok(());
+    }
+    counts
+        .try_reserve(1)
+        .map_err(|error| Error::invalid_data(format!("cannot grow {field} summary: {error}")))?;
+    counts.insert(fallible_copy_string(value, field)?, 1);
+    Ok(())
+}
+
+fn sorted_map_entries<K: Ord, V>(
+    entries: HashMap<K, V>,
+    field: &'static str,
+) -> Result<Vec<(K, V)>> {
+    let mut sorted = Vec::new();
+    sorted
+        .try_reserve_exact(entries.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    sorted.extend(entries);
+    sorted.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(sorted)
+}
+
 fn report_scene(path: &Path, load: &LoadOptions, output: &mut impl Write) -> CliResult<()> {
     let collection = load_asset_collection(path, load, output)?;
     let hierarchy = build_scene_hierarchy(&collection, SceneHierarchyLimits::default())?;
@@ -2803,7 +3439,7 @@ fn report_scene(path: &Path, load: &LoadOptions, output: &mut impl Write) -> Cli
     writeln!(
         output,
         "  serialized files: {}",
-        collection.serialized_files.len()
+        collection.serialized_files().len()
     )?;
     writeln!(output, "  nodes: {}", hierarchy.nodes.len())?;
     writeln!(output, "  roots: {}", hierarchy.roots.len())?;
@@ -2898,7 +3534,7 @@ fn write_scene_node(
     write!(output, "{} ", if root { "root" } else { "node" })?;
     write_scene_key(output, node.object)?;
     let source = collection
-        .serialized_files
+        .serialized_files()
         .get(node.object.file_index)
         .ok_or_else(|| Error::invalid_data("scene node source file index is out of range"))?;
     writeln!(
@@ -3033,57 +3669,272 @@ fn write_scene_indent(output: &mut impl Write, levels: usize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct InspectPathBudget {
+    bytes: usize,
+}
+
+impl InspectPathBudget {
+    fn charge(&mut self, length: usize, limits: AssetLoadLimits) -> Result<()> {
+        if length > limits.maximum_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "inspect filesystem path is {length} UTF-8 bytes, exceeding limit {}",
+                limits.maximum_path_bytes
+            )));
+        }
+        let total = self
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| Error::invalid_data("inspect filesystem path byte count overflowed"))?;
+        if total > limits.maximum_total_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "inspect filesystem paths total {total} UTF-8 bytes, exceeding limit {}",
+                limits.maximum_total_path_bytes
+            )));
+        }
+        self.bytes = total;
+        Ok(())
+    }
+}
+
+fn inspect_path_byte_length(path: &Path) -> usize {
+    path.as_os_str().as_encoded_bytes().len()
+}
+
+#[cfg(not(windows))]
+fn for_each_inspect_utf8_char(
+    mut input: &[u8],
+    mut visitor: impl FnMut(char) -> Result<()>,
+) -> Result<()> {
+    while !input.is_empty() {
+        match std::str::from_utf8(input) {
+            Ok(valid) => {
+                for character in valid.chars() {
+                    visitor(character)?;
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let valid_length = error.valid_up_to();
+                if valid_length != 0 {
+                    let valid = std::str::from_utf8(&input[..valid_length]).map_err(|_| {
+                        Error::invalid_data("valid inspect path prefix could not be decoded")
+                    })?;
+                    for character in valid.chars() {
+                        visitor(character)?;
+                    }
+                }
+                visitor(char::REPLACEMENT_CHARACTER)?;
+                let invalid_length = error
+                    .error_len()
+                    .unwrap_or_else(|| input.len() - valid_length);
+                input = &input[valid_length + invalid_length..];
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn for_each_inspect_os_str_char(
+    value: &OsStr,
+    mut visitor: impl FnMut(char) -> Result<()>,
+) -> Result<()> {
+    use std::char::decode_utf16;
+    use std::os::windows::ffi::OsStrExt;
+
+    for character in decode_utf16(value.encode_wide()) {
+        visitor(character.unwrap_or(char::REPLACEMENT_CHARACTER))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn for_each_inspect_os_str_char(
+    value: &OsStr,
+    visitor: impl FnMut(char) -> Result<()>,
+) -> Result<()> {
+    for_each_inspect_utf8_char(value.as_encoded_bytes(), visitor)
+}
+
+fn inspect_os_str_utf8_length(value: &OsStr) -> Result<usize> {
+    let mut length = 0_usize;
+    for_each_inspect_os_str_char(value, |character| {
+        length = length
+            .checked_add(character.len_utf8())
+            .ok_or_else(|| Error::invalid_data("inspect filesystem path length overflowed"))?;
+        Ok(())
+    })?;
+    Ok(length)
+}
+
+struct EscapedOsStr<'a>(&'a OsStr);
+
+impl fmt::Display for EscapedOsStr<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for_each_inspect_os_str_char(self.0, |character| {
+            for escaped in character.escape_default() {
+                formatter.write_char(escaped).map_err(|_| {
+                    Error::invalid_data("cannot stream escaped inspect filesystem path")
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|_| fmt::Error)
+    }
+}
+
+struct LossyOsStr<'a>(&'a OsStr);
+
+impl fmt::Display for LossyOsStr<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for_each_inspect_os_str_char(self.0, |character| {
+            formatter
+                .write_char(character)
+                .map_err(|_| Error::invalid_data("cannot stream inspect filesystem path"))?;
+            Ok(())
+        })
+        .map_err(|_| fmt::Error)
+    }
+}
+
+enum InspectLabelComponent<'a> {
+    Plain(&'a str),
+    Escaped(&'a str),
+}
+
+impl fmt::Display for InspectLabelComponent<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain(value) => formatter.write_str(value),
+            Self::Escaped(value) => write!(formatter, "{}", escape_text(value)),
+        }
+    }
+}
+
+struct NestedInspectLabel<'a> {
+    parent: &'a dyn fmt::Display,
+    component: InspectLabelComponent<'a>,
+}
+
+impl fmt::Display for NestedInspectLabel<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}::{}", self.parent, self.component)
+    }
+}
+
+fn copy_inspect_path(
+    path: &Path,
+    limits: AssetLoadLimits,
+    budget: &mut InspectPathBudget,
+) -> Result<PathBuf> {
+    let utf8_length = inspect_os_str_utf8_length(path.as_os_str())?;
+    budget.charge(utf8_length, limits)?;
+    let encoded_length = inspect_path_byte_length(path);
+    let mut copy = PathBuf::new();
+    copy.try_reserve_exact(encoded_length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate inspect filesystem path: {error}"))
+    })?;
+    copy.push(path);
+    Ok(copy)
+}
+
+fn join_inspect_path(
+    parent: &Path,
+    child: &OsStr,
+    limits: AssetLoadLimits,
+    budget: &mut InspectPathBudget,
+) -> Result<PathBuf> {
+    let parent_bytes = parent.as_os_str().as_encoded_bytes();
+    let separator_length =
+        usize::from(!parent_bytes.is_empty() && !matches!(parent_bytes.last(), Some(b'/' | b'\\')));
+    let encoded_length = parent_bytes
+        .len()
+        .checked_add(separator_length)
+        .and_then(|length| length.checked_add(child.as_encoded_bytes().len()))
+        .ok_or_else(|| Error::invalid_data("inspect filesystem path length overflowed"))?;
+    let parent_utf8_length = inspect_os_str_utf8_length(parent.as_os_str())?;
+    let child_utf8_length = inspect_os_str_utf8_length(child)?;
+    let utf8_length = parent_utf8_length
+        .checked_add(separator_length)
+        .and_then(|length| length.checked_add(child_utf8_length))
+        .ok_or_else(|| Error::invalid_data("inspect filesystem path length overflowed"))?;
+    budget.charge(utf8_length, limits)?;
+    let mut path = PathBuf::new();
+    path.try_reserve_exact(encoded_length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate inspect filesystem path: {error}"))
+    })?;
+    path.push(parent);
+    path.push(child);
+    if inspect_path_byte_length(&path) > encoded_length {
+        return Err(Error::invalid_data(
+            "inspect filesystem path grew beyond its checked allocation",
+        ));
+    }
+    Ok(path)
+}
+
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let limits = AssetLoadLimits::default();
+    let mut path_budget = InspectPathBudget::default();
     let mut pending_directories = Vec::new();
     pending_directories.try_reserve(1).map_err(|error| {
         Error::invalid_data(format!("cannot allocate directory queue: {error}"))
     })?;
-    pending_directories.push(root.to_owned());
+    pending_directories.push(copy_inspect_path(root, limits, &mut path_budget)?);
     let mut files = Vec::new();
     let mut directory_count = 1_usize;
     let mut entry_count = 0_usize;
     while let Some(directory) = pending_directories.pop() {
         let mut children = Vec::new();
-        for child in fs::read_dir(directory)? {
+        for child in fs::read_dir(&directory)? {
             entry_count = entry_count
                 .checked_add(1)
                 .ok_or_else(|| Error::invalid_data("directory entry count overflowed"))?;
-            if entry_count > MAX_DIRECTORY_ENTRIES {
+            if entry_count > limits.maximum_directory_entries {
                 return Err(Error::invalid_data(format!(
-                    "directory traversal exceeds {MAX_DIRECTORY_ENTRIES} entries"
+                    "directory traversal exceeds {} entries",
+                    limits.maximum_directory_entries
                 )));
             }
+            let child = child?;
+            let file_type = child.file_type()?;
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+            let path = join_inspect_path(&directory, &child.file_name(), limits, &mut path_budget)?;
             children.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!("cannot allocate directory entries: {error}"))
             })?;
-            children.push(child?);
+            children.push((path, file_type));
         }
-        children.sort_unstable_by_key(std::fs::DirEntry::file_name);
-        for child in children.into_iter().rev() {
-            let file_type = child.file_type()?;
+        children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for (path, file_type) in children.into_iter().rev() {
             if file_type.is_dir() {
                 directory_count = directory_count
                     .checked_add(1)
                     .ok_or_else(|| Error::invalid_data("directory count overflowed"))?;
-                if directory_count > MAX_DIRECTORIES {
+                if directory_count > limits.maximum_input_directories {
                     return Err(Error::invalid_data(format!(
-                        "directory traversal exceeds {MAX_DIRECTORIES} directories"
+                        "directory traversal exceeds {} directories",
+                        limits.maximum_input_directories
                     )));
                 }
                 pending_directories.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot grow directory queue: {error}"))
                 })?;
-                pending_directories.push(child.path());
+                pending_directories.push(path);
             } else if file_type.is_file() {
-                if files.len() >= MAX_DIRECTORY_FILES {
+                if files.len() >= limits.maximum_input_files {
                     return Err(Error::invalid_data(format!(
-                        "directory traversal exceeds {MAX_DIRECTORY_FILES} files"
+                        "directory traversal exceeds {} files",
+                        limits.maximum_input_files
                     )));
                 }
                 files.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot grow input file list: {error}"))
                 })?;
-                files.push(child.path());
+                files.push(path);
             }
         }
     }
@@ -3093,11 +3944,12 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
 
 fn inspect_file(path: &Path, output: &mut impl Write) -> Result<()> {
     let region = Region::from_file(path)?;
-    inspect_region(&path.display().to_string(), region, output, 0)
+    let label = LossyOsStr(path.as_os_str());
+    inspect_region(&label, region, output, 0)
 }
 
 fn inspect_region(
-    label: &str,
+    label: &dyn fmt::Display,
     region: Region,
     output: &mut impl Write,
     compression_depth: usize,
@@ -3148,7 +4000,7 @@ fn inspect_region(
 }
 
 fn inspect_compressed_stream(
-    label: &str,
+    label: &dyn fmt::Display,
     wrapper: &str,
     decoded: Region,
     output: &mut impl Write,
@@ -3156,10 +4008,19 @@ fn inspect_compressed_stream(
 ) -> Result<()> {
     let next_depth = checked_compression_depth(depth)?;
     writeln!(output, "  expanded size: {}", decoded.len())?;
-    inspect_region(&format!("{label}::{wrapper}"), decoded, output, next_depth)
+    let nested_label = NestedInspectLabel {
+        parent: label,
+        component: InspectLabelComponent::Plain(wrapper),
+    };
+    inspect_region(&nested_label, decoded, output, next_depth)
 }
 
-fn inspect_zip(label: &str, region: &Region, output: &mut impl Write, depth: usize) -> Result<()> {
+fn inspect_zip(
+    label: &dyn fmt::Display,
+    region: &Region,
+    output: &mut impl Write,
+    depth: usize,
+) -> Result<()> {
     let next_depth = checked_compression_depth(depth)?;
     let archive = ZipContainer::open(region, CompressionLimits::default())?;
     writeln!(output, "  entries: {}", archive.entries.len())?;
@@ -3170,8 +4031,12 @@ fn inspect_zip(label: &str, region: &Region, output: &mut impl Write, depth: usi
             escape_text(&entry.path),
             entry.size
         )?;
+        let nested_label = NestedInspectLabel {
+            parent: label,
+            component: InspectLabelComponent::Escaped(&entry.path),
+        };
         inspect_region(
-            &format!("{label}::{}", escape_text(&entry.path)),
+            &nested_label,
             archive.read_entry(index)?,
             output,
             next_depth,
@@ -3194,16 +4059,13 @@ fn checked_compression_depth(depth: usize) -> Result<usize> {
 
 fn inspect_serialized_file(region: &Region, output: &mut impl Write) -> Result<()> {
     let file = SerializedFile::open(region.clone())?;
-    let mut class_counts = BTreeMap::<i32, usize>::new();
+    let mut class_counts = HashMap::<i32, usize>::new();
     let mut object_bytes = 0_u64;
     for object in &file.objects {
         object_bytes = object_bytes
             .checked_add(object.byte_size)
             .ok_or_else(|| Error::invalid_data("serialized object byte total overflowed"))?;
-        let count = class_counts.entry(object.class_id).or_default();
-        *count = count
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_data("serialized class count overflowed"))?;
+        increment_class_count(&mut class_counts, object.class_id)?;
     }
     writeln!(output, "  format version: {}", file.header.version)?;
     writeln!(output, "  Unity version: {}", file.unity_version)?;
@@ -3227,7 +4089,7 @@ fn inspect_serialized_file(region: &Region, output: &mut impl Write) -> Result<(
     if class_counts.is_empty() {
         writeln!(output, "    none")?;
     } else {
-        for (class_id, count) in class_counts {
+        for (class_id, count) in sorted_map_entries(class_counts, "class summary")? {
             writeln!(
                 output,
                 "    {class_id}{}: {count}",
@@ -3299,8 +4161,19 @@ fn inspect_web_file(region: Region, output: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-fn escape_text(value: &str) -> String {
-    value.chars().flat_map(char::escape_default).collect()
+struct EscapedText<'a>(&'a str);
+
+impl fmt::Display for EscapedText<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for character in self.0.chars().flat_map(char::escape_default) {
+            formatter.write_char(character)?;
+        }
+        Ok(())
+    }
+}
+
+const fn escape_text(value: &str) -> EscapedText<'_> {
+    EscapedText(value)
 }
 
 fn class_name_suffix(class_id: i32) -> &'static str {
@@ -3333,19 +4206,345 @@ fn class_name_suffix(class_id: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioExportFormat, CliCommand, ExportMode, FilenameFormat, ImageFormat, Live2dExportState,
-        MAX_LIVE2D_OUTPUT_MODELS, MAX_LIVE2D_TOTAL_OUTPUT_BYTES, SceneObjectKey,
-        charge_live2d_model, obj_material_library_name, parse_cli_arguments,
-        parse_export_arguments, parse_extract_arguments, parse_live2d_arguments,
-        parse_live2d_package_arguments, sanitize_live2d_base_name, split_load_options,
-        write_object_reference, write_scene_key,
+        AudioExportFormat, CliArgumentDisplay, CliArgumentLimits, CliCommand, CliError,
+        EscapedOsStr, ExportMode, FbxTemporaryFile, FilenameFormat, ImageFormat,
+        InspectLabelComponent, InspectPathBudget, Live2dCommand, Live2dExportState,
+        Live2dPublicationLock, LoadOptions, LossyOsStr, MAX_LIVE2D_OUTPUT_MODELS,
+        MAX_LIVE2D_TOTAL_OUTPUT_BYTES, MAX_MONO_SCHEMA_DOCUMENTS, MonoSchemaDocumentBudget,
+        NestedInspectLabel, SceneObjectKey, charge_live2d_model, collect_cli_arguments_with_limits,
+        copy_inspect_path, copy_path_argument, escape_text, fallible_lowercase,
+        increment_class_count, increment_string_count, join_inspect_path,
+        obj_material_library_name, parse_cli_arguments, parse_export_arguments,
+        parse_extract_arguments, parse_live2d_arguments, parse_live2d_package_arguments,
+        persist_temporary_hard_link, positional_path_table, publish_fbx_with_textures,
+        push_class_filter, push_positional_path, read_bounded_schema_document,
+        sanitize_live2d_base_name, sorted_map_entries, split_load_options, write_object_reference,
+        write_scene_key,
     };
+    use assetstudio_core::loader::AssetLoadLimits;
+    use assetstudio_core::mono_schema::{
+        MonoBehaviourSchemaDocumentLimits, MonoBehaviourSchemaRegistry,
+    };
+    use assetstudio_core::scene_textures::{SceneTexture, SceneTextureSet};
     use assetstudio_core::serialized::ObjectReference;
-    use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
+    use std::io::{self, Cursor, Write as _};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn command_paths_are_copied_fallibly_and_positional_tables_stay_bounded() {
+        let value = OsStr::new("目录/model.assets");
+        assert_eq!(
+            copy_path_argument(value, "test path").unwrap().as_os_str(),
+            value
+        );
+
+        let mut paths = positional_path_table("test").unwrap();
+        push_positional_path(&mut paths, OsStr::new("input"), "test").unwrap();
+        push_positional_path(&mut paths, OsStr::new("output"), "test").unwrap();
+        let error = push_positional_path(&mut paths, OsStr::new("extra"), "test").unwrap_err();
+        assert!(error.to_string().contains("exactly two"), "{error}");
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn repeated_export_class_filters_grow_fallibly_and_preserve_order() {
+        let mut classes = Vec::new();
+        for value in ["28", "114", "-187", "28"] {
+            push_class_filter(&mut classes, &OsString::from(value)).unwrap();
+        }
+        assert_eq!(classes, [28, 114, -187, 28]);
+
+        let error = push_class_filter(&mut classes, &OsString::from("not-a-class")).unwrap_err();
+        assert!(error.to_string().contains("invalid class ID"), "{error}");
+        assert_eq!(classes, [28, 114, -187, 28]);
+    }
+
+    fn temporary_test_directory(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "assetstudio-cli-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn closed_fbx_temporary(directory: &Path) -> FbxTemporaryFile {
+        let mut temporary = FbxTemporaryFile::create(directory).unwrap();
+        temporary.file_mut().write_all(b"complete FBX").unwrap();
+        temporary.file_mut().flush().unwrap();
+        temporary.file_mut().sync_all().unwrap();
+        temporary.close().unwrap();
+        temporary
+    }
+
+    fn scene_texture(file_name: &str, path_id: i64) -> SceneTexture {
+        SceneTexture {
+            file_name: file_name.to_owned(),
+            object: SceneObjectKey {
+                file_index: 0,
+                path_id,
+            },
+            encoded: b"encoded texture".to_vec(),
+        }
+    }
+
+    #[test]
+    fn fbx_waits_for_the_complete_texture_batch_before_publication() {
+        let directory = temporary_test_directory("fbx-texture-transaction");
+        let destination = directory.join("model.fbx");
+        let mut temporary = closed_fbx_temporary(&directory);
+        let mut textures = SceneTextureSet::default();
+        textures.push_texture(scene_texture("first.png", 1));
+        textures.push_texture(scene_texture("../invalid.png", 2));
+
+        let error =
+            publish_fbx_with_textures(&mut temporary, &destination, &textures, 0, 0, 12, u64::MAX)
+                .unwrap_err();
+        assert!(error.to_string().contains("portable"), "{error}");
+        assert!(!destination.exists());
+        assert!(!directory.join("first.png").exists());
+        drop(temporary);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn fbx_collision_rolls_back_the_new_texture_batch() {
+        let directory = temporary_test_directory("fbx-late-collision");
+        let destination = directory.join("model.fbx");
+        fs::write(&destination, b"existing FBX").unwrap();
+        let mut temporary = closed_fbx_temporary(&directory);
+        let mut textures = SceneTextureSet::default();
+        textures.push_texture(scene_texture("body.png", 1));
+
+        let error =
+            publish_fbx_with_textures(&mut temporary, &destination, &textures, 0, 0, 12, u64::MAX)
+                .unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(fs::read(&destination).unwrap(), b"existing FBX");
+        assert!(!directory.join("body.png").exists());
+        drop(temporary);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_file(&destination).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn fbx_total_budget_counts_new_texture_bytes_before_model_commit() {
+        let directory = temporary_test_directory("fbx-texture-budget");
+        let destination = directory.join("model.fbx");
+        let mut temporary = closed_fbx_temporary(&directory);
+        let mut textures = SceneTextureSet::default();
+        textures.push_texture(scene_texture("body.png", 1));
+
+        let error =
+            publish_fbx_with_textures(&mut temporary, &destination, &textures, 0, 0, 12, 26)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("26 byte total output limit"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert!(!directory.join("body.png").exists());
+        drop(temporary);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn hard_link_is_the_commit_point_even_when_temp_cleanup_is_deferred() {
+        let directory = temporary_test_directory("hard-link-commit");
+        let temporary = directory.join("temporary");
+        let destination = directory.join("destination");
+        fs::write(&temporary, b"published").unwrap();
+
+        let cleaned = persist_temporary_hard_link(&temporary, &destination, "test", |_| {
+            Err(io::Error::other("deferred cleanup"))
+        })
+        .unwrap();
+        assert!(!cleaned);
+        assert_eq!(fs::read(&temporary).unwrap(), b"published");
+        assert_eq!(fs::read(&destination).unwrap(), b"published");
+
+        fs::remove_file(&temporary).unwrap();
+        fs::remove_file(&destination).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn live2d_lock_cleanup_failure_does_not_reverse_a_committed_package() {
+        let directory = temporary_test_directory("live2d-lock-cleanup");
+        let mut lock = Live2dPublicationLock::acquire(&directory, "Hero").unwrap();
+        let lock_path = lock.path.clone();
+
+        let removed =
+            lock.release_after_commit_with(|_| Err(io::Error::other("deferred lock cleanup")));
+        assert!(!removed);
+        assert!(lock_path.exists());
+
+        drop(lock);
+        assert!(!lock_path.exists());
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn command_line_arguments_are_bounded_before_collection() {
+        let limits = CliArgumentLimits {
+            arguments: 2,
+            argument_bytes: 4,
+            total_bytes: 4,
+        };
+        assert_eq!(
+            collect_cli_arguments_with_limits(arguments(&["ab", "cd"]), limits).unwrap(),
+            arguments(&["ab", "cd"])
+        );
+
+        let count_error = collect_cli_arguments_with_limits(
+            arguments(&["", ""]),
+            CliArgumentLimits {
+                arguments: 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{count_error:?}").contains("more than 1"));
+
+        let item_error = collect_cli_arguments_with_limits(
+            arguments(&["five!"]),
+            CliArgumentLimits {
+                argument_bytes: 4,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{item_error:?}").contains("5 bytes long"));
+
+        let total_error = collect_cli_arguments_with_limits(
+            arguments(&["abc", "de"]),
+            CliArgumentLimits {
+                total_bytes: 4,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{total_error:?}").contains("total 5 bytes"));
+    }
+
+    #[test]
+    fn command_line_diagnostics_do_not_echo_large_arguments() {
+        let oversized = format!("--{}", "é".repeat(33));
+        assert_eq!(oversized.len(), 68);
+        assert_eq!(
+            CliArgumentDisplay(OsStr::new(&oversized)).to_string(),
+            "<argument of 68 encoded bytes>"
+        );
+
+        let error = parse_cli_arguments(&[OsString::from(&oversized)]).unwrap_err();
+        let CliError::Usage(message) = error else {
+            panic!("an unknown option must be a usage error");
+        };
+        assert!(message.contains("<argument of 68 encoded bytes>"));
+        assert!(!message.contains(&oversized));
+    }
+
+    #[test]
+    fn inspect_paths_are_charged_before_retained_allocation() {
+        let mut budget = InspectPathBudget::default();
+        let single_limit = AssetLoadLimits {
+            maximum_path_bytes: 3,
+            ..AssetLoadLimits::default()
+        };
+        let error = copy_inspect_path(Path::new("four"), single_limit, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("path is 4 UTF-8 bytes"));
+        assert_eq!(budget.bytes, 0);
+
+        let mut budget = InspectPathBudget::default();
+        let cumulative_limit = AssetLoadLimits {
+            maximum_total_path_bytes: 4,
+            ..AssetLoadLimits::default()
+        };
+        let root = copy_inspect_path(Path::new("root"), cumulative_limit, &mut budget).unwrap();
+        let error = join_inspect_path(&root, OsStr::new("child"), cumulative_limit, &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("filesystem paths total"));
+        assert_eq!(budget.bytes, 4);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let invalid = PathBuf::from(OsString::from_vec(vec![b'a', 0xff]));
+            let mut budget = InspectPathBudget::default();
+            let replacement_limit = AssetLoadLimits {
+                maximum_path_bytes: 3,
+                ..AssetLoadLimits::default()
+            };
+            let error = copy_inspect_path(&invalid, replacement_limit, &mut budget).unwrap_err();
+            assert!(error.to_string().contains("is 4 UTF-8 bytes"), "{error}");
+            assert_eq!(budget.bytes, 0);
+
+            let exact_limit = AssetLoadLimits {
+                maximum_path_bytes: 4,
+                maximum_total_path_bytes: 4,
+                ..AssetLoadLimits::default()
+            };
+            assert_eq!(
+                copy_inspect_path(&invalid, exact_limit, &mut budget).unwrap(),
+                invalid
+            );
+            assert_eq!(budget.bytes, 4);
+            assert_eq!(
+                EscapedOsStr(invalid.as_os_str()).to_string(),
+                escape_text(&invalid.to_string_lossy()).to_string()
+            );
+            assert_eq!(
+                LossyOsStr(invalid.as_os_str()).to_string(),
+                invalid.to_string_lossy()
+            );
+            let root_label = LossyOsStr(invalid.as_os_str());
+            let compressed_label = NestedInspectLabel {
+                parent: &root_label,
+                component: InspectLabelComponent::Plain("gzip"),
+            };
+            assert_eq!(compressed_label.to_string(), "a\u{fffd}::gzip");
+            let entry_label = NestedInspectLabel {
+                parent: &compressed_label,
+                component: InspectLabelComponent::Escaped("line\nname"),
+            };
+            assert_eq!(entry_label.to_string(), "a\u{fffd}::gzip::line\\nname");
+
+            let invalid_child = OsString::from_vec(vec![0xff]);
+            let mut budget = InspectPathBudget::default();
+            let cumulative_limit = AssetLoadLimits {
+                maximum_total_path_bytes: 11,
+                ..AssetLoadLimits::default()
+            };
+            let root = copy_inspect_path(Path::new("root"), cumulative_limit, &mut budget).unwrap();
+            let error = join_inspect_path(
+                &root,
+                invalid_child.as_os_str(),
+                cumulative_limit,
+                &mut budget,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("total 12 UTF-8 bytes"),
+                "{error}"
+            );
+            assert_eq!(budget.bytes, 4);
+        }
     }
 
     #[test]
@@ -3392,6 +4591,45 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn mono_schema_documents_are_streamed_and_budgeted_across_repeated_flags() {
+        assert_eq!(
+            read_bounded_schema_document(Cursor::new(b"1234"), 4).unwrap(),
+            b"1234"
+        );
+        let error = read_bounded_schema_document(Cursor::new(b"12345"), 4).unwrap_err();
+        assert!(error.to_string().contains("4 byte total limit"), "{error}");
+
+        let schema = br#"{"version":1,"entries":[{"assembly":"A","class":"C","nodes":[{"level":0,"type":"T","name":"N"}]}]}"#;
+        let registry = MonoBehaviourSchemaRegistry::from_json(schema).unwrap();
+        let mut budget = MonoSchemaDocumentBudget::default();
+        budget.charge(schema.len(), &registry).unwrap();
+        let remaining = budget
+            .remaining(MonoBehaviourSchemaDocumentLimits {
+                maximum_document_bytes: schema.len(),
+                maximum_entries: 1,
+                maximum_nodes_per_entry: 1,
+                maximum_total_nodes: 1,
+                maximum_string_bytes: 1,
+                maximum_total_string_bytes: 4,
+            })
+            .unwrap();
+        assert_eq!(remaining.maximum_document_bytes, 0);
+        assert_eq!(remaining.maximum_entries, 0);
+        assert_eq!(remaining.maximum_total_nodes, 0);
+        assert_eq!(remaining.maximum_total_string_bytes, 0);
+
+        let load = LoadOptions {
+            mono_schemas: vec![PathBuf::from("schema.json"); MAX_MONO_SCHEMA_DOCUMENTS + 1],
+            ..LoadOptions::default()
+        };
+        let error = load.mono_schema_registry().unwrap_err();
+        let CliError::Usage(message) = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(message.contains("documents"), "{message}");
     }
 
     #[test]
@@ -3597,10 +4835,14 @@ mod tests {
     #[test]
     fn live2d_name_cleaning_and_aggregate_budgets_are_bounded() {
         assert_eq!(
-            sanitize_live2d_base_name("../unsafe:name.moc3"),
+            sanitize_live2d_base_name("../unsafe:name.moc3").unwrap(),
             "_unsafe_name"
         );
-        assert_eq!(sanitize_live2d_base_name("..."), "unnamed");
+        assert_eq!(sanitize_live2d_base_name("...").unwrap(), "unnamed");
+        assert_eq!(
+            fallible_lowercase("Modelİ", "test portable name").unwrap(),
+            "modeli\u{307}"
+        );
 
         let mut state = Live2dExportState {
             models_found: MAX_LIVE2D_OUTPUT_MODELS,
@@ -3608,11 +4850,37 @@ mod tests {
         };
         assert!(charge_live2d_model(&mut state, 1).is_err());
 
-        let mut state = Live2dExportState {
-            scheduled_bytes: MAX_LIVE2D_TOTAL_OUTPUT_BYTES,
-            ..Live2dExportState::default()
-        };
+        let mut state = Live2dExportState::default();
+        let next = charge_live2d_model(&mut state, MAX_LIVE2D_TOTAL_OUTPUT_BYTES).unwrap();
+        assert_eq!(next, MAX_LIVE2D_TOTAL_OUTPUT_BYTES);
+        assert_eq!(state.exported_bytes, 0);
+        assert_eq!(
+            charge_live2d_model(&mut state, MAX_LIVE2D_TOTAL_OUTPUT_BYTES).unwrap(),
+            MAX_LIVE2D_TOTAL_OUTPUT_BYTES
+        );
+        state.exported_bytes = next;
         assert!(charge_live2d_model(&mut state, 1).is_err());
+    }
+
+    #[test]
+    fn read_only_summaries_count_without_losing_deterministic_order() {
+        let mut classes = HashMap::new();
+        increment_class_count(&mut classes, 49).unwrap();
+        increment_class_count(&mut classes, 28).unwrap();
+        increment_class_count(&mut classes, 49).unwrap();
+        assert_eq!(
+            sorted_map_entries(classes, "test class summary").unwrap(),
+            vec![(28, 1), (49, 2)]
+        );
+
+        let mut versions = HashMap::new();
+        increment_string_count(&mut versions, "6000.3.0f1", "test Unity version").unwrap();
+        increment_string_count(&mut versions, "2022.3.62f1", "test Unity version").unwrap();
+        increment_string_count(&mut versions, "6000.3.0f1", "test Unity version").unwrap();
+        assert_eq!(
+            sorted_map_entries(versions, "test Unity version summary").unwrap(),
+            vec![("2022.3.62f1".to_owned(), 1), ("6000.3.0f1".to_owned(), 2),]
+        );
     }
 
     #[test]
@@ -3706,6 +4974,46 @@ mod tests {
         assert_eq!(extraction.input, PathBuf::from("input.assets"));
         assert_eq!(extraction.output, PathBuf::from("output"));
         assert!(extraction.options.overwrite_existing);
+
+        for legacy_mode in ["l2d", "live2d"] {
+            assert_eq!(
+                parse_cli_arguments(&arguments(&[
+                    "input.assets",
+                    "-m",
+                    legacy_mode,
+                    "-o",
+                    "output",
+                ]))
+                .unwrap(),
+                CliCommand::Live2dPackage(Live2dCommand {
+                    input: PathBuf::from("input.assets"),
+                    output: PathBuf::from("output"),
+                })
+            );
+        }
+        assert!(parse_cli_arguments(&arguments(&["input.assets", "-m", "live2d"])).is_err());
+        assert!(
+            parse_cli_arguments(&arguments(&[
+                "input.assets",
+                "-m",
+                "live2d",
+                "-o",
+                "output",
+                "--overwrite-existing",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_cli_arguments(&arguments(&[
+                "input.assets",
+                "-m",
+                "l2d",
+                "-o",
+                "output",
+                "--not-restore-extension",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

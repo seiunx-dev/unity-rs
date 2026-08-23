@@ -179,7 +179,9 @@ pub struct AclDecodedClip {
 /// Safe extension point for pure-Rust and language-binding ACL decoders.
 ///
 /// Implementations receive validated, owned input and cannot access Unity
-/// parser internals or raw pointers.
+/// parser internals or raw pointers. Request-declared frame, curve, and scalar
+/// output counts have already passed [`AclDecodeLimits`] before this method is
+/// called; returned values still undergo complete structural validation.
 pub trait AclDecoder: Send + Sync {
     fn decode(&self, request: &AclDecodeRequest<'_>) -> Result<AclDecodedClip>;
 }
@@ -204,12 +206,49 @@ impl Default for AclDecodeLimits {
     }
 }
 
+/// Rejects declared decoder work that already exceeds the caller's limits.
+pub fn validate_decode_request(
+    request: &AclDecodeRequest<'_>,
+    limits: AclDecodeLimits,
+) -> Result<()> {
+    let expected_frames = usize::try_from(request.frame_count)
+        .map_err(|_| Error::invalid_data("ACL frame count does not fit this platform"))?;
+    if expected_frames > limits.maximum_frames {
+        return Err(Error::invalid_data(format!(
+            "ACL frame count {expected_frames} exceeds limit {}",
+            limits.maximum_frames
+        )));
+    }
+    let Some(declared_curves) = request.declared_curve_count else {
+        return Ok(());
+    };
+    let declared_curves = usize::try_from(declared_curves)
+        .map_err(|_| Error::invalid_data("ACL curve count does not fit this platform"))?;
+    if declared_curves > limits.maximum_curves {
+        return Err(Error::invalid_data(format!(
+            "ACL declares {declared_curves} curves, exceeding limit {}",
+            limits.maximum_curves
+        )));
+    }
+    let expected_values = expected_frames
+        .checked_mul(declared_curves)
+        .ok_or_else(|| Error::invalid_data("ACL decoded value count overflowed"))?;
+    if expected_values > limits.maximum_values {
+        return Err(Error::invalid_data(format!(
+            "ACL decoder output requires {expected_values} values, exceeding limit {}",
+            limits.maximum_values
+        )));
+    }
+    Ok(())
+}
+
 /// Validates all structural and numerical invariants of injected decoder output.
 pub fn validate_decoded_clip(
     decoded: &AclDecodedClip,
     request: &AclDecodeRequest<'_>,
     limits: AclDecodeLimits,
 ) -> Result<()> {
+    validate_decode_request(request, limits)?;
     let expected_frames = usize::try_from(request.frame_count)
         .map_err(|_| Error::invalid_data("ACL frame count does not fit this platform"))?;
     if expected_frames > limits.maximum_frames {
@@ -656,6 +695,14 @@ mod tests {
         }
     }
 
+    struct MustNotRunDecoder;
+
+    impl AclDecoder for MustNotRunDecoder {
+        fn decode(&self, _request: &AclDecodeRequest<'_>) -> Result<AclDecodedClip> {
+            panic!("ACL decoder ran before request limits were checked")
+        }
+    }
+
     fn decodable_clip() -> AclClip {
         let tracks = compressed_tracks(10, 12, 1, 2, 30.0, &[]);
         let map_bytes = [7_u32.to_le_bytes(), 8_u32.to_le_bytes()].concat();
@@ -698,7 +745,7 @@ mod tests {
         );
 
         assert_rejected_shapes(&clip);
-        assert_rejected_limits(&clip, &valid);
+        assert_rejected_limits(&clip);
     }
 
     /// Each hostile output paired with the guard it must trip.
@@ -801,7 +848,7 @@ mod tests {
 
     /// The three resource ceilings, each tripped on its own so one cannot mask
     /// another.
-    fn assert_rejected_limits(clip: &AclClip, valid: &AclDecodedClip) {
+    fn assert_rejected_limits(clip: &AclClip) {
         for (reason, limits) in [
             (
                 "exceeds limit 1",
@@ -825,14 +872,7 @@ mod tests {
                 },
             ),
         ] {
-            let error = clip
-                .decode_with(
-                    &FakeDecoder {
-                        output: valid.clone(),
-                    },
-                    limits,
-                )
-                .unwrap_err();
+            let error = clip.decode_with(&MustNotRunDecoder, limits).unwrap_err();
             assert!(
                 error.to_string().contains(reason),
                 "expected {reason:?}, got {error}"

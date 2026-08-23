@@ -244,7 +244,11 @@ pub fn project_cubism_physics(
         wind: vec2_field(rig, "Wind", "CubismPhysicsRig")?,
         fps: number_field(rig, "Fps", "CubismPhysicsRig")?,
     };
-    result.write_physics3_json(0.0, &mut io::sink(), limits.maximum_output_bytes)?;
+    crate::error::output_validation(result.write_physics3_json(
+        0.0,
+        &mut io::sink(),
+        limits.maximum_output_bytes,
+    ))?;
     Ok(result)
 }
 

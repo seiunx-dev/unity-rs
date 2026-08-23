@@ -15,6 +15,8 @@ inconsistent with itself. It checks:
 * every node record's end offset landing exactly where the record ends;
 * the property-count and property-list-length fields matching the properties
   actually present;
+* raw and deflated arrays expanding to exactly their declared shape, with one
+  complete zlib member and no trailing compressed bytes;
 * nested lists terminating with a null record, and only where one is expected;
 * the footer's id, its alignment padding, the version repeated, and the closing
   magic.
@@ -32,6 +34,8 @@ from __future__ import annotations
 
 import struct
 import sys
+import zlib
+from dataclasses import dataclass
 from pathlib import Path
 
 MAGIC = b"Kaydara FBX Binary  \x00\x1a\x00"
@@ -48,10 +52,75 @@ FOOTER_MAGIC = bytes(
 SCALAR_WIDTHS = {ord("Y"): 2, ord("C"): 1, ord("I"): 4, ord("F"): 4, ord("D"): 8, ord("L"): 8}
 ARRAY_WIDTHS = {ord("f"): 4, ord("d"): 8, ord("l"): 8, ord("i"): 4, ord("b"): 1}
 RAW_CODES = {ord("S"), ord("R")}
+MAXIMUM_SAFE_DEPTH = 256
 
 
 class Invalid(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class VerificationLimits:
+    maximum_input_bytes: int = 1024 * 1024 * 1024
+    maximum_nodes: int = 1_000_000
+    maximum_properties: int = 4_000_000
+    maximum_depth: int = MAXIMUM_SAFE_DEPTH
+    maximum_array_elements: int = 128_000_000
+    maximum_total_expanded_array_bytes: int = 1024 * 1024 * 1024
+
+
+class Budget:
+    def __init__(self, limits: VerificationLimits) -> None:
+        values = vars(limits)
+        if any(value < 0 for value in values.values()):
+            raise Invalid("binary FBX verification limits cannot be negative")
+        if limits.maximum_depth > MAXIMUM_SAFE_DEPTH:
+            raise Invalid(
+                f"binary FBX verification depth cannot exceed {MAXIMUM_SAFE_DEPTH}"
+            )
+        if limits.maximum_input_bytes >= sys.maxsize:
+            raise Invalid(
+                f"binary FBX input limit must be smaller than {sys.maxsize} bytes"
+            )
+        self.limits = limits
+        self.nodes = 0
+        self.properties = 0
+        self.expanded_array_bytes = 0
+
+    def charge_node(self, depth: int) -> None:
+        if depth >= self.limits.maximum_depth:
+            raise Invalid(
+                f"binary FBX nesting exceeds {self.limits.maximum_depth} records"
+            )
+        self.nodes += 1
+        if self.nodes > self.limits.maximum_nodes:
+            raise Invalid(f"binary FBX exceeds {self.limits.maximum_nodes} nodes")
+
+    def charge_properties(self, count: int) -> None:
+        self.properties += count
+        if self.properties > self.limits.maximum_properties:
+            raise Invalid(
+                f"binary FBX exceeds {self.limits.maximum_properties} properties"
+            )
+
+    def charge_array(self, count: int, width: int) -> int:
+        if count > self.limits.maximum_array_elements:
+            raise Invalid(
+                f"binary FBX array has {count} elements, exceeding limit "
+                f"{self.limits.maximum_array_elements}"
+            )
+        expanded = count * width
+        self.expanded_array_bytes += expanded
+        if (
+            self.expanded_array_bytes
+            > self.limits.maximum_total_expanded_array_bytes
+        ):
+            raise Invalid(
+                "binary FBX arrays exceed the "
+                f"{self.limits.maximum_total_expanded_array_bytes} byte "
+                "expanded-data budget"
+            )
+        return expanded
 
 
 class Reader:
@@ -70,7 +139,7 @@ class Reader:
         return struct.unpack("<I", self.take(4))[0]
 
 
-def read_property(reader: Reader) -> None:
+def read_property(reader: Reader, budget: Budget) -> None:
     code = reader.take(1)[0]
     if code in SCALAR_WIDTHS:
         reader.take(SCALAR_WIDTHS[code])
@@ -80,21 +149,55 @@ def read_property(reader: Reader) -> None:
         count = reader.u32()
         encoding = reader.u32()
         compressed_length = reader.u32()
+        expected = budget.charge_array(count, ARRAY_WIDTHS[code])
+        payload = reader.take(compressed_length)
         if encoding == 0:
-            expected = count * ARRAY_WIDTHS[code]
             if compressed_length != expected:
                 raise Invalid(
                     f"uncompressed array of {count} {chr(code)} declares "
                     f"{compressed_length} bytes, not {expected}"
                 )
-        elif encoding != 1:
+        elif encoding == 1:
+            validate_deflated_array(payload, expected, chr(code))
+        else:
             raise Invalid(f"array encoding {encoding} is neither raw nor deflate")
-        reader.take(compressed_length)
     else:
         raise Invalid(f"property type {chr(code)!r} ({code}) is not an FBX 7.4 code")
 
 
-def read_node(reader: Reader, depth: int) -> bool:
+def validate_deflated_array(payload: bytes, expected: int, type_code: str) -> None:
+    """Checks one exact zlib member without materialising an unbounded array."""
+    decoder = zlib.decompressobj()
+    pending = payload
+    produced = 0
+    while pending:
+        maximum = min(64 * 1024, expected - produced + 1)
+        try:
+            decoded = decoder.decompress(pending, maximum)
+        except zlib.error as error:
+            raise Invalid(f"cannot inflate {type_code} array: {error}") from error
+        produced += len(decoded)
+        if produced > expected:
+            raise Invalid(
+                f"deflated {type_code} array expands beyond its declared "
+                f"{expected} bytes"
+            )
+        remaining = decoder.unconsumed_tail
+        if remaining and len(remaining) == len(pending) and not decoded:
+            raise Invalid(f"cannot make progress inflating {type_code} array")
+        pending = remaining
+
+    if not decoder.eof:
+        raise Invalid(f"deflated {type_code} array ends before its zlib stream")
+    if decoder.unused_data:
+        raise Invalid(f"deflated {type_code} array has bytes after its zlib stream")
+    if produced != expected:
+        raise Invalid(
+            f"deflated {type_code} array expands to {produced} bytes, not {expected}"
+        )
+
+
+def read_node(reader: Reader, depth: int, budget: Budget) -> bool:
     """Reads one record. Returns False for the null record ending a list."""
     start = reader.at
     end_offset = reader.u32()
@@ -106,11 +209,13 @@ def read_node(reader: Reader, depth: int) -> bool:
         if property_count or property_list_length or name_length:
             raise Invalid(f"null record at {start} is not all zeros")
         return False
+    budget.charge_node(depth)
+    budget.charge_properties(property_count)
     name = reader.take(name_length).decode("utf-8", "replace")
 
     properties_at = reader.at
     for _ in range(property_count):
-        read_property(reader)
+        read_property(reader, budget)
     consumed = reader.at - properties_at
     if consumed != property_list_length:
         raise Invalid(
@@ -121,7 +226,7 @@ def read_node(reader: Reader, depth: int) -> bool:
     # Anything left before the declared end is a nested list, which must be
     # terminated by its own null record.
     if reader.at < end_offset:
-        while read_node(reader, depth + 1):
+        while read_node(reader, depth + 1, budget):
             pass
     if reader.at != end_offset:
         raise Invalid(
@@ -130,8 +235,26 @@ def read_node(reader: Reader, depth: int) -> bool:
     return True
 
 
-def validate(path: Path) -> list[str]:
-    data = path.read_bytes()
+def validate(
+    path: Path, limits: VerificationLimits = VerificationLimits()
+) -> list[str]:
+    budget = Budget(limits)
+    declared_size = path.stat().st_size
+    if declared_size > limits.maximum_input_bytes:
+        raise Invalid(
+            f"binary FBX input is {declared_size} bytes, exceeding limit "
+            f"{limits.maximum_input_bytes}"
+        )
+    # Bound the read itself as well as checking metadata. A regular file could
+    # grow after stat(), and Path.read_bytes() would otherwise allocate the new
+    # unbounded size before the post-read check had a chance to reject it.
+    with path.open("rb") as source:
+        data = source.read(limits.maximum_input_bytes + 1)
+    if len(data) > limits.maximum_input_bytes:
+        raise Invalid(
+            f"binary FBX input is {len(data)} bytes, exceeding limit "
+            f"{limits.maximum_input_bytes}"
+        )
     notes: list[str] = []
     if not data.startswith(MAGIC):
         raise Invalid("the file does not start with the binary FBX magic")
@@ -143,7 +266,7 @@ def validate(path: Path) -> list[str]:
         raise Invalid(f"version {version} is not 7400")
 
     roots = 0
-    while read_node(reader, 0):
+    while read_node(reader, 0, budget):
         roots += 1
     if roots == 0:
         raise Invalid("the file has no top-level records")
@@ -154,8 +277,9 @@ def validate(path: Path) -> list[str]:
     if not footer.startswith(FOOTER_ID):
         raise Invalid("the footer does not begin with the footer id")
     # The id plus its padding aligns the whole body to 16 bytes.
-    aligned = -(-(body_end + len(FOOTER_ID)) // 16) * 16
-    padding = aligned - body_end - len(FOOTER_ID)
+    # Reference writers use `16 - (position % 16)`, so an already aligned
+    # position receives a complete 16-byte zero block rather than no padding.
+    padding = 16 - ((body_end + len(FOOTER_ID)) % 16)
     at = len(FOOTER_ID) + padding
     if any(footer[len(FOOTER_ID) : at]):
         raise Invalid("the footer's alignment padding is not zero")

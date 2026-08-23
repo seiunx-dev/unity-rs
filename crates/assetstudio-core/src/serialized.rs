@@ -185,9 +185,14 @@ pub struct AssetBundleContainerEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetBundleMetadata {
+    /// Effective bundle name used by the loader: `asset_bundle_name` when it
+    /// is present and non-empty, otherwise the inherited `NamedObject` name.
     pub name: String,
+    pub object_name: String,
+    pub asset_bundle_name: Option<String>,
     pub preload_table: Vec<ObjectReference>,
     pub container: Vec<AssetBundleContainerEntry>,
+    pub dependencies: Vec<String>,
     pub is_streamed_scene_asset_bundle: bool,
 }
 
@@ -204,6 +209,7 @@ pub struct ResourceManagerMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreloadDataMetadata {
+    pub name: String,
     pub assets: Vec<ObjectReference>,
 }
 
@@ -745,25 +751,34 @@ impl SerializedFile {
             let _runtime_compatibility = reader.reader.read_u32()?;
         }
 
-        let mut name = object_name;
+        let mut asset_bundle_name = None;
+        let mut dependencies = Vec::new();
         let mut is_streamed_scene_asset_bundle = false;
         if self.unity_version.components().0 >= 5 {
-            let asset_bundle_name = reader.read_string("AssetBundle name")?;
-            if !asset_bundle_name.is_empty() {
-                name = asset_bundle_name;
-            }
+            asset_bundle_name = Some(reader.read_string("AssetBundle name")?);
             let dependency_count =
                 reader.read_count("AssetBundle dependencies", limits.maximum_dependencies, 4)?;
+            dependencies = reserve_vec(dependency_count, "AssetBundle dependencies")?;
             for _ in 0..dependency_count {
-                let _dependency = reader.read_string("AssetBundle dependency")?;
+                dependencies.push(reader.read_string("AssetBundle dependency")?);
             }
             is_streamed_scene_asset_bundle = reader.reader.read_bool()?;
         }
+        let name = match asset_bundle_name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => reader.copy_string(value, "AssetBundle effective name")?,
+            None => reader.copy_string(&object_name, "AssetBundle effective name")?,
+        };
 
         Ok(AssetBundleMetadata {
             name,
+            object_name,
+            asset_bundle_name,
             preload_table,
             container,
+            dependencies,
             is_streamed_scene_asset_bundle,
         })
     }
@@ -797,7 +812,7 @@ impl SerializedFile {
     ) -> Result<PreloadDataMetadata> {
         let mut reader = ContainerObjectReader::new(self, index, PRELOAD_DATA_CLASS_ID, limits)?;
         reader.skip_editor_extension()?;
-        let _name = reader.read_string("PreloadData m_Name")?;
+        let name = reader.read_string("PreloadData m_Name")?;
         let count = reader.read_count(
             "PreloadData assets",
             limits.maximum_preload_references,
@@ -807,7 +822,7 @@ impl SerializedFile {
         for _ in 0..count {
             assets.push(reader.read_pptr()?);
         }
-        Ok(PreloadDataMetadata { assets })
+        Ok(PreloadDataMetadata { name, assets })
     }
 }
 
@@ -904,6 +919,25 @@ impl ContainerObjectReader {
                 self.limits.maximum_string_bytes
             )));
         }
+        self.charge_string_bytes(length)?;
+        let value = self.reader.read_utf8(length)?;
+        if length != 0 {
+            align_absolute(&mut self.reader, 0, 4)?;
+        }
+        Ok(value)
+    }
+
+    fn copy_string(&mut self, value: &str, field: &str) -> Result<String> {
+        self.charge_string_bytes(value.len())?;
+        let mut copy = String::new();
+        copy.try_reserve_exact(value.len()).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate {field} string: {error}"))
+        })?;
+        copy.push_str(value);
+        Ok(copy)
+    }
+
+    fn charge_string_bytes(&mut self, length: usize) -> Result<()> {
         self.total_string_bytes = self
             .total_string_bytes
             .checked_add(length)
@@ -914,11 +948,7 @@ impl ContainerObjectReader {
                 self.total_string_bytes, self.limits.maximum_total_string_bytes
             )));
         }
-        let value = self.reader.read_utf8(length)?;
-        if length != 0 {
-            align_absolute(&mut self.reader, 0, 4)?;
-        }
-        Ok(value)
+        Ok(())
     }
 }
 
@@ -1677,8 +1707,35 @@ fn read_aligned_string_limited<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{SerializedFile, SerializedOpenOptions, SerializedParseLimits};
+    use crate::Error;
     use crate::source::Region;
     use crate::unity_version::UnityVersion;
+
+    #[test]
+    fn rejects_pre_v5_formats_as_explicitly_unsupported() {
+        for version in 1..=4_u32 {
+            // Legacy headers put the endian byte at file_size - metadata_size.
+            // No invented metadata follows: the production parser must reject
+            // the unsupported format immediately after validating its header.
+            let mut bytes = vec![0_u8; 17];
+            bytes[0..4].copy_from_slice(&1_u32.to_be_bytes());
+            bytes[4..8].copy_from_slice(&17_u32.to_be_bytes());
+            bytes[8..12].copy_from_slice(&version.to_be_bytes());
+            bytes[12..16].copy_from_slice(&16_u32.to_be_bytes());
+            bytes[16] = 0;
+
+            match SerializedFile::open(Region::from_bytes(bytes)) {
+                Err(Error::Unsupported(message)) => assert!(
+                    message.contains(&format!("version {version}")),
+                    "format {version} error did not identify its version: {message}"
+                ),
+                Err(other) => {
+                    panic!("format {version} must be unsupported rather than malformed: {other}")
+                }
+                Ok(_) => panic!("format {version} unexpectedly parsed without a verified layout"),
+            }
+        }
+    }
 
     #[test]
     fn parses_v22_metadata_object_index_type_tree_and_text_asset() {

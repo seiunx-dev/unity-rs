@@ -138,7 +138,7 @@ pub fn read_font(
         name,
         payload,
         payload_kind: "font",
-        suggested_extension: extension.to_owned(),
+        suggested_extension: copy_simple_string(extension, "Font extension")?,
     })
 }
 
@@ -176,7 +176,7 @@ pub fn read_movie_texture(
         name,
         payload,
         payload_kind: "movie_ogv",
-        suggested_extension: ".ogv".to_owned(),
+        suggested_extension: copy_simple_string(".ogv", "MovieTexture extension")?,
     })
 }
 
@@ -258,7 +258,7 @@ fn read_legacy_audio_clip(
         } else {
             let offset = u64::from(reader.reader.read_u32()?);
             StreamedResource {
-                source: legacy_audio_resource_name(collection, file)?,
+                source: legacy_audio_resource_name(collection, file, limits.maximum_string_bytes)?,
                 offset,
                 size,
                 inline_region: reader.region.clone(),
@@ -296,7 +296,7 @@ fn build_audio_clip_asset(
         path_id,
         name,
         payload,
-        raw_extension: raw_extension.to_owned(),
+        raw_extension: copy_simple_string(raw_extension, "AudioClip extension")?,
         direct_wav,
     })
 }
@@ -344,17 +344,24 @@ fn inline_streamed_resource(
 fn legacy_audio_resource_name(
     collection: &AssetCollection,
     file: &SerializedFile,
+    maximum_string_bytes: usize,
 ) -> Result<String> {
-    collection
+    let path = collection
         .serialized_files
         .iter()
         .find(|loaded| std::ptr::eq(std::ptr::from_ref(&loaded.file), std::ptr::from_ref(file)))
-        .map(|loaded| format!("{}.resS", loaded.path))
+        .map(|loaded| loaded.path.as_str())
         .ok_or_else(|| {
             Error::invalid_data(
                 "legacy streamed AudioClip source file is not part of the asset collection",
             )
-        })
+        })?;
+    append_simple_suffix(
+        path,
+        ".resS",
+        maximum_string_bytes,
+        "legacy AudioClip resource name",
+    )
 }
 
 /// Reads a `VideoClip`, resolving its `StreamedResource` when needed.
@@ -399,7 +406,7 @@ pub fn read_video_clip(
         name,
         payload,
         payload_kind: "video_raw",
-        suggested_extension: portable_extension(&original_path),
+        suggested_extension: portable_extension(&original_path)?,
     })
 }
 
@@ -640,11 +647,46 @@ fn legacy_audio_extension(sound_type: i32) -> &'static str {
     }
 }
 
-fn portable_extension(path: &str) -> String {
+fn portable_extension(path: &str) -> Result<String> {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    name.rfind('.')
+    let extension = name
+        .rfind('.')
         .filter(|index| *index + 1 < name.len())
-        .map_or_else(|| ".video".to_owned(), |index| name[index..].to_owned())
+        .map_or(".video", |index| &name[index..]);
+    copy_simple_string(extension, "VideoClip extension")
+}
+
+fn copy_simple_string(value: &str, field: &str) -> Result<String> {
+    let mut copied = String::new();
+    copied
+        .try_reserve_exact(value.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    copied.push_str(value);
+    Ok(copied)
+}
+
+fn append_simple_suffix(
+    value: &str,
+    suffix: &str,
+    maximum_bytes: usize,
+    field: &str,
+) -> Result<String> {
+    let length = value
+        .len()
+        .checked_add(suffix.len())
+        .ok_or_else(|| Error::invalid_data(format!("{field} length overflowed")))?;
+    if length > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "{field} is {length} bytes, exceeding limit {maximum_bytes}"
+        )));
+    }
+    let mut output = String::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    output.push_str(value);
+    output.push_str(suffix);
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -787,6 +829,22 @@ mod tests {
             read_audio_clip(&collection, file, 0, SimpleAssetReadLimits::default()).unwrap();
         assert_eq!(audio.suggested_extension, ".mp3");
         assert_eq!(audio.payload.read_to_vec(16).unwrap(), b"mp3!!");
+
+        let error = read_audio_clip(
+            &collection,
+            file,
+            0,
+            SimpleAssetReadLimits {
+                // `legacy-stream` itself fits exactly. The collection path
+                // plus `.resS` does not, so the derived lookup string must be
+                // rejected before it allocates rather than bypassing this
+                // caller budget.
+                maximum_string_bytes: "legacy-stream".len(),
+                ..SimpleAssetReadLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy AudioClip resource name"));
     }
 
     #[test]
@@ -913,7 +971,7 @@ mod tests {
     #[test]
     fn reads_inline_video_without_materializing_its_payload() {
         let mut object = named_object("trailer");
-        push_aligned_string(&mut object, "movies/trailer.mp4");
+        push_aligned_string(&mut object, "movies\\目录\\trailer.mp4");
         object.extend_from_slice(&[0_u8; 16]);
         object.extend_from_slice(&[0_u8; 8]);
         object.extend_from_slice(&[0_u8; 20]);
@@ -937,6 +995,14 @@ mod tests {
         assert_eq!(video.name, "trailer");
         assert_eq!(video.suggested_extension, ".mp4");
         assert_eq!(video.payload.read_to_vec(32).unwrap(), b"vide");
+    }
+
+    #[test]
+    fn gives_a_video_without_a_portable_extension_a_fallback() {
+        assert_eq!(
+            super::portable_extension("movies\\目录\\trailer").unwrap(),
+            ".video"
+        );
     }
 
     #[test]

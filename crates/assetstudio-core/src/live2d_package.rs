@@ -1808,11 +1808,12 @@ impl<'a> PackageState<'a> {
             let texture_path =
                 concatenate("textures/", &claimed_name, "Live2D texture relative path")?;
             let file_name = concatenate(&texture_path, ".png", "Live2D texture file name")?;
+            let source_name = copy_string(&texture.name, "Live2D texture source name")?;
             self.charge_name(&file_name)?;
-            self.charge_name(&texture.name)?;
+            self.charge_name(&source_name)?;
             textures.push(Live2dPackageTexture {
                 object,
-                source_name: texture.name.clone(),
+                source_name,
                 file_name,
                 texture,
             });
@@ -2041,7 +2042,7 @@ impl<'a> PackageState<'a> {
         })?;
         for value in values {
             self.charge_name(value)?;
-            names.push(value.clone());
+            names.push(copy_string(value, "Live2D identifier name")?);
         }
         names.sort();
         names.dedup();
@@ -2411,10 +2412,24 @@ impl<'a> PackageState<'a> {
         file_index: usize,
         targets: &CubismMotionTargetNames,
     ) -> Result<Vec<Live2dPackageMotion>> {
-        let identities = Self::loose_identities(roles, CubismRole::FadeMotionData, file_index);
+        let count = Self::loose_identities(roles, CubismRole::FadeMotionData, file_index).count();
+        let _ = charge_usize(
+            self.motions,
+            count,
+            self.limits.maximum_motions,
+            "Live2D motions",
+        )?;
         let mut motions = Vec::new();
         let mut claimed = HashSet::new();
-        for identity in identities {
+        motions.try_reserve(count).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate loose Live2D motions: {error}"))
+        })?;
+        claimed.try_reserve(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate loose Live2D motion names: {error}"
+            ))
+        })?;
+        for identity in Self::loose_identities(roles, CubismRole::FadeMotionData, file_index) {
             if let Some(motion) = self.project_motion(identity, targets, &mut claimed)? {
                 motions.push(motion);
             }
@@ -2422,19 +2437,19 @@ impl<'a> PackageState<'a> {
         Ok(motions)
     }
 
-    /// Every loose component of `role` in `file_index`, in discovery order.
+    /// Every loose component of `role` in `file_index`, in discovery order,
+    /// without retaining a second copy of the collection-wide role table.
     fn loose_identities(
         roles: &[((usize, usize), CubismRole)],
         role: CubismRole,
         file_index: usize,
-    ) -> Vec<(usize, usize)> {
+    ) -> impl Iterator<Item = (usize, usize)> + '_ {
         roles
             .iter()
-            .filter(|((identity_file, _), candidate)| {
+            .filter(move |((identity_file, _), candidate)| {
                 *candidate == role && *identity_file == file_index
             })
             .map(|(identity, _)| *identity)
-            .collect()
     }
 
     /// The first loose component of `role` in `file_index`, if any.
@@ -2449,9 +2464,7 @@ impl<'a> PackageState<'a> {
         role: CubismRole,
         file_index: usize,
     ) -> Option<(usize, usize)> {
-        Self::loose_identities(roles, role, file_index)
-            .into_iter()
-            .next()
+        Self::loose_identities(roles, role, file_index).next()
     }
 
     /// Projects every loose `CubismExpressionData` in `file_index`.
@@ -2464,10 +2477,26 @@ impl<'a> PackageState<'a> {
         roles: &[((usize, usize), CubismRole)],
         file_index: usize,
     ) -> Result<Vec<Live2dPackageExpression>> {
-        let identities = Self::loose_identities(roles, CubismRole::ExpressionData, file_index);
+        let count = Self::loose_identities(roles, CubismRole::ExpressionData, file_index).count();
+        let _ = charge_usize(
+            self.expressions,
+            count,
+            self.limits.maximum_expressions,
+            "Live2D expressions",
+        )?;
         let mut expressions = Vec::new();
         let mut claimed_names = HashSet::new();
-        for (file_index, object_index) in identities {
+        expressions.try_reserve(count).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate loose Live2D expressions: {error}"))
+        })?;
+        claimed_names.try_reserve(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate loose Live2D expression names: {error}"
+            ))
+        })?;
+        for (file_index, object_index) in
+            Self::loose_identities(roles, CubismRole::ExpressionData, file_index)
+        {
             let loaded = self
                 .collection
                 .serialized_files
@@ -3320,7 +3349,7 @@ fn safe_file_stem(value: &str) -> Result<String> {
     }
     let output = output.trim_matches([' ', '.']);
     if output.is_empty() {
-        Ok("unnamed".to_owned())
+        copy_string("unnamed", "Live2D fallback file name")
     } else {
         let mut trimmed = String::new();
         trimmed.try_reserve_exact(output.len()).map_err(|error| {
@@ -3984,6 +4013,32 @@ mod tests {
         assert!(
             package.physics.is_some(),
             "the loose CubismPhysicsController should be picked up"
+        );
+
+        let expression_error = build_live2d_packages(
+            &collection,
+            Live2dPackageLimits {
+                maximum_expressions: 0,
+                ..Live2dPackageLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            expression_error.to_string().contains("Live2D expressions"),
+            "{expression_error}"
+        );
+
+        let motion_error = build_live2d_packages(
+            &collection,
+            Live2dPackageLimits {
+                maximum_motions: 0,
+                ..Live2dPackageLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            motion_error.to_string().contains("Live2D motions"),
+            "{motion_error}"
         );
     }
 

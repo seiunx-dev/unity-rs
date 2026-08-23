@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
@@ -35,6 +36,7 @@ use crate::type_tree_dump::write_type_tree_dump;
 use crate::{Error, Result};
 
 const TEXT_ASSET_CLASS_ID: i32 = 49;
+const MAX_PORTABLE_EXPORT_COMPONENT_BYTES: usize = 240;
 const MAXIMUM_TEMPORARY_FILE_ATTEMPTS: u64 = 1024;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -233,16 +235,23 @@ pub fn export_collection_with_plan(
     }
     let output_root = prepare_output_root(output_root)?;
     let mut report = ExportReport::default();
-    let mut claimed_paths = HashSet::new();
     let mut total_output_bytes = 0_u64;
 
     for (file_index, loaded) in collection.serialized_files.iter().enumerate() {
-        let group_name = format!(
-            "{file_index:04}_{}",
-            sanitize_file_name(portable_file_name(&loaded.path))
-        );
-        let group_path = output_root.join(group_name);
+        let group_prefix = format!("{file_index:04}_");
+        let source_name_limit = MAX_PORTABLE_EXPORT_COMPONENT_BYTES
+            .checked_sub(group_prefix.len())
+            .ok_or_else(|| Error::invalid_data("export group prefix is too long"))?;
+        let source_name = sanitize_file_name(portable_file_name(&loaded.path), source_name_limit)?;
+        let group_name = joined_component(
+            &[&group_prefix, &source_name],
+            MAX_PORTABLE_EXPORT_COMPONENT_BYTES,
+            "export group name",
+        )?;
+        let group_path =
+            join_export_path_fallibly(&output_root, Path::new(&group_name), "export group path")?;
         ensure_secure_export_directory(&group_path)?;
+        let mut claimed_paths = HashSet::new();
 
         for (object_index, object) in loaded.file.objects.iter().enumerate() {
             if let Some(classes) = plan.classes
@@ -263,6 +272,9 @@ pub fn export_collection_with_plan(
                 output_directory: &group_path,
                 options,
             };
+            report.exported.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow export records: {error}"))
+            })?;
             let outcome = export_object(
                 &context,
                 object_index,
@@ -275,9 +287,6 @@ pub fn export_collection_with_plan(
                         total_output_bytes.checked_add(written).ok_or_else(|| {
                             Error::invalid_data("export output byte total overflowed")
                         })?;
-                    report.exported.try_reserve(1).map_err(|error| {
-                        Error::invalid_data(format!("cannot grow export records: {error}"))
-                    })?;
                     report.exported.push(record);
                 }
                 Err(error) => {
@@ -293,10 +302,10 @@ pub fn export_collection_with_plan(
                         ))
                     })?;
                     bucket.push(ExportFailure {
-                        source: loaded.path.clone(),
+                        source: copy_export_string(&loaded.path, "export failure source")?,
                         path_id: object.path_id,
                         class_id: object.class_id,
-                        error: error.to_string(),
+                        error: format_export_error(&error)?,
                     });
                 }
             }
@@ -336,11 +345,35 @@ fn export_object(
         )));
     }
 
-    let formatted_name = format_file_name(
-        &sanitize_file_name(&base_name),
-        object.path_id,
-        context.options.filename_format,
-    );
+    let collision_suffix = format!(" @{}", object.path_id);
+    let format_suffix_bytes = if context.options.filename_format == FilenameFormat::AssetNamePathId
+    {
+        collision_suffix.len()
+    } else {
+        0
+    };
+    let reserved_bytes = extension
+        .len()
+        .checked_add(collision_suffix.len())
+        .and_then(|length| length.checked_add(format_suffix_bytes))
+        .ok_or_else(|| Error::invalid_data("export file name length overflowed"))?;
+    let base_name_limit = MAX_PORTABLE_EXPORT_COMPONENT_BYTES
+        .checked_sub(reserved_bytes)
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "export extension and collision suffix need {reserved_bytes} bytes, exceeding the {MAX_PORTABLE_EXPORT_COMPONENT_BYTES} byte portable component limit"
+            ))
+        })?;
+    let formatted_name = if context.options.filename_format == FilenameFormat::PathId {
+        format_file_name("", object.path_id, context.options.filename_format)?
+    } else {
+        let sanitized_name = sanitize_file_name(&base_name, base_name_limit)?;
+        format_file_name(
+            &sanitized_name,
+            object.path_id,
+            context.options.filename_format,
+        )?
+    };
     let output_path = unique_output_path(
         context.output_directory,
         &formatted_name,
@@ -348,8 +381,15 @@ fn export_object(
         object.path_id,
         claimed_paths,
     )?;
+    let record = ExportRecord {
+        source: copy_export_string(context.source, "export record source")?,
+        path_id: object.path_id,
+        class_id: object.class_id,
+        output_path,
+        payload_kind,
+    };
     ensure_secure_export_directory(context.output_directory)?;
-    let mut output = AtomicExportFile::create(&output_path)?;
+    let mut output = AtomicExportFile::create(&record.output_path)?;
     let written;
     {
         let mut writer =
@@ -373,18 +413,9 @@ fn export_object(
         write_result?;
         written = writer.written;
     }
-    output.persist(&output_path, context.options.overwrite_existing)?;
+    output.persist(&record.output_path, context.options.overwrite_existing)?;
 
-    Ok((
-        ExportRecord {
-            source: context.source.to_owned(),
-            path_id: object.path_id,
-            class_id: object.class_id,
-            output_path,
-            payload_kind,
-        },
-        written,
-    ))
+    Ok((record, written))
 }
 
 fn write_export_payload(
@@ -484,7 +515,7 @@ fn select_export_payload(
     }
     Ok(match options.mode {
         ExportMode::Raw => (
-            fallback_object_name(file, object_index),
+            fallback_object_name(file, object_index)?,
             ".dat".to_owned(),
             "raw",
             ExportPayload::Raw,
@@ -501,8 +532,10 @@ fn select_export_payload(
         }
         ExportMode::TypeTreeJson => {
             let value = file.read_type_tree_value(object_index)?;
-            let name = type_value_name(&value)
-                .map_or_else(|| fallback_object_name(file, object_index), str::to_owned);
+            let name = match type_value_name(&value) {
+                Some(name) => copy_export_string(name, "TypeTree object name")?,
+                None => fallback_object_name(file, object_index)?,
+            };
             (
                 name,
                 ".json".to_owned(),
@@ -512,8 +545,10 @@ fn select_export_payload(
         }
         ExportMode::DumpText => {
             let value = file.read_type_tree_value(object_index)?;
-            let name = type_value_name(&value)
-                .map_or_else(|| fallback_object_name(file, object_index), str::to_owned);
+            let name = match type_value_name(&value) {
+                Some(name) => copy_export_string(name, "TypeTree object name")?,
+                None => fallback_object_name(file, object_index)?,
+            };
             (
                 name,
                 ".txt".to_owned(),
@@ -578,8 +613,9 @@ fn select_auto_export_payload(
                 ..TextureArrayReadLimits::default()
             };
             let texture = read_texture2d_array(collection, file, object_index, limits)?;
+            let name = copy_export_string(&texture.name, "Texture2DArray export name")?;
             (
-                texture.name.clone(),
+                name,
                 String::new(),
                 "image_array_bundle_raw_rgba",
                 ExportPayload::TextureArrayBundle { texture, limits },
@@ -619,8 +655,9 @@ fn select_auto_export_payload(
             let shader = read_shader(file, object_index, limits)?;
             let payload_kind = shader.payload_kind();
             let extension = shader.suggested_extension().to_owned();
+            let name = copy_export_string(&shader.name, "Shader export name")?;
             (
-                shader.name.clone(),
+                name,
                 extension,
                 payload_kind,
                 ExportPayload::ShaderText(shader),
@@ -643,8 +680,9 @@ fn select_auto_export_payload(
                 ..MeshReadLimits::default()
             };
             let mesh = read_mesh_with_collection(collection, file, object_index, limits)?;
+            let name = copy_export_string(&mesh.name, "Mesh export name")?;
             (
-                mesh.name.clone(),
+                name,
                 ".obj".to_owned(),
                 "mesh_obj",
                 ExportPayload::MeshObj {
@@ -680,8 +718,10 @@ fn select_auto_export_payload(
         }
         _ => match file.read_type_tree_value(object_index) {
             Ok(value) => {
-                let name = type_value_name(&value)
-                    .map_or_else(|| fallback_object_name(file, object_index), str::to_owned);
+                let name = match type_value_name(&value) {
+                    Some(name) => copy_export_string(name, "TypeTree object name")?,
+                    None => fallback_object_name(file, object_index)?,
+                };
                 (
                     name,
                     ".json".to_owned(),
@@ -690,7 +730,7 @@ fn select_auto_export_payload(
                 )
             }
             Err(_) => (
-                fallback_object_name(file, object_index),
+                fallback_object_name(file, object_index)?,
                 ".dat".to_owned(),
                 "raw",
                 ExportPayload::Raw,
@@ -736,7 +776,7 @@ fn select_mono_behaviour_json(
         ),
     };
     let name = if behaviour.name.is_empty() {
-        fallback_object_name(file, object_index)
+        fallback_object_name(file, object_index)?
     } else {
         behaviour.name
     };
@@ -923,22 +963,33 @@ fn type_value_name(value: &TypeValue) -> Option<&str> {
     })
 }
 
-fn fallback_object_name(file: &SerializedFile, object_index: usize) -> String {
+fn fallback_object_name(file: &SerializedFile, object_index: usize) -> Result<String> {
     let object = &file.objects[object_index];
-    file.types
+    let name = file
+        .types
         .get(object.serialized_type_index.unwrap_or(usize::MAX))
         .and_then(|kind| kind.type_tree.as_ref())
         .and_then(|tree| tree.nodes.first())
-        .map(|node| node.type_name.clone())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("class_{}", object.class_id))
+        .map(|node| node.type_name.as_str())
+        .filter(|name| !name.is_empty());
+    match name {
+        Some(name) => copy_export_string(name, "fallback object name"),
+        None => Ok(format!("class_{}", object.class_id)),
+    }
 }
 
-fn format_file_name(base_name: &str, path_id: i64, format: FilenameFormat) -> String {
+fn format_file_name(base_name: &str, path_id: i64, format: FilenameFormat) -> Result<String> {
     match format {
-        FilenameFormat::AssetName => base_name.to_owned(),
-        FilenameFormat::AssetNamePathId => format!("{base_name} @{path_id}"),
-        FilenameFormat::PathId => path_id.to_string(),
+        FilenameFormat::AssetName => copy_export_string(base_name, "formatted asset name"),
+        FilenameFormat::AssetNamePathId => {
+            let suffix = format!(" @{path_id}");
+            joined_component(
+                &[base_name, &suffix],
+                MAX_PORTABLE_EXPORT_COMPONENT_BYTES,
+                "formatted asset name",
+            )
+        }
+        FilenameFormat::PathId => Ok(path_id.to_string()),
     }
 }
 
@@ -952,9 +1003,16 @@ fn unique_output_path(
     claimed_paths
         .try_reserve(2)
         .map_err(|error| Error::invalid_data(format!("cannot grow export path set: {error}")))?;
-    for suffix in [String::new(), format!(" @{path_id}")] {
-        let candidate = directory.join(format!("{name}{suffix}{extension}"));
-        let identity = candidate.to_string_lossy().to_lowercase();
+    let collision_suffix = format!(" @{path_id}");
+    for suffix in ["", collision_suffix.as_str()] {
+        let component = joined_component(
+            &[name, suffix, extension],
+            MAX_PORTABLE_EXPORT_COMPONENT_BYTES,
+            "export output file name",
+        )?;
+        let identity = portable_export_key(&component)?;
+        let candidate =
+            join_export_path_fallibly(directory, Path::new(&component), "export output path")?;
         if claimed_paths.insert(identity) {
             return Ok(candidate);
         }
@@ -964,11 +1022,94 @@ fn unique_output_path(
     )))
 }
 
+fn portable_export_key(component: &str) -> Result<String> {
+    let length = component.chars().try_fold(0_usize, |length, character| {
+        character
+            .to_lowercase()
+            .try_fold(length, |length, lowercase| {
+                length
+                    .checked_add(lowercase.len_utf8())
+                    .ok_or_else(|| Error::invalid_data("portable export key length overflowed"))
+            })
+    })?;
+    let mut key = String::new();
+    key.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate portable export key: {error}"))
+    })?;
+    for character in component.chars() {
+        key.extend(character.to_lowercase());
+    }
+    debug_assert_eq!(key.len(), length);
+    Ok(key)
+}
+
+fn join_export_path_fallibly(parent: &Path, child: &Path, label: &str) -> Result<PathBuf> {
+    if child.is_absolute() {
+        return Err(Error::invalid_data(format!("{label} child is absolute")));
+    }
+    if child.as_os_str().is_empty() {
+        return copy_export_path_fallibly(parent, label);
+    }
+    let separator = usize::from(!parent.as_os_str().is_empty());
+    let length = parent
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(child.as_os_str().as_encoded_bytes().len()))
+        .ok_or_else(|| Error::invalid_data(format!("{label} length overflowed")))?;
+    let mut path = PathBuf::new();
+    path.try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    path.push(parent);
+    path.push(child);
+    if path.as_os_str().as_encoded_bytes().len() > length {
+        return Err(Error::invalid_data(format!(
+            "{label} exceeded its checked allocation"
+        )));
+    }
+    Ok(path)
+}
+
+fn copy_export_path_fallibly(path: &Path, label: &str) -> Result<PathBuf> {
+    let mut copy = PathBuf::new();
+    copy.try_reserve_exact(path.as_os_str().as_encoded_bytes().len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    copy.push(path);
+    Ok(copy)
+}
+
+#[derive(Default)]
+struct FallibleExportFormatString {
+    value: String,
+}
+
+impl fmt::Write for FallibleExportFormatString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.value
+            .try_reserve(value.len())
+            .map_err(|_| fmt::Error)?;
+        self.value.push_str(value);
+        Ok(())
+    }
+}
+
+fn format_export_error(error: &Error) -> Result<String> {
+    let mut output = FallibleExportFormatString::default();
+    fmt::write(&mut output, format_args!("{error}"))
+        .map_err(|_| Error::invalid_data("cannot allocate export failure message"))?;
+    Ok(output.value)
+}
+
 fn prepare_output_root(path: &Path) -> Result<PathBuf> {
     let absolute = lexical_absolute(path)?;
     let temporary_root = lexical_absolute(&std::env::temp_dir())?;
     let secure = if let Ok(relative) = absolute.strip_prefix(&temporary_root) {
-        fs::canonicalize(&temporary_root)?.join(relative)
+        join_export_path_fallibly(
+            &fs::canonicalize(&temporary_root)?,
+            relative,
+            "canonical export output root",
+        )?
     } else {
         absolute
     };
@@ -978,11 +1119,16 @@ fn prepare_output_root(path: &Path) -> Result<PathBuf> {
 
 fn lexical_absolute(path: &Path) -> Result<PathBuf> {
     let joined = if path.is_absolute() {
-        path.to_owned()
+        copy_export_path_fallibly(path, "absolute export path")?
     } else {
-        std::env::current_dir()?.join(path)
+        join_export_path_fallibly(&std::env::current_dir()?, path, "absolute export path")?
     };
     let mut normalized = PathBuf::new();
+    normalized
+        .try_reserve_exact(joined.as_os_str().as_encoded_bytes().len())
+        .map_err(|error| {
+            Error::invalid_data(format!("cannot allocate normalized export path: {error}"))
+        })?;
     for component in joined.components() {
         match component {
             Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
@@ -1004,6 +1150,13 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf> {
 
 fn ensure_secure_export_directory(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
+    current
+        .try_reserve_exact(path.as_os_str().as_encoded_bytes().len())
+        .map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate secure export directory path: {error}"
+            ))
+        })?;
     for component in path.components() {
         current.push(component.as_os_str());
         if matches!(component, Component::Prefix(_) | Component::RootDir) {
@@ -1059,10 +1212,14 @@ impl AtomicExportFile {
         })?;
         for _ in 0..MAXIMUM_TEMPORARY_FILE_ATTEMPTS {
             let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(
-                ".assetstudio-export-{}-{sequence}.tmp",
-                std::process::id()
-            ));
+            let mut name = FallibleExportFormatString::default();
+            fmt::write(
+                &mut name,
+                format_args!(".assetstudio-export-{}-{sequence}.tmp", std::process::id()),
+            )
+            .map_err(|_| Error::invalid_data("cannot allocate export temporary file name"))?;
+            let path =
+                join_export_path_fallibly(parent, Path::new(&name.value), "export temporary path")?;
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => {
                     return Ok(Self {
@@ -1115,8 +1272,11 @@ impl AtomicExportFile {
         if !overwrite {
             return match fs::hard_link(&self.path, destination) {
                 Ok(()) => {
-                    fs::remove_file(&self.path)?;
-                    self.persisted = true;
+                    // The destination is now the committed result. Failure to
+                    // remove its temporary hard-link must not turn that
+                    // successful publication into a reported export failure;
+                    // keep `persisted` false so Drop retries the cleanup.
+                    self.persisted = fs::remove_file(&self.path).is_ok();
                     Ok(())
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -1146,15 +1306,18 @@ impl AtomicExportFile {
     }
 
     fn persist_with_backup(&mut self, destination: &Path, original: io::Error) -> Result<()> {
-        let backup = self.path.with_extension("replace-backup");
+        let backup = replace_backup_path(&self.path)?;
         if export_file_state(&backup)? != ExportFileState::Missing {
             return Err(original.into());
         }
         fs::rename(destination, &backup).map_err(|_| original)?;
         match fs::rename(&self.path, destination) {
             Ok(()) => {
-                self.persisted = true;
-                fs::remove_file(backup)?;
+                // Publication succeeded. Repoint Drop at the old destination
+                // backup so a failed cleanup is retried without reclassifying
+                // the committed export as a failure.
+                self.path = backup;
+                self.persisted = fs::remove_file(&self.path).is_ok();
                 Ok(())
             }
             Err(error) => {
@@ -1163,6 +1326,27 @@ impl AtomicExportFile {
             }
         }
     }
+}
+
+fn replace_backup_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::invalid_data("export temporary file name is not valid UTF-8"))?;
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::invalid_data("export temporary file stem is not valid UTF-8"))?;
+    let backup_name = joined_component(
+        &[stem, ".replace-backup"],
+        usize::MAX,
+        "export replacement backup name",
+    )?;
+    join_export_path_fallibly(
+        path.parent().unwrap_or_else(|| Path::new("")),
+        Path::new(&backup_name),
+        "export replacement backup path",
+    )
 }
 
 impl Drop for AtomicExportFile {
@@ -1197,26 +1381,68 @@ fn export_file_state(path: &Path) -> Result<ExportFileState> {
     })
 }
 
-fn sanitize_file_name(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
+fn sanitize_file_name(value: &str, maximum_bytes: usize) -> Result<String> {
+    // Trimming cannot reveal or change a character that would be sanitized,
+    // because spaces and dots are preserved by the replacement pass. Borrow
+    // the trimmed slice first so an arbitrarily long run of either character
+    // never needs an output allocation.
+    let value = value.trim_matches([' ', '.']);
+    if value.is_empty() {
+        return joined_component(&["unnamed"], maximum_bytes, "sanitized export name");
+    }
+    let mut output = String::new();
     for character in value.chars() {
-        if character.is_control()
+        let sanitized_character = if character.is_control()
             || matches!(
                 character,
                 '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
-            )
-        {
-            output.push('_');
+            ) {
+            '_'
         } else {
-            output.push(character);
+            character
+        };
+        let next_length = output
+            .len()
+            .checked_add(sanitized_character.len_utf8())
+            .ok_or_else(|| Error::invalid_data("export file name length overflowed"))?;
+        if next_length > maximum_bytes {
+            return Err(Error::invalid_data(format!(
+                "sanitized export name is at least {next_length} bytes, exceeding its {maximum_bytes} byte budget"
+            )));
         }
+        output
+            .try_reserve_exact(sanitized_character.len_utf8())
+            .map_err(|error| {
+                Error::invalid_data(format!("cannot allocate sanitized export name: {error}"))
+            })?;
+        output.push(sanitized_character);
     }
-    let output = output.trim_matches([' ', '.']);
-    if output.is_empty() || output == "." || output == ".." {
-        "unnamed".to_owned()
-    } else {
-        output.to_owned()
+    Ok(output)
+}
+
+fn copy_export_string(value: &str, field: &str) -> Result<String> {
+    joined_component(&[value], usize::MAX, field)
+}
+
+fn joined_component(parts: &[&str], maximum_bytes: usize, field: &str) -> Result<String> {
+    let length = parts.iter().try_fold(0_usize, |length, part| {
+        length
+            .checked_add(part.len())
+            .ok_or_else(|| Error::invalid_data(format!("{field} length overflowed")))
+    })?;
+    if length > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "{field} is {length} bytes, exceeding limit {maximum_bytes}"
+        )));
     }
+    let mut output = String::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
+    for part in parts {
+        output.push_str(part);
+    }
+    Ok(output)
 }
 
 fn portable_file_name(path: &str) -> &str {
@@ -1234,6 +1460,7 @@ fn has_extension(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{Cursor, Read};
     use std::path::PathBuf;
@@ -1243,26 +1470,125 @@ mod tests {
     use image_webp::WebPDecoder;
     use zune_jpeg::JpegDecoder;
 
+    use crate::Error;
     use crate::image_export::ImageFormat;
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::serialized::SerializedFile;
     use crate::source::Region;
 
     use super::{
-        ExportMode, ExportOptions, FilenameFormat, export_collection, format_file_name,
-        has_extension, sanitize_file_name, type_value_name,
+        ExportMode, ExportOptions, FilenameFormat, MAX_PORTABLE_EXPORT_COMPONENT_BYTES,
+        export_collection, format_export_error, format_file_name, has_extension,
+        join_export_path_fallibly, lexical_absolute, portable_export_key, prepare_output_root,
+        replace_backup_path, sanitize_file_name, type_value_name, unique_output_path,
     };
     use crate::type_tree::{TypeField, TypeValue};
 
     #[test]
     fn sanitizes_names_and_formats_path_ids() {
-        assert_eq!(sanitize_file_name("../bad:name?.txt"), "_bad_name_.txt");
-        assert_eq!(sanitize_file_name("..."), "unnamed");
         assert_eq!(
-            format_file_name("asset", -7, FilenameFormat::AssetNamePathId),
+            sanitize_file_name("../bad:name?.txt", MAX_PORTABLE_EXPORT_COMPONENT_BYTES).unwrap(),
+            "_bad_name_.txt"
+        );
+        assert_eq!(
+            sanitize_file_name("...", MAX_PORTABLE_EXPORT_COMPONENT_BYTES).unwrap(),
+            "unnamed"
+        );
+        assert_eq!(
+            sanitize_file_name(&".".repeat(4096), MAX_PORTABLE_EXPORT_COMPONENT_BYTES).unwrap(),
+            "unnamed"
+        );
+        assert_eq!(
+            format_file_name("asset", -7, FilenameFormat::AssetNamePathId).unwrap(),
             "asset @-7"
         );
-        assert_eq!(format_file_name("asset", 9, FilenameFormat::PathId), "9");
+        assert_eq!(
+            format_file_name("asset", 9, FilenameFormat::PathId).unwrap(),
+            "9"
+        );
+    }
+
+    #[test]
+    fn export_names_include_extensions_and_collision_suffixes_in_the_portable_budget() {
+        let unicode_boundary = "界".repeat(MAX_PORTABLE_EXPORT_COMPONENT_BYTES / "界".len());
+        assert_eq!(unicode_boundary.len(), MAX_PORTABLE_EXPORT_COMPONENT_BYTES);
+        assert_eq!(
+            sanitize_file_name(&unicode_boundary, MAX_PORTABLE_EXPORT_COMPONENT_BYTES).unwrap(),
+            unicode_boundary
+        );
+        let oversized = "a".repeat(MAX_PORTABLE_EXPORT_COMPONENT_BYTES + 1);
+        assert!(sanitize_file_name(&oversized, MAX_PORTABLE_EXPORT_COMPONENT_BYTES).is_err());
+
+        let directory = PathBuf::from("group");
+        let path_id = 7;
+        let name = "a".repeat(MAX_PORTABLE_EXPORT_COMPONENT_BYTES - " @7.txt".len());
+        let first = format!("{name}.txt");
+        let mut claimed = HashSet::from([portable_export_key(&first).unwrap()]);
+        let collision =
+            unique_output_path(&directory, &name, ".txt", path_id, &mut claimed).unwrap();
+        let component = collision.file_name().unwrap().to_string_lossy();
+        assert_eq!(component.len(), MAX_PORTABLE_EXPORT_COMPONENT_BYTES);
+        assert!(component.ends_with(" @7.txt"));
+
+        let overlong_name = format!("{name}a");
+        let mut claimed =
+            HashSet::from([portable_export_key(&format!("{overlong_name}.txt")).unwrap()]);
+        assert!(
+            unique_output_path(&directory, &overlong_name, ".txt", path_id, &mut claimed,).is_err()
+        );
+
+        assert_eq!(portable_export_key("İ.BIN").unwrap(), "i\u{307}.bin");
+        assert!(claimed.iter().all(|path| !path.contains("group")));
+    }
+
+    #[test]
+    fn export_failure_messages_preserve_error_families_through_fallible_formatting() {
+        assert_eq!(
+            format_export_error(&Error::invalid_data("invalid payload")).unwrap(),
+            "invalid payload"
+        );
+        assert_eq!(
+            format_export_error(&Error::unsupported("future layout")).unwrap(),
+            "unsupported: future layout"
+        );
+    }
+
+    #[test]
+    fn export_path_builders_are_fallible_and_preserve_filesystem_semantics() {
+        let parent = PathBuf::from("output-root");
+        assert_eq!(
+            join_export_path_fallibly(&parent, PathBuf::new().as_path(), "test path").unwrap(),
+            parent
+        );
+        assert_eq!(
+            join_export_path_fallibly(
+                PathBuf::from("output-root").as_path(),
+                PathBuf::from("group/file.bin").as_path(),
+                "test path",
+            )
+            .unwrap(),
+            PathBuf::from("output-root/group/file.bin")
+        );
+        assert_eq!(
+            replace_backup_path(PathBuf::from("group/.assetstudio-export-1-2.tmp").as_path())
+                .unwrap(),
+            PathBuf::from("group/.assetstudio-export-1-2.replace-backup")
+        );
+
+        let root = unique_temp_directory("assetstudio-export-path-builders");
+        fs::create_dir_all(&root).unwrap();
+        let lexical = root
+            .join("discarded")
+            .join("..")
+            .join("kept")
+            .join(".")
+            .join("leaf");
+        assert_eq!(lexical_absolute(&lexical).unwrap(), root.join("kept/leaf"));
+
+        let prepared = prepare_output_root(&root.join("one/two/three")).unwrap();
+        assert!(prepared.is_dir());
+        assert!(prepared.ends_with("one/two/three"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1430,6 +1756,35 @@ mod tests {
             "demo.lua"
         );
 
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn collision_claims_are_scoped_to_each_export_group() {
+        let files = ["first.assets", "second.assets"]
+            .into_iter()
+            .map(|path| LoadedSerializedFile {
+                path: path.to_owned(),
+                file: SerializedFile::open(Region::from_bytes(synthetic_v22_text_asset())).unwrap(),
+            })
+            .collect();
+        let collection = AssetCollection::from_loaded_parts(files, Vec::new());
+        let output = unique_temp_directory("assetstudio-export-group-claims");
+
+        let report = export_collection(&collection, &output, ExportOptions::default()).unwrap();
+
+        assert!(report.failures.is_empty());
+        assert_eq!(report.exported.len(), 2);
+        assert!(
+            report
+                .exported
+                .iter()
+                .all(|record| { record.output_path.file_name().unwrap() == "demo.lua" })
+        );
+        assert_ne!(
+            report.exported[0].output_path.parent(),
+            report.exported[1].output_path.parent()
+        );
         fs::remove_dir_all(output).unwrap();
     }
 

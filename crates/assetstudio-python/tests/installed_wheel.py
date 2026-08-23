@@ -39,8 +39,13 @@ def main() -> None:
     for name in assetstudio.__all__:
         assert hasattr(assetstudio, name), name
 
+    installed_distribution = distribution("assetstudio-rs")
+    classifiers = installed_distribution.metadata.get_all("Classifier") or []
+    assert "Development Status :: 4 - Beta" in classifiers, classifiers
+    assert "Development Status :: 3 - Alpha" not in classifiers, classifiers
+
     package = files("assetstudio")
-    installed_files = distribution("assetstudio-rs").files or ()
+    installed_files = installed_distribution.files or ()
     forbidden = [str(path) for path in installed_files if forbidden_delivery_path(str(path))]
     assert not forbidden, f"wheel contains out-of-scope GUI/C ABI/.NET files: {forbidden}"
     stub = package.joinpath("__init__.pyi")

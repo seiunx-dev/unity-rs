@@ -42,9 +42,20 @@ for (const legalFile of [
 }
 
 const nativeFiles = [...files].filter((file) => file.endsWith(".node"));
-assert.equal(nativeFiles.length, 1, nativeFiles);
+const targetSuffixes = {
+  "darwin-arm64": "darwin-arm64",
+  "darwin-x64": "darwin-x64",
+  "linux-arm64": "linux-arm64-gnu",
+  "linux-x64": "linux-x64-gnu",
+  "win32-arm64": "win32-arm64-msvc",
+  "win32-x64": "win32-x64-msvc",
+};
+const host = `${process.platform}-${process.arch}`;
+const targetSuffix = targetSuffixes[host];
+assert.ok(targetSuffix, `unsupported Node package-test host: ${host}`);
+assert.deepEqual(nativeFiles, [`assetstudio-node.${targetSuffix}.node`]);
 for (const required of ["index.js", "index.d.ts", "package.json", "README.md"]) {
   assert(files.has(required), `${required} is missing from the Node package`);
 }
 
-console.log("node package: native addon, license and notices ok");
+console.log(`node package: ${targetSuffix} addon, license and notices ok`);

@@ -25,6 +25,11 @@ export declare class AssetStudio {
    */
   readFbxWithAclDecoder(decoder: (request: AclDecodeRequest) => AclDecodedClip, maximumBytes?: number | undefined | null): Promise<Buffer>
   /**
+   * Writes the animated scene as binary FBX 7.4, decoding ACL tracks
+   * through a caller-supplied decoder on a worker.
+   */
+  readFbxBinaryWithAclDecoder(decoder: (request: AclDecodeRequest) => AclDecodedClip, maximumBytes?: number | undefined | null): Promise<Buffer>
+  /**
    * Opens a path with any combination of the load options.
    *
    * The single-option factories remain for the cases they already cover;
@@ -45,16 +50,24 @@ export declare class AssetStudio {
   static openWithOodle(path: string, decoder: (input: Buffer, expectedLength: number) => Buffer, options?: OpenOptions | undefined | null): Promise<AssetStudio>
   /**
    * Opens a path on a libuv worker so container discovery does not block
-   * the JavaScript event loop.
+   * the JavaScript event loop. The optional settings are identical to
+   * `openWith`; existing one-argument calls remain valid.
    */
-  static openAsync(path: string): Promise<AssetStudio>
+  static openAsync(path: string, options?: OpenOptions | undefined | null): Promise<AssetStudio>
   /**
    * Opens one in-memory asset, bundle, or resource after copying the Node
    * buffer into Rust-owned immutable storage.
+   *
+   * The final options argument exposes the same version override, UnityCN
+   * key, failure policy, and discovery budgets as `openWith`. It is last so
+   * existing `(data, name, maximumBytes)` calls remain source-compatible.
    */
-  static fromBuffer(data: Uint8Array, name?: string | undefined | null, maximumBytes?: number | undefined | null): AssetStudio
-  /** Copies a Node buffer once, then parses it on a libuv worker. */
-  static fromBufferAsync(data: Uint8Array, name?: string | undefined | null, maximumBytes?: number | undefined | null): Promise<AssetStudio>
+  static fromBuffer(data: Uint8Array, name?: string | undefined | null, maximumBytes?: number | undefined | null, options?: OpenOptions | undefined | null): AssetStudio
+  /**
+   * Copies a Node buffer once, then parses it on a libuv worker. The final
+   * options argument matches the synchronous `fromBuffer` entry point.
+   */
+  static fromBufferAsync(data: Uint8Array, name?: string | undefined | null, maximumBytes?: number | undefined | null, options?: OpenOptions | undefined | null): Promise<AssetStudio>
   get fileCount(): number
   get objectCount(): number
   get resourceCount(): number
@@ -78,10 +91,28 @@ export declare class AssetStudio {
   readTextureAsync(fileIndex: number, pathId: bigint, mipLevel?: number | undefined | null, maximumBytes?: number | undefined | null): Promise<RgbaImage>
   readTextureArray(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Array<RgbaImage>
   readTextureArrayAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<Array<RgbaImage>>
+  /** Reads one complete, bounded Unity `SpriteAtlas` metadata table. */
+  readSpriteAtlas(fileIndex: number, pathId: bigint, maximumEntries?: number | undefined | null, maximumStringBytes?: number | undefined | null, maximumTotalStringBytes?: number | undefined | null): SpriteAtlasInfo
+  /**
+   * Reads one complete, bounded Unity `Sprite` metadata object without
+   * resolving or decoding its texture references.
+   */
+  readSpriteMetadata(fileIndex: number, pathId: bigint, limits?: SpriteMetadataLimits | undefined | null): SpriteMetadata
   readSprite(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): RgbaImage
   readSpriteAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<RgbaImage>
   /** Reads an `AudioClip`'s stored payload without transcoding it. */
   readAudio(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AudioClip
+  /**
+   * Reads an `AudioClip` using the same `auto`, `raw`, or `wav` policy as
+   * Core, Python and the CLI exporter.
+   *
+   * `auto` writes a WAV only when Core has verified a decoder-free path;
+   * otherwise it preserves the source container. `wav` requires such a
+   * path and refuses compressed codecs rather than returning mislabeled
+   * bytes. The older `readAudio` method remains a raw-only compatibility
+   * alias.
+   */
+  readAudioClip(fileIndex: number, pathId: bigint, format?: string | undefined | null, maximumBytes?: number | undefined | null): AudioClip
   /** Reads the identity of a `MonoScript`. */
   readMonoScript(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): MonoScript
   /**
@@ -96,7 +127,10 @@ export declare class AssetStudio {
   readBuildSettings(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): BuildSettings
   /** Reads the company and product names from a `PlayerSettings` object. */
   readPlayerSettings(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): PlayerSettings
-  /** Reads an `Avatar`'s skeleton summary. */
+  /**
+   * Reads complete stable skeleton, TOS, and human-description metadata
+   * from one bounded `Avatar`.
+   */
   readAvatar(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Avatar
   /**
    * Opens several in-memory inputs as one collection.
@@ -104,9 +138,10 @@ export declare class AssetStudio {
    * A serialized file and the `.resS` its textures and audio stream from are
    * separate files; opening them one at a time leaves every streamed payload
    * unresolvable, so a caller holding both in memory needs to pass them
-   * together.
+   * together. The final options argument matches `openWith` and is placed
+   * after the existing aggregate byte limit to preserve old calls.
    */
-  static fromBuffers(inputs: Array<MemoryInput>, maximumBytes?: number | undefined | null): AssetStudio
+  static fromBuffers(inputs: Array<MemoryInput>, maximumBytes?: number | undefined | null, options?: OpenOptions | undefined | null): AssetStudio
   /**
    * Reads one checked byte range of a resource without materializing the
    * rest, which is how a caller pulls a single texture out of a large
@@ -177,6 +212,11 @@ export declare class AssetStudio {
   animatorFbxCandidates(): Array<FbxCandidate>
   /** Writes one selected `GameObject` branch as FBX. */
   readGameObjectFbx(fileIndex: number, pathId: bigint, includeAnimations?: boolean | undefined | null, maximumBytes?: number | undefined | null): Buffer
+  /**
+   * Writes one selected `GameObject` branch as animated ASCII FBX while a
+   * worker delegates Tuanjie ACL decompression to JavaScript.
+   */
+  readGameObjectFbxWithAclDecoder(fileIndex: number, pathId: bigint, decoder: (request: AclDecodeRequest) => AclDecodedClip, includeAnimations?: boolean | undefined | null, maximumBytes?: number | undefined | null): Promise<Buffer>
   /** Reads a `Font`'s resident payload. */
   readFont(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): BinaryAsset
   /** Reads the resident Ogg payload from a legacy `MovieTexture`. */
@@ -192,6 +232,15 @@ export declare class AssetStudio {
    */
   export(outputRoot: string, overwrite?: boolean | undefined | null): ExportReport
   /**
+   * Exports every supported object with the complete Core policy surface.
+   *
+   * This is additive to `export`: existing callers keep the compact
+   * overwrite flag, while callers that need deterministic names, raw/dump
+   * modes, image/audio selection or aggregate budgets can express them
+   * without dropping to the CLI.
+   */
+  exportWithOptions(outputRoot: string, options?: ExportConfiguration | undefined | null): ExportReport
+  /**
    * Recursively extracts one file or directory tree without loading it.
    *
    * Child symlinks are never followed and every archive path is made
@@ -199,8 +248,25 @@ export declare class AssetStudio {
    * cannot escape it.
    */
   static extract(input: string, outputRoot: string, overwrite?: boolean | undefined | null): ExtractionReport
-  /** Reads an `AnimationClip`'s shape without materializing its keyframes. */
+  /**
+   * Reads complete bounded `AnimationClip` shape, muscle, ACL, and external
+   * streaming metadata without copying parsed keyframe arrays into
+   * JavaScript.
+   */
   readAnimationClipInfo(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AnimationClipInfo
+  /** Reads the stable references from one legacy Unity `Animation` component. */
+  readLegacyAnimation(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): LegacyAnimationInfo
+  /** Reads one bounded Unity `AnimatorOverrideController` substitution table. */
+  readAnimatorOverrideController(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AnimatorOverrideControllerInfo
+  /**
+   * Reads inherited/effective names, dependencies and ordered tables from
+   * one bounded Unity `AssetBundle` object.
+   */
+  readAssetBundle(fileIndex: number, pathId: bigint, maximumEntries?: number | undefined | null, maximumStringBytes?: number | undefined | null, maximumTotalStringBytes?: number | undefined | null): AssetBundleInfo
+  /** Reads one bounded Unity `ResourceManager` named-container table. */
+  readResourceManager(fileIndex: number, pathId: bigint, maximumEntries?: number | undefined | null, maximumStringBytes?: number | undefined | null, maximumTotalStringBytes?: number | undefined | null): ResourceManagerInfo
+  /** Reads one bounded Unity `PreloadData` object-reference table. */
+  readPreloadData(fileIndex: number, pathId: bigint, maximumEntries?: number | undefined | null, maximumStringBytes?: number | undefined | null, maximumTotalStringBytes?: number | undefined | null): PreloadDataInfo
   /** Reads an `AnimatorController`'s identity and the clips it references. */
   readAnimatorController(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AnimatorControllerInfo
   /**
@@ -229,6 +295,23 @@ export declare class AssetStudio {
    * files land and stays inside whatever budget it set.
    */
   readLive2DPackages(maximumBytes?: number | undefined | null): Live2DPackageSet
+  /**
+   * Materializes every verified Live2D package using trusted external
+   * MonoBehaviour schemas when a shipped build stripped its type trees.
+   *
+   * Schemas are inert data produced by an offline tool. Embedded type trees
+   * retain priority, matching the Core and Python surfaces.
+   */
+  readLive2DPackagesWithSchemas(schemas: Array<MonoBehaviourSchema>, maximumFileBytes?: number | undefined | null, maximumTotalBytes?: number | undefined | null): Live2DPackageSet
+  /**
+   * Materializes every verified Live2D package on a worker while a
+   * JavaScript callback decodes Tuanjie ACL animation tracks.
+   *
+   * `schemas` is optional so the same call handles embedded trees, stripped
+   * managed layouts, or both. Core validates all decoded curves and output
+   * budgets before JavaScript receives the package bytes.
+   */
+  readLive2DPackagesWithAclDecoder(decoder: (request: AclDecodeRequest) => AclDecodedClip, schemas?: Array<MonoBehaviourSchema> | undefined | null, maximumFileBytes?: number | undefined | null, maximumTotalBytes?: number | undefined | null): Promise<Live2DPackageSet>
   /**
    * Writes the whole scene as one Wavefront OBJ, with the material library
    * it names and that library's textures.
@@ -264,6 +347,19 @@ export declare class AssetStudio {
    */
   readAclTracks(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AclTracks
   /**
+   * Reads a `MonoBehaviour` as JSON through the type tree embedded in the
+   * serialized file.
+   *
+   * A stripped build has no embedded managed layout and is refused rather
+   * than guessed; use `readMonoBehaviourJsonWithSchemas` for that case.
+   */
+  readMonoBehaviourJson(fileIndex: number, pathId: bigint, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): MonoBehaviourJson
+  /**
+   * Worker-backed form of `readMonoBehaviourJson` for large or untrusted
+   * embedded type trees.
+   */
+  readMonoBehaviourJsonAsync(fileIndex: number, pathId: bigint, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): Promise<MonoBehaviourJson>
+  /**
    * Reads a `MonoBehaviour` as JSON, resolving its stripped managed fields
    * through caller-supplied schemas.
    *
@@ -273,6 +369,12 @@ export declare class AssetStudio {
    * nothing in them is executed.
    */
   readMonoBehaviourJsonWithSchemas(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): MonoBehaviourJson
+  /**
+   * Worker-backed form of `readMonoBehaviourJsonWithSchemas`. Schema data
+   * is validated and converted before the task is queued; parsing and JSON
+   * materialization happen on the worker.
+   */
+  readMonoBehaviourJsonWithSchemasAsync(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): Promise<MonoBehaviourJson>
 }
 
 /**
@@ -329,26 +431,52 @@ export interface AclTracks {
 }
 
 /**
- * An `AnimationClip`'s shape, without materializing its keyframes.
+ * Complete bounded `AnimationClip` shape, muscle, ACL, and streaming metadata.
  *
- * Separate booleans rather than a bitfield: this is a JavaScript-facing shape
- * and a bitfield would only move the decoding to the other side.
+ * Core still parses the complete object and validates ordinary keyframes;
+ * their arrays stay in Rust and are summarized by counts rather than copied
+ * into JavaScript. Separate booleans rather than a bitfield keep callers from
+ * having to reproduce Core's decoding.
  */
 export interface AnimationClipInfo {
+  pathId: bigint
   name: string
   sampleRate: number
   wrapMode: number
   legacy: boolean
   compressed: boolean
+  useHighQualityCurve: boolean
   rotationCurveCount: number
   positionCurveCount: number
   scaleCurveCount: number
   eulerCurveCount: number
   floatCurveCount: number
+  pptrCurveCount: number
+  muscleClipSize: number
   /** Present when the clip carries muscle (humanoid) data. */
   hasMuscleClip: boolean
+  streamedCurveCount?: number
+  denseCurveCount?: number
+  constantValueCount?: number
+  hasAcl: boolean
+  aclFrameCount?: number
+  aclBoneCount?: number
+  aclSampleRate?: number
+  aclCurveCount?: number
+  aclTrackByteCount?: bigint
+  aclDecoderCount?: number
+  aclUseFastSampleMode?: boolean
   /** Present when the clip's samples live in a sibling resource file. */
   hasStreamingInfo: boolean
+  streamingOffset?: bigint
+  streamingSize?: number
+  streamingPath?: string
+}
+
+/** One original-to-replacement clip entry in an override controller. */
+export interface AnimationClipOverrideInfo {
+  originalClip: ObjectReference
+  overrideClip: ObjectReference
 }
 
 /** An `AnimatorController`'s identity and the clips it references. */
@@ -359,27 +487,79 @@ export interface AnimatorControllerInfo {
   animationClipPathIds: Array<bigint>
 }
 
+/** Stable references from one Unity `AnimatorOverrideController`. */
+export interface AnimatorOverrideControllerInfo {
+  pathId: bigint
+  name: string
+  controller: ObjectReference
+  clipOverrides: Array<AnimationClipOverrideInfo>
+  trailingBytes: bigint
+}
+
+/** One named entry in an `AssetBundle` container table. */
+export interface AssetBundleContainerEntry {
+  key: string
+  preloadIndex: number
+  preloadSize: number
+  asset: ObjectReference
+}
+
+/** Bounded, ordered metadata from one Unity `AssetBundle`. */
+export interface AssetBundleInfo {
+  pathId: bigint
+  name: string
+  objectName: string
+  assetBundleName?: string
+  preloadTable: Array<ObjectReference>
+  container: Array<AssetBundleContainerEntry>
+  dependencies: Array<string>
+  isStreamedSceneAssetBundle: boolean
+}
+
 /** One `AudioClip`'s stored payload and the extension its container implies. */
 export interface AudioClip {
   name: string
   /** The extension the stored bytes carry, `.fsb` or `.wav` for example. */
   extension: string
-  /** True when the payload is already a playable RIFF/WAVE stream. */
+  /**
+   * `audio_raw` for the serialized payload or `audio_wav` for a verified
+   * decoder-free WAV materialization.
+   */
+  payloadKind: string
+  /** True when Core can produce WAV bytes without an external decoder. */
   isDirectWav: boolean
   data: Buffer
 }
 
-/** An `Avatar`'s skeleton summary. */
+/**
+ * Complete stable skeleton, TOS, and human-description metadata from an
+ * `Avatar`.
+ */
 export interface Avatar {
+  pathId: bigint
   name: string
-  /** The size the object declares for its constant block. */
+  /** Compatibility alias retained for callers of the original Node slice. */
   declaredSize: number
+  /** The size the object declares for its constant block. */
+  declaredAvatarSize: number
+  skeletonNodeCount: number
+  humanSkeletonNodeCount: number
   /**
    * Bone path entries, retained in order so duplicate hashes keep Unity's
    * first-hit behaviour.
    */
   pathCount: number
+  paths: Array<AvatarPathEntry>
   hasHumanDescription: boolean
+  humanBoneCount: number
+  skeletonBoneCount: number
+  rootMotionBoneName?: string
+}
+
+/** One ordered Avatar TOS path entry. */
+export interface AvatarPathEntry {
+  hash: number
+  path: string
 }
 
 /**
@@ -457,6 +637,44 @@ export interface CubismPosePart {
   links: Array<string>
 }
 
+/**
+ * Complete caller-configurable Core export policy.
+ *
+ * Every field is optional and preserves Core's default when omitted. The
+ * older `export(outputRoot, overwrite?)` method remains available as the
+ * compact compatibility call.
+ */
+export interface ExportConfiguration {
+  /** `auto`, `raw`, `typetree-json`, or `dump-text`. */
+  mode?: string
+  /** `asset-name`, `asset-name-path-id`, or `path-id`. */
+  filenameFormat?: string
+  /** `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`. */
+  imageFormat?: string
+  jpegQuality?: number
+  /** `auto`, `raw`, or `wav`. */
+  audioFormat?: string
+  overwriteExisting?: boolean
+  restoreTextAssetExtension?: boolean
+  prettyJson?: boolean
+  maximumObjects?: number
+  maximumTotalOutputBytes?: number
+  maximumRawObjectBytes?: number
+  maximumTypeTreeJsonBytes?: number
+  maximumTypeTreeDumpBytes?: number
+  maximumTextAssetBytes?: number
+  maximumSimpleAssetBytes?: number
+  maximumAudioOutputBytes?: number
+  maximumTextureOutputBytes?: number
+  maximumTextureArrayOutputBytes?: number
+  maximumTextureArrayBundleBytes?: number
+  maximumSpriteOutputBytes?: number
+  maximumShaderOutputBytes?: number
+  maximumMonobehaviourJsonBytes?: number
+  maximumMeshObjectBytes?: number
+  maximumMeshOutputBytes?: number
+}
+
 /** One object the exporter could not write, and why. */
 export interface ExportFailure {
   source: string
@@ -513,6 +731,16 @@ export interface FileInfo {
   path: string
   unityVersion: string
   objectCount: number
+}
+
+/** Stable references from one legacy Unity `Animation` component. */
+export interface LegacyAnimationInfo {
+  pathId: bigint
+  gameObject: ObjectReference
+  enabled: number
+  defaultClip: ObjectReference
+  clips: Array<ObjectReference>
+  trailingBytes: bigint
 }
 
 /**
@@ -654,6 +882,12 @@ export interface ObjectInfo {
   container?: string
 }
 
+/** One Unity serialized-object pointer. */
+export interface ObjectReference {
+  fileId: number
+  pathId: bigint
+}
+
 /**
  * How an input is opened.
  *
@@ -685,6 +919,10 @@ export interface OpenOptions {
   maximumInputFiles?: number
   maximumInputDirectories?: number
   maximumDirectoryEntries?: number
+  /** Maximum UTF-8 bytes in one root label or fully qualified nested path. */
+  maximumPathBytes?: number
+  /** Maximum cumulative UTF-8 bytes of paths discovered during one load. */
+  maximumTotalPathBytes?: number
 }
 
 /** The identity fields of a `PlayerSettings` object. */
@@ -693,10 +931,29 @@ export interface PlayerSettings {
   productName: string
 }
 
+/** Bounded, ordered metadata from one Unity `PreloadData`. */
+export interface PreloadDataInfo {
+  pathId: bigint
+  name: string
+  assets: Array<ObjectReference>
+}
+
 export interface ResourceInfo {
   index: number
   path: string
   byteSize: bigint
+}
+
+/** One named entry in a `ResourceManager` container table. */
+export interface ResourceManagerContainerEntry {
+  key: string
+  asset: ObjectReference
+}
+
+/** Bounded, ordered metadata from one Unity `ResourceManager`. */
+export interface ResourceManagerInfo {
+  pathId: bigint
+  container: Array<ResourceManagerContainerEntry>
 }
 
 /** A decoded RGBA8 image. */
@@ -754,6 +1011,152 @@ export interface SchemaNode {
   /** Nesting depth, zero for the root. */
   level: number
   align: boolean
+}
+
+/** Complete, bounded metadata from one Unity `SpriteAtlas` object. */
+export interface SpriteAtlasInfo {
+  pathId: bigint
+  name: string
+  packedSprites: Array<ObjectReference>
+  packedSpriteNames: Array<string>
+  renderDataEntries: Array<SpriteAtlasRenderData>
+  tag: string
+  isVariant: boolean
+}
+
+export interface SpriteAtlasRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** Complete crop, texture and packing metadata for one atlas key. */
+export interface SpriteAtlasRenderData {
+  key: SpriteAtlasRenderDataKey
+  texture: ObjectReference
+  alphaTexture: ObjectReference
+  textureRect: SpriteAtlasRect
+  textureRectOffset: SpriteAtlasVector2
+  atlasRectOffset: SpriteAtlasVector2
+  uvTransform: SpriteAtlasVector4
+  downscaleMultiplier: number
+  settings: SpriteAtlasSettings
+  /** Absent before Unity 2020.2; present and possibly empty afterwards. */
+  secondaryTextures?: Array<SpriteAtlasSecondaryTexture>
+}
+
+/** Serialized composite key used by one `SpriteAtlas` render-data entry. */
+export interface SpriteAtlasRenderDataKey {
+  /** GUID bytes in Unity's original serialized order. */
+  guidBytes: Buffer
+  value: bigint
+}
+
+export interface SpriteAtlasSecondaryTexture {
+  texture: ObjectReference
+  name: string
+}
+
+/** Raw and decoded `SpriteSettings` bits. */
+export interface SpriteAtlasSettings {
+  raw: number
+  packed: boolean
+  packingMode: number
+  packingRotation: number
+  meshType: number
+}
+
+export interface SpriteAtlasVector2 {
+  x: number
+  y: number
+}
+
+export interface SpriteAtlasVector4 {
+  x: number
+  y: number
+  z: number
+  w: number
+}
+
+/** Complete, bounded metadata from one Unity `Sprite` object. */
+export interface SpriteMetadata {
+  objectIndex: number
+  pathId: bigint
+  name: string
+  rect: SpriteRect
+  offset: SpriteVector2
+  border: SpriteVector4
+  pixelsToUnits: number
+  pivot: SpriteVector2
+  extrude: number
+  isPolygon: boolean
+  renderDataKey?: SpriteAtlasRenderDataKey
+  atlasTags: Array<string>
+  spriteAtlas: ObjectReference
+  renderData: SpriteRenderData
+}
+
+/** Caller-configurable budgets for metadata-only `Sprite` parsing. */
+export interface SpriteMetadataLimits {
+  maximumEntries?: number
+  maximumStringBytes?: number
+  maximumTotalStringBytes?: number
+  maximumMeshBytes?: number
+}
+
+export interface SpriteRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** Complete resident render metadata stored directly on one `Sprite`. */
+export interface SpriteRenderData {
+  texture: ObjectReference
+  alphaTexture: ObjectReference
+  secondaryTextures: Array<SpriteSecondaryTexture>
+  textureRect: SpriteRect
+  textureRectOffset: SpriteVector2
+  atlasRectOffset: SpriteVector2
+  settings: SpriteSettings
+  uvTransform: SpriteVector4
+  downscaleMultiplier: number
+  meshTriangles: Array<SpriteTriangle>
+}
+
+export interface SpriteSecondaryTexture {
+  texture: ObjectReference
+  name: string
+}
+
+/** Raw and decoded `SpriteSettings` bits from resident render data. */
+export interface SpriteSettings {
+  raw: number
+  packed: boolean
+  packingMode: string
+  packingRotation: number
+  meshType: string
+}
+
+/** One validated local-space triangle used for tight-mesh masking. */
+export interface SpriteTriangle {
+  first: SpriteVector2
+  second: SpriteVector2
+  third: SpriteVector2
+}
+
+export interface SpriteVector2 {
+  x: number
+  y: number
+}
+
+export interface SpriteVector4 {
+  x: number
+  y: number
+  z: number
+  w: number
 }
 
 /** An FBX plus the texture files it references by name. */

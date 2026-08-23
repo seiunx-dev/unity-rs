@@ -339,7 +339,7 @@ fn rust_binary_payload(
     class_id: i32,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let simple_limits = SimpleAssetReadLimits {
         maximum_payload_bytes: maximum_bytes,
         ..SimpleAssetReadLimits::default()
@@ -464,7 +464,7 @@ fn animation_clip_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let clip = read_animation_clip(
         loaded,
         object_index,
@@ -526,7 +526,7 @@ fn avatar_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let avatar = read_avatar(
         loaded,
         object_index,
@@ -549,7 +549,7 @@ fn animator_controller_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let controller = read_animator_controller(
         loaded,
         object_index,
@@ -581,7 +581,7 @@ fn shader_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let shader = read_shader(
         loaded,
         object_index,
@@ -603,7 +603,7 @@ fn sprite_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let limits = SpriteReadLimits {
         maximum_mesh_bytes: maximum_bytes,
         maximum_output_bytes: maximum_bytes,
@@ -639,7 +639,7 @@ fn texture_array_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let array = read_texture2d_array(
         studio.collection(),
         loaded,
@@ -675,7 +675,7 @@ fn sprite_atlas_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let maximum = usize::try_from(maximum_bytes)?;
     let atlas = read_sprite_atlas(
         loaded,
@@ -761,7 +761,7 @@ fn material_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let material = read_material(
         loaded,
         object_index,
@@ -828,7 +828,7 @@ fn mesh_manifest(
     object_index: usize,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let mesh = read_mesh_with_collection(
         studio.collection(),
         loaded,
@@ -896,7 +896,7 @@ fn texture_manifest(
         maximum_decoder_working_bytes: maximum_bytes,
         ..TextureReadLimits::default()
     };
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     let texture = read_texture2d(studio.collection(), loaded, object_index, limits)?;
     // Mip zero only: the managed decoder exposes one decoded surface, and a
     // format it cannot handle decodes to null on both sides rather than failing
@@ -947,7 +947,7 @@ fn rust_metadata_payload(
     class_id: i32,
     maximum_bytes: u64,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let loaded = &studio.collection().serialized_files[file_index].file;
+    let loaded = &studio.collection().serialized_files()[file_index].file;
     Ok(match class_id {
         141 => {
             let build =

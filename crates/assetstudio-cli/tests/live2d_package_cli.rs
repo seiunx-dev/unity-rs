@@ -108,6 +108,37 @@ fn writes_exact_static_package_moc_manifest_and_unity_order_png() {
 }
 
 #[test]
+fn legacy_l2d_and_live2d_modes_export_the_complete_package() {
+    let root = TestDirectory::new("legacy");
+    let input = root.path().join("input");
+    write_fixture(&input, Fixture::Complete);
+
+    for mode in ["l2d", "live2d"] {
+        let output = root.path().join(format!("output-{mode}"));
+        let result = cli(
+            root.path(),
+            [
+                input.as_os_str().to_owned(),
+                OsString::from("-m"),
+                OsString::from(mode),
+                OsString::from("-o"),
+                output.as_os_str().to_owned(),
+            ],
+        );
+
+        assert_success(&result);
+        let package = output.join("Hero");
+        assert_eq!(fs::read(package.join("Hero.moc3")).unwrap(), b"MOC3\x09");
+        assert!(package.join("Hero.model3.json").is_file());
+        assert_eq!(
+            fs::read(package.join("textures/face.png")).unwrap(),
+            EXPECTED_FACE_PNG
+        );
+        assert_no_work_files(&output);
+    }
+}
+
+#[test]
 fn concurrent_publish_is_no_clobber_and_leaves_no_work_files() {
     let root = TestDirectory::new("concurrent");
     let input = root.path().join("input");
@@ -210,12 +241,12 @@ fn rejects_a_symbolic_link_in_the_output_path() {
     let real = root.path().join("real");
     let linked = root.path().join("linked");
     write_fixture(&input, Fixture::Complete);
-    fs::create_dir(&real).unwrap();
+    fs::create_dir_all(real.join("existing")).unwrap();
     symlink(&real, &linked).unwrap();
 
     let result = cli(
         root.path(),
-        package_arguments(&input, &linked.join("output")),
+        package_arguments(&input, &linked.join("existing/output")),
     );
 
     assert_eq!(result.status.code(), Some(1));
@@ -224,7 +255,7 @@ fn rejects_a_symbolic_link_in_the_output_path() {
         "stderr: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(!real.join("output").exists());
+    assert!(!real.join("existing/output").exists());
 }
 
 fn package_arguments(input: &Path, output: &Path) -> [OsString; 3] {

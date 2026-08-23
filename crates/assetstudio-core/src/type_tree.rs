@@ -12,36 +12,29 @@ const MANAGED_REFERENCES_REGISTRY: &str = "ManagedReferencesRegistry";
 const REFERENCED_MANAGED_TYPE: &str = "ReferencedManagedType";
 const REFERENCED_OBJECT_DATA: &str = "ReferencedObjectData";
 
-/// The class, namespace and assembly one registry entry names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ManagedTypeIdentity {
-    class_name: String,
-    namespace: String,
-    assembly_name: String,
-}
-
-fn managed_type_identity(value: &TypeValue) -> Result<ManagedTypeIdentity> {
+/// Borrows the class, namespace and assembly one registry entry names.
+///
+/// These strings already live in the materialized `ReferencedManagedType`
+/// value. Keeping a second owned copy until the data field is reached can add
+/// three maximum-sized strings per entry outside the materialization budget.
+fn managed_type_identity(value: &TypeValue) -> Result<(&str, &str, &str)> {
     let TypeValue::Object(fields) = value else {
         return Err(Error::invalid_data(
             "managed reference type is not a record of class, namespace and assembly",
         ));
     };
-    let text = |name: &str| -> Result<String> {
+    let text = |name: &str| -> Result<&str> {
         match fields.iter().find(|field| field.name == name) {
             Some(TypeField {
                 value: TypeValue::String(value),
                 ..
-            }) => Ok(value.clone()),
+            }) => Ok(value.as_str()),
             _ => Err(Error::invalid_data(format!(
                 "managed reference type has no {name} string"
             ))),
         }
     };
-    Ok(ManagedTypeIdentity {
-        class_name: text("class")?,
-        namespace: text("ns")?,
-        assembly_name: text("asm")?,
-    })
+    Ok((text("class")?, text("ns")?, text("asm")?))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,7 +431,9 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
         let parent_level = self.nodes[index].level;
         let end = subtree_end(self.nodes, index);
         let mut fields = Vec::new();
-        let mut identity = None;
+        // `Some(None)` is a declared null reference; outer `None` means the
+        // entry has not named its type yet.
+        let mut reference_type_index = None;
         let mut child = index + 1;
         while child < end {
             let node = &self.nodes[child];
@@ -451,13 +446,13 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
             }
             let name = self.clone_field_name(&node.field_name)?;
             if node.type_name == REFERENCED_OBJECT_DATA {
-                let identity = identity.as_ref().ok_or_else(|| {
+                let reference_type_index = reference_type_index.ok_or_else(|| {
                     Error::invalid_data("managed reference stores its data before naming its type")
                 })?;
                 // An entry naming no class is Unity's null reference. It
                 // stores nothing, and the field is left out rather than
                 // invented.
-                if let Some(tree_index) = self.reference_type_index(identity)? {
+                if let Some(tree_index) = reference_type_index {
                     let value = self.read_reference_type(tree_index, depth + 1)?;
                     self.push_field(&mut fields, TypeField { name, value })?;
                 }
@@ -466,7 +461,8 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
             }
             let (value, next) = self.read_node(child, depth + 1)?;
             if node.type_name == REFERENCED_MANAGED_TYPE {
-                identity = Some(managed_type_identity(&value)?);
+                reference_type_index =
+                    Some(self.reference_type_index(managed_type_identity(&value)?)?);
             }
             self.push_field(&mut fields, TypeField { name, value })?;
             child = next;
@@ -484,16 +480,19 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
     }
 
     /// Finds the reference type an entry names, or `None` for a null entry.
-    fn reference_type_index(&self, identity: &ManagedTypeIdentity) -> Result<Option<usize>> {
-        if identity.class_name.is_empty() {
+    fn reference_type_index(
+        &self,
+        (class_name, namespace, assembly_name): (&str, &str, &str),
+    ) -> Result<Option<usize>> {
+        if class_name.is_empty() {
             return Ok(None);
         }
         self.reference_types
             .iter()
             .position(|kind| {
-                kind.class_name.as_deref() == Some(identity.class_name.as_str())
-                    && kind.namespace.as_deref() == Some(identity.namespace.as_str())
-                    && kind.assembly_name.as_deref() == Some(identity.assembly_name.as_str())
+                kind.class_name.as_deref() == Some(class_name)
+                    && kind.namespace.as_deref() == Some(namespace)
+                    && kind.assembly_name.as_deref() == Some(assembly_name)
             })
             .map(Some)
             .ok_or_else(|| {
@@ -501,8 +500,10 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
                 // stream and their length is only known from the layout, so
                 // there is no way to step over what cannot be read.
                 Error::unsupported(format!(
-                    "managed reference names {}::{} in {}, which the file does not declare",
-                    identity.namespace, identity.class_name, identity.assembly_name
+                    "managed reference names an undeclared type (namespace {} bytes, class {} bytes, assembly {} bytes), which the file does not declare",
+                    namespace.len(),
+                    class_name.len(),
+                    assembly_name.len()
                 ))
             })
     }
@@ -1390,6 +1391,16 @@ mod tests {
                 .to_string()
                 .contains("which the file does not declare"),
             "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("namespace 4 bytes, class 6 bytes, assembly 8 bytes"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("Absent"),
+            "the error must not copy an asset-controlled type name: {error}"
         );
     }
 

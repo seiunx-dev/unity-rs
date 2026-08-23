@@ -11,10 +11,11 @@
 //! to a single path component here, so a texture called `../../etc/passwd`
 //! cannot escape the directory the caller chose.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
@@ -26,6 +27,7 @@ use crate::texture::{TEXTURE_2D_CLASS_ID, TextureReadLimits, read_texture2d};
 use crate::{Error, Result};
 
 const MAXIMUM_TEXTURE_TEMPORARY_ATTEMPTS: u64 = 1_024;
+const MAXIMUM_SCENE_TEXTURE_COMPONENT_BYTES: usize = 240;
 static TEXTURE_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The material channel a texture is bound to.
@@ -136,7 +138,7 @@ pub struct SceneTextureSkip {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SceneTextureSet {
     pub textures: Vec<SceneTexture>,
-    bindings: BTreeMap<SceneObjectKey, Vec<SceneTextureBinding>>,
+    bindings: HashMap<SceneObjectKey, Vec<SceneTextureBinding>>,
     /// References that resolved to something this exporter cannot use.
     ///
     /// Reported rather than dropped: a `RenderTexture` or a `Cubemap` in a
@@ -186,7 +188,7 @@ impl SceneTextureSet {
         names: &mut SceneTextureNames,
     ) -> Result<Self> {
         let mut set = Self::default();
-        let mut by_object: BTreeMap<SceneObjectKey, usize> = BTreeMap::new();
+        let mut by_object: HashMap<SceneObjectKey, usize> = HashMap::new();
         let mut total_encoded = 0_u64;
 
         for material in &model.materials {
@@ -204,7 +206,7 @@ impl SceneTextureSet {
                     Ok(Some(resolved)) => resolved,
                     Ok(None) => continue,
                     Err(error) => {
-                        record_texture_skip(&mut set, material.object, &property.name, error);
+                        record_texture_skip(&mut set, material.object, &property.name, error)?;
                         continue;
                     }
                 };
@@ -213,8 +215,8 @@ impl SceneTextureSet {
                         &mut set,
                         material.object,
                         &property.name,
-                        format!("class ID {} is not Texture2D", resolved.object.class_id),
-                    );
+                        format_args!("class ID {} is not Texture2D", resolved.object.class_id),
+                    )?;
                     continue;
                 }
                 let key = SceneObjectKey {
@@ -255,34 +257,37 @@ impl SceneTextureSet {
                                     limits.maximum_total_encoded_bytes
                                 )));
                             }
-                            let file_name = names.allocate(key, &name, format);
-                            let index = set.textures.len();
-                            set.textures.push(SceneTexture {
-                                file_name,
-                                object: key,
+                            insert_resolved_scene_texture(
+                                &mut set,
+                                &mut by_object,
+                                names,
+                                key,
+                                &name,
                                 encoded,
-                            });
-                            by_object.insert(key, index);
-                            index
+                                format,
+                            )?
                         }
                         Err(TextureEncodeFailure::TotalBudgetExceeded) => {
                             return Err(total_texture_budget_error(limits));
                         }
                         Err(TextureEncodeFailure::Recoverable(error)) => {
-                            record_texture_skip(&mut set, material.object, &property.name, error);
+                            record_texture_skip(&mut set, material.object, &property.name, error)?;
                             continue;
                         }
                     }
                 };
-                bindings.push(SceneTextureBinding {
-                    property: property.name.clone(),
+                append_scene_texture_binding(
+                    &mut bindings,
+                    &property.name,
                     texture,
-                    slot: TextureSlot::from_property_name(&property.name),
-                    offset: environment.offset,
-                    scale: environment.scale,
-                });
+                    environment.offset,
+                    environment.scale,
+                )?;
             }
             if !bindings.is_empty() {
+                set.bindings.try_reserve(1).map_err(|error| {
+                    Error::invalid_data(format!("cannot grow material texture bindings: {error}"))
+                })?;
                 set.bindings.insert(material.object, bindings);
             }
         }
@@ -305,9 +310,10 @@ impl SceneTextureSet {
     /// Adds an already-encoded texture, returning its index.
     ///
     /// For callers that decoded the image themselves; [`Self::from_model`]
-    /// covers resolving them from the collection. The file name is taken as
-    /// given, so a caller supplying an asset-derived name must reduce it to a
-    /// single path component first.
+    /// covers resolving them from the collection. [`Self::write_to_directory`]
+    /// revalidates the supplied file name as one portable relative component
+    /// before it creates a temporary file, so a manually constructed texture
+    /// cannot escape the selected output directory.
     pub fn push_texture(&mut self, texture: SceneTexture) -> usize {
         let index = self.textures.len();
         self.textures.push(texture);
@@ -323,7 +329,14 @@ impl SceneTextureSet {
                 self.textures.len()
             )));
         }
-        self.bindings.entry(material).or_default().push(binding);
+        self.bindings.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow material texture bindings: {error}"))
+        })?;
+        let bindings = self.bindings.entry(material).or_default();
+        bindings.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow model texture bindings: {error}"))
+        })?;
+        bindings.push(binding);
         Ok(())
     }
 
@@ -333,23 +346,106 @@ impl SceneTextureSet {
     /// models that share a texture into the same directory does not rewrite it
     /// and cannot clobber an unrelated file that happens to share the name.
     /// Each new file is completely written and synced under a temporary name
-    /// in the same directory before an atomic no-clobber publish; a failed
-    /// write therefore cannot leave a truncated final texture behind.
+    /// in the same directory before an atomic no-clobber publish. If any later
+    /// texture fails validation, writing or publication, every file newly
+    /// published by this call is removed; pre-existing files are never part of
+    /// that rollback.
     pub fn write_to_directory(&self, directory: &Path) -> Result<Vec<PathBuf>> {
         let mut written = Vec::new();
-        for texture in &self.textures {
-            let path = directory.join(&texture.file_name);
-            let mut temporary = TextureTemporaryFile::create(directory)?;
-            temporary.file_mut().write_all(&texture.encoded)?;
-            temporary.file_mut().flush()?;
-            temporary.file_mut().sync_all()?;
-            temporary.close()?;
-            if temporary.persist_no_clobber(&path)? {
-                written.push(path);
+        written
+            .try_reserve_exact(self.textures.len())
+            .map_err(|error| {
+                Error::invalid_data(format!("cannot allocate written texture paths: {error}"))
+            })?;
+        let result = (|| {
+            for texture in &self.textures {
+                validate_texture_file_name(&texture.file_name)?;
+                let path = join_scene_texture_path_fallibly(
+                    directory,
+                    Path::new(&texture.file_name),
+                    "model texture output path",
+                )?;
+                let mut temporary = TextureTemporaryFile::create(directory)?;
+                temporary.file_mut().write_all(&texture.encoded)?;
+                temporary.file_mut().flush()?;
+                temporary.file_mut().sync_all()?;
+                temporary.close()?;
+                if temporary.persist_no_clobber(&path)? {
+                    written.push(path);
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Err(cleanup) = remove_scene_texture_outputs(&written) {
+                return Err(Error::invalid_data(format!(
+                    "{error}; additionally failed to roll back model textures: {cleanup}"
+                )));
+            }
+            return Err(error);
         }
         Ok(written)
     }
+}
+
+fn remove_scene_texture_outputs(paths: &[PathBuf]) -> Result<()> {
+    let mut first_error = None;
+    for path in paths.iter().rev() {
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != io::ErrorKind::NotFound
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), |error| Err(error.into()))
+}
+
+fn insert_resolved_scene_texture(
+    set: &mut SceneTextureSet,
+    by_object: &mut HashMap<SceneObjectKey, usize>,
+    names: &mut SceneTextureNames,
+    key: SceneObjectKey,
+    name: &str,
+    encoded: Vec<u8>,
+    format: ImageFormat,
+) -> Result<usize> {
+    set.textures.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow resolved model textures: {error}"))
+    })?;
+    by_object.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow resolved texture index: {error}"))
+    })?;
+    let file_name = names.allocate(key, name, format)?;
+    let index = set.textures.len();
+    set.textures.push(SceneTexture {
+        file_name,
+        object: key,
+        encoded,
+    });
+    by_object.insert(key, index);
+    Ok(index)
+}
+
+fn append_scene_texture_binding(
+    bindings: &mut Vec<SceneTextureBinding>,
+    property: &str,
+    texture: usize,
+    offset: [f32; 2],
+    scale: [f32; 2],
+) -> Result<()> {
+    bindings.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow model texture bindings: {error}"))
+    })?;
+    let property = copy_scene_texture_string(property, "model texture property")?;
+    bindings.push(SceneTextureBinding {
+        slot: TextureSlot::from_property_name(&property),
+        property,
+        texture,
+        offset,
+        scale,
+    });
+    Ok(())
 }
 
 struct TextureTemporaryFile {
@@ -362,10 +458,17 @@ impl TextureTemporaryFile {
     fn create(directory: &Path) -> Result<Self> {
         for _ in 0..MAXIMUM_TEXTURE_TEMPORARY_ATTEMPTS {
             let sequence = TEXTURE_TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = directory.join(format!(
-                ".assetstudio-texture-{}-{sequence}.tmp",
-                std::process::id()
-            ));
+            let mut name = FallibleSceneTextureString::default();
+            fmt::write(
+                &mut name,
+                format_args!(".assetstudio-texture-{}-{sequence}.tmp", std::process::id()),
+            )
+            .map_err(|_| Error::invalid_data("cannot allocate texture temporary file name"))?;
+            let path = join_scene_texture_path_fallibly(
+                directory,
+                Path::new(&name.value),
+                "model texture temporary path",
+            )?;
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => {
                     return Ok(Self {
@@ -397,8 +500,10 @@ impl TextureTemporaryFile {
     fn persist_no_clobber(&mut self, destination: &Path) -> Result<bool> {
         match fs::hard_link(&self.path, destination) {
             Ok(()) => {
-                fs::remove_file(&self.path)?;
-                self.persisted = true;
+                // The destination is committed once the hard-link exists.
+                // Keep Drop responsible for retrying a failed temporary-link
+                // cleanup instead of reporting a false texture-write failure.
+                self.persisted = fs::remove_file(&self.path).is_ok();
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
@@ -420,12 +525,20 @@ fn record_texture_skip(
     material: SceneObjectKey,
     property: &str,
     reason: impl std::fmt::Display,
-) {
+) -> Result<()> {
+    let property = copy_scene_texture_string(property, "skipped texture property")?;
+    let mut formatted_reason = FallibleSceneTextureString::default();
+    fmt::write(&mut formatted_reason, format_args!("{reason}"))
+        .map_err(|_| Error::invalid_data("cannot allocate skipped texture reason"))?;
+    set.skipped.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow skipped model textures: {error}"))
+    })?;
     set.skipped.push(SceneTextureSkip {
         material,
-        property: property.to_owned(),
-        reason: reason.to_string(),
+        property,
+        reason: formatted_reason.value,
     });
+    Ok(())
 }
 
 fn encode_texture(
@@ -440,11 +553,8 @@ fn encode_texture(
         .get(key.file_index)
         .ok_or_else(|| Error::invalid_data("texture file index is outside the collection"))
         .map_err(TextureEncodeFailure::Recoverable)?;
-    let object_index = loaded
-        .file
-        .objects
-        .iter()
-        .position(|object| object.path_id == key.path_id)
+    let object_index = collection
+        .object_index_by_path_id(key.file_index, key.path_id)
         .ok_or_else(|| Error::invalid_data("texture path ID is absent from its file"))
         .map_err(TextureEncodeFailure::Recoverable)?;
     let texture = read_texture2d(collection, &loaded.file, object_index, limits.texture)
@@ -509,14 +619,13 @@ impl Write for FallibleEncodedTexture {
             .ok_or_else(|| io::Error::other("encoded model texture length overflowed"))?;
         if next > self.maximum {
             self.limit_exceeded = true;
-            return Err(io::Error::other(format!(
-                "encoded model texture exceeds {} bytes",
-                self.maximum
-            )));
+            return Err(io::Error::other(
+                "encoded model texture exceeds its output budget",
+            ));
         }
-        self.bytes.try_reserve(input.len()).map_err(|error| {
-            io::Error::other(format!("cannot allocate encoded model texture: {error}"))
-        })?;
+        self.bytes
+            .try_reserve(input.len())
+            .map_err(|_| io::Error::other("cannot allocate encoded model texture"))?;
         self.bytes.extend_from_slice(input);
         Ok(input.len())
     }
@@ -532,10 +641,10 @@ impl Write for FallibleEncodedTexture {
 /// allocator across every model it writes into a directory.
 #[derive(Debug, Clone, Default)]
 pub struct SceneTextureNames {
-    by_object: BTreeMap<SceneObjectKey, String>,
+    by_object: HashMap<SceneObjectKey, String>,
     /// Claimed file names. The value is where the next ` (n)` search for that
     /// name should start, so a name repeated many times stays linear.
-    used: BTreeMap<String, usize>,
+    used: HashMap<String, usize>,
 }
 
 impl SceneTextureNames {
@@ -545,29 +654,72 @@ impl SceneTextureNames {
     /// exports line up. Uniqueness is over the final file name, so two textures
     /// whose names differ only in characters sanitising strips still get
     /// separate files.
-    fn allocate(&mut self, object: SceneObjectKey, name: &str, format: ImageFormat) -> String {
+    fn allocate(
+        &mut self,
+        object: SceneObjectKey,
+        name: &str,
+        format: ImageFormat,
+    ) -> Result<String> {
         if let Some(existing) = self.by_object.get(&object) {
-            return existing.clone();
+            return copy_scene_texture_string(existing, "existing model texture name");
         }
-        let stem = sanitize_file_stem(name);
+        let stem = sanitize_file_stem(name)?;
         let extension = format.extension();
-        let candidate = format!("{stem}{extension}");
+        let candidate = join_scene_texture_strings(
+            &[&stem, extension],
+            MAXIMUM_SCENE_TEXTURE_COMPONENT_BYTES,
+            "model texture file name",
+        )?;
         let allocated = if self.used.contains_key(&candidate) {
             let mut next = self.used.get(&candidate).copied().unwrap_or(1);
             loop {
-                let attempt = format!("{stem} ({next}){extension}");
-                next += 1;
+                let mut suffix = FallibleSceneTextureString::default();
+                fmt::write(&mut suffix, format_args!(" ({next})"))
+                    .map_err(|_| Error::invalid_data("cannot allocate texture collision suffix"))?;
+                let attempt = join_scene_texture_strings(
+                    &[&stem, &suffix.value, extension],
+                    MAXIMUM_SCENE_TEXTURE_COMPONENT_BYTES,
+                    "colliding model texture file name",
+                )?;
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invalid_data("texture collision counter overflowed"))?;
                 if !self.used.contains_key(&attempt) {
+                    self.used.try_reserve(1).map_err(|error| {
+                        Error::invalid_data(format!(
+                            "cannot grow used model texture names: {error}"
+                        ))
+                    })?;
+                    self.by_object.try_reserve(1).map_err(|error| {
+                        Error::invalid_data(format!(
+                            "cannot grow model texture object names: {error}"
+                        ))
+                    })?;
+                    let used_name = copy_scene_texture_string(&attempt, "used model texture name")?;
+                    let object_name =
+                        copy_scene_texture_string(&attempt, "model texture object name")?;
                     self.used.insert(candidate, next);
+                    self.used.insert(used_name, 1);
+                    self.by_object.insert(object, object_name);
                     break attempt;
                 }
             }
         } else {
+            self.used.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow used model texture names: {error}"))
+            })?;
+            self.by_object.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow model texture object names: {error}"))
+            })?;
+            let object_name = copy_scene_texture_string(&candidate, "model texture object name")?;
+            self.used.insert(
+                copy_scene_texture_string(&candidate, "used model texture name")?,
+                1,
+            );
+            self.by_object.insert(object, object_name);
             candidate
         };
-        self.used.insert(allocated.clone(), 1);
-        self.by_object.insert(object, allocated.clone());
-        allocated
+        Ok(allocated)
     }
 }
 
@@ -576,7 +728,7 @@ impl SceneTextureNames {
 /// Separators, the reserved characters Windows rejects, control characters and
 /// a leading run of dots are replaced, and the result is truncated to a length
 /// every common file system accepts. An empty result becomes `Texture`.
-fn sanitize_file_stem(name: &str) -> String {
+fn sanitize_file_stem(name: &str) -> Result<String> {
     const MAXIMUM_STEM_BYTES: usize = 120;
 
     let mut stem = String::new();
@@ -589,21 +741,161 @@ fn sanitize_file_stem(name: &str) -> String {
         if stem.len() + safe.len_utf8() > MAXIMUM_STEM_BYTES {
             break;
         }
+        stem.try_reserve_exact(safe.len_utf8()).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate model texture stem: {error}"))
+        })?;
         stem.push(safe);
     }
     let trimmed =
         stem.trim_matches(|character: char| character == '.' || character.is_whitespace());
-    if trimmed.is_empty() {
-        "Texture".to_owned()
+    let mut output = if trimmed.is_empty() {
+        copy_scene_texture_string("Texture", "fallback model texture stem")?
     } else {
-        trimmed.to_owned()
+        copy_scene_texture_string(trimmed, "model texture stem")?
+    };
+    if is_windows_reserved_texture_name(&output) {
+        while output.len() >= MAXIMUM_STEM_BYTES {
+            output.pop();
+        }
+        let mut prefixed = String::new();
+        prefixed
+            .try_reserve_exact(output.len() + 1)
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate reserved model texture stem: {error}"
+                ))
+            })?;
+        prefixed.push('_');
+        prefixed.push_str(&output);
+        output = prefixed;
+    }
+    Ok(output)
+}
+
+fn is_windows_reserved_texture_name(value: &str) -> bool {
+    let base = value.split('.').next().unwrap_or(value).as_bytes();
+    let equals = |expected: &[u8]| base.eq_ignore_ascii_case(expected);
+    equals(b"CON")
+        || equals(b"PRN")
+        || equals(b"AUX")
+        || equals(b"NUL")
+        || (base.len() == 4
+            && (base[..3].eq_ignore_ascii_case(b"COM") || base[..3].eq_ignore_ascii_case(b"LPT"))
+            && matches!(base[3], b'1'..=b'9'))
+}
+
+fn validate_texture_file_name(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::invalid_data("model texture file name is empty"));
+    }
+    if value.len() > MAXIMUM_SCENE_TEXTURE_COMPONENT_BYTES {
+        return Err(Error::invalid_data(format!(
+            "model texture file name is {} bytes, exceeding portable limit {MAXIMUM_SCENE_TEXTURE_COMPONENT_BYTES}",
+            value.len()
+        )));
+    }
+    if value.ends_with([' ', '.'])
+        || value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
+        })
+        || is_windows_reserved_texture_name(value)
+    {
+        return Err(Error::invalid_data(
+            "model texture file name is not a portable single component",
+        ));
+    }
+    let mut components = Path::new(value).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(Error::invalid_data(
+            "model texture file name is not a single relative component",
+        ));
+    }
+    Ok(())
+}
+
+fn copy_scene_texture_string(value: &str, label: &str) -> Result<String> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn join_scene_texture_strings(
+    values: &[&str],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<String> {
+    let length = values.iter().try_fold(0_usize, |length, value| {
+        length
+            .checked_add(value.len())
+            .ok_or_else(|| Error::invalid_data(format!("{label} length overflowed")))
+    })?;
+    if length > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "{label} is {length} bytes, exceeding limit {maximum_bytes}"
+        )));
+    }
+    let mut output = String::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    for value in values {
+        output.push_str(value);
+    }
+    Ok(output)
+}
+
+fn join_scene_texture_path_fallibly(parent: &Path, child: &Path, label: &str) -> Result<PathBuf> {
+    if child.is_absolute() {
+        return Err(Error::invalid_data(format!("{label} child is absolute")));
+    }
+    let separator = usize::from(!parent.as_os_str().is_empty() && !child.as_os_str().is_empty());
+    let length = parent
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(child.as_os_str().as_encoded_bytes().len()))
+        .ok_or_else(|| Error::invalid_data(format!("{label} length overflowed")))?;
+    let mut path = PathBuf::new();
+    path.try_reserve_exact(length)
+        .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
+    path.push(parent);
+    if !child.as_os_str().is_empty() {
+        path.push(child);
+    }
+    if path.as_os_str().as_encoded_bytes().len() > length {
+        return Err(Error::invalid_data(format!(
+            "{label} exceeded its checked allocation"
+        )));
+    }
+    Ok(path)
+}
+
+#[derive(Default)]
+struct FallibleSceneTextureString {
+    value: String,
+}
+
+impl fmt::Write for FallibleSceneTextureString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.value
+            .try_reserve(value.len())
+            .map_err(|_| fmt::Error)?;
+        self.value.push_str(value);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetCollection, ImageFormat, ModelIr, SceneObjectKey, SceneTextureLimits,
+        AssetCollection, ImageFormat, ModelIr, SceneObjectKey, SceneTexture, SceneTextureLimits,
         SceneTextureNames, SceneTextureSet, TEXTURE_2D_CLASS_ID, TextureSlot, TextureTemporaryFile,
         sanitize_file_stem,
     };
@@ -831,6 +1123,73 @@ mod tests {
         std::fs::remove_dir(&directory).unwrap();
     }
 
+    #[test]
+    fn write_rejects_non_portable_names_before_creating_a_temporary_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "assetstudio-scene-texture-traversal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let escaped = directory.parent().unwrap().join("escaped.png");
+        let _ = std::fs::remove_file(&escaped);
+        for file_name in [
+            "../escaped.png".to_owned(),
+            "/absolute.png".to_owned(),
+            "nested/texture.png".to_owned(),
+            "CON.png".to_owned(),
+            "x".repeat(241),
+        ] {
+            let mut set = SceneTextureSet::default();
+            set.push_texture(SceneTexture {
+                file_name,
+                object: object(1),
+                encoded: b"not written".to_vec(),
+            });
+
+            assert!(set.write_to_directory(&directory).is_err());
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        }
+        assert!(!escaped.exists());
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn texture_batch_failure_rolls_back_files_published_by_the_same_call() {
+        let directory = std::env::temp_dir().join(format!(
+            "assetstudio-scene-texture-rollback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let existing = directory.join("existing.png");
+        std::fs::write(&existing, b"keep me").unwrap();
+
+        let mut set = SceneTextureSet::default();
+        set.push_texture(SceneTexture {
+            file_name: "first.png".to_owned(),
+            object: object(1),
+            encoded: b"published before the later failure".to_vec(),
+        });
+        set.push_texture(SceneTexture {
+            file_name: "existing.png".to_owned(),
+            object: object(2),
+            encoded: b"must not replace the existing file".to_vec(),
+        });
+        set.push_texture(SceneTexture {
+            file_name: "../invalid.png".to_owned(),
+            object: object(3),
+            encoded: b"must not be written".to_vec(),
+        });
+
+        let error = set.write_to_directory(&directory).unwrap_err();
+        assert!(error.to_string().contains("portable"), "{error}");
+        assert!(!directory.join("first.png").exists());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// A 1x1 RGBA32 `Texture2D` with inline pixel data.
     fn texture_object(name: &str, data: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
@@ -966,7 +1325,7 @@ mod tests {
     fn reduces_hostile_names_to_one_path_component() {
         // The traversal case only has to end up as one harmless component.
         for hostile in ["../../etc/passwd", "..\\..\\Windows", "/etc/passwd", "."] {
-            let stem = sanitize_file_stem(hostile);
+            let stem = sanitize_file_stem(hostile).unwrap();
             assert!(
                 !stem.contains('/') && !stem.contains('\\'),
                 "{stem:?} still contains a separator"
@@ -975,33 +1334,36 @@ mod tests {
             assert!(!stem.starts_with('.'), "{stem:?} starts with a dot");
         }
         assert_eq!(
-            sanitize_file_stem("C:\\Windows\\system32"),
+            sanitize_file_stem("C:\\Windows\\system32").unwrap(),
             "C__Windows_system32"
         );
-        assert_eq!(sanitize_file_stem("   "), "Texture");
-        assert_eq!(sanitize_file_stem("..."), "Texture");
-        assert_eq!(sanitize_file_stem("a\u{0}b"), "a_b");
-        assert!(sanitize_file_stem(&"x".repeat(400)).len() <= 120);
+        assert_eq!(sanitize_file_stem("   ").unwrap(), "Texture");
+        assert_eq!(sanitize_file_stem("...").unwrap(), "Texture");
+        assert_eq!(sanitize_file_stem("a\u{0}b").unwrap(), "a_b");
+        assert_eq!(sanitize_file_stem("CON").unwrap(), "_CON");
+        assert!(sanitize_file_stem(&"x".repeat(400)).unwrap().len() <= 120);
     }
 
     #[test]
     fn gives_colliding_names_distinct_files() {
         let mut names = SceneTextureNames::default();
         assert_eq!(
-            names.allocate(object(1), "Body", ImageFormat::Png),
+            names.allocate(object(1), "Body", ImageFormat::Png).unwrap(),
             "Body.png"
         );
         assert_eq!(
-            names.allocate(object(2), "Body", ImageFormat::Png),
+            names.allocate(object(2), "Body", ImageFormat::Png).unwrap(),
             "Body (1).png"
         );
         assert_eq!(
-            names.allocate(object(3), "Body", ImageFormat::Png),
+            names.allocate(object(3), "Body", ImageFormat::Png).unwrap(),
             "Body (2).png"
         );
         // A name that only collides after sanitising still gets its own file.
         assert_eq!(
-            names.allocate(object(4), "Body/", ImageFormat::Png),
+            names
+                .allocate(object(4), "Body/", ImageFormat::Png)
+                .unwrap(),
             "Body_.png"
         );
     }
@@ -1012,16 +1374,16 @@ mod tests {
         // a second model must not claim a second file.
         let mut names = SceneTextureNames::default();
         assert_eq!(
-            names.allocate(object(7), "Body", ImageFormat::Png),
+            names.allocate(object(7), "Body", ImageFormat::Png).unwrap(),
             "Body.png"
         );
         assert_eq!(
-            names.allocate(object(7), "Body", ImageFormat::Png),
+            names.allocate(object(7), "Body", ImageFormat::Png).unwrap(),
             "Body.png"
         );
         // A different object with the same Unity name still gets its own file.
         assert_eq!(
-            names.allocate(object(8), "Body", ImageFormat::Png),
+            names.allocate(object(8), "Body", ImageFormat::Png).unwrap(),
             "Body (1).png"
         );
     }
