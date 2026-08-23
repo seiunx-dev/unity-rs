@@ -7,8 +7,10 @@ const { join, resolve } = require("node:path");
 
 const packageRoot = resolve(__dirname, "..");
 const repositoryRoot = resolve(packageRoot, "../..");
+const npmCli = process.env.npm_execpath;
+assert.ok(npmCli, "npm_execpath is missing; run this check through npm test:package");
 const result = JSON.parse(
-  execFileSync("npm", ["pack", "--json", "--dry-run"], {
+  execFileSync(process.execPath, [npmCli, "pack", "--json", "--dry-run"], {
     cwd: packageRoot,
     encoding: "utf8",
   }),
