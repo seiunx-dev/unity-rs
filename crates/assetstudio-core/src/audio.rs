@@ -5141,8 +5141,7 @@ mod tests {
         );
     }
 
-    /// Records how far SILK/hybrid Opus sits from libopus. This is a known
-    /// defect, not a tolerance.
+    /// Records the two measured SILK/hybrid Opus oracle profiles.
     ///
     /// Written up with measurements in `docs/upstream-defects.md`.
     ///
@@ -5166,9 +5165,11 @@ mod tests {
     /// stream, measures 276 -- worse than any of the probes above, so the bound
     /// here is its own measurement rather than a number carried over.
     ///
-    /// The bound below pins the measured behaviour so a regression past it
-    /// fails. Fixing it means an upstream change or a different decoder;
-    /// `fsb5_opus_celt_tone_matches_vgmstream` guards the half that is right.
+    /// The pinned `vgmstream` r2117 Linux x86-64 release instead matches this
+    /// fixture exactly. The gate accepts only those two measured profiles, so
+    /// a new timing or amplitude shape still fails rather than being hidden by
+    /// a general codec tolerance. `fsb5_opus_celt_tone_matches_vgmstream`
+    /// independently guards the CELT path.
     #[test]
     #[ignore = "requires the optional vgmstream-cli decoder oracle"]
     fn fsb5_opus_silk_tone_divergence_from_libopus_is_bounded() {
@@ -5176,10 +5177,11 @@ mod tests {
         const ALIGNMENT: isize = -2;
 
         let (worst, shift) = opus_divergence_from_vgmstream(OPUS_TONE, "silk");
-        assert_eq!(shift, ALIGNMENT, "SILK alignment moved to {shift}");
+        let exact_linux_profile = (worst, shift) == (0, 0);
+        let recorded_divergent_profile = shift == ALIGNMENT && worst <= WORST_DELTA;
         assert!(
-            worst <= WORST_DELTA,
-            "SILK divergence grew to {worst}, past the recorded {WORST_DELTA}"
+            exact_linux_profile || recorded_divergent_profile,
+            "SILK oracle profile changed to shift {shift}, worst {worst}; expected exact output or shift {ALIGNMENT} with worst <= {WORST_DELTA}"
         );
     }
 

@@ -208,13 +208,22 @@ suggestion, because until then neither had a test of any kind.
 
 ---
 
-## 3. `ruopus` 0.1.2 — SILK output is early and inexact
+## 3. `ruopus` 0.1.2 — SILK comparison has two measured profiles
 
 **Affects** FSB5 Opus decoding wherever the stream uses SILK or hybrid packets,
 which is what libopus selects at lower bitrates. CELT-only packets are correct.
 
 **Severity** the output arrives two samples early at wideband, four at
 narrowband, and differs by roughly 3% of peak once aligned.
+
+The repository's formal Linux x86-64 gate is a notable exception: the pinned
+`vgmstream` r2117 release and `ruopus` 0.1.2 produce identical PCM for the
+checked SILK/hybrid fixture (`offset = 0`, `worst = 0`). That result was
+independently reproduced in a Rust 1.88 Linux amd64 container. The earlier
+measurements below came from a different local oracle/build environment. The
+responsible build or platform difference has not yet been isolated, so the
+test accepts exactly those two measured profiles rather than applying a broad
+codec tolerance.
 
 ### What is wrong
 
@@ -246,8 +255,9 @@ pre-skip, and compare against `ffmpeg -i` on the same file. Repeat at a bitrate
 that selects CELT to see the difference disappear.
 
 In this repository, `fsb5_opus_silk_tone_divergence_from_libopus_is_bounded`
-pins the measurement and `fsb5_opus_celt_tone_matches_vgmstream` guards the half
-that is correct; both need `vgmstream-cli` and run under `--ignored`.
+pins the exact Linux profile or the bounded earlier profile, while
+`fsb5_opus_celt_tone_matches_vgmstream` independently guards the CELT path;
+both need `vgmstream-cli` and run under `--ignored`.
 
 ### Status
 
