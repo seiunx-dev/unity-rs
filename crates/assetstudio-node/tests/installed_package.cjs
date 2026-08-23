@@ -8,6 +8,8 @@ const { join, resolve } = require("node:path");
 
 const packageRoot = resolve(__dirname, "..");
 const temporaryRoot = mkdtempSync(join(tmpdir(), "assetstudio-node-packed-"));
+const npmCli = process.env.npm_execpath;
+assert.ok(npmCli, "npm_execpath is missing; run this check through npm test:package");
 const functionOwnProperties = new Set([
   "arguments",
   "caller",
@@ -79,8 +81,8 @@ try {
 
   const packed = JSON.parse(
     execFileSync(
-      "npm",
-      ["pack", "--json", "--pack-destination", tarballDirectory],
+      process.execPath,
+      [npmCli, "pack", "--json", "--pack-destination", tarballDirectory],
       { cwd: packageRoot, encoding: "utf8" },
     ),
   );
@@ -92,8 +94,9 @@ try {
     JSON.stringify({ name: "assetstudio-packed-consumer", private: true }),
   );
   execFileSync(
-    "npm",
+    process.execPath,
     [
+      npmCli,
       "install",
       "--offline",
       "--ignore-scripts",

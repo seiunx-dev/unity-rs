@@ -278,6 +278,7 @@ jobs:
         run: |
           curl -fsSL -o vgmstream.zip \
             https://github.com/vgmstream/vgmstream/releases/download/${{ env.VGMSTREAM_VERSION }}/vgmstream-linux.zip
+          mkdir -p "$HOME/.local/bin"
           unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/vgmstream-cli"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"

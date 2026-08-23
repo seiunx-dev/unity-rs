@@ -187,6 +187,15 @@ def validate_workflow(workflow: str) -> None:
             "python3 tools/test_delivery_scope.py",
         ),
     )
+    require_fragments(
+        job_block(workflow, "audio-oracle"),
+        "audio-oracle",
+        (
+            'mkdir -p "$HOME/.local/bin"',
+            'unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"',
+            "run: vgmstream-cli -h > /dev/null",
+        ),
+    )
 
 
 def validate_node_package(package_json: str) -> None:
