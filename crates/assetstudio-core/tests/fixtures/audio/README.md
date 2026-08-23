@@ -62,3 +62,17 @@ the path -- and its test pins the measurement rather than accepting it.
 
 Both replaced an all-zero fixture that compared framing only, which is how the
 divergence went unnoticed: two decoders agree on silence whatever they do.
+
+`opus-celt-6ch.ogg` is the reproducible multistream counterpart: six distinct
+330/440/550/660/770/880 Hz tones encoded as 5.1, 48 kHz, CELT-only Opus with
+mapping family 1, four streams, two coupled streams, and channel mapping
+`[0, 4, 1, 2, 3, 5]`. `fsb5-opus-celt-6ch.fsb` wraps those exact audio packets
+in FSB5's little-endian length framing and declares 5,760 post-pre-skip frames.
+The regular test proves that all six output channels are non-silent and
+distinct. The ignored oracle decodes the FSB through the Rust implementation
+and the original Ogg through pinned `vgmstream r2117`, compares the complete FSB
+output with the corresponding Ogg prefix, and observes a maximum PCM16 delta of
+four. Because the Ogg retains the authoritative OpusHead, this independently
+checks both self-delimited multistream packet parsing and Vorbis-to-WAVE channel
+ordering; it does not compare the Rust decoder with another header synthesized
+from the same FSB assumptions.

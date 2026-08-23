@@ -2,17 +2,17 @@
 //!
 //! This module handles existing RIFF/WAVE payloads, raw legacy PCM16, PCM
 //! streams stored in an FSB5 sample bank, FMOD/Xbox IMA-ADPCM, Nintendo
-//! DSP/GC-ADPCM, Sony VAG/PS-ADPCM and HEVAG, FMOD FADPCM, and mono/stereo
-//! MPEG Layer II/III, FSB5 Vorbis, and mono/stereo FSB5 Opus. Other FMOD
-//! codecs remain source-bound raw data until a verified pure-Rust decoder is
-//! available.
+//! DSP/GC-ADPCM, Sony VAG/PS-ADPCM and HEVAG, FMOD FADPCM, MPEG Layer II/III,
+//! FSB5 Vorbis, and FSB5 Opus through the standard eight-channel surround
+//! mapping. Other FMOD codecs remain source-bound raw data until a verified
+//! pure-Rust decoder is available.
 
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use lewton::audio::{PreviousWindowRight, get_decoded_sample_count, read_audio_packet};
 use lewton::header::{IdentHeader, SetupHeader, read_header_ident, read_header_setup};
-use ruopus::{OpusDecoder, Packet as OpusPacket};
+use ruopus::{MultistreamDecoder, Packet as OpusPacket};
 use symphonia::core::codecs::audio::well_known::{CODEC_ID_MP2, CODEC_ID_MP3};
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::packet::PacketRef;
@@ -33,7 +33,7 @@ const MAX_MPEG_STREAM_CHANNELS: usize = 2;
 const MAX_FSB5_MPEG_CHANNELS: usize = 16;
 const FSB5_OPUS_ENCODER_DELAY: u64 = 312;
 const MAX_OPUS_PACKET_BYTES: usize = 65_535;
-const MAX_OPUS_CHANNELS: u16 = 2;
+const MAX_OPUS_CHANNELS: u16 = 8;
 const FSB5_VORBIS_SHORT_BLOCK_EXPONENT: u8 = 8;
 const FSB5_VORBIS_LONG_BLOCK_EXPONENT: u8 = 11;
 const FSB5_VORBIS_MIN_PACKET_FRAMES: u64 = 128;
@@ -159,7 +159,7 @@ pub struct Fsb5MpegStream {
     pub layer: Fsb5MpegLayer,
 }
 
-/// A validated mono/stereo FSB5 Opus stream that decodes to PCM16.
+/// A validated FSB5 Opus stream that decodes to PCM16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fsb5OpusStream {
     pub data_offset: u64,
@@ -274,6 +274,19 @@ struct OpusScan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpusMultistreamLayout {
+    stream_count: usize,
+    coupled_count: usize,
+    /// Maps coded Opus channels into FMOD/WAVE speaker order.
+    mapping: &'static [u8],
+}
+
+struct OpusDecodeState {
+    decoder: MultistreamDecoder,
+    packet_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VorbisScan {
     compressed_length: u64,
     decoded_frames: u64,
@@ -300,7 +313,7 @@ pub enum DirectWavKind {
     Fsb5Fadpcm(Fsb5FadpcmStream),
     /// The first subsound uses MPEG Layer II/III and decodes to PCM16.
     Fsb5Mpeg(Fsb5MpegStream),
-    /// The first subsound uses mono/stereo Opus and decodes to PCM16.
+    /// The first subsound uses Opus and decodes to PCM16.
     Fsb5Opus(Fsb5OpusStream),
     /// The first subsound uses Vorbis and decodes to PCM16.
     Fsb5Vorbis(Fsb5VorbisStream),
@@ -717,11 +730,13 @@ pub fn parse_fsb5_mpeg(payload: &Region) -> Result<Option<Fsb5MpegStream>> {
     }))
 }
 
-/// Parses the first mono/stereo Opus subsound from an FSB5 bank.
+/// Parses the first Opus subsound from an FSB5 bank.
 ///
 /// FSB stores each raw Opus packet behind a little-endian 16-bit byte count.
 /// FMOD Opus banks use a fixed 48 kHz timeline and discard 312 encoder-delay
-/// frames before exposing the declared sample count.
+/// frames before exposing the declared sample count. More than two channels
+/// use the standard RFC 7845 family-1 surround mapping, which is fully defined
+/// for one through eight output channels.
 pub fn parse_fsb5_opus(payload: &Region) -> Result<Option<Fsb5OpusStream>> {
     if !has_magic(payload, *b"FSB5")? {
         return Ok(None);
@@ -738,8 +753,8 @@ pub fn parse_fsb5_opus(payload: &Region) -> Result<Option<Fsb5OpusStream>> {
     }
     if first.channels > MAX_OPUS_CHANNELS {
         return Err(Error::unsupported(format!(
-            "FSB5 Opus with {} channels requires a multistream mapping",
-            first.channels
+            "FSB5 Opus channel count {} is outside the verified 1..={MAX_OPUS_CHANNELS} standard surround range",
+            first.channels,
         )));
     }
     if first.sample_rate != 48_000 {
@@ -754,6 +769,7 @@ pub fn parse_fsb5_opus(payload: &Region) -> Result<Option<Fsb5OpusStream>> {
         first.available_data,
         first.frame_count,
         FSB5_OPUS_ENCODER_DELAY,
+        first.channels,
     )?;
     Ok(Some(Fsb5OpusStream {
         data_offset: first.data_offset,
@@ -2874,6 +2890,63 @@ fn validate_decoded_mpeg_spec(
     Ok(())
 }
 
+fn opus_multistream_layout(channels: u16) -> Result<OpusMultistreamLayout> {
+    // FSB omits the Ogg OpusHead but retains its output channel count. FMOD's
+    // multichannel packets use mapping family 1, whose stream/coupled counts
+    // and coded-channel table are fixed for 1..=8 channels (RFC 7845
+    // section 5.1.1.2). The tables below additionally apply FFmpeg's
+    // `ff_vorbis_channel_layout_offsets`, converting the RFC's Vorbis speaker
+    // order to the FMOD/WAVE order used by this writer and by vgmstream.
+    let layout = match channels {
+        1 => OpusMultistreamLayout {
+            stream_count: 1,
+            coupled_count: 0,
+            mapping: &[0],
+        },
+        2 => OpusMultistreamLayout {
+            stream_count: 1,
+            coupled_count: 1,
+            mapping: &[0, 1],
+        },
+        3 => OpusMultistreamLayout {
+            stream_count: 2,
+            coupled_count: 1,
+            mapping: &[0, 1, 2],
+        },
+        4 => OpusMultistreamLayout {
+            stream_count: 2,
+            coupled_count: 2,
+            mapping: &[0, 1, 2, 3],
+        },
+        5 => OpusMultistreamLayout {
+            stream_count: 3,
+            coupled_count: 2,
+            mapping: &[0, 1, 4, 2, 3],
+        },
+        6 => OpusMultistreamLayout {
+            stream_count: 4,
+            coupled_count: 2,
+            mapping: &[0, 1, 4, 5, 2, 3],
+        },
+        7 => OpusMultistreamLayout {
+            stream_count: 4,
+            coupled_count: 3,
+            mapping: &[0, 1, 4, 6, 5, 2, 3],
+        },
+        8 => OpusMultistreamLayout {
+            stream_count: 5,
+            coupled_count: 3,
+            mapping: &[0, 1, 6, 7, 4, 5, 2, 3],
+        },
+        _ => {
+            return Err(Error::unsupported(format!(
+                "FSB5 Opus channel count {channels} is outside the verified 1..={MAX_OPUS_CHANNELS} standard surround range"
+            )));
+        }
+    };
+    Ok(layout)
+}
+
 fn opus_wave_output_size(payload: &Region, stream: Fsb5OpusStream) -> Result<u64> {
     validate_opus_source(payload, stream)?;
     let data_length = stream
@@ -2894,11 +2967,7 @@ fn validate_opus_source(payload: &Region, stream: Fsb5OpusStream) -> Result<()> 
             "FSB5 Opus channels and frame count must be nonzero",
         ));
     }
-    if stream.channels > MAX_OPUS_CHANNELS {
-        return Err(Error::unsupported(
-            "FSB5 multistream Opus decoding is not implemented",
-        ));
-    }
+    let _ = opus_multistream_layout(stream.channels)?;
     if stream.sample_rate != 48_000 {
         return Err(Error::unsupported(
             "FSB5 Opus decoding is verified only for 48000 Hz streams",
@@ -2921,6 +2990,7 @@ fn validate_opus_source(payload: &Region, stream: Fsb5OpusStream) -> Result<()> 
         stream.data_length,
         stream.frame_count,
         stream.encoder_delay,
+        stream.channels,
     )?;
     if scan.compressed_length != stream.compressed_length {
         return Err(Error::invalid_data(
@@ -2936,6 +3006,7 @@ fn scan_opus_packets(
     data_length: u64,
     frame_count: u64,
     encoder_delay: u64,
+    channels: u16,
 ) -> Result<OpusScan> {
     let data_end = data_offset
         .checked_add(data_length)
@@ -2946,6 +3017,7 @@ fn scan_opus_packets(
     let required_frames = frame_count
         .checked_add(encoder_delay)
         .ok_or_else(|| Error::invalid_data("FSB5 Opus sample count overflowed"))?;
+    let layout = opus_multistream_layout(channels)?;
     let mut packet_bytes = opus_packet_buffer()?;
     let mut offset = data_offset;
     let mut decoded_frames = 0_u64;
@@ -2973,14 +3045,8 @@ fn scan_opus_packets(
             )));
         }
         payload.read_exact_at(offset, &mut packet_bytes[..packet_size])?;
-        let packet = OpusPacket::parse(&packet_bytes[..packet_size])
-            .map_err(|error| Error::invalid_data(format!("invalid FSB5 Opus packet: {error}")))?;
-        let packet_frames = packet
-            .toc()
-            .frame_size()
-            .samples_per_channel_48k()
-            .checked_mul(packet.frames().len())
-            .ok_or_else(|| Error::invalid_data("FSB5 Opus packet sample count overflowed"))?;
+        let packet_frames =
+            opus_multistream_packet_frames(&packet_bytes[..packet_size], layout.stream_count)?;
         decoded_frames = decoded_frames
             .checked_add(
                 u64::try_from(packet_frames).expect("bounded Opus packet frame count fits u64"),
@@ -2998,6 +3064,47 @@ fn scan_opus_packets(
         compressed_length: compressed_end - data_offset,
         decoded_frames,
     })
+}
+
+fn opus_multistream_packet_frames(data: &[u8], stream_count: usize) -> Result<usize> {
+    let mut remaining = data;
+    let mut packet_frames = None;
+    for stream_index in 0..stream_count {
+        let packet = if stream_index + 1 == stream_count {
+            OpusPacket::parse(remaining).map_err(|error| {
+                Error::invalid_data(format!(
+                    "invalid final stream in an FSB5 Opus packet: {error}"
+                ))
+            })?
+        } else {
+            let (packet, consumed) = OpusPacket::parse_self_delimited(remaining).map_err(
+                |error| {
+                    Error::invalid_data(format!(
+                        "invalid self-delimited stream {stream_index} in an FSB5 Opus packet: {error}"
+                    ))
+                },
+            )?;
+            remaining = remaining.get(consumed..).ok_or_else(|| {
+                Error::invalid_data("FSB5 Opus self-delimited packet range overflowed")
+            })?;
+            packet
+        };
+        let frames = packet
+            .toc()
+            .frame_size()
+            .samples_per_channel_48k()
+            .checked_mul(packet.frames().len())
+            .ok_or_else(|| Error::invalid_data("FSB5 Opus packet sample count overflowed"))?;
+        if packet_frames
+            .replace(frames)
+            .is_some_and(|expected| expected != frames)
+        {
+            return Err(Error::invalid_data(
+                "FSB5 Opus elementary streams have different packet durations",
+            ));
+        }
+    }
+    packet_frames.ok_or_else(|| Error::invalid_data("FSB5 Opus packet has no streams"))
 }
 
 fn opus_packet_buffer() -> Result<Vec<u8>> {
@@ -3042,6 +3149,9 @@ fn write_fsb5_opus_wav(
             "WAV output is {output_size} bytes, exceeding limit {maximum_output_bytes}"
         )));
     }
+    // Construct all fixed decoder state and the maximum packet buffer before
+    // publishing the WAV header. The codec output itself remains streamed.
+    let mut state = opus_decode_state(stream)?;
     let data_size = u32::try_from(output_size - WAV_HEADER_BYTES)
         .expect("Opus WAV output size validation bounded the data chunk");
     write_wav_header(
@@ -3052,17 +3162,33 @@ fn write_fsb5_opus_wav(
         stream.sample_rate,
         16,
     )?;
-    decode_fsb5_opus(payload, stream, output)?;
+    decode_fsb5_opus(payload, stream, &mut state, output)?;
     Ok(output_size)
+}
+
+fn opus_decode_state(stream: Fsb5OpusStream) -> Result<OpusDecodeState> {
+    let layout = opus_multistream_layout(stream.channels)?;
+    let decoder = catch_unwind(AssertUnwindSafe(|| {
+        MultistreamDecoder::with_rate(
+            stream.sample_rate,
+            layout.stream_count,
+            layout.coupled_count,
+            layout.mapping,
+        )
+    }))
+    .map_err(|_| Error::invalid_data("cannot construct the FSB5 Opus multistream decoder"))?;
+    Ok(OpusDecodeState {
+        decoder,
+        packet_bytes: opus_packet_buffer()?,
+    })
 }
 
 fn decode_fsb5_opus(
     payload: &Region,
     stream: Fsb5OpusStream,
+    state: &mut OpusDecodeState,
     output: &mut impl Write,
 ) -> Result<()> {
-    let mut decoder = OpusDecoder::new(usize::from(stream.channels));
-    let mut packet_bytes = opus_packet_buffer()?;
     let mut offset = stream.data_offset;
     let mut skip_frames = stream.encoder_delay;
     let mut remaining_frames = stream.frame_count;
@@ -3074,9 +3200,11 @@ fn decode_fsb5_opus(
                 "FSB5 Opus stream ended before its declared sample count",
             ));
         }
-        payload.read_exact_at(offset, &mut packet_bytes[..packet_size])?;
+        payload.read_exact_at(offset, &mut state.packet_bytes[..packet_size])?;
         let pcm_samples = catch_unwind(AssertUnwindSafe(|| {
-            decoder.decode_packet_i16(&packet_bytes[..packet_size])
+            state
+                .decoder
+                .decode_packet(&state.packet_bytes[..packet_size])
         }))
         .map_err(|_| Error::invalid_data("FSB5 Opus decoder panicked on a malformed packet"))?
         .map_err(|error| Error::invalid_data(format!("FSB5 Opus decode failed: {error}")))?;
@@ -3100,7 +3228,7 @@ fn decode_fsb5_opus(
         let sample_count = write_frames
             .checked_mul(channels)
             .ok_or_else(|| Error::invalid_data("FSB5 Opus PCM sample count overflowed"))?;
-        write_i16_le_samples(
+        write_opus_f32_as_pcm16(
             &pcm_samples[first_sample..first_sample + sample_count],
             output,
         )?;
@@ -3110,6 +3238,27 @@ fn decode_fsb5_opus(
             .ok_or_else(|| Error::invalid_data("FSB5 Opus packet offset overflowed"))?;
     }
     Ok(())
+}
+
+fn write_opus_f32_as_pcm16(samples: &[f32], output: &mut impl Write) -> Result<()> {
+    let mut bytes = [0_u8; 4096];
+    for chunk in samples.chunks(bytes.len() / 2) {
+        for (value, destination) in chunk.iter().zip(bytes.chunks_exact_mut(2)) {
+            destination.copy_from_slice(&opus_float_to_i16(*value).to_le_bytes());
+        }
+        output.write_all(&bytes[..chunk.len() * 2])?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn opus_float_to_i16(value: f32) -> i16 {
+    if value.is_nan() {
+        return 0;
+    }
+    (value * 32_768.0)
+        .clamp(f32::from(i16::MIN), f32::from(i16::MAX))
+        .round_ties_even() as i16
 }
 
 fn vorbis_wave_output_size(payload: &Region, stream: Fsb5VorbisStream) -> Result<u64> {
@@ -3407,17 +3556,6 @@ fn decode_fsb5_vorbis(
         offset = offset
             .checked_add(u64::try_from(packet_size).expect("u16 packet size fits u64"))
             .ok_or_else(|| Error::invalid_data("FSB5 Vorbis packet offset overflowed"))?;
-    }
-    Ok(())
-}
-
-fn write_i16_le_samples(samples: &[i16], output: &mut impl Write) -> Result<()> {
-    let mut bytes = [0_u8; 4096];
-    for chunk in samples.chunks(bytes.len() / 2) {
-        for (sample, destination) in chunk.iter().zip(bytes.chunks_exact_mut(2)) {
-            destination.copy_from_slice(&sample.to_le_bytes());
-        }
-        output.write_all(&bytes[..chunk.len() * 2])?;
     }
     Ok(())
 }
@@ -3735,6 +3873,7 @@ mod tests {
         parse_fsb5_vag, parse_fsb5_vorbis, parse_mpeg_frame_header, write_direct_wav,
     };
     use crate::source::Region;
+    use ruopus::Packet as OpusPacket;
 
     type SampleSpec = (u64, u16, u32, Option<(u16, u32)>);
 
@@ -4736,6 +4875,57 @@ mod tests {
     }
 
     #[test]
+    fn decodes_six_channel_multistream_fsb5_opus() {
+        let region = Region::from_bytes(OPUS_MULTISTREAM_CELT_FSB.to_vec());
+        let stream = parse_fsb5_opus(&region).unwrap().unwrap();
+        assert_eq!(stream.channels, 6);
+        assert_eq!(stream.sample_rate, 48_000);
+        assert_eq!(stream.frame_count, OPUS_MULTISTREAM_CELT_FRAMES);
+        assert_eq!(stream.encoder_delay, 312);
+
+        let expected_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
+        let mut wav = Vec::new();
+        assert_eq!(
+            write_direct_wav(
+                &region,
+                DirectWavKind::Fsb5Opus(stream),
+                expected_size,
+                &mut wav,
+            )
+            .unwrap(),
+            expected_size
+        );
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 6);
+        let pcm = wave_data(&wav);
+        assert_eq!(pcm.len(), usize::try_from(stream.frame_count).unwrap() * 12);
+
+        // Every source channel uses a different sine frequency. Distinct,
+        // nontrivial hashes ensure the multistream mapping did not duplicate,
+        // silence, or collapse channels while still producing the right size.
+        let mut hashes = [0xcbf2_9ce4_8422_2325_u64; 6];
+        let mut peaks = [0_i32; 6];
+        for frame in pcm.chunks_exact(12) {
+            for channel in 0..6 {
+                let bytes: [u8; 2] = frame[channel * 2..channel * 2 + 2].try_into().unwrap();
+                peaks[channel] = peaks[channel].max(i32::from(i16::from_le_bytes(bytes)).abs());
+                for byte in bytes {
+                    hashes[channel] ^= u64::from(byte);
+                    hashes[channel] = hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        assert!(
+            peaks.into_iter().all(|peak| peak > 100),
+            "decoded channel peaks are {peaks:?}"
+        );
+        for left in 0..hashes.len() {
+            for right in left + 1..hashes.len() {
+                assert_ne!(hashes[left], hashes[right], "channels {left} and {right}");
+            }
+        }
+    }
+
+    #[test]
     fn rejects_malformed_multistream_and_over_budget_fsb5_opus() {
         let fsb = Region::from_bytes(fsb5_opus(2, 2));
         let stream = parse_fsb5_opus(&fsb).unwrap().unwrap();
@@ -4759,7 +4949,33 @@ mod tests {
         assert!(write_direct_wav(&fsb, forged, output_size, &mut output).is_err());
         assert!(output.is_empty());
 
+        // A stereo elementary packet is not a valid six-channel multistream
+        // packet: the first three streams need self-delimited framing.
         assert!(parse_fsb5_opus(&Region::from_bytes(fsb5_opus(6, 2))).is_err());
+        assert!(parse_fsb5_opus(&Region::from_bytes(fsb5_opus(9, 2))).is_err());
+
+        let mut mismatched_duration = OPUS_MULTISTREAM_CELT_FSB.to_vec();
+        let valid = Region::from_bytes(mismatched_duration.clone());
+        let multistream = parse_fsb5_opus(&valid).unwrap().unwrap();
+        let packet_start = usize::try_from(multistream.data_offset).unwrap() + 2;
+        let packet_size = usize::from(u16::from_le_bytes(
+            mismatched_duration[packet_start - 2..packet_start]
+                .try_into()
+                .unwrap(),
+        ));
+        let packet_end = packet_start + packet_size;
+        let (_, first_stream_bytes) =
+            OpusPacket::parse_self_delimited(&mismatched_duration[packet_start..packet_end])
+                .unwrap();
+        // Keep the second stream's frame count and channel flag, but change
+        // its CELT configuration from 20 ms to 10 ms.
+        mismatched_duration[packet_start + first_stream_bytes] &= 0x07;
+        mismatched_duration[packet_start + first_stream_bytes] |= 30 << 3;
+        let error = parse_fsb5_opus(&Region::from_bytes(mismatched_duration)).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::InvalidData(message) if message.contains("different packet durations")
+        ));
         let wrong_rate = fsb5(1, 17, 0, &[(648, 1, 44_100, None)], &[2, 0, 3, 0]);
         assert!(parse_fsb5_opus(&Region::from_bytes(wrong_rate)).is_err());
         let malformed = fsb5(1, 17, 0, &[(648, 1, 48_000, None)], &[2, 0, 3, 0]);
@@ -5290,8 +5506,13 @@ mod tests {
     const OPUS_TONE: &[u8] = include_bytes!("../tests/fixtures/audio/opus-tone-packets.bin");
     const OPUS_TONE_CELT: &[u8] =
         include_bytes!("../tests/fixtures/audio/opus-tone-celt-packets.bin");
+    const OPUS_MULTISTREAM_CELT_FSB: &[u8] =
+        include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-6ch.fsb");
+    const OPUS_MULTISTREAM_CELT_OGG: &[u8] =
+        include_bytes!("../tests/fixtures/audio/opus-celt-6ch.ogg");
     /// Seven packets at 960 samples each, less the encoder delay FSB5 hides.
     const OPUS_TONE_FRAMES: u64 = 7 * 960 - 312;
+    const OPUS_MULTISTREAM_CELT_FRAMES: u64 = 5_760;
 
     /// How far either way the alignment search looks. The observed shifts are
     /// well inside this; the margin exists so a regression that moves further
@@ -5377,6 +5598,76 @@ mod tests {
         assert!(
             worst <= 1,
             "CELT divergence is {worst}, past the measured 1"
+        );
+    }
+
+    /// The FSB container omits the standard `OpusHead` mapping table. This
+    /// comparison decodes the exact same multistream packets through the Rust
+    /// FSB path and through vgmstream's Ogg/libopus path, where the original
+    /// family-1 header remains present. Comparing every channel catches both a
+    /// packet-framing mistake and a Vorbis-to-WAVE channel-order mistake.
+    #[test]
+    #[ignore = "requires the optional vgmstream-cli decoder oracle"]
+    fn fsb5_multistream_opus_celt_matches_vgmstream_ogg_oracle() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let region = Region::from_bytes(OPUS_MULTISTREAM_CELT_FSB.to_vec());
+        let kind = detect_direct_wav(&region, Some(16)).unwrap().unwrap();
+        let mut actual = Vec::new();
+        write_direct_wav(&region, kind, 1024 * 1024, &mut actual).unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let input = std::env::temp_dir().join(format!(
+            "assetstudio-fsb5-opus-multistream-{}-{unique}.ogg",
+            std::process::id()
+        ));
+        let output = input.with_extension("wav");
+        std::fs::write(&input, OPUS_MULTISTREAM_CELT_OGG).unwrap();
+        let status = Command::new("vgmstream-cli")
+            .arg("-o")
+            .arg(&output)
+            .arg(&input)
+            .status()
+            .expect("vgmstream-cli must be installed to run this ignored oracle test");
+        assert!(status.success());
+        let expected = std::fs::read(&output).unwrap();
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_file(output).unwrap();
+
+        let rust = wave_data(&actual);
+        let oracle = wave_data(&expected);
+        // Ogg preserves an encoder-tail granule after the original 0.12-second
+        // signal. FSB's declared frame count trims that tail, so its complete
+        // output must equal the corresponding prefix of the oracle.
+        assert!(oracle.len() >= rust.len());
+        let oracle = &oracle[..rust.len()];
+        assert!(oracle.chunks_exact(2).any(|sample| {
+            i16::from_le_bytes(sample.try_into().unwrap()).unsigned_abs() > 1_000
+        }));
+        let mut worst = (0_i32, 0_usize, 0_i32, 0_i32);
+        for (index, (rust, oracle)) in rust.chunks_exact(2).zip(oracle.chunks_exact(2)).enumerate()
+        {
+            let rust = i32::from(i16::from_le_bytes(rust.try_into().unwrap()));
+            let oracle = i32::from(i16::from_le_bytes(oracle.try_into().unwrap()));
+            let difference = (rust - oracle).abs();
+            if difference > worst.0 {
+                worst = (difference, index, rust, oracle);
+            }
+        }
+        // With these exact packets the four independently rounded elementary
+        // decoder paths differ from libopus by at most four PCM16 units. This
+        // is the measured fixture bound, not a general codec tolerance.
+        assert!(
+            worst.0 <= 4,
+            "multistream Opus worst sample {}: {} vs {} (difference {})",
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.0
         );
     }
 
