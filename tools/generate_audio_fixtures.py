@@ -61,6 +61,9 @@ MPEG_NAME = "mpeg-layer3-tone.mp3"
 MPEG_TONE = "sine=frequency=440:sample_rate=44100:duration=0.3"
 MPEG_MULTISTREAM_NAME = "fsb5-mpeg-layer3-6ch.fsb"
 MPEG_MULTISTREAM_PAIRS = ((330, 440), (550, 660), (770, 880))
+OPUS_MULTISTREAM_FSB_NAME = "fsb5-opus-celt-6ch.fsb"
+OPUS_MULTISTREAM_OGG_NAME = "opus-celt-6ch.ogg"
+OPUS_MULTISTREAM_FREQUENCIES = (330, 440, 550, 660, 770, 880)
 
 
 def run(command: list[str]) -> None:
@@ -88,6 +91,25 @@ def ogg_packets(path: Path) -> list[bytes]:
                 partial = b""
         offset = body
     return packets
+
+
+def ogg_last_granule(path: Path) -> int:
+    """Returns the final non-sentinel Ogg granule position."""
+    data = path.read_bytes()
+    granule = None
+    offset = 0
+    while offset < len(data):
+        if data[offset : offset + 4] != b"OggS":
+            raise ValueError(f"not an Ogg page at offset {offset}")
+        segment_count = data[offset + 26]
+        segments = data[offset + 27 : offset + 27 + segment_count]
+        page_granule = int.from_bytes(data[offset + 6 : offset + 14], "little")
+        if page_granule != (1 << 64) - 1:
+            granule = page_granule
+        offset += 27 + segment_count + sum(segments)
+    if granule is None:
+        raise ValueError("Ogg stream has no granule position")
+    return granule
 
 
 def generate_opus(name: str, options: list[str], work: Path) -> None:
@@ -224,6 +246,68 @@ def generate_multistream_mpeg(work: Path) -> None:
     )
 
 
+def generate_multistream_opus(work: Path) -> None:
+    """Builds a six-channel FSB5 from a standard family-1 Opus stream."""
+    ogg = work / OPUS_MULTISTREAM_OGG_NAME
+    command = ["ffmpeg", "-v", "error", "-y"]
+    for frequency in OPUS_MULTISTREAM_FREQUENCIES:
+        command.extend(
+            [
+                "-f", "lavfi", "-i",
+                f"sine=frequency={frequency}:sample_rate=48000:duration={OPUS_DURATION}",
+            ]
+        )
+    inputs = "".join(f"[{index}:a]" for index in range(6))
+    command.extend(
+        [
+            "-filter_complex", f"{inputs}amerge=inputs=6[a]",
+            "-map", "[a]", "-ac", "6", "-channel_layout", "5.1",
+            "-c:a", "libopus", "-mapping_family", "1",
+            "-application", "audio", "-b:a", "384k", "-vbr", "off",
+            "-frame_duration", "20", str(ogg),
+        ]
+    )
+    run(command)
+    packets = ogg_packets(ogg)
+    head, audio = packets[0], packets[2:]
+    expected_mapping = bytes((0, 4, 1, 2, 3, 5))
+    if (
+        not head.startswith(b"OpusHead")
+        or len(head) != 27
+        or head[9] != 6
+        or head[18] != 1
+        or head[19] != 4
+        or head[20] != 2
+        or head[21:] != expected_mapping
+    ):
+        raise ValueError("unexpected six-channel Opus mapping-family-1 header")
+    pre_skip = int.from_bytes(head[10:12], "little")
+    if pre_skip != 312:
+        raise ValueError(f"six-channel Opus pre-skip is {pre_skip}, expected 312")
+    frame_count = ogg_last_granule(ogg) - pre_skip
+    if frame_count <= 0:
+        raise ValueError("six-channel Opus stream has no post-skip frames")
+
+    data = b"".join(len(packet).to_bytes(2, "little") + packet for packet in audio)
+    data += b"\0\0"
+    header = bytearray(0x3C)
+    header[:4] = b"FSB5"
+    header[4:8] = (1).to_bytes(4, "little")
+    header[8:12] = (1).to_bytes(4, "little")
+    header[12:16] = (8).to_bytes(4, "little")
+    header[20:24] = len(data).to_bytes(4, "little")
+    header[24:28] = (17).to_bytes(4, "little")
+    # Compact channel code 2 is six channels; rate code 9 is 48 kHz.
+    sample_mode = (frame_count << 34) | (2 << 5) | (9 << 1)
+    fsb = header + sample_mode.to_bytes(8, "little") + data
+    (FIXTURES / OPUS_MULTISTREAM_FSB_NAME).write_bytes(fsb)
+    (FIXTURES / OPUS_MULTISTREAM_OGG_NAME).write_bytes(ogg.read_bytes())
+    print(
+        f"wrote {OPUS_MULTISTREAM_FSB_NAME} and {OPUS_MULTISTREAM_OGG_NAME}: "
+        f"{len(audio)} packets, {frame_count} frames"
+    )
+
+
 def main() -> None:
     for tool in ("ffmpeg", "lame"):
         if subprocess.run(["which", tool], capture_output=True).returncode != 0:
@@ -234,6 +318,7 @@ def main() -> None:
             generate_opus(name, options, work)
         generate_mpeg(work)
         generate_multistream_mpeg(work)
+        generate_multistream_opus(work)
 
 
 if __name__ == "__main__":
