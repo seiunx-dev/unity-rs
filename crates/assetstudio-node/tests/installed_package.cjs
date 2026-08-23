@@ -7,9 +7,6 @@ const { tmpdir } = require("node:os");
 const { join, resolve } = require("node:path");
 
 const packageRoot = resolve(__dirname, "..");
-const temporaryRoot = mkdtempSync(join(tmpdir(), "assetstudio-node-packed-"));
-const npmCli = process.env.npm_execpath;
-assert.ok(npmCli, "npm_execpath is missing; run this check through npm test:package");
 const functionOwnProperties = new Set([
   "arguments",
   "caller",
@@ -73,51 +70,12 @@ function assertAssetStudioSurface(assetStudio, declaration, checkCounts = true) 
   }
 }
 
-try {
-  const tarballDirectory = join(temporaryRoot, "tarball");
-  const consumerDirectory = join(temporaryRoot, "consumer");
-  mkdirSync(tarballDirectory);
-  mkdirSync(consumerDirectory);
-
-  const packed = JSON.parse(
-    execFileSync(
-      process.execPath,
-      [npmCli, "pack", "--json", "--pack-destination", tarballDirectory],
-      { cwd: packageRoot, encoding: "utf8" },
-    ),
-  );
-  assert.equal(packed.length, 1, packed);
-  const tarball = join(tarballDirectory, packed[0].filename);
-
-  writeFileSync(
-    join(consumerDirectory, "package.json"),
-    JSON.stringify({ name: "assetstudio-packed-consumer", private: true }),
-  );
-  execFileSync(
-    process.execPath,
-    [
-      npmCli,
-      "install",
-      "--offline",
-      "--ignore-scripts",
-      "--no-audit",
-      "--no-fund",
-      "--no-package-lock",
-      tarball,
-    ],
-    { cwd: consumerDirectory, stdio: "pipe" },
-  );
-
-  const installedRoot = join(
-    consumerDirectory,
-    "node_modules",
-    "assetstudio-rs-node",
-  );
+function verifyInstalledPackage(installedRoot, expectedVersion) {
   const installedPackage = JSON.parse(
     readFileSync(join(installedRoot, "package.json"), "utf8"),
   );
   assert.equal(installedPackage.name, "assetstudio-rs-node");
-  assert.equal(installedPackage.version, packed[0].version);
+  assert.equal(installedPackage.version, expectedVersion);
 
   const addon = require(installedRoot);
   assert.deepEqual(Object.keys(addon), ["AssetStudio"]);
@@ -136,8 +94,65 @@ try {
     () => assertAssetStudioSurface(addon.AssetStudio, alteredDeclaration, false),
     assert.AssertionError,
   );
-} finally {
-  rmSync(temporaryRoot, { recursive: true, force: true });
 }
 
-console.log("installed Node tarball loads the exact AssetStudio runtime surface");
+if (process.argv[2] === "--verify-installed") {
+  verifyInstalledPackage(process.argv[3], process.argv[4]);
+} else {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "assetstudio-node-packed-"));
+  const npmCli = process.env.npm_execpath;
+  assert.ok(npmCli, "npm_execpath is missing; run this check through npm test:package");
+  try {
+    const tarballDirectory = join(temporaryRoot, "tarball");
+    const consumerDirectory = join(temporaryRoot, "consumer");
+    mkdirSync(tarballDirectory);
+    mkdirSync(consumerDirectory);
+
+    const packed = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [npmCli, "pack", "--json", "--pack-destination", tarballDirectory],
+        { cwd: packageRoot, encoding: "utf8" },
+      ),
+    );
+    assert.equal(packed.length, 1, packed);
+    const tarball = join(tarballDirectory, packed[0].filename);
+
+    writeFileSync(
+      join(consumerDirectory, "package.json"),
+      JSON.stringify({ name: "assetstudio-packed-consumer", private: true }),
+    );
+    execFileSync(
+      process.execPath,
+      [
+        npmCli,
+        "install",
+        "--offline",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--no-package-lock",
+        tarball,
+      ],
+      { cwd: consumerDirectory, stdio: "pipe" },
+    );
+
+    const installedRoot = join(
+      consumerDirectory,
+      "node_modules",
+      "assetstudio-rs-node",
+    );
+    // Load the native addon in a child process. Windows keeps a loaded `.node`
+    // DLL locked until its process exits, so loading it here would make the
+    // package cleanup fail even though every package assertion had succeeded.
+    execFileSync(
+      process.execPath,
+      [__filename, "--verify-installed", installedRoot, packed[0].version],
+      { encoding: "utf8", stdio: "pipe" },
+    );
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+
+  console.log("installed Node tarball loads the exact AssetStudio runtime surface");
+}

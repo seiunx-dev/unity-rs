@@ -142,6 +142,16 @@ class CiMatrixAuditTests(unittest.TestCase):
         with self.assertRaises(check_ci_matrix.AuditError):
             check_ci_matrix.validate_workflow(altered)
 
+    def test_vgmstream_smoke_checks_its_documented_info_status(self) -> None:
+        altered = self.workflow.replace(
+            "assert result.returncode == 1, result; ",
+            "",
+            1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
     def test_missing_installed_node_tarball_test_is_rejected(self) -> None:
         package_json = check_ci_matrix.NODE_PACKAGE.read_text(encoding="utf-8")
         altered = package_json.replace(

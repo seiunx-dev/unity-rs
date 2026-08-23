@@ -193,7 +193,8 @@ def validate_workflow(workflow: str) -> None:
         (
             'mkdir -p "$HOME/.local/bin"',
             'unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"',
-            "run: vgmstream-cli -h > /dev/null",
+            "result.returncode == 1",
+            "json.loads(result.stdout)['version'] == os.environ['VGMSTREAM_VERSION']",
         ),
     )
 
