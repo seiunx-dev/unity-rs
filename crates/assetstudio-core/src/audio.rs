@@ -5170,18 +5170,25 @@ mod tests {
     /// a new timing or amplitude shape still fails rather than being hidden by
     /// a general codec tolerance. `fsb5_opus_celt_tone_matches_vgmstream`
     /// independently guards the CELT path.
+    fn is_measured_silk_oracle_profile(worst: i32, shift: isize) -> bool {
+        matches!((worst, shift), (0, 0) | (276, -2))
+    }
+
+    #[test]
+    fn silk_oracle_gate_accepts_only_measured_profiles() {
+        assert!(is_measured_silk_oracle_profile(0, 0));
+        assert!(is_measured_silk_oracle_profile(276, -2));
+        assert!(!is_measured_silk_oracle_profile(275, -2));
+        assert!(!is_measured_silk_oracle_profile(276, 0));
+    }
+
     #[test]
     #[ignore = "requires the optional vgmstream-cli decoder oracle"]
     fn fsb5_opus_silk_tone_divergence_from_libopus_is_bounded() {
-        const WORST_DELTA: i32 = 276;
-        const ALIGNMENT: isize = -2;
-
         let (worst, shift) = opus_divergence_from_vgmstream(OPUS_TONE, "silk");
-        let exact_linux_profile = (worst, shift) == (0, 0);
-        let recorded_divergent_profile = shift == ALIGNMENT && worst <= WORST_DELTA;
         assert!(
-            exact_linux_profile || recorded_divergent_profile,
-            "SILK oracle profile changed to shift {shift}, worst {worst}; expected exact output or shift {ALIGNMENT} with worst <= {WORST_DELTA}"
+            is_measured_silk_oracle_profile(worst, shift),
+            "SILK oracle profile changed to shift {shift}, worst {worst}; expected exact output (0, 0) or the measured divergent profile (-2, 276)"
         );
     }
 
