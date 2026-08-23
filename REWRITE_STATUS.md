@@ -1,6 +1,6 @@
 # AssetStudio Rust 重写进度与缺口
 
-最后更新：2026-08-16
+最后更新：2026-08-23
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -18,7 +18,7 @@
 - WinForms 或其他 GUI；
 - 旧版自定义 C ABI 的兼容、发布或语义复刻。
 
-托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `ASSETSTUDIO_REPO` 或同级目录定位它。旧 `assetstudio-ffi` 源码已排除在 Cargo workspace 之外。
+托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `ASSETSTUDIO_REPO` 或同级目录定位它。旧 `assetstudio-ffi`/context handle 源码已从仓库删除，不再只是排除在 Cargo workspace 之外。
 
 ## 当前阶段
 
@@ -29,10 +29,13 @@
 | Rust Core | Beta，主流程可用 | 主要容器、SerializedFile、常见资产、场景、动画和导出链路已实现；长尾格式继续补齐 |
 | Python | Beta，主要目标接口 | 直接绑定 Core，覆盖加载、枚举、资源读取、主要资产读取、FBX、Live2D、导出和解包 |
 | CLI | Beta | inspect/info/list/scene、export/extract、FBX、Animator/SplitObjects、Live2D 已接入 |
-| Node.js | 可选 Beta | 同步与 Promise worker API 已覆盖加载、枚举及主要读取路径；保留 `scene(maximumGameObjects?)`，并通过 `sceneWithLimits` 暴露与 Core/Python 相同的六类场景预算；加载选项（Unity 版本、UnityCN 密钥、失败容忍策略、输入上限）可组合传入，Live2D 包连同 diagnostics 一起返回，并可直接读取 pose/display-info、标准与调用方解码的 Tuanjie ACL AnimationClip motion，模型导出（场景 OBJ 与带贴图的 FBX）与 Python 等价 |
+| Node.js | 可选 Beta | 同步与 Promise worker API 已覆盖加载、枚举及主要读取路径；保留 `scene(maximumGameObjects?)`，并通过 `sceneWithLimits` 暴露与 Core/Python 相同的六类场景预算；路径与单/多内存输入都可组合传入加载选项（Unity 版本、UnityCN 密钥、失败容忍策略、输入上限），Live2D 包连同 diagnostics 一起返回，外部 schema 可恢复 stripped 包，Promise worker 可在同一次调用中再注入 Tuanjie ACL decoder；模型导出（场景 OBJ 与带贴图的 FBX）与 Python 等价；Core→Node 映射、Rust addon、生成声明和严格 TypeScript 消费均有机器审计 |
 | .NET 运行时退役 | 尚未完成 | 公开 Rust/Python/Node 不依赖 .NET；C# 仍用于差分 oracle 和格式核验 |
 
 这些状态是风险分级，不是按代码行数计算的完成百分比。
+Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classifier；安装后门禁同时
+拒绝旧 Alpha classifier，避免代码、文档与包索引显示不同成熟度。Python 本地开发与发布
+命令也已改用独立仓库根下的 `crates/assetstudio-python`，不再引用迁仓前的 `rust/` 前缀。
 
 ## 已完成能力
 
@@ -43,6 +46,13 @@
 - UnityWeb/UnityRaw v1-v6、UnityWebData/TuanjieWebData；
 - gzip、Brotli、ZIP Stored/Deflate；
 - `.split0`...`.splitN` 惰性拼接、递归容器发现、外部资源和跨文件 PPtr；
+- 根输入标签和递归发现路径现分别受单路径与累计 UTF-8 字节预算约束，默认与既有
+  Python/Node 内存输入契约一致为 1 MiB/64 MiB；Bundle/WebData/ZIP 会继承调用方更低的
+  路径上限，gzip/Brotli 复用原路径不重复计费。嵌套路径按精确长度先检查并
+  `try_reserve_exact`，反斜杠在写入最终缓冲时直接规范化，不再先 `replace` 出一份中间
+  String；文件系统根路径中的无效 Unicode 也先流式计算 replacement 后的精确 UTF-8
+  长度、通过单项/累计预算后才分配 `LoadPath`。Python 三个加载入口和 Node
+  `OpenOptions` 均可收紧这两项；
 - UnityCN 加密包检测与调用方密钥解密（无密钥时明确拒绝），以及 UnityArchive 签名识别后的明确拒绝；
 - Oodle 通过调用方注入的精确长度安全 decoder 接口接入，Core 不链接或分发专有库；
 - Unity 版本解析对齐托管优先级：调用方显式版本 > 仅在 format < 7 时生效的 bundle revision > 文件自身声明；文件版本被 strip 且无覆盖时回退 bundle revision（相对 C# 硬抛的有意偏离，已记录）；
@@ -60,18 +70,71 @@
 - AnimationClip、AnimatorController、Avatar、动画绑定图；
 - 通用层级 ASCII/Binary FBX 7.4，覆盖普通/蒙皮网格、材质与贴图、骨骼、静态 blend shape 和已验证动画采样；
 - Live2D MOC、model3、纹理 PNG、expression、motion、physics、pose、display-info 和参数组；
-- 有界递归解包，以及拒绝符号链接、同目录临时文件和原子发布的安全导出。
+- 有界递归解包，以及拒绝符号链接、同目录临时文件和原子发布的安全导出；文件系统
+  名称中的非 UTF-8 数据按 Unix 字节或 Windows UTF-16 的现有 replacement 语义流式清洗，
+  不再先物化完整 `to_string_lossy` 临时字符串。replacement 后的诊断标签长度先计入单项和
+  累计路径预算再精确分配，输出组件则在逐字符清洗时直接执行 240 字节便携上限。
 
 ### 公开 API 和发布
 
 - Rust 高层 `Studio` API 可直接从路径、单个内存区域或多文件内存集合加载；
+- Rust 高层 `Studio` 的整场景 OBJ/MTL 现与 FBX、单 Mesh OBJ 和 TypeTree 文本一样，通过有界 writer 与 `try_reserve` 物化；材质库名的拥有型副本也使用可失败分配。Python 与 Node 直接复用这条 Core 路径，不再先写入不可失败增长的普通 `Vec`；
+- binary FBX 的高层场景投影会在构造几何、蒙皮、形变、动画和 Connections 数组前检查长度并执行可失败分配，输出预算随后在编码器每个内部缓冲增长前生效，不再先完整物化后比较长度；数值数组直接流入 zlib，不再额外复制一份完整未压缩字节。低层 `FbxBinaryWriteLimits` 另在递归编码前限制最终输出、节点、属性、非空深度和单数组元素；旧 `write_fbx_binary`/`read_fbx_binary` 保持兼容并包装默认预算，显式 limits 失败不会向调用方 writer 留半个文件。公开属性层覆盖 FBX 7.4 的全部标准 scalar/array code，含 raw 与 deflated `b` 布尔数组以及非零字节为 `true` 的读取语义。独立 verifier 现在真正执行输入、节点、属性、非空深度、单数组元素和累计展开工作预算；文件读取本身封顶为 `maximum_input_bytes + 1`，不会先由 `Path.read_bytes()` 无界物化后才检查。压缩数组以 64 KiB 有界块实际解压，只接受声明长度精确相等的单个完整 zlib member，并拒绝截断、额外输出和压缩流尾随字节；所有 offset 使用 checked arithmetic，并完整验证 footer ID、1–16 字节 padding、重复版本、保留区、结尾 magic 与文件精确结束位置；恶意超大 count、解压炸弹、过深树、提前 null terminator、损坏/truncated/trailing footer 和精确输出上限均有回归；
+- 原生 CLI 的 Live2D/FBX 候选、输出名称、便携大小写键和只读统计表同样使用可失败分配；`info`/`list`/`inspect` 先在有界增长的哈希表中计数，再按键排序后输出，既不依赖哈希随机顺序，也不为每段转义文本额外物化一个 `String`；
+- CLI `inspect` 的独立目录扫描按 replacement 后的 UTF-8 长度执行与 Loader 相同的单路径和
+  累计路径预算；失败文件名直接逐字符 replacement 并 `escape_default` 写入输出流，不再先
+  完整构造 lossy 路径再转义；成功根路径和递归 gzip/ZIP 标签也通过组合式 `Display` 直接
+  写入，不再为每层 `display().to_string()` 或 `format!` 复制完整前缀；
 - Python 提供惰性/分页枚举、资源读取、主要专用 reader、schema/ACL/Oodle 适配器、导出和解包；`SceneLimits` 可独立收紧 GameObject、组件、Transform 子项、材质、骨骼和层级边预算；Core 的 I/O、无效数据和未支持功能分别保留为标准 `OSError` 子类、`ValueError` 和 `NotImplementedError`，所有 Rust→Python 字节复制以及可能很大的场景、候选、图片层和报告转换都使用可失败分配，并以 `MemoryError` 报告内存不足；
 - Python wheel 使用 `cp39-abi3`，CI 构建 Linux、Windows、macOS 的 x86-64/ARM64 组合，并在构建解释器和 Python 3.14 上安装测试；
 - Python sdist 会被重新构建成 wheel 并执行完整 API 测试；
-- Node 提供本地模块、TypeScript 声明、同步 API 和 libuv worker Promise API；旧的 `scene(maximumGameObjects?)` 调用保持兼容，`sceneWithLimits` 可分别限制 GameObject、组件、Transform 子项、材质、骨骼和层级边；
+- `AssetCollection` 的 SerializedFile/资源表通过只读 slice 公开；低层调用方以
+  `into_parts` 无克隆地取回无索引的拥有型文件/资源/诊断表，修改后用 `from_parts` 重建，
+  再显式建立引用/资源索引或解析对象元数据。外部安全 Rust 代码不能在索引建立后直接改
+  PathID、换序或插入同名资源，因此不会让首匹配语义与缓存表静默分叉；编译失败 rustdoc
+  回归锁定这条边界，parts 往返回归则锁定诊断保留、派生 metadata/index 丢弃和重建；
+- 旧 `assetstudio-ffi` 已于 2026-08-23 从仓库删除，而不是继续作为 excluded crate 保留；
+  root workspace 不再需要 `exclude` 例外，本地遗留的独立 target/Cargo.lock/dylib 缓存也已清理。
+  Rust 公开 `Studio`、Python stub 与 Node 声明本来已经直接持有高层对象、没有 context handle；
+  交付范围门禁现在同时拒绝旧 FFI 源文件和 `StudioContext`/`context_id`/`contextId` 回流，
+  反向自测逐个恢复两份旧源码路径并污染三类公开面，均必须失败。内部 parser/动画/FBX 的
+  私有 `*Context` 仍保留，因为它们是有生命周期的借用状态，不是用户 API 或数字 handle。
+  此外，原先为了让绑定共享文件系统路径转换而从 Core 根部隐藏导出的两个
+  `#[doc(hidden)] pub` helper 也已移除；doc-hidden 符号仍属于 Rust semver 公共面，不能作为
+  绑定内部接口。Core walker 现为 `pub(crate)`，Python 和 Node 各自保留私有两趟实现，并
+  分别维持 `MemoryError` 与 napi 错误分类；交付范围门禁会阻止这两个 helper 名称重新从
+  Core 根部导出。
+  整个 `crates/assetstudio-ffi` 路径（包括仅含 ignored cache 的空壳）、root `Cargo.toml` 与
+  `.gitignore` 都不得保留旧 crate；全部 Core、
+  Python 与 Node Rust 源文件还会扫描公开声明，避免非根模块重新引入 `pub *Context`。
+  每个 workspace package 的生产 target 还必须精确等于 Core lib、CLI bin、Python cdylib 或
+  Node cdylib；在现有 package 里偷加第二个 GUI/bin target 不再能绕过包名检查。全部第一方
+  Rust 源同时拒绝 `no_mangle`/`export_name` 和公开 C/system ABI 函数；内部受控 codec
+  adapter 仍可声明调用方函数指针，但不能重新发布一套自定义 C ABI。交付范围反向测试
+  8/8、CI 结构反向测试 13/13 通过；删除及 helper 私有化后重新执行完整
+  `outputs quality rust python node typing security cross` 与 Linux amd64/arm64 原生矩阵，
+  Core/CLI、release CLI、Python wheel 和 Node addon/npm 全部通过且零组跳过。Python
+  安装后公开面本就双向核对 `__all__` 与 stub；Node addon 另新增精确顶层导出断言，当前
+  `Object.keys` 必须恰为 `AssetStudio`，不能静默多出未声明的 `Context` runtime class；
+  Python/Node 的 `cdylib` 仍会由 PyO3/napi 生成各自宿主规定的模块入口，这是两种语言加载
+  native extension 所必需的 ABI，不是本项目另行设计、发布或承诺兼容的 C API/context；
+- Node 提供本地模块、TypeScript 声明、同步 API 和 libuv worker Promise API；`readAudioClip` 与 Core/Python 共用 `auto`/`raw`/`wav` 策略和输出预算，旧的 raw-only `readAudio` 继续兼容；`exportWithOptions` 完整暴露 Core 的模式、命名、图片/音频、JSON、覆盖和全部单项/累计预算，旧的紧凑 export 调用继续兼容；Tuanjie ACL decoder 可通过 worker 注入整场景 ASCII/binary FBX、选定 GameObject FBX、Cubism motion 和完整 Live2D 包，完整包调用还能同时消费可信外部 schema；旧的 `scene(maximumGameObjects?)` 调用保持兼容，`sceneWithLimits` 可分别限制 GameObject、组件、Transform 子项、材质、骨骼和层级边；
+- Node tarball 门禁不再只数 `.node` 文件个数：它按当前 CI 平台精确要求
+  `darwin-{x64,arm64}`、`linux-{x64,arm64}-gnu` 或 `win32-{x64,arm64}-msvc` 文件名，随后
+  真正 `npm pack`、在临时消费者中离线安装该 `.tgz`，再从安装目录 `require()` 并断言运行时
+  顶层导出恰为 `AssetStudio`。安装后的 `index.d.ts` 还会被重新解析，并与安装后的 native
+  class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 84 个方法与 3 个
+  属性，另以保持数量不变的重命名反向测试证明不是只数成员。源码树能加载但发布包漏文件、
+  声明/运行时漂移或带错架构时都会直接失败。macOS
+  arm64 debug/release 与 Linux amd64/arm64 release 容器已实际通过，Windows 两架构留给正式
+  runner 验证；
+- 原生 CLI 发布任务会先把二进制、`LICENSE`、第三方 notices 与完整许可证集合 stage 到最终
+  上传目录，再执行该目录中的 `assetstudio[.exe] --help`；不再只运行构建目录原件后假定复制品
+  等价。矩阵审计同时锁定六个平台的 staged 路径和 stage-before-smoke 顺序，本地临时 artifact
+  与 Linux amd64/arm64 容器也执行同一份复制后的二进制；
 - Rust Core crate、Python wheel/sdist、Node 包和原生 CLI 都有独立发布校验。
 - 四类发布产物都携带项目 `LICENSE`、第三方归属摘要和由锁定依赖图生成的完整许可证文本；生成器当前覆盖 97 个非开发依赖，遇到缺少许可证文件、依赖更新或分发副本漂移会直接失败。
-- 交付范围由 `tools/check_delivery_scope.py` 与各产物内容检查共同锁定：workspace 只能包含 Core、CLI、Python 和可选 Node，三个前端必须直接依赖 Core；发布 crate、wheel/sdist 与 npm 包拒绝 GUI、旧 `assetstudio-ffi` 和 C# 工程文件。托管 oracle 仍可作为仓库测试输入存在，但不会进入运行时依赖或二进制交付面。
+- 交付范围由 `tools/check_delivery_scope.py` 与各产物内容检查共同锁定：workspace 只能包含 Core、CLI、Python 和可选 Node，三个前端必须直接依赖 Core；仓库不得重新出现旧 `assetstudio-ffi` 源文件，Rust `Studio`、Python stub 与 Node 声明不得公开 `Context`/`context_id` handle；发布 crate、wheel/sdist 与 npm 包拒绝 GUI、旧 FFI 和 C# 工程文件。托管 oracle 仍可作为仓库测试输入存在，但不会进入运行时依赖或二进制交付面。
 
 ## 当前验证证据
 
@@ -85,11 +148,580 @@
   独立测试可执行文件运行；那条路径绕过 Python loader，因而没有
   `Python3.framework` 的运行时 rpath。wheel 安装后的公开面和完整 API
   测试由下方独立 Python 门禁负责；
+- **当前工作树的 14 个本地验收分组已于 2026-08-23 全部实跑通过、零跳过**：先执行
+  `outputs quality rust python node typing security cross` 与 `linux`，覆盖格式/声明/API/
+  六平台矩阵/交付范围审计、Clippy、rustdoc、workspace、RustSec、输出格式、Windows/Linux
+  交叉编译、CLI/Python/Node 发布包，以及 Linux amd64/arm64 原生运行；再执行
+  `cli-package oracle audio python314 unitypy`，覆盖独立 release CLI staging、.NET 托管差分、
+  MonoBehaviour schema 生成器、vgmstream 音频差分、Python 3.14 abi3 和 UnityPy 第三实现差分。
+  UnityPy 组使用本机已有 UnityPy 的 Homebrew Python 重新构建并安装同一 wheel，不依赖
+  Xcode Python 的空 system-site；没有联网补依赖或把缺失前置条件记成成功；
+- **加载/解包文件系统非 UTF-8 路径的分配边界已于 2026-08-22 收口**：此前 Loader 的
+  `LoadPath::from_path`/`from_precharged_path` 与 extractor 的单文件名、目录相对组件和
+  诊断标签都会先完整调用 `to_string_lossy()`，Unix 恶意无效字节可在单路径或累计路径预算
+  拒绝它之前膨胀成 replacement 字符串。现抽出一个 Core 内部公共流式遍历：Unix 按
+  UTF-8 错误边界发出 replacement character，Windows 按 `decode_utf16` 把未配对 surrogate
+  替换，保持现有 lossy 命名语义；逐案例回归还把结果和标准 `to_string_lossy` 对照。
+  Loader 与 extractor 都先扫描 replacement 后的精确 UTF-8 长度、提交单项/额外累计预算，
+  再只分配一次；输出组件则在逐字符清洗控制字符和 Windows 保留字符时同步执行 240 字节
+  便携上限。Unix 回归锁定 80 个无效字节恰好得到 240 字节、81 个在 243 字节处拒绝、
+  混合无效字节/保留字符，以及 Loader/extractor 的单项和累计预算失败都不提交预算。
+  本轮 Core lib 547 项通过、10 项可选 vgmstream oracle 忽略，畸形输入 6/6 与严格
+  Clippy 通过；完整
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`
+  也通过且零组跳过，包含 Windows x86-64 Core/CLI/Python 交叉编译。另执行
+  `tools/local_ci.py --fail-on-skip linux`，在 Linux amd64/arm64 两个原生容器中实际创建并
+  加载无效字节文件名，Core/CLI 全测、release CLI、Python wheel 和可选 Node addon 的
+  安装后测试与打包全部通过，零组跳过；
+- **Python/Node 报告路径与 CLI 诊断的最后几处整串 lossy 分配已于 2026-08-22 收口**：
+  Core 的 Loader/extractor 已经能按平台 replacement 语义流式遍历 `OsStr`，但 Python 的
+  export/extraction 报告仍先 `path.to_string_lossy()`，再把这份可能已经分配好的 Cow 复制到
+  可失败 String；Node export report 同样如此。现两个绑定各自使用私有两趟 walker：第一趟
+  精确计算 replacement 后的 UTF-8 长度，Python 用自己的 `try_reserve_exact` 保持
+  `MemoryError` 分类，Node 用 napi 错误映射，第二趟只复制一次并复核长度；Core 内部使用
+  同一语义，但不再向公开 crate 根泄漏绑定 helper。CLI 的参数诊断和
+  `--mono-schema` 错误标签也改为把 replacement/escape 直接写入 formatter，不再先
+  `to_string_lossy` 或 `display().to_string()`。Core 逐案例仍与标准库 lossy 结果比对，Node
+  另用真实 `0xff` Unix 路径锁定绑定接线，Linux wheel API 还会把带 `0xff` 的输出根传入
+  Python、实际导出并断言报告路径包含 replacement character；Core 定向 1/1、Node 4/4、CLI 33/33、workspace
+  严格 Clippy 和重新构建 wheel/sdist 后的完整 Python API 门禁均通过。随后完整
+  `outputs quality rust python node typing security cross` 与 Linux amd64/arm64 原生矩阵
+  再次通过且零组跳过；首次 arm64 容器启动只遇到一次 Docker Hub 鉴权 EOF，严格重试后
+  两架构 Core/CLI、release CLI、Python wheel 和 Node addon/npm 全部实际运行通过；
+- **CLI inspect 非 UTF-8 路径与递归标签已于 2026-08-22 收口**：其目录队列此前只按平台编码原始
+  字节计费，打开失败后又对完整路径执行 `to_string_lossy()`，无效字节既能绕过名义上的
+  UTF-8 路径预算，也会在转义输出前产生 replacement-expanded 临时 String。现根目录和每个
+  child 都先流式计算 replacement 后的精确长度、事务性提交单项/累计预算，再按较小的原始
+  编码长度复制 `PathBuf`；错误行通过 `EscapedOsStr` 把 replacement character 的
+  `escape_default` 结果直接写入 formatter；成功根路径使用 `LossyOsStr` 流式 replacement，
+  gzip/Brotli 与 ZIP entry 通过借用父标签的 `NestedInspectLabel` 逐层组合，递归深度增加时不再
+  重复分配整条标签。单测覆盖原始 2 字节→UTF-8 4 字节的单项拒绝、
+  精确边界、child 全路径累计拒绝与预算不提交；Linux 进程测试用实际 `bad-0xff.gz` 截断文件
+  锁定部分失败退出码、ASCII `\\u{fffd}` 诊断和稳定 summary；
+- **CLI 路径参数的二次复制已于 2026-08-22 收口**：进程入口虽已把参数限制为 65,536 项、
+  单项 1 MiB 和累计 64 MiB，并以 `try_reserve` 保存第一份 `OsString`，后续 read-only、裸/legacy、
+  FBX/OBJ、批量 FBX、Live2D、export 与 extract 解析器仍用 `PathBuf::from(&OsString)` 再复制
+  input/output；allocator 失败因此绕过 `Result`，五个现代写命令的位置 `Vec` 也会在首个路径
+  push 时不可失败地增长。现七类入口统一按平台原始编码计算精确字节数，先
+  `PathBuf::try_reserve_exact` 再复制，不经过 UTF-8；每个双路径命令先可失败地预留完整两项，
+  第三项在复制前立即拒绝。解析阶段其余集合逐一核对后只剩可重复 `export --class` 的过滤表仍
+  直接 `push`；现同样在每项前 `try_reserve`，保留调用顺序、重复 ID 和负 synthetic class ID，
+  无效值不会改变已有表。回归锁定 Unicode 路径逐字保真、两项表不因第三项增长，以及
+  `[28, 114, -187, 28]` 的精确过滤顺序；CLI 单元 33 项与全部进程测试、严格 CLI Clippy 均通过；
+- **Core binary FBX 分配边界已于 2026-08-22 收口**：Rust 公开 parser 原先允许
+  资产声明控制递归深度，并把 zlib 数组直接无界 `read_to_end`，property offset
+  也存在未 checked 的加法；writer 则在完整文件和数组 scratch 分配完后才比较
+  `maximum_output_bytes`。现 verifier 有显式输入/节点/属性/深度/数组元素/累计拥有型
+  分配预算，压缩数组按 `count × element_width` 精确解压，只接受一个完整 zlib member，
+  并拒绝截断、多余输出和压缩流尾随字节；所有拥有型
+  容器在增长前 `try_reserve`；writer 的文件、record、property、children、zlib 和
+  footer 缓冲都在增长前执行输出预算，数值数组直接流入 zlib，不再复制一份完整 raw
+  bytes。场景投影的顶点/索引、cluster、blend shape、关键帧和 Connections 也在 checked
+  cardinality 后通过 `try_reserve` 增长；同轮修正 binary 动画把 Y/Z 曲线也连接为 `d|X`
+  的错误，并锁定三个 component connection。公开 parser 的深度预算现在只计非空 record，
+  所以零预算可验证空 root list，位于深度边界的 list terminator 也不会被误算成一层。
+  parser 读完根终止符后继续验证完整 footer，截断、尾随字节以及六个 footer 区段的损坏
+  writer 现在也有对称的 output/node/property/depth/array limits，默认 256 层会在递归前
+  拒绝过深的调用方节点树；零深度仍允许空 root list，任一预算失败都发生在调用方输出流
+  写入之前。body 加 footer ID 正好对齐时仍要求完整 16 字节 padding。24 项定向测试覆盖
+  精确预算、全部标准属性、raw/deflated boolean array、压缩/未压缩 round-trip、超大
+  count、解压炸弹、深度/节点/分配上限、提前 terminator 和场景投影
+  分配溢出。独立 Python verifier 另以不调用 Rust writer 的 fixture 锁定输入、节点、
+  属性、非空深度、单数组元素和累计展开字节六类预算；默认 256 层上限也避免恶意树
+  落到 Python `RecursionError`。修复后的完整工作树执行
+  `tools/local_ci.py --fail-on-skip quality rust python node typing security` 以及独立
+  `outputs` 格式校验组全部通过，零组跳过；
+- **主导出文件名分配与可移植边界已于 2026-08-22 收口**：此前资产名和源文件名
+  先通过 `String::with_capacity`、`clone` 或 `to_owned` 完整复制，最终输出组件又没有
+  把扩展名及碰撞时追加的 ` @PathID` 纳入统一上限。现源文件分组前缀、清洗后的资产
+  名、文件名格式后缀、扩展名和最坏碰撞后缀共同服从 240 字节预算；所有输入派生的
+  String 副本均先 `try_reserve_exact`，超限对象作为稳定导出失败报告而不是交给不同
+  文件系统产生不一致结果。只含任意长首尾空格/点号的名称仍保持旧语义成为
+  `unnamed`，但通过借用切片完成，不物化整串。定向测试覆盖 ASCII/三字节 UTF-8、
+  240/241 字节边界、扩展名、碰撞后缀及原有清洗/PathID 格式。修复后的完整工作树
+  执行 `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security`，
+  Rust/Python/Node 构建、测试、发布包、类型、安全与六类输出校验全部通过，零组跳过；
+- **主导出报告、碰撞索引和落盘路径已于 2026-08-22 收口**：此前文件成功原子发布后才
+  复制 `ExportRecord.source` 并为 `report.exported` 扩容；allocator 失败会让 API 返回错误，
+  但磁盘上已经留下调用方无法从报告识别的成功文件。碰撞 `HashSet` 又为每个对象保存
+  `absolute_output_path.to_string_lossy().to_lowercase()`，百万对象会重复保留同一条长 output
+  root，Unicode lowercase 和临时错误文本也走不可失败分配。现成功 report slot 与完整
+  record 在创建临时文件之前准备，发布后只执行已有容量的 `Vec::push`；失败文本通过
+  fallible `fmt::Write` 保持原错误族。每个源文件分组使用独立碰撞表，只保存最多 240 字节
+  组件的精确 fallible Unicode lowercase key，命名顺序和跨组同名语义不变。output root 的
+  lexical normalization、分组/文件 join、逐组件安全目录检查、临时文件名及 Windows
+  replacement backup 全部先 checked 计算并 `try_reserve_exact`。回归覆盖 Unicode
+  `İ -> i + combining dot`、两组同名均保持 `demo.lua`、failure family、空 child、路径
+  normalization、深目录创建和 replacement backup 名；34 项 export/image/model 相关测试、
+  Core 全目标编译和严格 workspace Clippy 已通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security` 后，
+  Rust/Python/Node 构建、测试、发布包、类型、安全与六类输出校验全部通过，零组跳过；
+- **三条原子发布路径的提交点语义已于 2026-08-22 统一**：主导出、递归解包和模型同级
+  贴图都使用同目录临时文件 + hard-link no-clobber；主导出/解包覆盖时另有 replacement
+  backup。旧实现会在目标 hard-link 或新文件 rename 已经成功后继续以 `?` 删除临时 link
+  或旧 backup，清理失败便把已提交的目标重新报告成失败，形成磁盘状态与 report 不一致。
+  现 hard-link/rename 成功就是提交点：临时 link 删除失败时保持 `persisted=false`，由 Drop
+  再试；replacement 成功后把清理目标切换为旧 backup，同样先尝试并由 Drop 重试。清理
+  错误不再改变已发布结果，写入/同步/链接/rename 本身的失败仍照常传播。解包 backup 名
+  同轮去掉不可失败 `with_extension`，改为 checked/fallible 组件与路径构造。19 项
+  extraction、34 项 export/image/model 和 11 项 scene-texture 定向测试、Core 全目标编译及
+  严格 workspace Clippy 已通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security` 后，
+  Rust/Python/Node 构建、测试、发布包、类型、安全与六类输出校验全部通过，零组跳过；
+- **模型同级贴图的名称、诊断和发布报告已于 2026-08-22 收口**：自动路径此前用
+  `BTreeMap`、普通 `Vec::push`、`String::clone`/`to_owned` 和 `format!` 保留资产派生的
+  名称、材质 property、skip reason 与 written path；公共 `push_texture` 又允许调用方把
+  `../outside.png` 送入 `directory.join`，从而越过目标目录。现对象/名称索引改为只用于
+  查找、不参与输出顺序的 `HashMap` 并在插入前 `try_reserve`；名称清洗、碰撞后缀、保留
+  名前缀、property、diagnostic 和路径副本均先 checked 计算并可失败分配，对象解析复用
+  collection 的 PathID 索引而不再线扫。写盘边界会在创建临时文件前重新验证空名、绝对
+  或多组件路径、控制/保留字符、Windows device name 和 240 字节上限；成功 written report
+  的全部 slot 也在第一张图片发布前预留。回归覆盖 `../`/绝对/嵌套/`CON.png`/241 字节
+  手工名称、资产名清洗、三路稳定碰撞、跨模型同对象复用、count/累计字节预算、失败诊断、
+  no-clobber 与放弃临时文件清理；11 项 scene-texture 定向测试、Core 全目标编译及严格
+  workspace Clippy 已通过；完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security`，Rust/Python/
+  Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、无头交付范围
+  与六类输出格式校验全部通过，零组跳过。同一快照继续执行严格
+  `cli-package oracle cross python314` 与 `linux`：release CLI 的构建/运行/法律文件 staging、
+  托管差分和 MonoBehaviour schema 生成器、Linux x86-64 workspace 与 Windows x86-64
+  Core/CLI/Python 交叉编译、Python 3.14 abi3 wheel
+  的安装后公开面/完整 API，以及 Linux amd64/arm64 容器中的 Core+CLI 全测试、release CLI、
+  Python wheel 和 Node 24 release addon/JS/TypeScript/npm tarball 均通过，仍为零组跳过；
+- **FBX/OBJ/贴图的多文件发布已于 2026-08-22 改为整批事务**：旧 CLI 的单文件 FBX、
+  `split-objects`/`animator` 候选和 OBJ 都会先发布模型，再写同级贴图或 MTL；例如目标 OBJ
+  尚不存在、同名 MTL 已存在时，命令会失败却留下
+  一个新 OBJ，且该文件引用的是调用前已有的 MTL。贴图集合本身也会逐张立即提交，后面的
+  名称校验、写入或发布失败会留下前面已经写成的子集。现一组贴图在任一后续失败时逆序删除
+  本次调用新发布的文件，已有而被 no-clobber 跳过的文件从不进入回滚集合；单 FBX 与每个
+  batch candidate 都在自己的贴图整批成功后最后发布，OBJ 则按贴图、MTL、OBJ 的顺序提交，
+  MTL/OBJ 的晚失败会回滚同一命令此前新建的文件。所有载荷仍先在同目录临时文件中完整写入、
+  flush、sync 和关闭，最终 hard-link no-clobber 的原子边界不变。同轮还修正 CLI 自己的
+  FBX 与单 MOC 临时文件：hard-link 成功即为提交点，删除临时名字失败只让 `Drop` 重试清理，
+  不再把已经可见的目标重新报告成失败。完整 Live2D 包也在临时目录 rename 并同步后完成提交；
+  之后的发布锁删除及其目录 sync 只属于 cleanup，删除失败由 `Drop` 重试，不再反转包的成功状态。
+  同轮复核发现完整包虽会逐组件拒绝输出根里的符号链接，单 MOC 仍直接 `create_dir_all`，会沿调用方
+  选中的 symlink 把文件写到目录外；两条命令现共用同一安全目录创建器，在创建任何输出前拒绝
+  symlink 和非目录组件。Unix 进程回归用真实 symlink 指向空目录，锁定单 MOC 返回运行错误且真实
+  目标保持为空。继续向下审计又发现 FBX 与 Live2D 的目录创建器会向上遍历缺失路径，并为每一级
+  保存一份完整 `PathBuf`；深层 CLI 参数因此产生 O(深度×路径长度) 的复制，且 FBX 的相对深层
+  新目录没有绝对锚点时会直接失败。两套实现现进一步收敛为公共线性 helper：相对路径只规范化
+  一次，随后用一个预留到最终长度的缓冲逐组件检查/创建；所有中间组件都检查 symlink/非目录，
+  所以即使 symlink 后面已经存在真实子目录也无法绕过。macOS 仅为系统固定 `/var`→`/private/var`
+  和 `/tmp`→`/private/tmp` 保留精确 canonical 例外。回归覆盖 symlink 后已有目录及 64 层相对 FBX
+  输出；FBX/OBJ 15 项、单 MOC 5 项与完整包 7 项端到端测试均通过。
+  回归锁定贴图第三项非法时首项消失而既有文件保持、
+  FBX 在完整贴图批次前不可见、既有 FBX 冲突时新贴图回滚、模拟临时名 cleanup 失败仍返回
+  已提交，以及既有 MTL 冲突时 OBJ 不存在且旧 MTL 字节不变。批处理原有 16 GiB 累计上限也
+  从只统计 FBX 本体改为统计每个 FBX 加上该候选实际新发布的贴图文件大小；共享/既有而跳过的
+  文件不重复计费，超限在模型提交前回滚贴图。单次 `fbx`/`obj` 的
+  `--maximum-output-bytes` 也从只限制主模型文件（OBJ 甚至分别给 OBJ 和 MTL 各一份完整额度）
+  改为限制本次新发布的模型文档、MTL 和贴图累计字节；预算在 MTL/OBJ/FBX 提交前核对，超限
+  回滚本次新贴图，已有或共享而跳过的贴图不重复计费。新增端到端回归先实测同一 fixture 的
+  OBJ/MTL 大小，再用“每个文件都能单独通过、两者合计必超”的额度验证两份最终文件都不存在；
+  另以失败注入锁定 Live2D 锁 cleanup 不反转提交。
+  单 MOC 的 4 GiB 累计预算此前还在发布前永久增加 `scheduled_bytes`，所以一个因目标已存在、
+  写入或 hard-link 失败的模型仍会占住额度，后面的模型可能在磁盘实际为零时被误拒；summary
+  却只报告成功的 `exported_bytes`。现预检只根据已成功字节计算候选总量并返回它，hard-link
+  提交成功后才把该值写入状态；失败不占额度，成功路径也不再在提交后执行第二次可能失败的
+  checked add。低上限状态回归锁定两次未提交的满额度预检都成功且计数保持零，模拟第一次提交后
+  再加一字节才拒绝；单 MOC 5 项端到端与严格 CLI Clippy 通过。
+  scene-texture 12 项、CLI 单元 33 项和 FBX/OBJ
+  CLI 15 项定向测试全部通过。完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，格式、
+  结构审计、Clippy、rustdoc、workspace 测试、RustSec、输出格式、Windows 交叉编译、Node
+  debug/release addon 与 npm 包、Python wheel/sdist/安装后 API 和严格 Python 3.9 类型消费
+  全部通过，零组跳过；`tools/local_ci.py --fail-on-skip linux` 又在 Linux amd64/arm64 原生
+  容器中通过 Core/CLI、release CLI、Python wheel 与 Node addon/npm 包全部运行门禁，仍为
+  零组跳过；
+- **WebData/UnityFS 目录的派生文件名已于 2026-08-22 改为可失败分配**：两条 reader
+  原本已经在读取完整 path 时执行 UTF-8/终止符/长度上限和 `try_reserve`，随后却对
+  `/` 或 `\\` 后的便携叶子再次直接 `to_owned`；这份为公开 entry table 保留的第二个
+  String 因而仍可在 allocator 失败时越过 Core 的 `Result` 边界。现先借用定位叶子，按
+  精确 UTF-8 字节数 `try_reserve_exact` 后复制；完整 path、派生 file name、entry Vec 和
+  payload Region 均保持各自既有合同。回归真实解析 `folder\\目录\\表.bin`，逐字段验证
+  Windows separator 与 Unicode，并锁定 UnityFS 的低 path limit 在复制前拒绝；7 项 WebData、
+  31 项 bundle/legacy-bundle 测试及严格 workspace Clippy 已通过；完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **Font/MovieTexture/AudioClip/VideoClip 的派生字符串已于 2026-08-22 收口**：四条
+  reader 原先分别用 `to_owned` 保存静态扩展名和从 VideoClip 原始路径截出的扩展名；旧
+  AudioClip 的外部资源名还通过 `format!("{}.resS", loaded.path)` 构造，不仅不可失败，
+  也可能在原文件名刚好位于 `maximum_string_bytes` 边界时通过追加后缀绕过调用方预算。
+  现所有拥有型扩展名均按精确长度 `try_reserve_exact` 后复制；VideoClip 只借用最后一个
+  portable component 的 extension，无后缀时仍稳定返回 `.video`；legacy `.resS` 名先 checked
+  计算完整长度、比较字符串预算，再一次预留并写入。回归覆盖 Windows separator + Unicode
+  VideoClip path、无后缀 fallback，以及 `legacy-stream` 名本身恰好允许但集合 path 追加
+  `.resS` 后必须拒绝；20 项 simple-asset 测试及严格 workspace Clippy 已通过；完整工作树
+  随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **外部 MonoBehaviour schema 文档已于 2026-08-22 进入统一预算**：CLI 原先对每个
+  `--mono-schema` 直接调用 `fs::read`，会在 Core 看见文档前按整个文件大小分配；Core 的
+  `from_json` 随后把 serde JSON 已拥有的 assembly/class/namespace/version 和每个节点的
+  type/name 再用 `to_owned` 复制，既没有条目/节点/解码后字符串总预算，重复文档也能逐份
+  绕过任何单文件限制。现新增 `MonoBehaviourSchemaDocumentLimits`：默认限制 256 MiB 文档、
+  100,000 个条目、单条 100,000/全文件 1,000,000 个节点、单字符串 16 MiB 和解码后字符串
+  总计 256 MiB；所有保留字符串先计费并精确可失败预留，JSON 中非字符串 namespace 不再
+  静默变为空串。CLI 用 16 KiB 固定缓冲逐块读取，最多接受 1,024 份文档，并把文档字节、
+  entries、nodes 与 decoded strings 的剩余额度贯穿后续每一份文件；因此大文件和重复参数
+  都会在扩容前稳定返回 usage/invalid-data 错误。回归覆盖字节边界、entry/per-entry/total
+  node、Unicode escape 解码后的 UTF-8 长度、单/总字符串、非字符串 namespace、流式读取
+  和重复 flag 总预算；8 项 Core 与 3 项 CLI schema 定向测试、严格 workspace Clippy 已通过；
+  完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **Live2D 散件回退分配已于 2026-08-22 收口**：散落在同一 SerializedFile 中的
+  `CubismFadeMotionData`/`CubismExpressionData` 原先先从集合级 role table 收集第二份
+  identity `Vec`，之后才在逐项投影时触发 motion/expression 数量限制；角色上限达到百万级时，
+  即使调用方给了更低的输出数量预算，也可能先产生一次与整表同量级的重复分配。现两条回退都
+  对 role table 做惰性稳定遍历，先计数并核对剩余额度，再对最终结果和去重名称表执行
+  `try_reserve`；只取第一项的 physics/pose/display fallback 直接调用迭代器 `next()`。
+  Texture 源名称、MOC identifier 名称和空名称 fallback 的拥有型副本也改为精确可失败复制。
+  现有散件 fixture 新增 expression/motion 零预算断言，证明限制在输出容器分配前生效；
+  16 项 Core Live2D package 定向测试及严格 workspace Clippy 通过。完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **`SerializeReference` 身份字符串已于 2026-08-22 纳入现有物化预算**：TypeTree reader
+  已经把 `ReferencedManagedType` 的 class/namespace/assembly 三条字符串保留在输出树中，
+  但原先为匹配 SerializedFile reference types 又逐条 `clone` 到临时
+  `ManagedTypeIdentity`；这三份副本不在 `maximum_materialized_bytes` 计数中，单条字符串
+  默认又允许 16 MiB。现 reader 直接借用刚解析的三条字符串完成 reference type 查找，
+  立即保存解析后的 type-tree index，随后仍把原始 identity value 按既有结构交给调用方，
+  不再产生第二组拥有型字符串。未声明类型的错误也只报告 namespace/class/assembly 的 UTF-8
+  字节数，不再为了诊断再次复制或回显资产控制的大字符串；null entry、三字段精确匹配和
+  “数据出现在 identity 前”拒绝语义均不变。9 项 TypeTree 定向测试覆盖有效、null、未声明、
+  嵌套 registry 与错误边界，严格 workspace Clippy 通过。完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **整场景 OBJ/MTL 临时分组已于 2026-08-22 去除输入规模复制**：OBJ writer 原先为每个
+  renderable Renderer 创建 `ObjGroup` 时完整 `clone` 其材质槽 `Vec`，随后 MTL writer
+  又为每个 submesh 用 `MaterialName::to_string()` 物化名称，并把所有已写名称保存在第二个
+  `Vec<String>`。这些数据在 `ModelIr` 中已经存在且受场景预算约束，重复持有不会增加输出
+  信息，只会让大模型在写出前额外占用与材质引用数同量级的内存。现 `ObjGroup` 直接借用
+  Renderer 的材质切片；分组数和全部 submesh material slot 数先 checked 累加，分别通过
+  `try_reserve_exact`/`HashSet::try_reserve` 建立临时索引。MTL 去重以
+  `Option<SceneObjectKey>` 为稳定身份，仍按首次遍历顺序写出，并直接格式化到 bounded writer，
+  不再保留名称副本。新增回归以 slice pointer 同一性证明两个 group 均借用原 Renderer，
+  并验证共享材质仍只写一个 `newmtl`；9 项 whole-model OBJ 定向测试和严格 workspace Clippy
+  通过。完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **Binary FBX 场景字符串已于 2026-08-22 在节点树构造前进入输出预算**：场景投影原先
+  会在调用 binary encoder 前，用 `format!`/`to_owned` 构造 model、geometry、material、
+  texture/video、skin/cluster、blend shape/target shape 和 animation 的全部拥有型字符串属性；
+  encoder 的输出与 node/property/array 预算虽然完整，但看不到这批已经发生的分配。现新增
+  `SceneStringBudget`，以调用方同一个 `maximum_output_bytes` 为累计上限，所有资产派生名称先
+  checked 计算 prefix/value/suffix 的精确 UTF-8 长度并计费，再通过 `try_reserve_exact` 一次
+  构造；重复写入 FBX 的纹理文件名按每个实际 property 分别计费，因此预算对应真实拥有型
+  node tree，而不是只检查最长单串。静态 FBX 7.4 关键字和最终字节布局保持不变。新增公开
+  writer 回归用 20 字节上限证明 `Model::root` 与 `Geometry::quad` 累计到 25 字节时，在 binary
+  encoder 和调用方输出写入前稳定拒绝；几何、纹理、skin、blend shape、动画共 9 项场景
+  定向测试及严格 workspace Clippy 通过。完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **Python/Node 导出选项解析已于 2026-08-22 去除输入规模副本并收紧诊断**：Python 的
+  export mode、image format、audio format 与 Node 的 export mode、filename format、image
+  format、audio format 原先都会在 `trim` 后调用 `to_ascii_lowercase`，为任意调用方字符串
+  分配一份等长小写副本；拒绝值时又把完整原串插进异常。Node 的缺省 PNG 分支还会创建一条
+  临时拥有型 `String`。现所有匹配都直接借用 trim 后的 `&str` 并使用
+  `eq_ignore_ascii_case`，保持已有大小写不敏感、下划线/连字符和别名语义；Node 图片路径移动
+  napi-rs 已交付的拥有型参数而不复制，缺省值直接借用静态 `"png"`。无效值不超过 64 个
+  UTF-8 字节时仍保留原有可读诊断，超过后只报告精确字节数，不把资产外部的 Python/JavaScript
+  长字符串复制进第二条错误消息。Rust 单测锁定四类 Node alias、默认值与 4096 字节 Unicode
+  拒绝；安装后的 Python API 和 Node debug/release addon 测试真实走混合大小写/首尾空白及
+  三/四类长值，并断言错误不回显输入。绑定定向门禁与严格 Node Clippy 通过；完整工作树随后
+  执行 `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **原生 CLI 的 `argv` 保留与错误诊断已于 2026-08-22 建立分配边界**：进程入口原先对
+  `env::args_os().skip(1)` 直接 `collect::<Vec<OsString>>()`，在任何数量/字节限制生效前用
+  infallible Vec 增长保留全部参数；全局 load-option 过滤又 clone 一份剩余参数，重复
+  `--mono-schema` 路径表同样普通增长。legacy `-m` 还先 `to_string_lossy().into_owned()`，再
+  `to_ascii_lowercase()` 建第二份模式字符串，未知 option/格式错误会把完整调用方参数写入异常。
+  现入口最多保留 65,536 项、单项 1 MiB 编码字节和累计 64 MiB，checked 累加后每项
+  `try_reserve`；过滤表、每条 `OsString` 副本、schema `PathBuf` 和 schema 路径表均在增长前
+  可失败预留，文档数量上限也前移到路径复制之前。legacy mode 直接借用有效 UTF-8 并以
+  `eq_ignore_ascii_case` 分派，所有 parser 诊断通过同一 Display wrapper：64 编码字节以内保留
+  旧可读文本，更长或非文本参数只形成有界摘要，不再回显整串。单元测试用可注入低预算分别
+  锁定 count/per-item/cumulative 三条边界、Unicode 编码长度和无回显；进程测试真实启动 CLI，
+  断言 68 字节未知选项以 usage exit 2 返回且 stderr 不含输入。CLI 26 项单测与 52 项进程集成
+  测试、严格 CLI Clippy 均通过；完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **Core 三条分类/规范化热路径已于 2026-08-22 去除整串输入副本**：单文件加载会为父目录
+  每个同 stem 候选调用 `extension.to_ascii_lowercase()` 才判断 `.resS`/`.resource`；Cubism
+  fade-motion 的 PartOpacity 回退会为每条 parameter ID 小写化完整 String 再找 `part`；解包
+  每个 WebData/ZIP/bundle 条目则先 `path.replace('\\', "/")`，再做绝对路径、drive、`..` 和
+  component 清洗。三者的输入本来都已有上限，但这些临时副本既不增加输出信息，也在目录、曲线
+  或 entry 数量上重复发生。现 companion extension 原地 `eq_ignore_ascii_case` 静态两项；motion
+  ID 通过字节窗口做与旧 `to_ascii_lowercase().contains("part")` 完全相同的 ASCII 匹配；archive
+  path 直接以 `['/', '\\']` 双分隔符单趟扫描，首字节同时拒绝 Unix/Windows absolute，不再保留
+  normalized String。fixture 新增混合大小写 `resources.ReSS`、4096 字节后缀 `PART` motion ID，
+  以及安全 `safe\\nested\\data.bin`；原有 `../`、反斜杠父跳转、Windows drive、UNC 和混合
+  traversal 仍逐类拒绝。Core 544 项单测全部通过（另 10 项既有 vgmstream 外部 oracle 测试按
+  设计 ignored），严格 Core Clippy 通过；完整工作树随后执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
+  无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **公共 EndianReader 字符串分配已于 2026-08-22 收口**：`read_c_string` 与
+  `read_c_string_required` 原先只给前 256 字节预留空间，之后每个字节通过普通
+  `Vec::push` 不可失败扩容；三条 UTF-8 路径又依赖
+  `String::from_utf8_lossy(...).into_owned()`，全非法输入可在字节缓冲之外再产生约三倍
+  的不可失败拥有型字符串。现 C 字符串在调用方上限和剩余输入的交集内按块
+  `try_reserve_exact`，定长字符串复用已检查的 `read_bytes`；有效 UTF-8 直接接管原
+  Vec，非法序列先按 `Utf8Error::valid_up_to/error_len` 精确计算 U+FFFD replacement
+  后长度，再一次可失败预留并分段写入，保持 .NET replacement fallback 语义。回归
+  覆盖跨越 256 字节增长、非法起始/过长/续字节、尾部截断序列、全非法三倍展开、
+  必需终止符恰在限制外以及非必需字符串读满限制。修复后的完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security`，
+  Rust/Python/Node 构建、测试、发布包、类型、安全与六类输出校验全部通过，零组跳过；
+- **加载路径预算已于 2026-08-22 贯通全部正式 API**：此前 `AssetLoadLimits` 只限制
+  输入个数、目录项和展开载荷，没有限制根标签或递归拼接后的拥有型路径；大量零/小载荷
+  长名称可绕开字节预算，而 `nested_path` 还会先 `replace` 出子路径副本、再由 `format!`
+  生成完整路径。现每个根路径和新发现的 Bundle/WebData/ZIP 路径只计一次，分别服从
+  单项与累计 UTF-8 字节预算；gzip/Brotli 仅移动同一条路径，不重复计费。嵌套路径先用
+  checked arithmetic 算出精确长度并检查预算，再 `try_reserve_exact` 一次写入，反斜杠
+  同步规范化，无中间 String。默认 1 MiB/64 MiB 与既有 Python/Node 内存输入上限一致，
+  Python 的路径、单 buffer、多文件入口及 Node `OpenOptions` 均可收紧。Core 回归真实走
+  根标签、累计多根和含反斜杠 WebData 子项；安装后的 wheel/sdist 及 Node debug/release
+  addon 也验证公开选项和错误。完整工作树执行 `tools/local_ci.py --fail-on-skip outputs
+  quality rust python node typing security` 全部通过，零组跳过；
+- **文件系统枚举预算已于 2026-08-22 前移到保留分配之前**：旧目录入口会先把整棵
+  `read_dir` 结果收集成 `DirEntry`/`PathBuf`，最后才把文件标签送进加载路径预算；
+  单文件 companion resource 与显式 split segment 的父目录扫描也没有消费目录数和目录项
+  预算，超大空目录或超长名称因而能在拒绝之前放大队列与路径分配。现根目录、每个子项的
+  文件系统编码路径、输入目录和目录项都在进入排序列表/遍历队列之前计费；`PathBuf` 先按
+  checked 长度执行 `try_reserve_exact` 再拼接，最终 UTF-8 标签只补计 lossy 转换产生的额外
+  字节，不把普通路径重复收费。companion 与 split 扫描复用同一组预算；split 分组改为已
+  预留的排序 `Vec` 顺序归并，不再依赖不可失败增长的树集合，同时保留“真实 base 文件优先于
+  `.splitN`”的旧语义。回归覆盖单文件 companion 的目录/目录项上限、目录根路径耗尽后在
+  第一个子项立即拒绝、split 数字排序与 base 优先；22 项 loader 测试和严格 workspace
+  Clippy 已通过；完整工作树执行 `tools/local_ci.py --fail-on-skip outputs quality rust
+  python node typing security` 后，Rust/Python/Node 构建、测试、发布包、类型、安全与六类
+  输出校验全部通过，零组跳过；
+- **原生 CLI 的递归 `inspect` 已于 2026-08-22 使用相同的分配前路径预算**：此前只读
+  inspector 虽有文件、目录和目录项计数上限，却仍把 root `to_owned` 并对每个项调用
+  `DirEntry::path()` 后才保留，且这三组常量与 Core 默认值各自维护。现 inspector 直接取
+  `AssetLoadLimits::default()`，根/子路径在加入目录队列或文件表前按文件系统编码字节检查
+  1 MiB 单项和 64 MiB 累计预算、checked 计算分隔符与完整长度并
+  `try_reserve_exact`；只对确认是目录/普通文件的项形成路径，计数上限也不再复制常量。
+  单元回归锁定单路径失败不消费预算、累计失败保持事务性，全部 CLI 套件和严格 workspace
+  Clippy 已通过；完整工作树执行 `tools/local_ci.py --fail-on-skip outputs quality rust python
+  node typing security` 后，所有 Rust/Python/Node 构建、测试、发布包、类型、安全与输出校验
+  通过，零组跳过；
+- **外部资源路径解析已于 2026-08-22 从逐次分配线扫改为安全索引**：旧
+  `AssetCollection::resource` 每查一次都先给请求分配规范化 String，再为资源表中的每
+  一项重复 `replace`/`to_owned`；Texture2D/Texture2DArray/Mesh/Audio/Video 的 streamed
+  payload 会反复走这条路径，大集合因此同时产生 O(对象×资源) 扫描与短命分配。现加载
+  完成后建立“规范化完整路径”和“便携文件名”两张排序下标表，不复制任何路径键；查询
+  通过 allocation-free 字节迭代器完成 ASCII-insensitive、反斜杠和 `archive:/` 语义，
+  两类命中取最早发现下标，保持旧的 union/first-match 契约。两张表共用独立条目预算和
+  可失败预留。后续复核发现“公开表可随时修改、命中后复验”仍不足以维护该契约：调用方
+  可把更早下标改成相同 PathID/便携资源名，而缓存中的较晚命中仍然有效，单点复验会静默
+  返回后项。现 `serialized_files`/`resources` 对 crate 外只提供只读 slice；调用方若需替换
+  内容，以 `into_parts` 消费并移动出原表、修改后交给 `from_parts`，再显式 rebuild/resolve，
+  不需要复制可能很大的 source-bound Region。这样正常查询保持索引复杂度，不必为
+  防任意外部 mutation 在每次命中前重新线扫；rustdoc `compile_fail` 用例同时锁定两个字段
+  不能由外部安全代码清空。
+  `Studio::resource_by_path` 直接复用返回下标，也不再命中后为了找下标再扫第二遍。Core
+  全量、畸形输入与严格 workspace Clippy 通过；完整工作树执行 `tools/local_ci.py
+  --fail-on-skip outputs quality rust python node typing security` 全部通过，零组跳过；
+- **解包路径组件的校验前分配已于 2026-08-22 收口**：归档条目虽然一直有
+  240 字节的可移植组件上限，旧实现却先按完整不可信组件长度
+  `String::with_capacity`，清洗完成后才拒绝超限；恶意超长文件名因此能在失败前
+  迫使进程申请一块同样大的内存。现改为逐个 UTF-8 字符计算清洗后的下一长度，
+  只有仍位于 240 字节预算内才执行 `try_reserve_exact` 和写入；Windows 保留名需要
+  添加前缀时同样先检查剩余预算。ASCII、三字节 UTF-8、恰好 240 字节、241 字节
+  拒绝及保留名边界均有回归；Core 532 项单测中的 522 项常规测试、6 项畸形输入
+  扫描和严格 all-target Clippy 已通过，10 项外部 oracle 测试按声明保持 ignored。
+  修复后的完整工作树再次执行 `tools/local_ci.py --fail-on-skip outputs quality rust
+  python node typing security`，Rust/Python/Node 构建、测试、发布包、类型、安全与六类
+  输出校验全部通过，零组跳过；
+- **递归解包的文件系统输入路径已于 2026-08-22 纳入分配前预算**：此前归档内部输出名
+  有 `maximum_path_bytes`，目录输入扫描却仍会先 `root.to_owned()`/`DirEntry::path()`，最多
+  一百万个深路径可在解包器看见任何路径限制之前进入队列和文件列表。现
+  `ExtractionLimits` 同时提供单路径上限与默认 64 MiB 的 `maximum_total_path_bytes`；根路径、
+  子目录和普通文件都先按文件系统编码长度计费，再以 checked 长度
+  `try_reserve_exact` 后拼接。目录项只在确认是目录/普通文件后形成路径，最终诊断标签的
+  lossy UTF-8 增量也计入累计预算。目录输入 roots 的结果表改为显式可失败预留，relative
+  path 不再先 `to_owned` 一份中间副本；Python `ExtractionLimits` 的运行时属性、类型桩和
+  严格消费测试均暴露同一参数。Core 回归覆盖根路径刚好耗尽累计预算、单路径超限以及原有
+  目录项上限，14 项 extraction 测试和严格 workspace Clippy 已通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security` 后，全部
+  Rust/Python/Node 构建、测试、发布包、类型、安全与输出校验通过，零组跳过；
+- **递归解包的调用方与嵌套诊断标签已于 2026-08-22 共用路径预算**：仅限制文件系统
+  路径仍留下另一条放大路径——`extract_region` 的 root label 不受限，Bundle/Web/ZIP/wrapper
+  每层又通过 `format!` 加一份 parent、通过 `replace` 加一份 child；大量长条目可在输出路径
+  已受限时继续堆积拥有型诊断字符串。现 root label 在创建输出目录前计费，嵌套标签先以
+  checked arithmetic 计算 `parent + "::" + child`，事务性消费单项/累计预算，再一次
+  `try_reserve_exact` 并在写入时把反斜杠规范化；失败不消费预算、不留下输出目录。
+  `ExtractionLimits` 的 Rust 文档明确该预算同时覆盖文件系统路径、调用方标签、归档路径和
+  完整递归标签。回归锁定 root 的分配前拒绝、13 字节累计边界、规范化和失败后的预算不变；
+  15 项 extraction 测试和严格 workspace Clippy 已通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security` 后，全部
+  Rust/Python/Node 构建、测试、发布包、类型、安全与输出校验通过，零组跳过；
+- **`ExtractionReport` 的增长与失败文本已于 2026-08-22 改为可失败分配**：此前
+  `extracted`、`skipped_existing`、`failures` 三张表都直接 `Vec::push`，source 直接
+  `to_owned`，错误又直接 `to_string`；百万级有界条目仍可能在 allocator 失败时越过 Core
+  的 `Result` 契约。现三张表逐项 `try_reserve`，source 走精确 fallible copy，错误通过
+  自定义 `fmt::Write` 在每个片段写入前预留，仍保持 I/O/InvalidData/Unsupported 的原展示。
+  原子写入前同时预留成功记录与并发 no-clobber skip 记录并只复制一次 source，因此不会出现
+  文件已经发布、随后报告扩容失败而调用方看不到成功的状态；早期 existing skip 同样在副作用
+  前完成分配。所有 `record_failure` 调用现在传播 `Result`，报告自身分配失败不会被降成普通
+  资产失败继续运行。16 项 extraction 测试和严格 workspace Clippy 已通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security` 后，全部
+  Rust/Python/Node 构建、测试、发布包、类型、安全与输出校验通过，零组跳过；
+- **解包输出的 portable claims 索引已于 2026-08-22 改为 fallible 且纳入路径预算**：
+  旧实现为每次 `contains/get/insert` 都通过 `to_string_lossy().to_lowercase()` 和
+  `collect::<PathBuf>()` 重建 key，最多百万项的 `BTreeMap::insert` 又没有 `try_reserve`；
+  allocator 失败仍可越过 Core 错误边界。claims 从不参与命名迭代，只做精确 membership，
+  因而现改为逐次 `try_reserve` 的 `HashMap` 不改变稳定文件树。portable key 先遍历组件计算
+  Unicode lowercase 展开后的精确 UTF-8 长度，以当前 retained 路径字节检查单项/累计预算，
+  再一次预留并直接写入；临时查询不提交字节，真正插入在 HashMap 预留成功后才事务性提交，
+  同一候选不再为 contains 与 insert 分配两次。回归覆盖 `İ -> i + combining dot` 展开、临时
+  lookup 不消费预算、差一字节拒绝、失败后预算不变、ASCII-insensitive `~1` 碰撞和 claims
+  数量；17 项 extraction 测试及严格 workspace Clippy 已通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security` 后，全部
+  Rust/Python/Node 构建、测试、发布包、类型、安全与输出校验通过，零组跳过；
+- **解包输出路径的构造已于 2026-08-22 改为 checked/fallible**：claims 安全化之后，
+  Bundle/WebData/ZIP 条目、`_unpacked` 容器目录、父目录碰撞重建、wrapper 解码名、`~N`
+  碰撞后缀、最终绝对候选和临时发布名仍分别通过 `PathBuf::join`、`collect::<PathBuf>`、
+  `clone` 或 `format!` 构造；其中完整路径往往在比较 `maximum_path_bytes` 前已经分配，
+  `_unpacked`/`.decoded`/碰撞后缀也可能把已清洗组件再次推过 240 字节边界。现统一先以
+  checked arithmetic 计算组件、分隔符和完整路径的精确编码长度，先检查 portable/调用方
+  上限，再 `try_reserve_exact` 一次写入；空 parent 保持原路径而不会因 `push("")` 多出
+  尾部分隔符。父目录各组件只 fallible copy 一次，碰撞候选从原始组件重建；内部输出名
+  必须保持 UTF-8，不再通过 `to_string_lossy` 额外分配。回归覆盖空 parent、完整路径恰差
+  一字节、父级重建、240 字节容器名追加 `_unpacked`、大小写 wrapper 去后缀、`.decoded`
+  扩张、两位数碰撞后缀、suffix 后完整路径上限以及临时文件名；18 项 extraction 测试、
+  Core 全目标编译和严格 workspace Clippy 已通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security` 后，
+  Rust/Python/Node 构建、测试、发布包、类型、安全与六类输出校验全部通过，零组跳过；
+- **调用方解包输出根的规范化与祖先扫描已于 2026-08-22 线性化**：资产控制的相对路径
+  收口后，`lexical_absolute` 仍通过不可失败 `to_owned/join` 复制调用方路径，规范化缓冲也
+  未预留；查找最近存在祖先时，每退一层又把已积累 suffix 完整复制到新 `PathBuf`，深层
+  不存在目录因此是 O(depth²) 拷贝。现绝对/相对根都走 fallible 路径副本或 join，规范化与
+  符号链接祖先扫描按输入编码长度一次预留；最近祖先只缩短一份 ancestor，命中后通过
+  `strip_prefix` 一次 fallible copy 剩余 suffix，创建目录前再为最终追加长度预留。绝对路径
+  中的 `.`/`..` 语义、越过文件系统 root 的拒绝、macOS 受信任系统 alias 和 no-follow
+  规则不变。新增回归锁定 lexical normalization、四层不存在 suffix 的 ancestor/suffix
+  拆分与安全创建；19 项 extraction 测试、Core 全目标编译和严格 workspace Clippy 通过；
+  完整工作树执行 `tools/local_ci.py --fail-on-skip outputs quality rust python node typing
+  security` 后，Rust/Python/Node 构建、测试、发布包、类型、安全与六类输出校验全部通过，
+  零组跳过；
+- **Node 完整 Live2D adapter 已于 2026-08-22 验证**：新增同步
+  `readLive2DPackagesWithSchemas` 和 Promise
+  `readLive2DPackagesWithAclDecoder`，后者可在一个 worker 调用中同时接收
+  外部 schema 与 ACL decoder。JavaScript fixture 真实走 stripped
+  `CubismModel`/`CubismRenderer`、跨文件 `Texture2D`、Tuanjie
+  `AnimatorController` 和两帧非空 ACL 曲线；无 schema、无 decoder、错误
+  decoder、单文件/总预算均有独立断言。`tools/local_ci.py --fail-on-skip
+  node` 的 debug/release addon、JS/TS、包内容和 npm tarball 八步全绿，随后
+  `quality rust security typing` 也全部通过，零组跳过；
+- **Node 绑定边界的可失败分配已于 2026-08-22 收口**：同步/异步内存输入、
+  多文件 Region、外部 schema、FBX 候选与动画 PathID、Live2D 包元数据、模型
+  贴图/诊断列表，以及 ACL/Oodle callback 的输入、输出与 f64→f32 数组转换，
+  均先 `try_reserve` 再复制或移动，不再使用不可失败的 `to_vec`、`collect`、
+  `Vec::with_capacity` 或大对象 `clone`。直接 physics3/exp3/motion3 JSON 和带
+  贴图 FBX 输出改用同时检查写入计数、输出上限和分配失败的 bounded writer。
+  后续审计又确认 napi-rs 对回调返回的 `Vec<T>` 会先按 JavaScript 数组长度执行
+  `Vec::with_capacity`，使 ACL 返回值能在 Core 校验前触发不可失败的大分配。现 TSFN
+  先把结果保留为 opaque JavaScript value，在事件循环侧核对对象形状、times/bindings/
+  values 三张表的声明长度、frame×curve 乘法和 `AclDecodeLimits`，再以 `try_reserve`
+  逐项复制；values 直接由 JavaScript `number` 窄化为 `f32`，不再生成中间
+  `Vec<f64>`。三项 Rust 单测锁定超限、writer 计数不符和 ACL 有序窄化；JavaScript
+  新回归用会抛异常的数组 getter 证明长度不匹配时没有读取任何元素，原有 fixture
+  继续覆盖 fromBuffer/fromBuffers、模型贴图、ACL、Oodle 与完整 Live2D callback。
+  同类审计随后发现 `fromBuffers(Vec<MemoryInput>)`、四个外部 schema 入口以及
+  `MonoBehaviourSchema.nodes: Vec<SchemaNode>` 仍会在绑定函数运行前走 napi-rs 的
+  eager `Vec::with_capacity`。现公开 TypeScript 形状不变，Rust 参数改为 raw `Array`：
+  文件/schema/node 数量先验拒绝，名称和 schema 字符串先读 UTF-8 长度并计入单项/
+  累计预算，再通过唯一审计过的 N-API copy 写入 `try_reserve` 成功的缓冲区。稀疏
+  JavaScript 数组在首元素安装会抛异常的 getter，分别证明超限 input/schema/nodes
+  都在访问任何元素前失败；生成声明仍保留原参数和可选 `undefined | null` 兼容。
+  公开输入面继续反向枚举后，唯一剩余的嵌套列表是
+  `CubismMotionTargets.parameters/parts`；它们原先同样会先变成 `Vec<String>`。
+  现两张表先合并检查 `maximum_curves`，每个名称和累计 UTF-8 字节分别复用
+  `CubismClipMotionReadLimits`，再逐项可失败复制。第四个稀疏数组 getter 回归证明
+  超限 target 表也不会读取首元素；同步/ACL worker 两个入口共用该转换，TypeScript
+  参数继续是可选 `CubismMotionTargets | undefined | null`。至此生成声明中所有
+  JavaScript→Rust 数组输入均已分类：其余 `Array` 字段是 Rust→JavaScript 输出；
+  `tools/local_ci.py --fail-on-skip quality node` 的 quality、debug/release addon、JS/TS、
+  包内容与 npm tarball 全部通过，零组跳过；
+- **Core/Python 整场景 OBJ/MTL 物化已于 2026-08-22 收口**：`Studio` 审计确认
+  其他直接字节结果均已通过 `Region::read_to_vec` 或 `LimitedBuffer` 返回，唯独
+  `read_model_obj` 仍把 OBJ 与 MTL 写入不可失败增长的普通 `Vec`，并用
+  `to_owned` 复制材质库名。现三者分别改为有界 writer 和 `try_reserve`；Core
+  单测锁定精确上限与越界状态，Python wheel/sdist API 测试锁定精确字节预算
+  成功、少一字节稳定失败。修复后 `tools/local_ci.py --fail-on-skip quality rust
+  python` 与独立 `node` 门禁全部通过，零组跳过；Node 同样直接复用这条 Core
+  路径，并已由 debug/release addon、JavaScript、TypeScript 和 npm tarball 验证；
+- **Python 内存 writer 审计已于 2026-08-22 收口**：继续逐项扫描 binding 的
+  `Vec`/`String` 写入后，确认带贴图 FBX 仍直接写普通 `Vec`，expression、physics、
+  fade-motion 和 clip-motion JSON 也只预留 64 KiB，超过后会回到不可失败扩容。
+  五条路径现统一使用 `BoundedPythonOutput`：每次写入先检查累计上限并
+  `try_reserve`，分配失败为 `MemoryError`，预算耗尽为 `ValueError`，真实文件 I/O
+  仍保留标准 `OSError` 子类。Core 侧的四个 Live2D sink-validation 入口同时把
+  纯内存输出预算错误从 `Error::Io` 纠正为 `Error::InvalidData`。Python API 回归
+  锁定 textured FBX、exp3、physics3 和 motion3 的精确上限成功、少一字节失败；
+  29 项 Core Live2D 定向测试、严格 Core/Python Clippy，以及零跳过的 `python`、
+  `quality`、`rust`、`node` 门禁全部通过；
+- **CLI 分配边界审计已于 2026-08-22 收口**：Live2D 候选表、清洗后的模型名、
+  Unicode 小写碰撞键、FBX 批量名称以及 `info`/`list`/`inspect` 的版本和 class
+  汇总均在增长前 `try_reserve`，分配失败稳定转为数据错误；输出转义改为直接实现
+  `Display` 的流式写入，不再先 `collect` 一份等长或更长的临时字符串。统计仍在输出前
+  排序，回归同时锁定重复计数、class/版本顺序以及 `İ` 小写扩张。当前 CLI 的 73 项
+  unit/integration 测试与 all-target 严格 Clippy 已通过；
+- **Node 的直接/异步 MonoBehaviour JSON 入口已于 2026-08-22 补齐**：此前只有
+  `readMonoBehaviourJsonWithSchemas`，即使文件自带 TypeTree，JavaScript 也必须传一个
+  无意义的空 schema 数组。现在 `readMonoBehaviourJson` 直接走内嵌树，stripped 对象仍
+  明确要求可信 schema；直接与 schema 两条路径都另有 worker-backed Promise 入口，
+  共用同一个输出预算和 Core reader，并返回 `embedded`/`schema` 来源。JavaScript
+  fixture 锁定同步/异步内嵌树成功、异步少一字节预算失败、同步/异步 stripped 拒绝、
+  异步 schema 恢复和错误 class 拒绝，生成的 napi-rs 声明由严格 TypeScript 调用；
+- **Python 的 `MonoBehaviourSchema` 构建已于 2026-08-22 释放 GIL**：逐项审计绑定后，
+  加载、资源、场景、FBX、模型、动画、TypeTree、纹理、Sprite、音频、材质、设置、
+  Cubism、导出、Live2D 和解包等高成本 Core 路径本来已经通过 `Python::detach` 执行，
+  唯一确定遗漏是 schema 构造仍可在持有 GIL 时验证并转换至多一百万个节点、累计
+  256 MiB 字符串并建立 registry。审计继续发现 PyO3 原先会在 Rust 检查一百万节点/
+  256 MiB 字符串上限前，先把整个 Python list 自动转换成拥有型 `Vec<String>`；现改为
+  先读取 Python list 长度、逐项计算 UTF-8 累计预算，再做可失败复制，超限不会先物化
+  无界 Rust 输入。只有这段 Python 字符串/tuple 转换保留在 GIL 内，TypeTreeNode 转换、
+  registry 构建及其可失败分配移入 detached 区域。安装后 API 回归先用 1,000,001 个
+  无效元素证明节点数闸门发生在元素转换之前，再把 Python 线程切换间隔提高到 1,000 秒，
+  证明辅助线程在进入 Rust 构造器前没有运行，并要求它在 100,000 节点 schema 构造期间
+  取得 GIL；release wheel、sdist、由 sdist 重建的 wheel 以及完整 API 测试均已通过。
+  当前工作树随后执行 `tools/local_ci.py --fail-on-skip quality rust python node typing`
+  全绿，零组跳过；
+- **Python 调用方列表与 ACL adapter 输出的前置预算已于 2026-08-22 收口**：继续扫
+  `Vec` 自动提取后发现 `from_memory_files(maximum_files=...)` 原先会在检查文件数、文件名
+  和累计字节前先把整张 Python 表复制成 `Vec<(String, bytes)>`；schema 集合和 Cubism
+  target 名称也依赖 PyO3 的 eager `Vec`，而 ACL callback 的 times/bindings/values 更会在
+  Core 检查 frame×curve 与 `maximum_values` 前完整物化。现这些入口都先读取 Python list
+  长度，按现有预算验证，再逐项以 `try_reserve`/可失败字符串或字节复制构造拥有型值；
+  ACL adapter 持有与 Core 相同的 `AclDecodeLimits`，三张返回列表的声明长度和乘法预算在
+  任何元素转换前完成。`unity_cn_key` 同时收紧到 `.pyi` 已声明的 `bytes | str`，直接复制
+  精确 16 字节，不再把任意整数序列先抽成 `Vec<u8>`。安装后回归分别用无效文件 tuple、
+  超限 schema 无效节点和 ACL 无效元素证明闸门发生在元素转换之前，并覆盖有效 raw/string
+  key。继续向 Core 追踪后又发现 `AclClip::decode_with` 原先先调用 decoder、再检查声明的
+  frame/curve/value 是否越过 `AclDecodeLimits`；恶意资产仍可先诱使任意 Rust/Python/Node
+  adapter 分配超限输出。现只依赖请求头的三项检查在 decoder 调用前完成，返回后的 shape、
+  binding、时间和值验证仍完整保留；Core 用会 panic 的 decoder 锁定三种超限请求均不可达
+  callback，Python 另以标志位和无效列表元素分别证明前置拒绝与返回列表长度闸门；
 - **CI 的常规作业步骤已于 2026-08-15 在本机完整复跑一遍**（`cargo fmt --check`、`clippy -D warnings`、`cargo doc -D warnings`、`cargo package -p assetstudio-core`、workspace 测试、Node 的 build/test/pack、Python 的 release wheel 与 sdist 两条路各跑 `installed_wheel.py` 与 `python_api.py`、UnityPy 差分、托管差分、vgmstream 音频差分），全部通过；当前主机上的 release CLI 与 Node tarball 也按发布作业的命令构建、直接执行/测试并检查了包内容。工作流另经锁定的 `actionlint` 1.7.12 验证，六个平台使用的 runner label 也逐项对过 [GitHub 当前官方清单](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)。六平台发布矩阵本身尚未在 GitHub runner 上跑过，无法在本机复现的仍是 Windows 运行及其他架构的 runner 环境。之所以要手工跑一遍：CI 自 LZMA 那次提交起就没跑过，而这一跑就发现 Python 侧其实已经坏了一段时间（见上面 sprite fixture 那条）。
 - **Linux 双架构交付面已于 2026-08-15 实跑**：`python3 tools/local_ci.py linux` 在 `linux/amd64` 与 `linux/arm64` 容器中分别完成 Core+CLI 全量测试、release CLI 构建/执行/法律文件 staging、`cp39-abi3` Python wheel 的 release 构建/安装/公开 API 测试，以及 Node 24 release addon 的构建/加载、JavaScript 与严格 TypeScript 消费测试、包内容检查和真实 npm tarball 构建。Node 在只读源码的干净临时副本中打包，宿主机已有的其他平台 addon 不可能混入产物；六个当前步骤均已实跑通过。该结果证明当前工作树的 Linux x86-64/ARM64 运行与发布产物面，不替代仍待 GitHub runner 验证的 Windows/macOS 六路发布矩阵。
 - **发布法律文件已按实际产物验证（2026-08-15）**：根目录补齐项目 MIT `LICENSE`，`tools/generate_dependency_licenses.py` 从 `Cargo.lock` 与 `cargo metadata` 的非开发依赖闭包生成 97 个依赖的许可证全文聚合，并同步 Core、Python、Node 的分发副本。Core `.crate`、实际 npm tarball、Python wheel、Python sdist 及由 sdist 重建的 wheel、release CLI staging 目录均检查三份法律文件存在且与根副本逐字节一致；门禁第一次运行就抓到了 Core 内陈旧的 NOTICE，而不是只确认“有同名文件”。同轮还发现并修复 Python 3.9 测试文件使用 `int | str` 却未延迟求值的支持下限回归；3.9 wheel/API 已重新通过。
-- **输出格式的独立校验已建立（2026-08-15）**：本项目产出的几种文件此前只有自己校自己——binary FBX 的读写是一起写的（记录头里存的是绝对结束偏移，写入端事后回填，读取端若与写入端理解一致，错的偏移一样会被接受），ASCII FBX 根本没有 oracle（托管走 FBX SDK），WAV 头由本项目写、又由本项目的 helper 读回去比对采样；PNG 的 chunk 分帧、CRC、IHDR 与逐行 filter 全是本项目手写的，而它的单元测试用本项目自己的 `png_crc32` 去核对 CRC——CRC 表要是错了，测试照样过，每个看图软件都打不开。现在四者都有了照格式另写的第二实现：`tools/validate_fbx_binary.py`（magic、版本、每条记录的结束偏移、属性数与属性区长度、嵌套列表的 null 记录、footer 的 id/对齐/重复版本/结尾 magic）、`tools/validate_fbx_ascii.py`（括号配平、必备段、`Definitions` 声明的 Count 与实际对象数、`C:` 连线引用的 id 是否存在、`*N` 数组的值个数）、`tools/validate_wav_output.py`（直接交给 Python 标准库的 `wave` 模块读，它不是为本项目写的，字段自相矛盾就会拒绝）、`tools/validate_png_output.py`（用标准库 `zlib` 提供独立的 CRC-32 与 inflate：逐 chunk 核对 CRC、校验 IHDR 为 8 位色彩类型 6 且非隔行、解压 IDAT、还原 0–4 号 filter、要求 IHDR 在首 IEND 在尾且其后无残留，最后把像素与源数据逐字节比对，包含 Unity 自下而上到 PNG 自上而下的翻行）。另外 `json.rs`（TypeTree dump 的 JSON emitter）也是手写分帧，而它原有的测试同样是拿手写字符串对比——两边同一套理解，天然一致，且覆盖的形状都很浅。现补了随机树的往返测试：确定性 xorshift 生成任意 `TypeValue` 树，pretty 与 compact 两种形式都交给 serde_json 的 parser（与 writer 不共享任何代码）解析，再与本模块声明的映射逐值比对；对象键序不比（解析后的对象无序），那部分仍由原有手写测试覆盖。末尾的覆盖断言不是装饰：十一个 variant、空容器、容器套容器、非有限浮点、未配对代理项各至少出现一次，把生成器限制成只出叶子会让 variant 断言失败。五种人为破坏均被抓住（裸 `NaN`、对象字段间少逗号、typeless 元数据少逗号、map 的 key/value 互换、float 加宽成 f64），其中前三种只有真正的 parser 才看得见。BMP 与 TGA 同理：两者都是本项目手写的二进制布局，而且是那种「写错了也照样能看」的布局——32 位 BMP 的通道掩码写错、TGA 的 descriptor 把行序写反，任何按惯例假定 BGRA/top-down 的读取器都会照样显示正确的图，直到遇上一个真按文件头来读的读取器；file size、pixel offset、image size 这类冗余字段更是错了也不影响解码。`tools/validate_image_output.py` 按两个格式的规则解码：行序取自文件头而不是假定，BMP 的通道排列取自文件声明的掩码而不是假定 BGRA，再与源像素逐字节比对。六种人为破坏均被抓住（BMP 红蓝掩码互换、BMP 高度写成正数即声称 bottom-up、BMP file size 少算文件头、BMP image size 清零、TGA descriptor 声称 bottom-up、行数据按 RGBA 而非 BGRA 写）。五者都接进了 `tools/local_ci.py` 的 `outputs` 组，并且都反向验证过：人为改坏各自检查的那一项都会被准确指出（PNG 这条试了改 IDAT 的 CRC 与截断 IEND 两种，分别报出 CRC 不符的具体两个值、和 chunk 声明的长度越过文件末尾）。
-  值得记一笔的是，写这三个校验器的过程中有两次是**校验器自己错了**——binary FBX 的 footer 漏了版本前的 4 个零字节，WAV 那边把 legacy AudioClip 的第一个字段当成了声道数（实际是 `format`，声道数是 `format >> 1`）。这恰恰是第二实现的价值：分歧会逼人去对格式或对读取端的实现，而不是让代码自我确认。
+- **输出格式的独立校验已建立（2026-08-15）**：本项目产出的几种文件此前只有自己校自己——binary FBX 的读写是一起写的（记录头里存的是绝对结束偏移，写入端事后回填，读取端若与写入端理解一致，错的偏移一样会被接受），ASCII FBX 根本没有 oracle（托管走 FBX SDK），WAV 头由本项目写、又由本项目的 helper 读回去比对采样；PNG 的 chunk 分帧、CRC、IHDR 与逐行 filter 全是本项目手写的，而它的单元测试用本项目自己的 `png_crc32` 去核对 CRC——CRC 表要是错了，测试照样过，每个看图软件都打不开。现在四者都有了照格式另写的第二实现：`tools/validate_fbx_binary.py`（有界输入、节点/属性/深度/数组预算，magic、版本、每条记录的结束偏移、属性数与属性区长度、raw/deflated 数组的实际长度与单一完整 zlib member、嵌套列表的 null 记录、footer 的 id/对齐/重复版本/结尾 magic）、`tools/validate_fbx_ascii.py`（括号配平、必备段、`Definitions` 声明的 Count 与实际对象数、`C:` 连线引用的 id 是否存在、`*N` 数组的值个数）、`tools/validate_wav_output.py`（直接交给 Python 标准库的 `wave` 模块读，它不是为本项目写的，字段自相矛盾就会拒绝）、`tools/validate_png_output.py`（用标准库 `zlib` 提供独立的 CRC-32 与 inflate：逐 chunk 核对 CRC、校验 IHDR 为 8 位色彩类型 6 且非隔行、解压 IDAT、还原 0–4 号 filter、要求 IHDR 在首 IEND 在尾且其后无残留，最后把像素与源数据逐字节比对，包含 Unity 自下而上到 PNG 自上而下的翻行）。另外 `json.rs`（TypeTree dump 的 JSON emitter）也是手写分帧，而它原有的测试同样是拿手写字符串对比——两边同一套理解，天然一致，且覆盖的形状都很浅。现补了随机树的往返测试：确定性 xorshift 生成任意 `TypeValue` 树，pretty 与 compact 两种形式都交给 serde_json 的 parser（与 writer 不共享任何代码）解析，再与本模块声明的映射逐值比对；对象键序不比（解析后的对象无序），那部分仍由原有手写测试覆盖。末尾的覆盖断言不是装饰：十一个 variant、空容器、容器套容器、非有限浮点、未配对代理项各至少出现一次，把生成器限制成只出叶子会让 variant 断言失败。五种人为破坏均被抓住（裸 `NaN`、对象字段间少逗号、typeless 元数据少逗号、map 的 key/value 互换、float 加宽成 f64），其中前三种只有真正的 parser 才看得见。BMP 与 TGA 同理：两者都是本项目手写的二进制布局，而且是那种「写错了也照样能看」的布局——32 位 BMP 的通道掩码写错、TGA 的 descriptor 把行序写反，任何按惯例假定 BGRA/top-down 的读取器都会照样显示正确的图，直到遇上一个真按文件头来读的读取器；file size、pixel offset、image size 这类冗余字段更是错了也不影响解码。`tools/validate_image_output.py` 按两个格式的规则解码：行序取自文件头而不是假定，BMP 的通道排列取自文件声明的掩码而不是假定 BGRA，再与源像素逐字节比对。六种人为破坏均被抓住（BMP 红蓝掩码互换、BMP 高度写成正数即声称 bottom-up、BMP file size 少算文件头、BMP image size 清零、TGA descriptor 声称 bottom-up、行数据按 RGBA 而非 BGRA 写）。五者都接进了 `tools/local_ci.py` 的 `outputs` 组，并且都反向验证过：人为破坏 zlib 数组的截断、尾随垃圾、声明元素数，或改坏任一条记录的结束偏移、footer 区段、PNG IDAT 的 CRC、IEND 截断，都会由对应第二实现准确拒绝。
+  值得记一笔的是，写这些校验器的过程中有三次是**校验器自己错了**——binary FBX 的 footer 最初漏了版本前的 4 个零字节；随后又把 `body + footer ID` 已经 16 字节对齐时规范要求的完整 padding 块误算成 0，普通 CLI fixture 因未落在该边界而一直通过，现由不调用 Rust writer 的 11 字节根名 fixture 锁定；WAV 那边则把 legacy AudioClip 的第一个字段当成了声道数（实际是 `format`，声道数是 `format >> 1`）。这恰恰是第二实现的价值：分歧会逼人去对格式或对读取端的实现，而不是让代码自我确认。
 - **畸形输入扫描已建立（2026-08-15）**：`crates/assetstudio-core/tests/malformed_input.rs`。"不可信输入不崩溃"此前只有各模块零散的拒绝用例背书——那些覆盖的是有人想到的情况。现在拿有效输入批量损坏（单比特翻转、截断、把长度字段改成 `0xFFFFFFFF`/`0x80000000` 一类的毒值），每个结果只允许是解析成功或 `Err`，panic 即失败并报出确切的偏移量以便复现。两处防自欺的断言：种子本身必须能解析（否则损坏的是本来就坏的东西，全是空洞的 Err），以及损坏后仍能解析的比例必须够高（否则全被文件头挡掉，根本进不到对象表）。另有三条把损坏的数据送到真正的解码器：一条把真实压缩载荷（ASTC LDR/HDR、BC6H、Crunch）包进 Texture2D 再损坏后解码——第一版直接喂原始载荷，而那些不是序列化文件，reader 在嗅探阶段就退掉了，解码器一次都没跑到，正是这份文件要防的那种测试。这条验证的是外部解码器的 catch_unwind 护栏确实生效（已反向验证：把护栏外面插一个 panic，扫描立刻失败）。另一条损坏真实 FSB5 音频后走 `detect_direct_wav`/`write_direct_wav`，覆盖 codec 分发与 Vorbis 解码——Vorbis 尤其值得测，它的 setup header 是从表里重建的而不是从流里读的，损坏的流可以配上一个解析得干干净净的 setup。第三条损坏 MOC3 头：那是本项目里唯一一处由载荷自己决定 reader 下一步去哪儿看的地方（四个表偏移在固定位置，然后按定宽切标识符记录），因此偏移或计数被改就是直接的越界邀请，翻转位置也刻意偏向头部。三条都要求"损坏后仍有成功解出的样本"，否则说明解码器压根没跑到。
 - **第二份提取的差分从 400 个 bundle 跑到了全部 2,778 个（2026-08-16），三处发现全在"报告方式"上而不在解析上**：此前这条差分只跑过前 400 个 case，而 637 个 OBJ 里有 636 个、577 个 txt 里几乎全部都在 400 之后——也就是说网格与文本这两类其实基本没被这条差分覆盖过。跑完之后：**OBJ 637 个比对、598 个逐值相同、39 个"本项目没导出"**；**txt 577 个里 571 个"不一致"**；**PNG 2,609 个里 214 个"超出容差"**。后两条查下来都不是本项目的问题，但也都不该就这么放着：
   - **txt 那 571 个是那份提取把二进制 TextAsset 当文本解码后写回去了**。抓到的证据是逐字节的：本项目导出的 `0039_02.txt` 以 `1f 8b 08` 开头（gzip magic），交给 Python 标准库 `gzip` 能解出 17,635 字节的 JSON；那份提取的同名文件第二个字节是 `?`（0x3f），`gzip` 直接拒绝，而且它有 1,044 个 `?` 字节、本项目只有 8 个。机制也已精确复现：把本项目的字节按 UTF-8 解码、每个解不出来的字节替换成一个 `?` 再编码回去，得到的就是那份提取的文件，**逐字节相等**（长度都是 2,403，因为每个坏字节换一个 `?`）。所以这一行比的不是两个实现的分歧，是一个被破坏了的 oracle。工具现在按这个精确变换归因，记成 `.txt oracle re-encoded` 而不是不一致；**没有放宽任何东西**：只要差异不能被这个变换完全解释就照样失败。已知盲点写在代码注释里——差异如果只落在本来就解不出来的字节上，两边都会塌成 `?`，这条看不见。
@@ -102,12 +734,31 @@
   - **第六处：UnityPy 纹理差分本身有三处让它测不到东西（2026-08-16）**。`tools/unitypy_texture_diff.py` 写好之后从没在这份语料上整跑过，一跑就发现：（1）它只比 `Texture2D`，却导出整个 bundle 的所有类，于是**两个 Live2D bundle 里那个"物化超出 type tree 上限 11 字节"的 MonoBehaviour 一失败，整个 bundle 的纹理全被丢掉**——为一个不是纹理的东西丢纹理；现已只导 class 28。（2）导不出东西的 bundle 被静默跳过，跟"比过了且一致"长得一样；现在汇总里报出跳过数（本语料 2,778 个里 1,763 个，绝大多数是压根没有纹理的 bundle，但这是一句陈述而不是一个空白）。（3）它把 `Alpha8` 归进"不需要解码、必须逐字节相同"那一类，于是报"两边解法相同、本应完全一致"——而 `Alpha8` 只存 alpha，RGB 填什么是约定：本项目照托管填白，UnityPy 填黑，那张字体图集 **16,777,216 个 alpha 字节两边完全相同**。现在按"该格式没存的通道可以不同、alpha 必须逐字节相同"归因并计数，alpha 错了照样是缺陷（已验证这道闸有效）。修完之后全量跑通：**RGBA32 143/143 逐字节相同；ASTC 4x4 139 张、ASTC 6x6 931 张与 ARM 参考解码器每通道差不超过 1；Alpha8 那张在该格式真正存储的每一个字节上都相同**。这条给出了纹理路径的第三方实现佐证，而且与上面 Alpha8 那条互相印证：托管说白、本项目跟托管，UnityPy 与另一份提取说黑。
   - 五处全部修完后的最终全量结果（2,778 个 bundle）：`.obj` **637 比对 / 632 逐值相同 / 5 未导出**（全为 Unity 写的空 mesh，本项目有意拒绝）；`.png` **2,609 比对 / 248 逐像素相同 / 2,147 在解码器容差内 / 212 有分歧 / 2 记为同名无法比较 / 0 未导出**；`.txt` **577 比对 / 6 逐字节相同 / 571 归因为 oracle 重编码 / 0 未导出 / 0 不一致**。那 212 张里，颜色分歧只剩 Alpha8 字体图集一张（已查明是提取那侧的约定，且已由新增的托管差分行长期把守），其余全部是遮罩边缘的 4,496 个像素。"没导出"那一列现在只剩 5 个，而且每一个都说得出理由。**零处指向本项目的解析或导出错误**——这句话在四处报告缺陷修掉之前是说不出口的，因为当时的数字里混着 41 个工具自己认不出名字的文件。
 - **收口后的真实语料复跑与 schema 版本作用域实证（2026-08-15）**：这一批改动里有两处会碰真实数据的行为变化，收口时都单独验过，而不是靠"合成测试过了"推断。（1）**语料没有回归**：用临时只读 manifest 在 release 下重跑 6000.3.12f1 的 2,778 个 Addressables bundle，得到 **243,617 个对象、104,565 个有解析载荷**，与本文此前记录的数字**逐个相同**——纹理首图放宽与模型贴图预算/原子发布这两处改动没有让任何东西多解析或少解析。顺带印证了前几天那条错误信息的修复确实有用：第一次跑我自己把用例预算declare小了，报出来的是"materializing Live2D textures exhausted the 536870912 byte total budget with 7953295 bytes left"，直接指出是哪个预算见底、还剩多少，而不是像从前那样去怪一张纹理。（2）**schema 版本作用域是有效而不是有害的**：从这款游戏的 187 个 DummyDll 现生成一份带 `unity_version` 的 schema（826 个类，全部标 `6000.3.12f1`），跑 `tools/mono_schema_diff.py`：先取 120 个 bundle 抽查（1,288 个对象全对），随后**跑满全部 2,777 个 bundle——94,743 个经 schema 读出的对象取值与 Unity 自己的树逐一相同**（53,380 个连 JSON 都逐字节相同，41,363 个只差字段名，即已记录的 `UnityEngine.Rect` 那类命名分歧），零取值不符。对照本文此前记录的 94,713 个，加版本门之后**一个匹配都没少，反而多了 30 个**——也就是说这道门没有把任何本该读到的对象挡在外面。抽查和跑满都记在这里：这一天里被抽查坑过四次，抽查过了不等于跑满会过。反向验证同样重要：把同一份 826 个条目改标成 `2022.3.62f1` 再跑，**匹配数为 0**，工具以"nothing was read through a schema, so nothing was checked"退出码 1 失败。两条合起来才说明这个门是按预期咬合的：对得上就照常读，对不上就明确拒绝，而不是安静地套一份别的版本的布局。
-- **收口后的完整本机复跑（2026-08-15）**：把工作树整理成 13 个提交之后，在最终提交的树上跑了 `tools/local_ci.py` 的**全部 12 组**（quality、rust、cli-package、oracle、audio、outputs、cross、linux、node、python、python314、typing、unitypy），**全部通过、零跳过**——也就是说 .NET 托管差分、vgmstream 音频差分、UnityPy 第三实现差分、输出格式的独立校验器、Linux amd64/arm64 容器里的运行与发布产物、Python 3.14 abi3 前向兼容、严格 mypy 消费端这些可选组这一轮都真的执行了，而不是因为缺工具被记成跳过。另外这批提交里**带源码的那 12 个**逐个在独立 worktree 里用 `cargo check --workspace --all-targets --locked` 验证过能单独编译，没有哪个要靠后面的提交才能构建；其余两个只动 `.gitattributes` 与 Markdown，不进构建。
+- **收口后的完整本机复跑（2026-08-15）**：在最终提交的树上跑了 `tools/local_ci.py` 的**全部 13 组**（quality、rust、cli-package、oracle、audio、outputs、cross、linux、node、python、python314、typing、unitypy），**全部通过、零跳过**——也就是说 .NET 托管差分、vgmstream 音频差分、UnityPy 第三实现差分、输出格式的独立校验器、Linux amd64/arm64 容器里的运行与发布产物、Python 3.14 abi3 前向兼容、严格 mypy 消费端这些可选组这一轮都真的执行了，而不是因为缺工具被记成跳过。另外收口时带源码的提交逐个在独立 worktree 里用 `cargo check --workspace --all-targets --locked` 验证过能单独编译，没有哪个要靠后面的提交才能构建；只改仓库元数据或 Markdown 的提交不进构建。
+- **收口门禁新增严格跳过策略（2026-08-16）**：`tools/local_ci.py --fail-on-skip ...` 在任何请求分组因缺少工具或语义前置条件而跳过时返回失败，日常不带该选项的兼容行为仍会报告并允许可选组跳过。七项回归分别锁定默认跳过成功、严格跳过失败、严格可运行成功、复合平台组缺第二工具必须跳过、未知组用法错误，以及锁定工具版本不符时必须跳过/精确相同时才可运行；测试本身已接入 `quality`。随后按路线图原样执行严格 `quality rust node python typing` 与 `linux`，本机和 Linux amd64/arm64 的全部步骤均通过、零跳过。
+- **Python 主接口审计已闭环（2026-08-22）**：逐组对照 Core 的加载、枚举、资源、专用 reader、场景/模型、Live2D、导出和解包能力后，没有发现仍缺失的稳定 Python 主能力；Rust 的 borrowed view、`write_*` 与低层 ownership escape 分别由 Python 的拥有型元数据/键读取、bytes 或原子路径输出和内部所有权边界替代，映射记录在 `docs/python-api-audit.md`。原来的严格 mypy 消费端漏掉了分页/迭代、按路径资源、静态 binary FBX、ACL 原始输入和 TypeTree JSON/dump 等 11 个真实方法；现已全部调用。随后对托管对象构造分派的机械复核先发现 class 111 `Animation` 与 class 221 `AnimatorOverrideController` 已有完整 Core parser，却没有高层 Rust/Python 入口；现分别增加有界的 GameObject/default/ordered-clip reader 与 base-controller/ordered-substitution reader。继续复核又确认 class 142 `AssetBundle`、147 `ResourceManager`、150 `PreloadData` 的生产 loader 解析器虽已建立容器索引，却没有高层直接读取入口；现同样暴露 inherited/effective 名称、bundle dependencies 和有序 preload/container/reference 表，Python 可分别收紧条目、单字符串和累计字符串预算，兼容 effective-name 的额外字符串副本也计入累计预算。最后补齐了此前只被渲染链间接使用的 class 213 `Sprite` 和 class 687078895 `SpriteAtlas` 完整元数据：Sprite 返回 rect/pivot/border、复合 atlas key/tags/PPtr、resident texture/alpha/secondary references、settings/UV/downscale 和规范化 tight-mesh 三角形，SpriteAtlas 返回原始复合 GUID key、有序 render-data、颜色/alpha PPtr、裁剪/UV/settings、secondary textures、tag 与 variant 标志；版本范围仍严格限定在已有 parser、fixture 和差分证据覆盖的边界。release wheel 和 sdist 重建 wheel 用合成 v22 普通/tight Sprite 与 atlas 对象逐字段、顺序和预算验证这些 reader。审计器同时解析 `studio.rs` 的四个高层 impl，当前 **106 个公开 Core 方法**中 102 个必须指向实际存在的 Python symbol，`from_collection`/`collection`/`into_collection`/`object_by_index` 四个接受、借用或返回 Rust 内部类型的入口明确保留 Rust-only；Core 新增公开方法未分类、映射目标从 stub 消失都会失败。Python 方向则要求 **65 个公开方法和 3 个属性**全在严格消费端出现。六项正反回归覆盖当前计数、漏方法/属性、缺少类/消费函数、Core 新方法未分类和 Python target 消失；GitHub workflow 结构门禁还要求这组自测不能被移除。当前树重新执行严格 `quality typing`、release wheel、sdist、从 sdist 重建 wheel、两条安装后公开面和两条完整 API 测试，全部通过、零跳过。
+- **可选 Node 主接口也有了独立机器审计（2026-08-23）**：`tools/check_node_api_surface.py` 不复用 Python 的映射结论，只复用 Core 方法解析器；同样对 106 个 Core 高层方法逐项分类，要求 102 个真实 Node target 同时存在于 `#[napi]` Rust 源和 `index.d.ts`，仅保留与 Python 相同的 4 个 Rust ownership/borrow 入口。反向再要求 Rust addon 与生成声明的 `AssetStudio` 精确一致，并让当前 **84 个方法和 3 个属性**全部出现在严格 TypeScript 消费端；注释先被剥离，不能冒充调用。八项反向测试覆盖新 Core 方法、Rust/声明 target 消失、addon/声明漂移、漏消费、注释掉调用和对象字段消失，GitHub workflow 结构门禁又要求审计及其自测都不能被移除。盘点没有只产出表格：它发现 `fromBuffer`/`fromBuffers` 只能限制绑定复制字节，不能把 `OpenOptions` 交给 Core，导致内存 UnityCN、stripped version、skip policy 和路径预算与磁盘入口不等价；现把 options 作为旧字节上限之后的末尾可选参数，旧位置调用不变。JavaScript 回归真实证明单 buffer 的 `maximumPathBytes` 与多 buffer 的 `maximumInputFiles` 在遍历/解析前生效，生成声明与 pinned TypeScript 编译通过。详细映射和边界见 `docs/node-api-audit.md`；Node 仍是可选交付面，不会反过来成为 Rust/Python 完成的前置条件。变更后严格 `quality` 已增长为 15/15，Node 的 debug/release addon、JavaScript/TypeScript、包内容和 tarball 8/8，以及 workspace build/test 2/2 全部通过且零组跳过。
+  同一轮继续核对 worker 入口，发现 `openAsync`/`fromBufferAsync` 仍丢失同一份 options；现同样在旧参数之后追加可选 `OpenOptions`，task 持有配置并在 worker 内调用 Core 的 `*_with_options`，实际 Promise 回归分别证明路径和内存标签预算生效，旧一/三参数调用保持通过。
+  最后把发布包本身纳入同一约束：临时消费者从实际 `.tgz` 安装后，测试会解析安装后的
+  `index.d.ts`，再与加载出来的 native `AssetStudio` class 双向比较 84 个方法和 3 个 getter；
+  保持成员总数不变、只重命名一个声明方法也必须失败。隔离 npm 缓存下该安装门禁已通过，
+  因此当前证据不再依赖源码树中的 addon 或声明碰巧正确。随后重新执行完整
+  `outputs quality rust python node typing security cross` 以及 `linux`：本机全部构建、测试、
+  打包、类型、安全和交叉编译步骤，连同 Linux amd64/arm64 的 Core/CLI、release CLI、
+  Python wheel、Node addon 与实际 npm tarball 安装测试均通过，零组跳过。
+- **可选 Node 绑定同步了完整 `Sprite`/`SpriteAtlas` 元数据（2026-08-22）**：`readSpriteMetadata` 与 `readSpriteAtlas` 直接复用同一组 Core reader。Sprite 返回 object index/name/rect/pivot/border、原始 16-byte GUID `Buffer` 与 `bigint` key/PathID、atlas tags/PPtr、resident color/alpha/secondary references、解码后的 settings、UV/downscale 和规范化 tight-mesh triangles；条目、单字符串、累计字符串和 mesh bytes 预算可分别收紧。SpriteAtlas 返回有序 render-data、颜色/alpha PPtr、Rect/Vector/UV、settings、secondary textures、tag 和 variant 标志。JavaScript fixture 对普通 Sprite 逐字段核对并覆盖四个低预算拒绝分支，另一个有效 tight fixture 证明 triangle 跨过 napi 转换；atlas fixture 则故意把较大的原始 GUID key 写在前面并带一项 secondary texture，验证绑定保留 Core 的确定排序和全部嵌套字段。napi-rs 重生成的声明由严格 TypeScript 消费端实际调用，release addon build、JavaScript 和 TypeScript 测试全部通过。
+- **Node 的 `AnimationClipInfo` 已从简略 shape 补到完整稳定元数据（2026-08-22）**：保留原方法名和旧字段，新增 PathID、high-quality 标志、PPtr 曲线、muscle size 与 streamed/dense/constant 计数、ACL frame/bone/rate/curve/track bytes/decoder/fast-sample 字段，以及外部 streaming offset/size/path。`maximumBytes` 现在同时收紧对象、字符串、packed/reference 与累计分配预算，两个 clip 入口共用同一限制构造。现有完整 Unity 2022.2 muscle fixture 验证无 ACL/streaming 时所有 optional 字段保持 `undefined`；Tuanjie 2022.3.55t4 fixture 验证 32-byte ACL 容器、decoder map、fast-sample 与空路径 StreamingInfo。生成声明中的 `bigint`/optional 字段由严格 TypeScript 消费端实际赋值，不再只做方法存在性 smoke。
+- **Node 的 `Avatar` 已从四字段摘要补到完整稳定元数据（2026-08-22）**：`readAvatar` 现在返回 PathID、声明大小、普通/人形骨架节点数、保序 TOS `(hash,path)`、HumanDescription 的人形骨/骨架骨计数和 root-motion bone name；旧 `declaredSize` 保留为 `declaredAvatarSize` 的兼容别名。`maximumBytes` 同时收紧对象、单/累计字符串、引用与累计分配预算。由 Python 已通过的 Tuanjie 2022.3.55t4 fixture 逐字节移植到 JavaScript，完整对象解析后逐字段核对 `0xfeedbeef -> Root/Hips` 与 `Hips` root motion，并证明一字节预算拒绝；生成声明的 `AvatarPathEntry[]` 与 `bigint` PathID 进入严格 TypeScript 消费。
+- **六平台发布配置有了自动结构门禁（2026-08-22）**：`tools/check_ci_matrix.py` 不把“workflow 里看起来有 matrix”当证据，而是逐 job 要求 Python wheel、CLI 和可选 Node 包各自恰好包含 Linux/Windows/macOS × x86-64/ARM64 六个 `(runner, artifact)` 对；Python 必须安装并跑 wheel API/mypy，CLI 必须执行精确 release 二进制的 `--help` 并带法律文件 staging，Node 必须测试 release addon、检查 npm 内容并真正 `npm pack`。门禁自身接入本地与 GitHub `quality`，八项回归锁定当前配置、缺一个 Windows ARM64 目标、矩阵项重复键、移除 CLI smoke、移除 local-CI 完成策略自测、移除 Python API 审计自测、移除 RustSec 执行步骤，以及把 RustSec `run:` 行注释掉。收口审查实际发现 GitHub `quality` 原先没有执行 `tools/test_local_ci.py`，所以 `--fail-on-skip` 的正反策略虽在本地跑、却可能在正式 CI 中退化；现已补上该步骤并由反向测试锁定。注释场景则暴露了另一处真实漏洞：旧检查只搜原始 YAML 字符串，注释中的命令也会被误认成可执行证据；现只在有效 YAML 行中计数。锁定的 `actionlint 1.7.12` 也在 2026-08-22 对最新 workflow 零告警通过，因此专用矩阵断言没有被冒充为通用 YAML/Actions 表达式检查。以上仍然**不替代 GitHub runner 的六路绿色记录**。外部状态也已按 API 核实：`81b02a5` 的 [run 31947620200](https://github.com/Team-Haruki/unity-rs/actions/runs/31947620200) 在 2026-08-16 启动后约六秒即失败，所有 16 个主 job 都是 `steps=[]` 且没有日志，两个依赖 job 被跳过，因此没有一条仓库命令实际执行；仓库级 Actions 当前为 enabled、允许全部 actions，默认 workflow 权限为 write，所以不是仓库禁用了 Actions。API 没有给出可进一步归因的错误文本；组织计费端点需要当前 token 没有的 `admin:org` 权限，不能越权把根因写成某一种计费状态，也不能把这次 run 写成代码失败或绿色证据。
+- **旧无头 WorkMode 的入口名已补齐（2026-08-22）**：逐项核对托管 `WorkMode` 与 CLI alias 后，原生 CLI 现接受 Extract、Export、ExportRaw、Dump、Info、Live2D（`l2d`/`live2d`）、SplitObjects 和 Animator 的旧式 `-m` 写法。新补的两个 Live2D alias 进入完整 `live2d-package` 路径，而不是只写散件 MOC；仍要求显式 `-o`，并拒绝 overwrite 与无关的 extension flag，以保持当前原子 no-clobber 契约而不恢复隐式 `ASExport` 副作用。解析单测同时覆盖两个 alias、缺输出和两个拒绝分支；进程级测试逐个核对 MOC、model3、PNG 和临时文件清理。完整 CLI 共 **72 项测试**通过，严格 CLI Clippy 通过；同一工作树随后执行严格 `quality rust typing`，共 12 项快速质量步骤、workspace build/test 和 Python 3.9 严格消费端全部通过、零跳过。
+- **锁定依赖图现有 RustSec 门禁（2026-08-22）**：`cargo-audit 0.22.2` 的 MSRV 正好是项目下限 Rust 1.88；当前数据库载入 1,225 条 advisory，扫描 `Cargo.lock` 的 103 个依赖后没有漏洞、unsound 或 yanked 包。唯一输出是 `paste 1.0.15` 的停止维护警告 RUSTSEC-2024-0436，它只经 `texture2ddecoder 0.1.2` 进入构建图；后者没有新版，而为去掉一个无已知漏洞的 proc-macro 完整 vendor 需要再维护约 8,685 行上游解码代码，因此现阶段明确允许 unmaintained 提示，但不忽略 advisory，也不放宽漏洞/unsound/yanked。GitHub `quality` 会安装锁定版本并执行该策略；本地 `security` 组不仅检查命令存在，还要求 `--version` 精确为同一个 `cargo-audit 0.22.2`，旧版或无法读取版本时按缺少前置条件处理，配合 `--fail-on-skip` 必然失败而不会产出较弱的假证据。对应正反测试与“注释掉 GitHub 执行行”的结构测试都已通过。
+- **SerializedFile v1-v4 保持验收边界而不猜实现（2026-08-22）**：托管枚举定义 1、2、3 后直接跳到 5，格式 4 没有公开定义；v1-v3 又早于当前 TPK/真实语料能提供的最早 TypeTree。Rust 内部已有 v2/v3 recursive-node 字段门只说明代码为未来样本留了位置，不能当作兼容证据。生产入口继续在完整 header/layout 校验后返回带具体版本号的 `Unsupported`，新增回归逐一锁定 1、2、3、4 不得退化成 `InvalidData`、误解析或 panic。只有拿到真实文件和可独立核验的树/对象载荷后才扩展差分矩阵；在此之前不从 v5 树反推更老格式。
 - **Python 门禁在断言被关掉时会整片变绿（2026-08-15）**：收口当前工作树时查出的一条自欺路径，而且正好压在刚补上的法律文件门禁上。仓库里当门禁跑的 Python 脚本——`check_delivery_scope.py`、`check_core_package.py`、`test_monoschema.py`、`sdist_contents.py`、`installed_wheel.py`、`python_api.py`——判定全部是裸 `assert`，而 `-O` 与 `PYTHONOPTIMIZE` 是把 assert 整条从字节码里删掉，不是跳过。实测而不是推演：造一个只带 README、三份法律文件和全部必需源码一个都没有的 sdist，`PYTHONOPTIMIZE=1 python3 tests/sdist_contents.py` 退出码 0、一个字都不说；正常模式下它会把缺的十二项逐个列出来。暴露面是具体的：CI 里 `python3 tools/*.py` 和 `python tests/sdist_contents.py` 这几步都不带 `-I`，环境变量能直接生效；带 `-I` 的那几步隐含 `-E`，只有命令行 `-O` 能触发。六个门禁与 `local_ci.py` 现在都在模块层拒绝在断言关闭时运行，`local_ci.py` 那道同时挡住它内嵌的四个 `-c` 断言和它派生的全部子进程（子进程继承同一份环境）。七处都反向验证过：`-O`/`PYTHONOPTIMIZE=1` 下一律以退出码 1 拒绝并说明原因，正常模式下逐个照常通过。
 - **同一条路子又扫了三处，两处干净、一处有修（2026-08-15）**：既然"检查其实没在检查"这一类当天已经抓到两个，就把它扫完。（1）**`#[ignore]` 全部有归属**：12 个里 1 个是托管差分（有 CI job 与 `local_ci oracle`）、10 个是 vgmstream 音频差分（有 `audio-oracle` job 与 `local_ci audio`）、1 个是 `real_corpus`（按设计只能靠私有语料手动跑，`corpus/README.md` 写明）。没有第二个"写好了但没有任何东西会跑它"的音频差分那种情况。（2）**托管差分的每一行都已有反空洞断言**：ASTC/块格式解码为 null、Live2D 各文档没产出、split 组没对象、版本门没对象、容器没文件、曲线没 segment、关键帧行取值为零——都会直接失败并说明"比较证明不了任何东西"，不是靠两边同为空而通过。这一条是负结果，但值得记：这类扫描不写下来，下次还会有人重扫一遍。（3）**BC6H fixture 的位数检查用的是 `debug_assert_eq!`**，release 下整条消失，而那份提交入库的载荷正是这个函数产出的——重新生成时它是唯一一个会指出"块没填满 128 位"的东西，短了就会被写进文件然后永远跟自己比对。已改成 `assert_eq!`；反向验证：把一个十位端点写成九位，release 下报 `125` 对 `128`，而改之前一声不响。多填的情况本来就会被数组边界挡住，少填的只有这一条能抓。
 - **UnityCN 没有第二实现这条已按版本核实（2026-08-15）**：此前写的是"本机这份 UnityPy 也没有 UnityCN"，属于陈述而非核对。实测本机 UnityPy **1.25.0** 的包内没有任何文件提到 UnityCN，托管 AssetStudio 仍然只检测不解密。结论不变，但现在是有版本号的核实结果，而不是印象。
 - **顺带补上一处没有守卫的比较（2026-08-15）**：`unitypy_oracle.py` 的 `assert_double_precision` 对 15 个 fixture 每个都跑一遍，而只有一个 fixture 带那个 `Double` 字段——也就是说它今天确实比了一个值，但没有任何东西保证它明天还在比。旁边的 TypeTree 行早就有"比较了多少棵树、为零即失败"的计数器，这一条没有。现在按同样的形状把计数汇总到 `main`，全程为零即失败，摘要里也报出实际比了几个。反向验证：把字段名换成一个不存在的键（模拟 fixture 哪天不再携带它），差分立刻以"no double field was compared"失败，而在此之前那样改是全绿的。
-- Core 497 项普通测试通过，10 项依赖可选 vgmstream oracle 的测试在本机额外执行并全部通过（其中 1 项钉住的是已记录的上游 Opus 偏离，不是一致性）；
+- **生产目标 panic/占位审计补查（2026-08-23）**：项目生产代码没有遗留项目级 `TODO`、`todo!` 或 `unimplemented!`；vendored 纹理解码器的上游注释不冒充本项目功能。额外以 Clippy 的 `unwrap_used`/`expect_used`/`panic` 扫描 Core、CLI、Python 与 Node 生产 target 后，确认 Python 自身没有该类调用，Node 的命中均为受支持 64 位目标上的有界整数转换，CLI 临时文件命中由私有状态机约束，vendored ASTC panic 已在统一解码边界被 `catch_unwind` 转为错误。唯一仍把两个输入派生预算相加后 `expect` 的动画构建状态已改为 checked `InvalidData`；直接构造 `usize::MAX + 1` 的回归证明其返回错误而不 panic；
+- Core 当前 550 项常规测试通过，10 项依赖可选 vgmstream oracle 的测试保持忽略并已在本机音频 oracle 门中另行通过（其中 1 项钉住的是已记录的上游 Opus 偏离，不是一致性）；CLI 全目标当前 89 项测试通过；
 - C#→Rust 托管差分 oracle 通过；
 - TypeTree dump 浮点文本对照 .NET 10 实测生成的 849 个取值（边界值 + 位模式扫描）逐字节一致，期望值以 fixture 形式入库；
 - `cargo doc --workspace --no-deps` 在 `-D warnings` 下通过；
@@ -231,7 +882,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 1. **模型/FBX**
    - 当前场景可输出确定性的 ASCII 与 binary FBX 7.4；
-   - **binary FBX 编码层已落地（2026-08-14）**：`fbx_binary.rs` 提供 FBX 7.4 的节点树、属性类型与字节布局，写出与读回两条路径。写出走的是记录头里的绝对 end offset，因此每条记录先编码体再回填头；数组属性到阈值才 deflate，小数组压了反而更大。7.5+ 的 64 位 offset 明确拒绝而不是截断。读回的解析器是照格式写的、不共享写出侧代码，所以两者互为对照——但要说清楚它证明了什么：它证明编码自洽，不证明 FBX SDK 会接受。2026-08-15 补了一层独立校验：`tools/validate_fbx_binary.py` 是照格式规则另写的解析器（不看本项目的读取代码），会检查 23 字节 magic、版本字、每条记录头里的绝对结束偏移是否正好落在记录末尾、属性数与属性区长度是否与实际属性吻合、嵌套列表的 null 记录、以及 footer 的 id/对齐填充/重复版本/结尾 magic；`--cli` 模式会自己造模型、走 CLI 导出再校验，已接进 `tools/local_ci.py` 的 `fbx` 组。写这个校验器时它一上来就报 footer 不对，查下来是**校验器**漏了版本前面那 4 个零字节、写入端是对的——独立实现的价值正在于此：分歧会逼人去对格式，而不是对着代码自我确认。反向也验证过：改坏任一条记录的结束偏移或结尾 magic，校验器都会准确指出。ASCII 那条也补了同样性质的校验（`tools/validate_fbx_ascii.py`）：括号配平、7.4 必备的几个段是否齐全、`Definitions` 里每个 `ObjectType` 声明的 Count 是否与 `Objects` 里实际写出的对象数一致、每条 `C:` 连线引用的 id 是否真的存在（root 的 0 除外）、以及 `*N { a: ... }` 的值个数是否等于 N。这四条都是导入器会依赖、而写入端自己的测试不会注意到的东西；四种人为破坏都能被准确指出。本机没有 Blender/assimp/FBX SDK，因此导入器接受度这一条仍然只能由你那边验证。真正的差分做不了，因为托管侧是通过 FBX SDK 产出二进制的，字节结构本就不同。
+   - **binary FBX 编码层已落地（2026-08-14）**：`fbx_binary.rs` 提供 FBX 7.4 的节点树、全部标准 scalar/array 属性类型与字节布局，写出与读回两条路径；`b` 布尔数组覆盖 raw/zlib 两种 encoding，读取时按规范把任意非零字节归一化为 `true`。`FbxBinaryWriteLimits` 对输出、节点、属性、非空深度和数组元素提供对称预算，默认 256 层先于递归拒绝过深的公共 `FbxNode`，而旧 API 继续包装默认值。写出走的是记录头里的绝对 end offset，因此每条记录先编码体再回填头；数组属性到阈值才 deflate，小数组压了反而更大。7.5+ 的 64 位 offset 明确拒绝而不是截断。读回的解析器是照格式写的、不共享写出侧代码，所以两者互为对照——但要说清楚它证明了什么：它证明编码自洽，不证明 FBX SDK 会接受。2026-08-15 补了一层独立校验：`tools/validate_fbx_binary.py` 是照格式规则另写的解析器（不看本项目的读取代码），会检查 23 字节 magic、版本字、每条记录头里的绝对结束偏移是否正好落在记录末尾、属性数与属性区长度是否与实际属性吻合、嵌套列表的 null 记录、以及 footer 的 id/对齐填充/重复版本/结尾 magic；额外的手工 fixture 不调用 Rust writer，直接构造包含 `b` 属性的 raw 布尔数组。`--cli` 模式会自己造模型、走 CLI 导出再校验，已接进 `tools/local_ci.py` 的 `outputs` 组。写这个校验器时它一上来就报 footer 不对，查下来是**校验器**漏了版本前面那 4 个零字节、写入端是对的——独立实现的价值正在于此：分歧会逼人去对格式，而不是对着代码自我确认。反向也验证过：改坏任一条记录的结束偏移或结尾 magic，校验器都会准确指出。ASCII 那条也补了同样性质的校验（`tools/validate_fbx_ascii.py`）：括号配平、7.4 必备的几个段是否齐全、`Definitions` 里每个 `ObjectType` 声明的 Count 是否与 `Objects` 里实际写出的对象数一致、每条 `C:` 连线引用的 id 是否真的存在（root 的 0 除外）、以及 `*N { a: ... }` 的值个数是否等于 N。这四条都是导入器会依赖、而写入端自己的测试不会注意到的东西；四种人为破坏都能被准确指出。本机没有 Blender/assimp/FBX SDK，因此导入器接受度这一条仍然只能由你那边验证。真正的差分做不了，因为托管侧是通过 FBX SDK 产出二进制的，字节结构本就不同。
    - **场景层已接上（2026-08-14）**：`fbx_binary_scene.rs` 把 `StaticScene` 的计划映射成节点树——Model、Geometry、Material 与 Connections，外加 header/GlobalSettings/Definitions。场景内容复用的就是 ASCII writer 的计划，所以几何、变换、材质颜色、连线都来自托管差分已经覆盖的代码；新增的只是记录布局。测试拿二进制解析回来的顶点数组跟 ASCII 文本里的同一个数组逐值比对，这样二进制的场景内容是靠 ASCII 那条已验证路径传递过来的，而不是只跟自己自洽。
    - 贴图的二进制布局也已接上：`Texture`/`Video` 记录与指向材质通道的 OP 连线，UV 变换按 FBX 的约定挂在 texture 上。蒙皮也已接上：Skin/Cluster deformer、Indexes/Weights 与两个 bind 矩阵，连线按 cluster→skin→geometry 与 cluster→bone model 建立。blend shape 也已接上：BlendShape/BlendShapeChannel deformer 与 Shape geometry，目标形状按 FBX 的约定写成相对基础控制点的偏移而不是绝对坐标。动画也已接上：AnimationStack/Layer/CurveNode/Curve 与相应的 OP 连线，key 时间按 FBX tick 写（1 秒 = 46186158000 tick，写成秒会让整个 clip 塌到第 0 帧却仍然能解析）。binary FBX 的场景层至此与 ASCII 覆盖同一组内容。**但直到 2026-08-15 之前，没有任何调用方能碰到它**——CLI、Node、Python 都只连着 ASCII writer，编码器写完了却是死代码。现已三个交付面全部接上：Core 补了 `Studio::read_static_fbx_binary`/`read_fbx_binary`（含 ACL decoder 注入变体），CLI 的 `fbx` 加了 `--binary`（`obj` 传这个标志会明确报错而不是默默忽略，因为 OBJ 只有一种编码），Node 加了 `readStaticFbxBinary`/`readFbxBinary`，Python 加了 `read_static_fbx_binary`/`read_fbx_binary`。测试都按格式本身验证（23 字节 magic、版本字 7400）而不是拿本项目产出的字节当基准；CLI 与 Python 还把同一个模型用文本 writer 也导一遍，确认两边描述的是同一个场景。Node 那套没有模型 fixture，因此只验证方法确实存在且行为与文本版一致（先断言是 function 再断言抛错，否则「没绑定」和「绑定了但报错」分不开）。顺带一提，Python 的 wheel 有一道 API 面守卫：运行时多出来的方法必须同时出现在类型 stub 里，这次正是它拦下来提醒补 `.pyi` 的。这些目前会明确报 Unsupported 而不是当普通几何写出去——写出去会得到一个看起来导出成功、实际丢了绑定的文件。
    - **新增 `obj` 命令（2026-08-14）**：整模型导出为 Wavefront OBJ + 同名 `.mtl` + 同级贴图。OBJ 没有层级，因此节点变换烘进世界空间、顶点索引跨 group 累加；面引用只写网格真正有的通道，与 `export` 写单个 Mesh 的 `.obj`（照抄托管 writer 无条件 `v/vt/vn`）刻意不同；
@@ -275,10 +926,10 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - 生成器现在默认给每个条目写入精确 `unity_version`，避免一份布局静默套到另一引擎版本；只有显式 `--unversioned` 才生成跨版本 fallback，并有真实临时 DLL 的端到端门禁。仍存在的已知分歧是重建树的字段命名（枚举、`UnityEngine.Rect` 等引擎结构），详见 `docs/mono-schema.md`。
 
 4. **Node 专用 reader 完整度**
-   - Node 公开面已覆盖主要 Python reader：读取面包括 `readAudio`、`readMonoScript`、`readMaterial`、`readBuildSettings`、`readPlayerSettings`、`readAvatar`、`readAnimationClipInfo`、`readAnimatorController`、`readAclTracks`（只读 ACL 头，够调用方判断自己的 decoder 能不能处理）、`readMonoBehaviourJsonWithSchemas`（用调用方提供的可信 schema 还原被剥掉的托管字段；schema 是纯数据，查找过程不执行任何资产控制的代码）、`readResourceRange`、`resourceIndexByPath`、`scene` 和 Cubism 单对象 reader；输出面包括 `readStaticFbx`、`readFbx`（含动画）、`readFbxWithTextures`（贴图随 FBX 一起返回，由调用方决定写哪）、`export`、静态 `extract`、`live2DPackages`、`readLive2DPackages`；加载面包括 `openWithVersion`、`fromBuffers` 与 `openWithOodle`。Material 属性值刻意只给名字不给值：它们按表分类型，硬摊平到 JS 只会丢信息。
+   - Node 公开面已覆盖主要 Python reader：读取面包括 `readAudio`、`readMonoScript`、`readMaterial`、`readBuildSettings`、`readPlayerSettings`、`readAvatar`、完整的 `readAnimationClipInfo`、`readLegacyAnimation`、`readAnimatorOverrideController`、`readAnimatorController`、`readAssetBundle`、`readResourceManager`、`readPreloadData`、`readSpriteMetadata`、`readSpriteAtlas`、`readAclTracks`（只读 ACL 头，够调用方判断自己的 decoder 能不能处理）、直接内嵌树的 `readMonoBehaviourJson` 与可信外部 schema 的 `readMonoBehaviourJsonWithSchemas`（schema 是纯数据，查找过程不执行任何资产控制的代码）、`readResourceRange`、`resourceIndexByPath`、`scene` 和 Cubism 单对象 reader；输出面包括 `readStaticFbx`、`readFbx`（含动画）、`readFbxWithTextures`（贴图随 FBX 一起返回，由调用方决定写哪）、`export`、静态 `extract`、`live2DPackages`、`readLive2DPackages`；加载面包括 `openWithVersion`、`fromBuffers` 与 `openWithOodle`。新增的直接 reader 共用一个 `ObjectReference { fileId, pathId }` 形状，JavaScript 有效 v22 fixture 逐字段、顺序、`bigint` 与预算验证，napi-rs 生成声明由严格 TypeScript 消费端调用。Material 属性值刻意只给名字不给值：它们按表分类型，硬摊平到 JS 只会丢信息。
    - Core 侧同时补上 `Studio::write_fbx_with_textures`：此前贴图输出只有 CLI 走得到，库调用方拿不到。它返回贴图集合而不是自己写盘——这个方法只持有一个输出流，没有目录可以写同级文件，由调用方决定落在哪里。
    - Live2D 包发现与落盘、FBX 静态几何/动画/贴图均已接；
-   - Oodle decoder 注入已接（`openWithOodle`，只提供异步形式：解码回调要在事件循环上跑而 worker 在等它，同步调用会把该跑回调的那条线程堵死）；ACL decoder 注入同时覆盖 `readFbxWithAclDecoder` 与单对象 `readCubismClipMotionWithAclDecoder`，同样只提供异步形式，回落的曲线由 Core 校验形状、顺序与预算，不信调用方的承诺；
+   - Oodle decoder 注入已接（`openWithOodle`，只提供异步形式：解码回调要在事件循环上跑而 worker 在等它，同步调用会把该跑回调的那条线程堵死）；ACL decoder 注入覆盖 FBX、单对象 Cubism motion 与完整 Live2D 包，同样只提供异步形式，回落的曲线由 Core 校验形状、顺序与预算，不信调用方的承诺；完整包的 worker 可同时带入外部 schema，另有同步 `readLive2DPackagesWithSchemas` 给不含 ACL 的 stripped 包；
    - napi-rs 生成的声明由严格 TypeScript 消费端编译把守；ACL 与 Oodle 回调签名从 Rust 参数注解生成，避免原生测试通过但 `.d.ts` 留下未声明内部类型；
    - Node 是可选交付面，因此优先级低于 Core 和 Python 的真实语料兼容。
 
@@ -308,18 +959,20 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 ## 下一步执行清单
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
-不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。工作树已于
-2026-08-15 收口（见第 0 项），本地 `main` 比远端超前 46 个提交且**尚未推送**；
-远端发布矩阵之前必须先把这些提交推上去。提交和推送属于显式的仓库操作，
-需要得到维护者授权后执行——本轮已获授权在本地提交，推送尚未获授权。
+不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
+整理出的主体提交已经推送，2026-08-22 核对时本地 `main` 与 `origin/main`
+均指向 `81b02a5`。当前工作树包含严格跳过策略、对应回归测试、Python 主接口
+审计、六平台矩阵门禁、多文件模型导出的事务发布和本文同步这批尚未提交的收口改动；它们不阻塞读取现有
+远端代码，但正式发布矩阵应在这批改动审查并提交后再运行，避免可选门禁因
+环境缺失而静默跳过。
 
 | 顺序 | 接下来要做的事 | 完成证据 |
 | --- | --- | --- |
-| 0 | **收口当前工作树**：逐模块审查现有 Core、Python、Node、CI、许可证和文档改动，确认所有新增文件都属于交付范围，再整理为可审查提交 | **本地部分已完成（2026-08-15）**：`python3 tools/local_ci.py quality rust node python typing` 28 步全绿零跳过、`python3 tools/local_ci.py linux` 六步全绿、`git diff --check` 干净；工作树已整理成 14 个按主题的提交，其中带源码的 12 个每个都单独用 `cargo check --workspace --all-targets --locked` 在独立 worktree 里验证过能编译、不依赖后续提交（另两个只动 `.gitattributes` 与 Markdown）。**未完成的是远端那一半**：这些提交还没推送，所以还不存在一个远端可验证分支 |
+| 0 | **收口当前工作树**：逐模块审查现有 Core、Python、Node、CI、许可证和文档改动，确认所有新增文件都属于交付范围，再整理为可审查提交 | **主体已完成并同步远端（2026-08-22）**：本地 `main` 与 `origin/main` 同为 `81b02a5`；此前带源码的提交均在独立 worktree 里验证过能单独编译、不依赖后续提交。当前新增的 `--fail-on-skip`、回归测试、Python API/RustSec 审计、六平台矩阵门禁、多文件模型导出事务、旧 `l2d`/`live2d` CLI alias 和文档同步仍未提交。本轮已逐模块审查 Core/CLI、Python、Node、CI、许可证和文档；唯一确定遗漏是 GitHub `quality` 没有运行 local-CI 完成策略自测，现已修复并有删除该步骤即失败的回归。修复后重新执行严格 `quality rust security typing` 以及 `node python`：格式、十二项结构/反向审计、Clippy、rustdoc、Core 打包、许可证、无 GUI/旧 C ABI/context handle 交付范围、workspace build/test、RustSec、Python 3.9 typing、Node debug/release addon/JS/TS/npm tarball、Python release wheel/sdist/重建 wheel/安装后公开面与完整 API 全部通过，零组跳过；最新多文件事务切片又执行完整 `outputs quality rust python node typing security cross` 与 Linux amd64/arm64 原生门禁，同样零组跳过。`git diff --check` 已复核；剩余工作只是把当前改动整理为可审查提交并在 GitHub runner 上跑正式矩阵 |
 | 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | 六路 job 全绿；每个 CLI 产物能运行 `--help`，每个 wheel 能安装并通过公开 API 测试，每个 Node tarball 只含目标平台 addon 并通过 JS/TypeScript smoke；产物包含一致的许可证和 notices |
 | 2 | **扩充代表性真实 corpus**：在现有 Unity 2022.3 与 6000.3 之外，优先加入 Tuanjie 2022.3.x、Nintendo Switch、旧 Unity 4/5/2017 和带完整托管快照的样本 | 私有 manifest 在 release 模式稳定通过；每类至少有对象顺序、PathID/class、名称/container、原始载荷 hash、主要解码结果或明确错误族的版本化快照；专有样本不提交到仓库 |
 | 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
-| 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | 安装后的 wheel 公开面与 `.pyi` 双向一致，Python 3.9 严格 mypy 消费端和完整 API 测试通过；大结果采用有界、可失败分配；Rust/Python 路径不经过 C ABI 或 .NET |
+| 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22）**：106 个高层 Core 方法均被机器检查为 102 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；65 个公开 Python 方法和 3 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
 | 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | 默认构建、测试、安装和用户工作流均不需要 .NET；没有 GUI 或旧 C ABI 发布物；七项完成条件均有当前证据，未满足项不得被标成完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
 
@@ -333,7 +986,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 **需要外部输入，我这边无法推进：**
 
-1. 让 CI 重新跑起来（GitHub Actions 计费）。本机已把 CI 的常规步骤复跑过一遍且全绿；Linux 运行面现已在 amd64/arm64 容器中覆盖，仍无法本机复现的是 Windows 运行与 GitHub 托管发布矩阵。为降低这条的代价，新增 `tools/local_ci.py`：一条命令跑完 CI 的全部步骤（现为 51 步）（格式、Clippy、rustdoc、打包、许可证聚合、无 GUI/旧 C ABI 的交付范围与产物校验、workspace 构建/测试、托管差分、MonoBehaviour schema 生成器、音频差分、输出格式校验、release CLI 的构建/smoke/staging、Node debug/release 构建/测试/打包、Python wheel 与 sdist 的构建/安装/两套测试、Python 3.14 abi3 前向兼容、严格 Python 类型消费、UnityPy 差分，以及可选交叉/Linux 容器门禁），缺哪个工具就把那一组记为跳过而不是失败。2026-08-15 修了一处会让证据凭空消失的问题：wheel 原先直接装进当前解释器，而 Homebrew/发行版的 Python 现在按 PEP 668 直接拒绝安装——于是 `install wheel` 失败，依赖它的 `wheel surface`、`python api` 与 UnityPy 差分一并失败，也就是说 Python 那一侧的公开面守卫和 API 套件其实根本没在跑。现在 `python` 组自己建一个 `--clear` 的临时 venv（带 `--system-site-packages`，好让宿主已装的 UnityPy 仍可导入），宿主解释器只作为建 venv 的底座和 maturin 的目标。修好之后第一次跑就抓出一条陈旧断言：`python_api.py` 里还在断言 physics3.json 的紧凑写法，而两次提交前刚把 Cubism 文档改成与托管一致的展开写法——正是「没在跑的测试」会掩盖的那类回归。随后类型桩审计又抓到两项幽灵 API：`.pyi` 允许导入 `AclDecoder`/`OodleDecoder`，运行时模块却没有这两个名字；现在二者是真正的运行时导出，wheel 守卫也改成双向比较。本轮逐项对照 workflow 时又发现本地脚本漏掉了 workspace build、sdist 重建、release CLI/Node 产物和 Python 3.14 安装；这些步骤现已接入并实际通过。交付范围检查也已实际通过，会把 workspace、依赖方向或产物内容的漂移直接变成失败；schema 生成器步骤则在本轮以真实临时 DLL 单独验证，并和托管差分一起通过 `oracle` 组。这不能替代 CI——CI 是在三个平台上跑这套矩阵——但它让拿得到 Linux/Windows 的人能自己产出同样的证据，而不必先从 workflow 文件里把步骤拼出来。另外补了一个 `cross` 组：本机交叉编译到 `x86_64-unknown-linux-gnu`（含全部测试目标）已验证通过，Windows 侧用 `zig cc` 也验证了 core/CLI/Python 三个 crate 能编过（Node addon 要链 libnode.dll，交叉环境下不适用）。这只覆盖「能不能编译」——路径假设、漏掉的 `cfg`、只在某个平台成立的 `Send` 之类——行为层面则由新增的 `linux` 组覆盖：用 CI 钉住的同一个 Rust 1.88 镜像，在容器里跑 core+CLI 的完整测试（当前 497 项 core、6 项畸形输入扫描、全部 CLI 套件），并构建、执行和 stage release CLI；Python wheel 也完成 release 构建与两套安装后测试，x86-64 与 arm64 两个架构都已实跑通过（CI 的 wheel 矩阵正是这两个）——这是 LZMA 那次提交之后第一次拿到 Linux 上的真实运行结果，而 Python 那两套正是之前坏了很久没人发现的。Node release addon 也在两种 Linux 架构的干净容器副本里跑通了，且实际生成并检查了 npm tarball（镜像没有 Node，因此按 CI 用的版本拉官方构建），10 组 API 测试全过，整个构建发生在只读源码的临时副本中，容器销毁后不会污染宿主构建。Windows 目前仍只有编译层面的验证。顺带记一笔：workspace 唯一的 C 依赖是 `zstd`（`zstd-sys` 会编 C 源码），交叉编译因此需要目标平台的 C 工具链；`docs/upstream-defects.md` 里原先把「纯 Rust」当成本 crate 已有的性质来论证，那是不准确的，已改成「再加一个原生依赖的代价」；
+1. 让 CI 重新跑起来（GitHub Actions 计费）。本机已把 CI 的常规步骤复跑过一遍且全绿；Linux 运行面现已在 amd64/arm64 容器中覆盖，仍无法本机复现的是 Windows 运行与 GitHub 托管发布矩阵。为降低这条的代价，新增 `tools/local_ci.py`：一条命令跑完 CI 的全部步骤（现为 62 步、14 组）（格式、Python/Node API、六平台矩阵与交付范围审计及其反向自测、RustSec、Clippy、rustdoc、打包、许可证聚合、无 GUI/旧 C ABI 的交付范围与产物校验、workspace 构建/测试、托管差分、MonoBehaviour schema 生成器、音频差分、输出格式校验、release CLI 的构建/smoke/staging、Node debug/release 构建/测试/打包、Python wheel 与 sdist 的构建/安装/两套测试、Python 3.14 abi3 前向兼容、严格 Python 类型消费、UnityPy 差分，以及可选交叉/Linux 容器门禁），缺哪个工具就把那一组记为跳过而不是失败。2026-08-15 修了一处会让证据凭空消失的问题：wheel 原先直接装进当前解释器，而 Homebrew/发行版的 Python 现在按 PEP 668 直接拒绝安装——于是 `install wheel` 失败，依赖它的 `wheel surface`、`python api` 与 UnityPy 差分一并失败，也就是说 Python 那一侧的公开面守卫和 API 套件其实根本没在跑。现在 `python` 组自己建一个 `--clear` 的临时 venv（带 `--system-site-packages`，好让宿主已装的 UnityPy 仍可导入），宿主解释器只作为建 venv 的底座和 maturin 的目标。修好之后第一次跑就抓出一条陈旧断言：`python_api.py` 里还在断言 physics3.json 的紧凑写法，而两次提交前刚把 Cubism 文档改成与托管一致的展开写法——正是「没在跑的测试」会掩盖的那类回归。随后类型桩审计又抓到两项幽灵 API：`.pyi` 允许导入 `AclDecoder`/`OodleDecoder`，运行时模块却没有这两个名字；现在二者是真正的运行时导出，wheel 守卫也改成双向比较。本轮逐项对照 workflow 时又发现本地脚本漏掉了 workspace build、sdist 重建、release CLI/Node 产物和 Python 3.14 安装；这些步骤现已接入并实际通过。交付范围检查也已实际通过，会把 workspace、依赖方向或产物内容的漂移直接变成失败；schema 生成器步骤则在本轮以真实临时 DLL 单独验证，并和托管差分一起通过 `oracle` 组。这不能替代 CI——CI 是在三个平台上跑这套矩阵——但它让拿得到 Linux/Windows 的人能自己产出同样的证据，而不必先从 workflow 文件里把步骤拼出来。另外补了一个 `cross` 组：Linux x86-64 继续编译完整 workspace 与全部测试目标；Windows x86-64 现在由同一门禁用 MinGW 编译 Core/CLI/Python，并在开始前同时检查两套 C 工具链，缺任一个时严格模式都会失败而不是先产出一半证据。Node addon 要链接 `libnode.dll`，仍由真实 Windows runner 验证，不用不完整的交叉环境冒充。这只覆盖「能不能编译」——路径假设、漏掉的 `cfg`、只在某个平台成立的 `Send` 之类——行为层面则由新增的 `linux` 组覆盖：用 CI 钉住的同一个 Rust 1.88 镜像，在容器里跑 core+CLI 的完整常规测试、6 项畸形输入扫描和全部 CLI 套件，并构建、执行和 stage release CLI；Python wheel 也完成 release 构建与两套安装后测试，x86-64 与 arm64 两个架构都已实跑通过（CI 的 wheel 矩阵正是这两个）——这是 LZMA 那次提交之后第一次拿到 Linux 上的真实运行结果，而 Python 那两套正是之前坏了很久没人发现的。Node release addon 也在两种 Linux 架构的干净容器副本里跑通了，且实际生成并检查了 npm tarball（镜像没有 Node，因此按 CI 用的版本拉官方构建），10 组 API 测试全过，整个构建发生在只读源码的临时副本中，容器销毁后不会污染宿主构建。Windows 目前仍只有编译层面的验证。顺带记一笔：workspace 唯一的 C 依赖是 `zstd`（`zstd-sys` 会编 C 源码），交叉编译因此需要目标平台的 C 工具链；`docs/upstream-defects.md` 里原先把「纯 Rust」当成本 crate 已有的性质来论证，那是不准确的，已改成「再加一个原生依赖的代价」；
 2. 扩充真实 corpus，按实际命中率排序缺口（需要真实游戏文件）。为降低这条的门槛，corpus 用例的 `expected` 快照改成可选：不给快照时依然会把每个对象都读一遍、出错即失败，并报出读到了多少文件/对象/可解析载荷，只是没法断言取值对不对。这样「有游戏文件」就够跑，不再同时要求 .NET SDK 与 AssetStudio checkout 来生成快照。另加了一条防自欺断言：没有快照的用例必须至少解析出一个对象——reader 认不出来的输入会被当成资源文件、解析出零个对象，否则那种用例会安静地通过；
 3. 获取样本并实现 Unity 6000.2 MeshLOD/虚拟几何、Tuanjie 虚拟几何 cluster、UnityArchive，而不是猜测布局；
 4. 是否把 `ruopus` 与 `texture2ddecoder` 的缺陷提到上游（补丁已备好，见 `docs/upstream-defects.md`）。
@@ -342,7 +995,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 5. 纯 Rust Tuanjie ACL 2.x 解码。crates.io 上没有现成实现，属于从零写；而且没有可对照的样本，写出来无法验证，因此在拿到样本之前不宜动手；
 6. 补齐高命中率的平台纹理/音频长尾（新 codec 必须先有真实样本和独立 oracle）；
-7. 继续提升 Node 专用 API 覆盖。2026-08-15 补了此前完全没有绑定的 `readFont`/`readMovieTexture`/`readVideoClip`，按 GameObject 粒度的 FBX 规划（`splitObjectFbxCandidates`/`animatorFbxCandidates`/`readGameObjectFbx`），以及 Cubism 单对象读取器。后者先接入 physics/expression/fade-motion，又补齐 `readCubismPosePart`、`readCubismDisplayInfo`、标准 Unity `AnimationClip` 的 `readCubismClipMotion` 和 Tuanjie ACL 的异步 `readCubismClipMotionWithAclDecoder`。测试不是只断言方法存在：pose/display 由真实嵌入 TypeTree 的 class 114 fixture 驱动，标准 clip fixture 完整走 2022.2 muscle/binding/event 布局，Tuanjie fixture 走 2022.3.55t4 `m_AnimData`、ACL 容器/hash/decoder map 与 Core 回传校验，两者生成的 motion3 JSON 都交给 JavaScript JSON parser；错误类型、坏 decoder 输出和一字节输出预算分别拒绝。至此 Node 的直接 motion 读取面与 Python 对齐；TypeScript 消费测试另外验证 ACL/Oodle callback 与 `Buffer` 类型能由发布声明直接编译。
+7. 继续提升 Node 专用 API 覆盖。2026-08-15 补了此前完全没有绑定的 `readFont`/`readMovieTexture`/`readVideoClip`，按 GameObject 粒度的 FBX 规划（`splitObjectFbxCandidates`/`animatorFbxCandidates`/`readGameObjectFbx`），以及 Cubism 单对象读取器。后者先接入 physics/expression/fade-motion，又补齐 `readCubismPosePart`、`readCubismDisplayInfo`、标准 Unity `AnimationClip` 的 `readCubismClipMotion` 和 Tuanjie ACL 的异步 `readCubismClipMotionWithAclDecoder`；2026-08-22 又把完整 Sprite/SpriteAtlas、AnimationClip 和 Avatar 稳定元数据接上，并让新 `readAudioClip` 与 Core/Python 共用 `auto`/`raw`/`wav` 选择和输出预算，旧 `readAudio` 保持 raw-only 兼容；同轮 `exportWithOptions` 把 Core 的 mode、filename format、image/audio、JSON、overwrite 以及 16 项对象/累计/单 payload 预算完整带到 JavaScript，旧 `export(outputRoot, overwrite?)` 不变；`readFbxBinaryWithAclDecoder` 与 `readGameObjectFbxWithAclDecoder` 又补齐 Python 已有的 Binary/selected-model ACL 导出面。测试不是只断言方法存在：pose/display 由真实嵌入 TypeTree 的 class 114 fixture 驱动，标准 clip fixture 完整走 2022.2 muscle/binding/event 布局，Tuanjie fixture 走 2022.3.55t4 `m_AnimData`、ACL 容器/hash/decoder map/StreamingInfo 与 Core 回传校验，Avatar 则完整走 Tuanjie skeleton/TOS/HumanDescription；音频 fixture 走 legacy PCM16 到精确 48-byte RIFF/WAVE、raw 保真、格式拒绝与一字节输出预算；导出 fixture 逐项拒绝全部负预算，并真实写出 path-ID raw、lossless WebP、raw AudioClip 和受限 WAV；ACL 场景 fixture 真实绑定 GameObject→Animator→Controller→Tuanjie clip，分别证明 ASCII、binary 和 selected-model worker 各调用 decoder，`includeAnimations=false` 则不得调用。两类 clip 生成的 motion3 JSON 都交给 JavaScript JSON parser，完整 clip/avatar 元数据另逐字段核对。至此 Node 的直接 motion、稳定 clip、Avatar、decoder-free AudioClip、通用导出配置和模型 ACL 面与 Python/Core 对齐；TypeScript 消费测试另外验证 ACL/Oodle callback、`Buffer`、`bigint`、路径表和全部 export optional 字段能由发布声明直接编译。最新又补上完整包的两个入口：同步 `readLive2DPackagesWithSchemas` 恢复 stripped 模型/渲染器字段，Promise `readLive2DPackagesWithAclDecoder` 可同时接 schema 与 decoder。回归集合真实走 `GameObject → CubismModel → CubismMoc`、跨文件 `CubismRenderer → Texture2D` 和 `Animator → Controller → ACL AnimationClip`；没有 schema 时包不存在，没有 decoder 时保留包并给出 `MotionReadFailed`，两者都有时产出可解析的非空 motion3，错误 decoder 则降为带原因的包诊断。
 
 ## 完成判定
 
@@ -396,11 +1049,11 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 | 条件 | 状态 |
 |---|---|
-| Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足，且**从 2026-08-15 起有门禁把守而不再只是约定**；C ABI crate 已排除在 workspace 外，只作历史参考。`tools/check_delivery_scope.py` 读 `cargo metadata` 的解析结果（不是读清单文本）核对：workspace 恰好四个成员、各自的 target kind 正确、清单都在本仓库内、三个前端都直接依赖 Core，且任何一个的普通依赖里都不许出现 GUI/旧 FFI 包名。产物侧另有 Core `.crate`、npm tarball、wheel 与 sdist 的内容检查，拒收 `.cs`/`.csproj`/GUI 目录 |
+| Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足，且**从 2026-08-15 起有门禁把守而不再只是约定**；2026-08-23 进一步删除了此前仅排除在 workspace 外的旧 C ABI/context crate。`tools/check_delivery_scope.py` 读 `cargo metadata` 的解析结果（不是读清单文本）核对：workspace 恰好四个成员、各自的 target kind 正确、清单都在本仓库内、三个前端都直接依赖 Core，任何一个的普通依赖里都不许出现 GUI/旧 FFI 包名；同时拒绝旧 FFI 源文件或 Rust/Python/Node 公开 `Context`/`context_id` handle 回流。产物侧另有 Core `.crate`、npm tarball、wheel 与 sdist 的内容检查，拒收 `.cs`/`.csproj`/GUI 目录 |
 | 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷；2021+/2022+ 的 shader 已实现（见下），其结构正确性由 46 个真实 shader 与 UnityPy 的逐一比对背书；托管差分覆盖的仍是 5.2/5.3，因为托管侧对 2021+ 根本不产出对象 |
 | 代表性真实 corpus 稳定通过 | **部分满足，且已扩到第二款游戏与第二个引擎世代（2026-08-15）**；(1) 一份完整的 Unity 2022.3.62f2 播放器目录（23 文件 / 610,552 对象 / 190,300 个有解析载荷）；(2) 四个真实 UnityFS v8 bundle；(3) **2,778 个 Unity 6000.3.12f1 的 Addressables bundle（926 MB / 243,617 对象）**，全部零错误通过。仍缺的是 Tuanjie / Switch / 更老版本，以及带托管快照的取值比对 |
 | 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
-| 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux 的 x86-64 与 arm64 两个架构上，core+CLI 测试及 release CLI 构建/执行/staging、Python release wheel 构建与两套安装后测试、Node release addon 与 npm tarball 构建/测试均已在容器里实跑通过；Windows 侧验证了编译。CI 已配置 Python wheel、CLI 和可选 Node 包的 Linux/Windows/macOS × x86-64/ARM64 六路发布矩阵，并对 CLI 二进制和 Node release addon 做产物自身 smoke，但该发布矩阵尚未在 GitHub runner 上实际跑通。缺的仍是 Windows 上的真实运行——本机查过 wine（未安装）、Windows 容器（macOS 上不支持）与 Parallels（只有一个无效的 Debian 虚拟机），都不具备条件，装 wine 属于往你机器上装东西，没有自作主张——以及 CI 发布作业的实际绿色记录 |
+| 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux 的 x86-64 与 arm64 两个架构上，core+CLI 测试及 release CLI 构建/执行/staging、Python release wheel 构建与两套安装后测试、Node release addon 与 npm tarball 构建/测试均已在容器里实跑通过；Windows 侧验证了编译。CI 已配置 Python wheel、CLI 和可选 Node 包的 Linux/Windows/macOS × x86-64/ARM64 六路发布矩阵，并对 CLI 二进制和 Node release addon 做产物自身 smoke；专用静态门禁现会在任一路被删除、矩阵键重复或必要产物测试消失时失败，但该发布矩阵尚未在 GitHub runner 上实际跑通。缺的仍是 Windows 上的真实运行——本机查过 wine（未安装）、Windows 容器（macOS 上不支持）与 Parallels（只有一个无效的 Debian 虚拟机），都不具备条件，装 wine 属于往你机器上装东西，没有自作主张——以及 CI 发布作业的实际绿色记录 |
 | 导出/解包有界、拒绝穿越与符号链接、原子发布 | **现在才算满足（2026-08-15 修）**；此前这一行写"满足"是**说大了**：主导出与解包路径确实是临时文件加原子发布，但模型同级贴图那条不是——它直接以最终文件名 `create_new` 然后往里写，写到一半失败就留下一张截断的图片，而下一次导出会因为"已存在"跳过它，于是一张坏图会被当成成功的结果永远留在那里。现已改成同目录临时文件、`sync_all`、硬链接 no-clobber 发布，放弃时由 Drop 清掉临时文件。这一行的教训与本文其他几处同源：断言覆盖面时要按路径逐条数，而不是按"这个模块做过这件事"泛化 |
 | C# 仅作历史参考或可选 oracle | 满足 |
 
