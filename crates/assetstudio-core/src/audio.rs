@@ -29,7 +29,8 @@ const WAV_HEADER_BYTES: u64 = 44;
 const MPEG_FRAME_HEADER_BYTES: u64 = 4;
 const MAX_MPEG_FRAME_BYTES: usize = 4096;
 const MAX_MPEG_FRAME_SAMPLES: usize = 1152;
-const MAX_MPEG_CHANNELS: usize = 2;
+const MAX_MPEG_STREAM_CHANNELS: usize = 2;
+const MAX_FSB5_MPEG_CHANNELS: usize = 16;
 const FSB5_OPUS_ENCODER_DELAY: u64 = 312;
 const MAX_OPUS_PACKET_BYTES: usize = 65_535;
 const MAX_OPUS_CHANNELS: u16 = 2;
@@ -145,7 +146,8 @@ pub enum Fsb5MpegLayer {
     Layer3,
 }
 
-/// A validated mono/stereo FSB5 MPEG stream that decodes to PCM16.
+/// A validated FSB5 MPEG stream, including interleaved multistream audio, that
+/// decodes to PCM16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fsb5MpegStream {
     pub data_offset: u64,
@@ -250,6 +252,22 @@ struct MpegScan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MpegStreamLayout {
+    stream_count: usize,
+    channels_per_stream: u16,
+    interleave: u64,
+}
+
+struct MpegDecodeState {
+    layout: MpegStreamLayout,
+    decoders: Vec<MpaDecoder>,
+    frame_bytes: [u8; MAX_MPEG_FRAME_BYTES],
+    stream_samples: [i16; MAX_MPEG_FRAME_SAMPLES * MAX_MPEG_STREAM_CHANNELS],
+    pcm_samples: Vec<i16>,
+    pcm_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OpusScan {
     compressed_length: u64,
     decoded_frames: u64,
@@ -280,7 +298,7 @@ pub enum DirectWavKind {
     Fsb5Hevag(Fsb5HevagStream),
     /// The first subsound uses FMOD FADPCM and decodes to PCM16.
     Fsb5Fadpcm(Fsb5FadpcmStream),
-    /// The first subsound uses mono/stereo MPEG Layer II/III and decodes to PCM16.
+    /// The first subsound uses MPEG Layer II/III and decodes to PCM16.
     Fsb5Mpeg(Fsb5MpegStream),
     /// The first subsound uses mono/stereo Opus and decodes to PCM16.
     Fsb5Opus(Fsb5OpusStream),
@@ -659,11 +677,13 @@ pub fn parse_fsb5_fadpcm(payload: &Region) -> Result<Option<Fsb5FadpcmStream>> {
     }))
 }
 
-/// Parses the first mono/stereo MPEG Layer II/III subsound from an FSB5 bank.
+/// Parses the first MPEG Layer II/III subsound from an FSB5 bank.
 ///
-/// FMOD pads every MPEG frame to a four-byte boundary inside FSB5. The parser
-/// validates the complete declared sample range and records the exact padded
-/// source span; decoding later re-reads only one bounded frame at a time.
+/// FMOD pads mono/stereo frames to four bytes. Wider signals are represented by
+/// independent one- or two-channel MPEG streams whose frames are padded to 16
+/// bytes and interleaved. The parser validates the complete declared sample
+/// range and records the exact padded source span; decoding later re-reads only
+/// one bounded frame from each stream at a time.
 pub fn parse_fsb5_mpeg(payload: &Region) -> Result<Option<Fsb5MpegStream>> {
     if !has_magic(payload, *b"FSB5")? {
         return Ok(None);
@@ -677,12 +697,6 @@ pub fn parse_fsb5_mpeg(payload: &Region) -> Result<Option<Fsb5MpegStream>> {
         return Err(Error::invalid_data(
             "FSB5 MPEG subsound contains no sample frames",
         ));
-    }
-    if first.channels > 2 {
-        return Err(Error::unsupported(format!(
-            "FSB5 MPEG with {} channels uses multiple interleaved MPEG streams",
-            first.channels
-        )));
     }
     let scan = scan_mpeg_frames(
         payload,
@@ -2376,10 +2390,11 @@ fn validate_mpeg_source(payload: &Region, stream: Fsb5MpegStream) -> Result<()> 
             "FSB5 MPEG channels, sample rate, and frame count must be nonzero",
         ));
     }
-    if stream.channels > 2 {
-        return Err(Error::unsupported(
-            "FSB5 multistream MPEG decoding is not implemented",
-        ));
+    if usize::from(stream.channels) > MAX_FSB5_MPEG_CHANNELS {
+        return Err(Error::unsupported(format!(
+            "FSB5 MPEG channel count {} exceeds the verified {MAX_FSB5_MPEG_CHANNELS}-channel decoder range",
+            stream.channels
+        )));
     }
     let data_end = stream
         .data_offset
@@ -2422,25 +2437,62 @@ fn scan_mpeg_frames(
     if data_end > payload.len() {
         return Err(Error::invalid_data("FSB5 MPEG source exceeds its payload"));
     }
+    if data_length < MPEG_FRAME_HEADER_BYTES {
+        return Err(Error::invalid_data(
+            "FSB5 MPEG source has no complete frame header",
+        ));
+    }
+    let first_header = read_mpeg_frame_header(payload, data_offset)?;
+    let layout = mpeg_stream_layout(first_header, channels)?;
+    let block_length = layout
+        .interleave
+        .checked_mul(u64::try_from(layout.stream_count).expect("bounded stream count fits u64"))
+        .ok_or_else(|| Error::invalid_data("FSB5 MPEG interleaved block size overflowed"))?;
     let mut offset = data_offset;
     let mut decoded_frames = 0_u64;
-    let mut first_layer = None;
     while decoded_frames < frame_count {
-        let header = read_mpeg_frame_header(payload, offset)?;
-        validate_mpeg_frame_spec(header, channels, sample_rate, first_layer)?;
-        first_layer.get_or_insert(header.layer);
-        let padded_length = align_mpeg_frame(header.byte_length)?;
         let next = offset
-            .checked_add(padded_length)
-            .ok_or_else(|| Error::invalid_data("FSB5 MPEG frame range overflowed"))?;
+            .checked_add(block_length)
+            .ok_or_else(|| Error::invalid_data("FSB5 MPEG block range overflowed"))?;
         if next > data_end {
             return Err(Error::invalid_data(format!(
-                "FSB5 MPEG frame at {offset} requires {padded_length} padded bytes"
+                "FSB5 MPEG block at {offset} requires {block_length} padded bytes"
             )));
+        }
+        let mut block_samples = None;
+        for stream_index in 0..layout.stream_count {
+            let stream_offset = offset
+                .checked_add(
+                    layout.interleave
+                        * u64::try_from(stream_index).expect("bounded stream index fits u64"),
+                )
+                .ok_or_else(|| Error::invalid_data("FSB5 MPEG stream offset overflowed"))?;
+            let header = read_mpeg_frame_header(payload, stream_offset)?;
+            validate_mpeg_frame_spec(
+                header,
+                mpeg_stream_channels(layout, channels, stream_index),
+                sample_rate,
+                Some(first_header.layer),
+            )?;
+            if align_mpeg_frame(header.byte_length, mpeg_frame_alignment(channels))?
+                != layout.interleave
+            {
+                return Err(Error::invalid_data(
+                    "FSB5 multistream MPEG changes its padded frame span",
+                ));
+            }
+            if block_samples.is_some_and(|samples| samples != header.samples) {
+                return Err(Error::invalid_data(
+                    "FSB5 multistream MPEG frames disagree on their sample count",
+                ));
+            }
+            block_samples.get_or_insert(header.samples);
         }
         offset = next;
         decoded_frames = decoded_frames
-            .checked_add(u64::from(header.samples))
+            .checked_add(u64::from(
+                block_samples.expect("nonzero stream count parsed at least one MPEG frame"),
+            ))
             .ok_or_else(|| Error::invalid_data("FSB5 MPEG sample count overflowed"))?;
     }
     if data_end - offset >= 32 {
@@ -2450,8 +2502,40 @@ fn scan_mpeg_frames(
     }
     Ok(MpegScan {
         compressed_length: offset - data_offset,
-        layer: first_layer.expect("nonzero FSB5 frame count parsed at least one MPEG frame"),
+        layer: first_header.layer,
     })
+}
+
+fn mpeg_stream_layout(first: MpegFrameHeader, channels: u16) -> Result<MpegStreamLayout> {
+    if channels == 0 {
+        return Err(Error::invalid_data(
+            "FSB5 MPEG channel count cannot be zero",
+        ));
+    }
+    if usize::from(channels) > MAX_FSB5_MPEG_CHANNELS {
+        return Err(Error::unsupported(format!(
+            "FSB5 MPEG channel count {channels} exceeds the verified {MAX_FSB5_MPEG_CHANNELS}-channel decoder range"
+        )));
+    }
+    if first.channels == 0 || first.channels > channels {
+        return Err(Error::invalid_data(format!(
+            "FSB5 declares {channels} MPEG channels but its first frame declares {}",
+            first.channels
+        )));
+    }
+    let stream_count = usize::from(channels.div_ceil(first.channels));
+    let interleave = align_mpeg_frame(first.byte_length, mpeg_frame_alignment(channels))?;
+    Ok(MpegStreamLayout {
+        stream_count,
+        channels_per_stream: first.channels,
+        interleave,
+    })
+}
+
+fn mpeg_stream_channels(layout: MpegStreamLayout, channels: u16, stream_index: usize) -> u16 {
+    let consumed = u16::try_from(stream_index).expect("bounded MPEG stream index fits u16")
+        * layout.channels_per_stream;
+    (channels - consumed).min(layout.channels_per_stream)
 }
 
 fn validate_mpeg_frame_spec(
@@ -2583,10 +2667,14 @@ fn mpeg_sample_rate(version_id: u8, index: usize) -> Result<u32> {
     })
 }
 
-fn align_mpeg_frame(length: u64) -> Result<u64> {
+const fn mpeg_frame_alignment(channels: u16) -> u64 {
+    if channels > 2 { 16 } else { 4 }
+}
+
+fn align_mpeg_frame(length: u64, alignment: u64) -> Result<u64> {
     length
-        .checked_add(3)
-        .map(|value| value & !3)
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
         .ok_or_else(|| Error::invalid_data("FSB5 MPEG padding size overflowed"))
 }
 
@@ -2602,6 +2690,7 @@ fn write_fsb5_mpeg_wav(
             "WAV output is {output_size} bytes, exceeding limit {maximum_output_bytes}"
         )));
     }
+    let mut state = create_mpeg_decode_state(payload, stream)?;
     let data_size = u32::try_from(output_size - WAV_HEADER_BYTES)
         .expect("MPEG WAV output size validation bounded the data chunk");
     write_wav_header(
@@ -2612,62 +2701,141 @@ fn write_fsb5_mpeg_wav(
         stream.sample_rate,
         16,
     )?;
-    decode_fsb5_mpeg(payload, stream, output)?;
+    decode_fsb5_mpeg(payload, stream, &mut state, output)?;
     Ok(output_size)
+}
+
+fn create_mpeg_decoders(stream: Fsb5MpegStream, count: usize) -> Result<Vec<MpaDecoder>> {
+    let codec = match stream.layer {
+        Fsb5MpegLayer::Layer2 => CODEC_ID_MP2,
+        Fsb5MpegLayer::Layer3 => CODEC_ID_MP3,
+    };
+    let mut decoders = Vec::new();
+    decoders
+        .try_reserve_exact(count)
+        .map_err(|_| Error::invalid_data("cannot allocate bounded FSB5 MPEG decoder state"))?;
+    for _ in 0..count {
+        let mut parameters = AudioCodecParameters::new();
+        parameters
+            .for_codec(codec)
+            .with_sample_rate(stream.sample_rate);
+        let options = AudioDecoderOptions::default().gapless(false);
+        decoders.push(MpaDecoder::try_new(&parameters, &options).map_err(|error| {
+            Error::invalid_data(format!("cannot create MPEG decoder: {error}"))
+        })?);
+    }
+    Ok(decoders)
+}
+
+fn try_zeroed<T: Default>(length: usize, context: &'static str) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| Error::invalid_data(context))?;
+    values.resize_with(length, T::default);
+    Ok(values)
+}
+
+fn create_mpeg_decode_state(payload: &Region, stream: Fsb5MpegStream) -> Result<MpegDecodeState> {
+    let first_header = read_mpeg_frame_header(payload, stream.data_offset)?;
+    let layout = mpeg_stream_layout(first_header, stream.channels)?;
+    Ok(MpegDecodeState {
+        layout,
+        decoders: create_mpeg_decoders(stream, layout.stream_count)?,
+        frame_bytes: [0; MAX_MPEG_FRAME_BYTES],
+        stream_samples: [0; MAX_MPEG_FRAME_SAMPLES * MAX_MPEG_STREAM_CHANNELS],
+        pcm_samples: try_zeroed::<i16>(
+            MAX_MPEG_FRAME_SAMPLES * MAX_FSB5_MPEG_CHANNELS,
+            "cannot allocate bounded FSB5 MPEG PCM scratch",
+        )?,
+        pcm_bytes: try_zeroed::<u8>(
+            MAX_MPEG_FRAME_SAMPLES * MAX_FSB5_MPEG_CHANNELS * 2,
+            "cannot allocate bounded FSB5 MPEG byte scratch",
+        )?,
+    })
 }
 
 fn decode_fsb5_mpeg(
     payload: &Region,
     stream: Fsb5MpegStream,
+    state: &mut MpegDecodeState,
     output: &mut impl Write,
 ) -> Result<()> {
-    let codec = match stream.layer {
-        Fsb5MpegLayer::Layer2 => CODEC_ID_MP2,
-        Fsb5MpegLayer::Layer3 => CODEC_ID_MP3,
-    };
-    let mut parameters = AudioCodecParameters::new();
-    parameters
-        .for_codec(codec)
-        .with_sample_rate(stream.sample_rate);
-    let options = AudioDecoderOptions::default().gapless(false);
-    let mut decoder = MpaDecoder::try_new(&parameters, &options)
-        .map_err(|error| Error::invalid_data(format!("cannot create MPEG decoder: {error}")))?;
-    let mut frame_bytes = [0_u8; MAX_MPEG_FRAME_BYTES];
-    let mut pcm_samples = [0_i16; MAX_MPEG_FRAME_SAMPLES * MAX_MPEG_CHANNELS];
-    let mut pcm_bytes = [0_u8; MAX_MPEG_FRAME_SAMPLES * MAX_MPEG_CHANNELS * 2];
+    let MpegDecodeState {
+        layout,
+        decoders,
+        frame_bytes,
+        stream_samples,
+        pcm_samples,
+        pcm_bytes,
+    } = state;
+    let layout = *layout;
     let mut offset = stream.data_offset;
     let mut remaining_frames = stream.frame_count;
+    let block_length = layout
+        .interleave
+        .checked_mul(u64::try_from(layout.stream_count).expect("bounded stream count fits u64"))
+        .ok_or_else(|| Error::invalid_data("FSB5 MPEG interleaved block size overflowed"))?;
 
     while remaining_frames > 0 {
-        let header = read_mpeg_frame_header(payload, offset)?;
-        validate_mpeg_frame_spec(
-            header,
-            stream.channels,
-            stream.sample_rate,
-            Some(stream.layer),
-        )?;
-        let frame_length = usize::try_from(header.byte_length)
-            .expect("validated MPEG frame size fits the fixed frame buffer");
-        payload.read_exact_at(offset, &mut frame_bytes[..frame_length])?;
-        let packet = PacketRef::new(
-            0,
-            Timestamp::ZERO,
-            Duration::from(u64::from(header.samples)),
-            &frame_bytes[..frame_length],
-        );
-        let audio_buffer = decoder
-            .decode_ref(&packet)
-            .map_err(|error| Error::invalid_data(format!("FSB5 MPEG decode failed: {error}")))?;
-        validate_decoded_mpeg_spec(&audio_buffer, stream, header)?;
-        let write_frames = audio_buffer
-            .frames()
-            .min(usize::try_from(remaining_frames).unwrap_or(usize::MAX));
+        let mut write_frames = None;
+        let mut channel_offset = 0_usize;
+        for (stream_index, decoder) in decoders.iter_mut().enumerate() {
+            let frame_offset = offset
+                .checked_add(
+                    layout.interleave
+                        * u64::try_from(stream_index).expect("bounded stream index fits u64"),
+                )
+                .ok_or_else(|| Error::invalid_data("FSB5 MPEG stream offset overflowed"))?;
+            let header = read_mpeg_frame_header(payload, frame_offset)?;
+            let stream_channels = mpeg_stream_channels(layout, stream.channels, stream_index);
+            validate_mpeg_frame_spec(
+                header,
+                stream_channels,
+                stream.sample_rate,
+                Some(stream.layer),
+            )?;
+            let frame_length = usize::try_from(header.byte_length)
+                .expect("validated MPEG frame size fits the fixed frame buffer");
+            payload.read_exact_at(frame_offset, &mut frame_bytes[..frame_length])?;
+            let packet = PacketRef::new(
+                0,
+                Timestamp::ZERO,
+                Duration::from(u64::from(header.samples)),
+                &frame_bytes[..frame_length],
+            );
+            let audio_buffer = decoder.decode_ref(&packet).map_err(|error| {
+                Error::invalid_data(format!("FSB5 MPEG decode failed: {error}"))
+            })?;
+            validate_decoded_mpeg_spec(&audio_buffer, stream_channels, stream.sample_rate, header)?;
+            let current_write_frames = audio_buffer
+                .frames()
+                .min(usize::try_from(remaining_frames).unwrap_or(usize::MAX));
+            if write_frames.is_some_and(|frames| frames != current_write_frames) {
+                return Err(Error::invalid_data(
+                    "FSB5 multistream MPEG decoders produced different frame counts",
+                ));
+            }
+            write_frames.get_or_insert(current_write_frames);
+            let stream_sample_count = current_write_frames
+                .checked_mul(usize::from(stream_channels))
+                .ok_or_else(|| Error::invalid_data("FSB5 MPEG PCM sample count overflowed"))?;
+            audio_buffer
+                .slice(..current_write_frames)
+                .copy_to_slice_interleaved::<i16, _>(&mut stream_samples[..stream_sample_count]);
+            for frame in 0..current_write_frames {
+                for channel in 0..usize::from(stream_channels) {
+                    pcm_samples[frame * usize::from(stream.channels) + channel_offset + channel] =
+                        stream_samples[frame * usize::from(stream_channels) + channel];
+                }
+            }
+            channel_offset += usize::from(stream_channels);
+        }
+        let write_frames = write_frames.expect("nonzero MPEG stream count decoded one frame");
+        debug_assert_eq!(channel_offset, usize::from(stream.channels));
         let sample_count = write_frames
             .checked_mul(usize::from(stream.channels))
             .ok_or_else(|| Error::invalid_data("FSB5 MPEG PCM sample count overflowed"))?;
-        audio_buffer
-            .slice(..write_frames)
-            .copy_to_slice_interleaved::<i16, _>(&mut pcm_samples[..sample_count]);
         for (sample, bytes) in pcm_samples[..sample_count]
             .iter()
             .zip(pcm_bytes[..sample_count * 2].chunks_exact_mut(2))
@@ -2677,19 +2845,20 @@ fn decode_fsb5_mpeg(
         output.write_all(&pcm_bytes[..sample_count * 2])?;
         remaining_frames -= u64::try_from(write_frames).expect("MPEG frame count fits u64");
         offset = offset
-            .checked_add(align_mpeg_frame(header.byte_length)?)
-            .ok_or_else(|| Error::invalid_data("FSB5 MPEG frame offset overflowed"))?;
+            .checked_add(block_length)
+            .ok_or_else(|| Error::invalid_data("FSB5 MPEG block offset overflowed"))?;
     }
     Ok(())
 }
 
 fn validate_decoded_mpeg_spec(
     decoded: &symphonia::core::audio::GenericAudioBufferRef<'_>,
-    stream: Fsb5MpegStream,
+    channels: u16,
+    sample_rate: u32,
     header: MpegFrameHeader,
 ) -> Result<()> {
-    if decoded.spec().rate() != stream.sample_rate
-        || decoded.spec().channels().count() != usize::from(stream.channels)
+    if decoded.spec().rate() != sample_rate
+        || decoded.spec().channels().count() != usize::from(channels)
     {
         return Err(Error::invalid_data(
             "decoded MPEG signal specification differs from FSB5 metadata",
@@ -3571,6 +3740,8 @@ mod tests {
 
     const FSB5_VORBIS_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/audio/fsb5-vorbis-stereo.fsb");
+    const FSB5_MPEG_MULTISTREAM_FIXTURE: &[u8] =
+        include_bytes!("../tests/fixtures/audio/fsb5-mpeg-layer3-6ch.fsb");
 
     #[test]
     fn writes_little_and_big_endian_fsb5_pcm16() {
@@ -4347,6 +4518,49 @@ mod tests {
     }
 
     #[test]
+    fn decodes_six_channel_multistream_fsb5_mpeg_layer3() {
+        let fsb = Region::from_bytes(FSB5_MPEG_MULTISTREAM_FIXTURE);
+        let stream = parse_fsb5_mpeg(&fsb).unwrap().unwrap();
+        assert_eq!(stream.channels, 6);
+        assert_eq!(stream.sample_rate, 44_100);
+        assert_eq!(stream.frame_count, 13 * 1152);
+        assert_eq!(stream.layer, Fsb5MpegLayer::Layer3);
+
+        let expected_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
+        let mut wav = Vec::new();
+        assert_eq!(
+            write_direct_wav(
+                &fsb,
+                DirectWavKind::Fsb5Mpeg(stream),
+                expected_size,
+                &mut wav,
+            )
+            .unwrap(),
+            expected_size
+        );
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 6);
+
+        let mut channel_hashes = [0xcbf2_9ce4_8422_2325_u64; 6];
+        for frame in wave_data(&wav).chunks_exact(12) {
+            for (channel, sample) in frame.chunks_exact(2).enumerate() {
+                for byte in sample {
+                    channel_hashes[channel] ^= u64::from(*byte);
+                    channel_hashes[channel] =
+                        channel_hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        for left in 0..channel_hashes.len() {
+            for right in left + 1..channel_hashes.len() {
+                assert_ne!(
+                    channel_hashes[left], channel_hashes[right],
+                    "fixture channels {left} and {right} stopped carrying distinct signals"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn decodes_fsb5_mpeg_layer2() {
         let fsb = Region::from_bytes(fsb5_mpeg_layer2_silence());
         let stream = parse_fsb5_mpeg(&fsb).unwrap().unwrap();
@@ -4391,6 +4605,28 @@ mod tests {
         let multistream = Region::from_bytes(fsb5_mpeg_silence(6, 2));
         assert!(parse_fsb5_mpeg(&multistream).is_err());
 
+        let mut wrong_stream_channels = FSB5_MPEG_MULTISTREAM_FIXTURE.to_vec();
+        let first_header = parse_mpeg_frame_header(u32::from_be_bytes(
+            wrong_stream_channels[68..72].try_into().unwrap(),
+        ))
+        .unwrap();
+        let interleave =
+            usize::try_from(super::align_mpeg_frame(first_header.byte_length, 16).unwrap())
+                .unwrap();
+        wrong_stream_channels[68 + interleave + 3] |= 0xc0;
+        assert!(parse_fsb5_mpeg(&Region::from_bytes(wrong_stream_channels)).is_err());
+
+        let mut wrong_stream_span = FSB5_MPEG_MULTISTREAM_FIXTURE.to_vec();
+        wrong_stream_span[68 + interleave + 2] =
+            (wrong_stream_span[68 + interleave + 2] & 0x0f) | 0x10;
+        assert!(parse_fsb5_mpeg(&Region::from_bytes(wrong_stream_span)).is_err());
+
+        let too_many_channels = Region::from_bytes(fsb5_mpeg_silence(17, 2));
+        assert!(matches!(
+            parse_fsb5_mpeg(&too_many_channels),
+            Err(crate::Error::Unsupported(_))
+        ));
+
         let mut bad_sync = fsb_bytes.clone();
         bad_sync[0x3c + 8] = 0;
         assert!(parse_fsb5_mpeg(&Region::from_bytes(bad_sync)).is_err());
@@ -4416,6 +4652,7 @@ mod tests {
             ("silence-mono", fsb5_mpeg_silence(1, 2)),
             ("silence-stereo", fsb5_mpeg_silence(2, 2)),
             ("tone-mono", fsb5_mpeg_tone()),
+            ("tone-6ch", FSB5_MPEG_MULTISTREAM_FIXTURE.to_vec()),
         ];
         for (channels, fsb_bytes) in cases {
             let region = Region::from_bytes(fsb_bytes.clone());
@@ -4704,7 +4941,9 @@ mod tests {
                 _ => 0,
             };
             let rate_code = compact_rate_code(rate).unwrap_or(0);
-            let has_metadata = u64::from(metadata.is_some() || !matches!(channels, 1 | 2 | 6 | 8));
+            let metadata = metadata
+                .or_else(|| (!matches!(channels, 1 | 2 | 6 | 8)).then_some((channels, rate)));
+            let has_metadata = u64::from(metadata.is_some());
             let mode = (frames << 34)
                 | ((u64::try_from(data_offset).unwrap() / 32) << 7)
                 | (channel_code << 5)

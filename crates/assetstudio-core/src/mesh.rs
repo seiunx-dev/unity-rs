@@ -142,10 +142,11 @@ pub struct Mesh {
 /// Unity 6000.2's serialized mesh-LOD tail is walked from its sample-verified
 /// `TypeTree` layout; the levels are not exposed because this reader exports the
 /// mesh itself rather than an LOD chain.
-/// Packed/compressed geometry, non-triangle topology, non-zero base vertices,
-/// and non-float position/normal/UV layouts are rejected explicitly instead of
-/// being interpreted heuristically. Use [`read_mesh_with_collection`] when the
-/// object references an external vertex stream.
+/// Tuanjie virtual geometry, line/point topology, non-zero base vertices, and
+/// integer position/normal/UV layouts are rejected explicitly instead of being
+/// interpreted heuristically. Packed `CompressedMesh` geometry is decoded.
+/// Use [`read_mesh_with_collection`] when the object references an external
+/// vertex stream.
 pub fn read_mesh(
     file: &SerializedFile,
     object_index: usize,

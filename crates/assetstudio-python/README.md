@@ -52,10 +52,11 @@ The initial API supports:
 - source-bound `AudioClip` reads with verified WAV output for pre-2.6 PCM16,
   existing RIFF/WAVE payloads, FSB5 PCM8/16/24/32/float, and pure-Rust
   FMOD/Xbox IMA-ADPCM, Nintendo DSP/GC-ADPCM, Sony VAG/PS-ADPCM and HEVAG,
-  FMOD FADPCM, mono/stereo MPEG Layer II/III with FMOD frame padding, and
+  FMOD FADPCM, MPEG Layer II/III including FSB multistream audio up to 16
+  channels with FMOD frame padding, and
   sample-verified 48 kHz mono/stereo FSB Opus with its 312-frame encoder delay,
   plus pure-Rust FSB Vorbis backed by the checked 161-entry FMOD setup-header
-  table; multistream MPEG/Opus and remaining platform codecs are
+  table; multistream Opus and remaining platform codecs are
   preserved raw until a verified pure-Rust decoder is available;
 - direct embedded `Font`, legacy `MovieTexture`, and inline or externally
   streamed `VideoClip` payload reads, distinct from serialized wrapper bytes; and

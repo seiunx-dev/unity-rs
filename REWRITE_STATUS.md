@@ -773,7 +773,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - **UnityCN 没有第二实现这条已按版本核实（2026-08-15）**：此前写的是"本机这份 UnityPy 也没有 UnityCN"，属于陈述而非核对。实测本机 UnityPy **1.25.0** 的包内没有任何文件提到 UnityCN，托管 AssetStudio 仍然只检测不解密。结论不变，但现在是有版本号的核实结果，而不是印象。
 - **顺带补上一处没有守卫的比较（2026-08-15）**：`unitypy_oracle.py` 的 `assert_double_precision` 对 15 个 fixture 每个都跑一遍，而只有一个 fixture 带那个 `Double` 字段——也就是说它今天确实比了一个值，但没有任何东西保证它明天还在比。旁边的 TypeTree 行早就有"比较了多少棵树、为零即失败"的计数器，这一条没有。现在按同样的形状把计数汇总到 `main`，全程为零即失败，摘要里也报出实际比了几个。反向验证：把字段名换成一个不存在的键（模拟 fixture 哪天不再携带它），差分立刻以"no double field was compared"失败，而在此之前那样改是全绿的。
 - **生产目标 panic/占位审计补查（2026-08-23）**：项目生产代码没有遗留项目级 `TODO`、`todo!` 或 `unimplemented!`；vendored 纹理解码器的上游注释不冒充本项目功能。额外以 Clippy 的 `unwrap_used`/`expect_used`/`panic` 扫描 Core、CLI、Python 与 Node 生产 target 后，确认 Python 自身没有该类调用，Node 的命中均为受支持 64 位目标上的有界整数转换，CLI 临时文件命中由私有状态机约束，vendored ASTC panic 已在统一解码边界被 `catch_unwind` 转为错误。唯一仍把两个输入派生预算相加后 `expect` 的动画构建状态已改为 checked `InvalidData`；直接构造 `usize::MAX + 1` 的回归证明其返回错误而不 panic；
-- Core 当前 551 项常规测试通过，10 项依赖可选 vgmstream oracle 的测试保持忽略并已在音频 oracle 门中另行通过；其中 SILK 项只接受两个精确实测 profile：固定 r2117 Linux amd64 的 `(shift=0, worst=0)`，或此前本地 oracle/build 的 `(shift=-2, worst=276)`；即使 shift 相同但差值为 275 也会被反向测试拒绝。CLI 全目标当前 89 项测试通过；
+- Core 当前 552 项常规测试通过，10 项依赖可选 vgmstream oracle 的测试保持忽略并已在音频 oracle 门中另行通过；其中 SILK 项只接受两个精确实测 profile：固定 r2117 Linux amd64 的 `(shift=0, worst=0)`，或此前本地 oracle/build 的 `(shift=-2, worst=276)`；即使 shift 相同但差值为 275 也会被反向测试拒绝。CLI 全目标当前 89 项测试通过；
 - C#→Rust 托管差分 oracle 通过；
 - TypeTree dump 浮点文本对照 .NET 10 实测生成的 849 个取值（边界值 + 位模式扫描）逐字节一致，期望值以 fixture 形式入库；
 - `cargo doc --workspace --no-deps` 在 `-D warnings` 下通过；
@@ -919,9 +919,10 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - **BC6H 已纳入托管差分（2026-08-15），并修正与 ASTC HDR 同源的第二处上游缺陷**：手头没有 BC6H 编码器可借（`astcenc` 只管 ASTC），但差分需要的不是最优编码器、只是**定义明确的块**，因此直接构造单子集模式的块（5 位 mode + 三对 10 位端点 + 16 个 4 位索引），这个模式没有任何保留编码可踩。首轮查出 `texture2ddecoder` 0.1.2 的 `f32_to_u8` 把参考实现的 `roundf` 写成 `as u8`（截断）；本 fixture 256 字节里有 11 个通道因此恒低 1。vendored BC6H 解码器恢复舍入后与托管完全一致，这也反向证明构造块合法；`texture.rs` 的逐字节测试和托管差分现在都要求相等，把修复改回截断会立即失败。
    - **DXT5 与 DXT1 同属已记录的 s3tc 偏离**：托管的颜色调色板复刻 NV4x 硬件，本项目跟规范；DXT5 的 alpha 半边（BC4）能对上，颜色半边对不上，正好印证根因。
    - **DXT1 punch-through alpha 已裁决（2026-08-14）：跟 s3tc 规范**。`q0 <= q1` 模式下 index 3 解为透明黑 `(0,0,0,0)`，与独立解码器（Pillow）一致；AssetStudio 原生 `bcn.cpp` 给不透明黑 `(0,0,0,255)`，复刻的是 NV4x 时代硬件行为。这是对 oracle 的有意偏离——镂空贴图的遮罩区应当透明而非黑块——已在 `texture.rs` 注释、测试和兼容矩阵中记录。UnityPy 无法作为第三方仲裁：它与本项目共用同一个 `texture2ddecoder` 上游。（同批复核确认 DXT3/DXT5 调色板不是缺陷：Rust 符合 s3tc 规范，原生解码器复刻的是 NV4x 时代硬件行为，且 C# 侧根本没有 DXT3 解码器。）
-   - multistream MPEG/Opus 和少数平台音频 codec 仍保留原始数据；
+   - multistream Opus 和少数平台音频 codec 仍保留原始数据；
    - 8 个音频差分此前虽然写好却从未跑过（全部 `#[ignore]`，CI 也没有对应 job），现已加 `audio-oracle` job：按固定 release 拉 `vgmstream-cli` 再跑 `--ignored`，8 条首次执行即全部通过；
    - **MPEG/Opus 的全零 fixture 已换成真实音频（2026-08-15）**：此前两边比的都是静音，解码器无论怎么处理比特两边都会一致地得到零，等于只验证了分帧。现在各自嵌入一段真实编码的正弦——MPEG 是 6 帧 MP3，Opus 是 libopus 编的 6 个包（FSB5 的 MPEG 帧按 4 字节对齐、Opus 包带 u16 长度前缀并以零长度收尾，这两条框架细节也因此第一次被真实数据验证）。MPEG 换成有内容之后仍然对得上，容差 1（实测得来，不是猜的）。
+   - **FSB5 multistream MPEG 已完成（2026-08-24）**：总声道数大于 2 时，FSB 不是把一个 MPEG frame 扩成任意多声道，而是把若干个独立的 1/2 声道码流按帧交织；每个 frame 的槽位从 4 字节对齐扩大到 16 字节。实现为每条码流保留独立的 Symphonia decoder 状态，逐帧同步后再按原声道顺序重组 PCM，最多 16 声道（与固定 oracle 的验证范围一致）；输出和 scratch 都在写入前做 checked/bounded/fallible 分配。新增的 6 声道 fixture 由三组不同频率的 stereo CBR MP3 组成，六个声道可观测地互不相同，公开 CI 用固定 `vgmstream r2117` 逐样本比较，最大差仍只有 Layer III 已测得的 1。另有回归拒绝截断 block、内部码流声道不一致、frame span 变化和超过验证上限，不会用补零伪装损坏流。
    - **Opus 偏离已定位到上游 `ruopus` 0.1.2 的 SILK 路径（2026-08-15）**：换成有内容 fixture 后先暴露出偏离，再把它从本项目的 FSB5 代码里摘出来复现——直接把同一批包喂给解码器、按流自己声明的 pre-skip 裁掉前导，不经过本项目任何一行代码，偏离照旧；而 `ffmpeg` 与 `vgmstream` 两个 libopus 实现彼此差 1 以内。分模式实测（峰值都在 4200 附近）：
 
      | 包模式 | 偏移 | 最大差 |
