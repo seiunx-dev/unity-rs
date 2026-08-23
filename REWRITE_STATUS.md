@@ -126,12 +126,13 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 84 个方法与 3 个
   属性，另以保持数量不变的重命名反向测试证明不是只数成员。源码树能加载但发布包漏文件、
   声明/运行时漂移或带错架构时都会直接失败。macOS
-  arm64 debug/release 与 Linux amd64/arm64 release 容器已实际通过，Windows 两架构留给正式
-  runner 验证；
+  arm64 debug/release 与 Linux amd64/arm64 release 容器已实际通过；2026-08-24 的正式
+  GitHub runner 又完成 Windows x64/arm64 以及其余五个平台的发布包验证；
 - 原生 CLI 发布任务会先把二进制、`LICENSE`、第三方 notices 与完整许可证集合 stage 到最终
   上传目录，再执行该目录中的 `assetstudio[.exe] --help`；不再只运行构建目录原件后假定复制品
   等价。矩阵审计同时锁定六个平台的 staged 路径和 stage-before-smoke 顺序，本地临时 artifact
-  与 Linux amd64/arm64 容器也执行同一份复制后的二进制；
+  与 Linux amd64/arm64 容器也执行同一份复制后的二进制；2026-08-24 的手工发布矩阵已让六个
+  CLI artifact 和六个 Node artifact 全部在对应 GitHub runner 上构建、smoke 并上传；
 - Rust Core crate、Python wheel/sdist、Node 包和原生 CLI 都有独立发布校验。
 - 四类发布产物都携带项目 `LICENSE`、第三方归属摘要和由锁定依赖图生成的完整许可证文本；生成器当前覆盖 97 个非开发依赖，遇到缺少许可证文件、依赖更新或分发副本漂移会直接失败。
 - 交付范围由 `tools/check_delivery_scope.py` 与各产物内容检查共同锁定：workspace 只能包含 Core、CLI、Python 和可选 Node，三个前端必须直接依赖 Core；仓库不得重新出现旧 `assetstudio-ffi` 源文件，Rust `Studio`、Python stub 与 Node 声明不得公开 `Context`/`context_id` handle；发布 crate、wheel/sdist 与 npm 包拒绝 GUI、旧 FFI 和 C# 工程文件。托管 oracle 仍可作为仓库测试输入存在，但不会进入运行时依赖或二进制交付面。
@@ -750,14 +751,20 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - **Node 的 `AnimationClipInfo` 已从简略 shape 补到完整稳定元数据（2026-08-22）**：保留原方法名和旧字段，新增 PathID、high-quality 标志、PPtr 曲线、muscle size 与 streamed/dense/constant 计数、ACL frame/bone/rate/curve/track bytes/decoder/fast-sample 字段，以及外部 streaming offset/size/path。`maximumBytes` 现在同时收紧对象、字符串、packed/reference 与累计分配预算，两个 clip 入口共用同一限制构造。现有完整 Unity 2022.2 muscle fixture 验证无 ACL/streaming 时所有 optional 字段保持 `undefined`；Tuanjie 2022.3.55t4 fixture 验证 32-byte ACL 容器、decoder map、fast-sample 与空路径 StreamingInfo。生成声明中的 `bigint`/optional 字段由严格 TypeScript 消费端实际赋值，不再只做方法存在性 smoke。
 - **Node 的 `Avatar` 已从四字段摘要补到完整稳定元数据（2026-08-22）**：`readAvatar` 现在返回 PathID、声明大小、普通/人形骨架节点数、保序 TOS `(hash,path)`、HumanDescription 的人形骨/骨架骨计数和 root-motion bone name；旧 `declaredSize` 保留为 `declaredAvatarSize` 的兼容别名。`maximumBytes` 同时收紧对象、单/累计字符串、引用与累计分配预算。由 Python 已通过的 Tuanjie 2022.3.55t4 fixture 逐字节移植到 JavaScript，完整对象解析后逐字段核对 `0xfeedbeef -> Root/Hips` 与 `Hips` root motion，并证明一字节预算拒绝；生成声明的 `AvatarPathEntry[]` 与 `bigint` PathID 进入严格 TypeScript 消费。
 - **六平台发布配置有了自动结构门禁（2026-08-22）**：`tools/check_ci_matrix.py` 不把“workflow 里看起来有 matrix”当证据，而是逐 job 要求 Python wheel、CLI 和可选 Node 包各自恰好包含 Linux/Windows/macOS × x86-64/ARM64 六个 `(runner, artifact)` 对；Python 必须安装并跑 wheel API/mypy，CLI 必须执行精确 release 二进制的 `--help` 并带法律文件 staging，Node 必须测试 release addon、检查 npm 内容并真正 `npm pack`。门禁自身接入本地与 GitHub `quality`，八项回归锁定当前配置、缺一个 Windows ARM64 目标、矩阵项重复键、移除 CLI smoke、移除 local-CI 完成策略自测、移除 Python API 审计自测、移除 RustSec 执行步骤，以及把 RustSec `run:` 行注释掉。收口审查实际发现 GitHub `quality` 原先没有执行 `tools/test_local_ci.py`，所以 `--fail-on-skip` 的正反策略虽在本地跑、却可能在正式 CI 中退化；现已补上该步骤并由反向测试锁定。注释场景则暴露了另一处真实漏洞：旧检查只搜原始 YAML 字符串，注释中的命令也会被误认成可执行证据；现只在有效 YAML 行中计数。锁定的 `actionlint 1.7.12` 也在 2026-08-22 对最新 workflow 零告警通过，因此专用矩阵断言没有被冒充为通用 YAML/Actions 表达式检查。以上仍然**不替代 GitHub runner 的六路绿色记录**。外部状态也已按 API 核实：`81b02a5` 的 [run 31947620200](https://github.com/Team-Haruki/unity-rs/actions/runs/31947620200) 在 2026-08-16 启动后约六秒即失败，所有 16 个主 job 都是 `steps=[]` 且没有日志，两个依赖 job 被跳过，因此没有一条仓库命令实际执行；仓库级 Actions 当前为 enabled、允许全部 actions，默认 workflow 权限为 write，所以不是仓库禁用了 Actions。API 没有给出可进一步归因的错误文本；组织计费端点需要当前 token 没有的 `admin:org` 权限，不能越权把根因写成某一种计费状态，也不能把这次 run 写成代码失败或绿色证据。
-- **正式 PR 已建立，但 runner 被账单策略挡在执行前（2026-08-24）**：收口分支已推送到
-  [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)，head 为 `2c24e2f`；对应
-  [run 32656083818](https://github.com/Team-Haruki/unity-rs/actions/runs/32656083818)
-  的 16 个主 job 仍全部在两至四秒内失败，API 显示每项 `steps=[]`、`runner_id=0`、
-  runner 名称与组均为空。与旧 run 不同，这次 check annotation 已给出精确原因：近期账户付款
-  失败或 spending limit 需要提高，并要求检查 Billing & plans。仓库级 Actions 仍为 enabled、
-  `allowed_actions=all`；因此不能把这些红项算作代码失败，也不能反复重跑来冒充验证。修复账户
-  账单后必须重跑同一矩阵，只有实际分配 runner、出现步骤日志并六平台全绿才满足第 1 项。
+- **仓库公开后正式 runner 与发布矩阵全绿（2026-08-24）**：
+  [`Team-Haruki/unity-rs`](https://github.com/Team-Haruki/unity-rs) 已从 Private 改为 Public，
+  此前在分配 runner 前由账户账单策略拒绝的阻塞随之解除。收口分支位于
+  [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)，上述绿色运行验证的代码 head 为
+  `a07642e`。
+  [PR run 32659993206](https://github.com/Team-Haruki/unity-rs/actions/runs/32659993206)
+  的 16 个主 job 全部成功，覆盖三平台 Rust、三平台 Node、六平台 Python wheel、质量门禁和
+  managed/UnityPy/vgmstream 三类差分 oracle；随后
+  [workflow_dispatch run 32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990)
+  28/28 成功，其中额外 12 项为 Linux/Windows/macOS × x64/arm64 的 CLI 与 Node 发布制品。
+  公开 runner 首轮实际发现并修正了 vgmstream 安装目录、其信息命令的特殊退出码、Windows
+  npm 启动方式、已加载 `.node` DLL 的 Windows 清理锁，以及 SILK fixture 在固定 r2117 Linux
+  oracle 上的第二个实测 profile；这些都经过本地零跳过门禁和后续真实 runner 复验，不再只是
+  workflow 结构检查。
 - **旧无头 WorkMode 的入口名已补齐（2026-08-22）**：逐项核对托管 `WorkMode` 与 CLI alias 后，原生 CLI 现接受 Extract、Export、ExportRaw、Dump、Info、Live2D（`l2d`/`live2d`）、SplitObjects 和 Animator 的旧式 `-m` 写法。新补的两个 Live2D alias 进入完整 `live2d-package` 路径，而不是只写散件 MOC；仍要求显式 `-o`，并拒绝 overwrite 与无关的 extension flag，以保持当前原子 no-clobber 契约而不恢复隐式 `ASExport` 副作用。解析单测同时覆盖两个 alias、缺输出和两个拒绝分支；进程级测试逐个核对 MOC、model3、PNG 和临时文件清理。完整 CLI 共 **72 项测试**通过，严格 CLI Clippy 通过；同一工作树随后执行严格 `quality rust typing`，共 12 项快速质量步骤、workspace build/test 和 Python 3.9 严格消费端全部通过、零跳过。
 - **锁定依赖图现有 RustSec 门禁（2026-08-22）**：`cargo-audit 0.22.2` 的 MSRV 正好是项目下限 Rust 1.88；当前数据库载入 1,225 条 advisory，扫描 `Cargo.lock` 的 103 个依赖后没有漏洞、unsound 或 yanked 包。唯一输出是 `paste 1.0.15` 的停止维护警告 RUSTSEC-2024-0436，它只经 `texture2ddecoder 0.1.2` 进入构建图；后者没有新版，而为去掉一个无已知漏洞的 proc-macro 完整 vendor 需要再维护约 8,685 行上游解码代码，因此现阶段明确允许 unmaintained 提示，但不忽略 advisory，也不放宽漏洞/unsound/yanked。GitHub `quality` 会安装锁定版本并执行该策略；本地 `security` 组不仅检查命令存在，还要求 `--version` 精确为同一个 `cargo-audit 0.22.2`，旧版或无法读取版本时按缺少前置条件处理，配合 `--fail-on-skip` 必然失败而不会产出较弱的假证据。对应正反测试与“注释掉 GitHub 执行行”的结构测试都已通过。
 - **SerializedFile v1-v4 保持验收边界而不猜实现（2026-08-22）**：托管枚举定义 1、2、3 后直接跳到 5，格式 4 没有公开定义；v1-v3 又早于当前 TPK/真实语料能提供的最早 TypeTree。Rust 内部已有 v2/v3 recursive-node 字段门只说明代码为未来样本留了位置，不能当作兼容证据。生产入口继续在完整 header/layout 校验后返回带具体版本号的 `Unsupported`，新增回归逐一锁定 1、2、3、4 不得退化成 `InvalidData`、误解析或 panic。只有拿到真实文件和可独立核验的树/对象载荷后才扩展差分矩阵；在此之前不从 v5 树反推更老格式。
@@ -766,7 +773,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - **UnityCN 没有第二实现这条已按版本核实（2026-08-15）**：此前写的是"本机这份 UnityPy 也没有 UnityCN"，属于陈述而非核对。实测本机 UnityPy **1.25.0** 的包内没有任何文件提到 UnityCN，托管 AssetStudio 仍然只检测不解密。结论不变，但现在是有版本号的核实结果，而不是印象。
 - **顺带补上一处没有守卫的比较（2026-08-15）**：`unitypy_oracle.py` 的 `assert_double_precision` 对 15 个 fixture 每个都跑一遍，而只有一个 fixture 带那个 `Double` 字段——也就是说它今天确实比了一个值，但没有任何东西保证它明天还在比。旁边的 TypeTree 行早就有"比较了多少棵树、为零即失败"的计数器，这一条没有。现在按同样的形状把计数汇总到 `main`，全程为零即失败，摘要里也报出实际比了几个。反向验证：把字段名换成一个不存在的键（模拟 fixture 哪天不再携带它），差分立刻以"no double field was compared"失败，而在此之前那样改是全绿的。
 - **生产目标 panic/占位审计补查（2026-08-23）**：项目生产代码没有遗留项目级 `TODO`、`todo!` 或 `unimplemented!`；vendored 纹理解码器的上游注释不冒充本项目功能。额外以 Clippy 的 `unwrap_used`/`expect_used`/`panic` 扫描 Core、CLI、Python 与 Node 生产 target 后，确认 Python 自身没有该类调用，Node 的命中均为受支持 64 位目标上的有界整数转换，CLI 临时文件命中由私有状态机约束，vendored ASTC panic 已在统一解码边界被 `catch_unwind` 转为错误。唯一仍把两个输入派生预算相加后 `expect` 的动画构建状态已改为 checked `InvalidData`；直接构造 `usize::MAX + 1` 的回归证明其返回错误而不 panic；
-- Core 当前 550 项常规测试通过，10 项依赖可选 vgmstream oracle 的测试保持忽略并已在本机音频 oracle 门中另行通过（其中 1 项钉住的是已记录的上游 Opus 偏离，不是一致性）；CLI 全目标当前 89 项测试通过；
+- Core 当前 550 项常规测试通过，10 项依赖可选 vgmstream oracle 的测试保持忽略并已在音频 oracle 门中另行通过；其中 SILK 项只接受两个实测 profile：固定 r2117 Linux amd64 的逐样本完全一致，或此前本地 oracle/build 的 `shift=-2, worst<=276`，任何第三种形态仍失败。CLI 全目标当前 89 项测试通过；
 - C#→Rust 托管差分 oracle 通过；
 - TypeTree dump 浮点文本对照 .NET 10 实测生成的 849 个取值（边界值 + 位模式扫描）逐字节一致，期望值以 fixture 形式入库；
 - `cargo doc --workspace --no-deps` 在 `-D warnings` 下通过；
@@ -925,6 +932,11 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
      | SILK 窄带 | -4 | 115 |
 
      CELT 路径是准确的，偏差只出在 SILK；偏移量还随 SILK 的内部采样率变化（窄带 8 kHz 偏 4 个、宽带 16 kHz 偏 2 个，折算下来是同一个固定的内部采样分数），这正是重采样器延迟补偿差一点点的形态。因此现在拆成两个差分：`fsb5_opus_celt_tone_matches_vgmstream` 要求 CELT 对齐精确、幅度差不超过 1（实测值）；`fsb5_opus_silk_tone_divergence_from_libopus_is_bounded` 把 SILK fixture 的实测值 276 钉住（**这不是容差，是对已知缺陷的记录**），超过就失败。2026-08-15 又用同一组真实包、同一个 312-sample pre-skip 和同一个 `vgmstream` oracle 评估了独立纯 Rust 候选 `opus-rs`：0.1.26 与当前 0.1.28 都把 SILK 从 `shift=-2/worst=276` 变成 `-5/164`，同时把本来正确的 CELT 从 `0/1` 退化成 `0/36`，因此不能替换；精确步骤和版本记录在 `docs/upstream-defects.md`。目前已知能通过现有 oracle 的替代仍只有 libopus FFI，它与纯 Rust 取向冲突，先记录不动。全零 fixture 把这一切都盖住了；
+     **2026-08-24 的公开 runner 补充测量**：固定 `vgmstream` r2117 的 Linux x86-64
+     release 对同一 SILK/hybrid fixture 给出 `shift=0, worst=0`，并在 Rust 1.88 Linux amd64
+     隔离容器中独立复现。旧 profile 来自另一套本地 oracle/build；具体由版本、构建选项还是
+     平台造成尚未隔离。门禁因此只接受“完全一致”或上述 `-2/276` profile，不使用一般 codec
+     容差；完整说明见 `docs/upstream-defects.md`。
    - **音频 fixture 的生成过程已补上（2026-08-15）**：`tools/generate_audio_fixtures.py` 用记录在案的 ffmpeg/lame 命令重新生成三个编码 fixture，两次运行字节一致，连此前只写了文字描述的 MP3 也逐字节复现出来——原来的 Opus fixture 只有“从一次 ffmpeg 编码里提取”这句话，没有命令，等于是不可复现的二进制块，而这正是我一直在别处挑的毛病；
    - 新增 codec 必须先有真实样本和独立 oracle，不能只凭推测实现。
 
@@ -947,12 +959,18 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 ### 上游缺陷
 
-两处依赖的输出都已证明与独立参考实现不符：纹理解码器已通过有许可证记录的 vendored 补丁在本仓库内修正，`ruopus` SILK 仍未解决。`docs/upstream-defects.md` 记录了测量数据、不依赖本项目的复现步骤和可提交上游的补丁。
+纹理解码器已证明与独立参考实现不符，并通过有许可证记录的 vendored 补丁在本仓库内修正。
+`ruopus` SILK 则存在两个已实测 oracle profile：此前环境有固定时序/幅度偏离，固定 r2117
+Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 profile 外推为所有平台的结论。
+`docs/upstream-defects.md` 记录了测量数据、不依赖本项目的复现步骤和门禁策略。
 
 - `texture2ddecoder` 0.1.2 的 `f32_to_u8` 有两份移植（ASTC 一份、BC6H 一份），都把参考实现的 `roundf` 丢了；影响 6 个 ASTC HDR 格式加 BC6H，每个受影响通道恒低一格。上游 master 至今未修，仓库通过 vendored ASTC/BC6H 解码器修正并由托管差分把守。
-- `ruopus` 0.1.2 的 SILK 路径输出偏早且不精确（宽带早 2 个采样、窄带早 4 个，对齐后约差峰值的 3%），CELT 路径准确。
+- `ruopus` 0.1.2 的 SILK 路径在此前本地 oracle/build 中偏早且不精确（宽带早 2 个采样、窄带早 4 个，对齐后约差峰值的 3%）；固定 r2117 Linux amd64 对 CI fixture 完全一致。CELT 路径在两类测量中都准确。
 
 纹理那处已于 2026-08-15 决定采用 vendor 修复：`crates/assetstudio-core/src/vendor/texture2ddecoder/` 收入 ASTC 与 BC6H 解码器，只改两个舍入表达式（就地标 `VENDOR FIX`），并删除一段本项目不用、依赖 `paste` 的宏（标 `VENDOR DELTA`），其余保持可与上游直接 diff。18 个 ASTC 格式加 BC6H 现在与托管解码器**完全一致**，测试也由“钉住已知偏差”改为要求相等。Opus 未采用同一路线：独立纯 Rust 候选 `opus-rs` 0.1.26/0.1.28 已实测仍有更大的时序偏差并使 CELT 精度回退，剩余已知替代只有 libopus 绑定，会为仅 SILK 路径的偏差引入新的原生运行时依赖并终结该解码链的纯 Rust 性质，而当前 CELT 路径本身已经准确；因此现阶段保留明确记录与有界偏差测试，等待可审计的纯 Rust 修复或上游版本。
+
+公开 runner 的完全一致 profile 进一步降低了立即替换 decoder 的收益，但并未解释另一环境的
+稳定偏差；在原因被隔离前，不能据此删除第二个已测 profile，也不能声称 SILK 已在所有平台修复。
 
 ### 设计上保留的外部适配器
 
@@ -968,16 +986,16 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-24 核对时，本地与远端分支
-`codex/headless-rewrite-closure` 均指向 `2c24e2f`，工作树干净。收口改动已按 Core、CI、
-文档三个可独立审查的提交进入 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。
-正式发布矩阵已经触发，但 GitHub 在分配 runner 之前因账户付款失败或 spending limit
-不足拒绝了全部主 job；这不是仓库命令失败，也不能作为绿色发布证据。
+整理出的主体提交已经推送；2026-08-24 的绿色矩阵验证代码 head 为 `a07642e`。收口改动及公开 runner 修复已进入
+[PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
+[32659993206](https://github.com/Team-Haruki/unity-rs/actions/runs/32659993206) 16/16 全绿，
+包含六平台 CLI/Node 制品的手工发布矩阵
+[32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
 | 顺序 | 接下来要做的事 | 完成证据 |
 | --- | --- | --- |
 | 0 | **收口当前工作树**：逐模块审查现有 Core、Python、Node、CI、许可证和文档改动，确认所有新增文件都属于交付范围，再整理为可审查提交 | **已完成并同步远端（2026-08-24）**：`37e6ee0`、`ca0ea56`、`2c24e2f` 分别收口 Core/绑定、CI/交付范围和文档，均在独立 worktree 中验证可单独构建或通过对应严格门禁；分支 `codex/headless-rewrite-closure` 已推送并创建 PR #1。完整 `outputs quality rust python node typing security cross`、其余 `cli-package oracle audio python314 unitypy` 组，以及 Linux amd64/arm64 原生 Core/CLI、release CLI、Python wheel、Node addon/npm 均通过且零跳过；`git diff --check` 通过。CodeRabbit 的免费审查未报告可执行阻断问题 |
-| 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | 六路 job 全绿；每个 CLI 产物能运行 `--help`，每个 wheel 能安装并通过公开 API 测试，每个 Node tarball 只含目标平台 addon 并通过 JS/TypeScript smoke；产物包含一致的许可证和 notices |
+| 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | **已完成（2026-08-24）**：PR run 32659993206 的 16 个主 job 全绿；workflow_dispatch run 32660298990 为 28/28，全量包含六个 CLI artifact、六个 Node artifact 和六个 Python wheel。CLI staged 产物运行 `--help`，wheel 安装后通过公开 API/mypy，Node tarball 从临时消费者安装并核对 JS/TypeScript 运行时表面；法律文件随所有产物校验 |
 | 2 | **扩充代表性真实 corpus**：在现有 Unity 2022.3 与 6000.3 之外，优先加入 Tuanjie 2022.3.x、Nintendo Switch、旧 Unity 4/5/2017 和带完整托管快照的样本 | 私有 manifest 在 release 模式稳定通过；每类至少有对象顺序、PathID/class、名称/container、原始载荷 hash、主要解码结果或明确错误族的版本化快照；专有样本不提交到仓库 |
 | 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22）**：106 个高层 Core 方法均被机器检查为 102 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；65 个公开 Python 方法和 3 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
@@ -991,6 +1009,10 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 ## 后续优先顺序
 
 上表用于安排实际工作；本节保留各项背景、限制和已完成调查。前一版的九条里有四条已在 2026-08-15 完成或走到尽头，按本文维护规则移出：托管差分已扩到容器/版本门/已实现的解码路径（含整包 Live2D 与全部块格式）；binary FBX 已在 Core/CLI/Node/Python 全部可达；MOC3 标识表与散件发现回退已接；`ruopus` SILK 已定位为上游缺陷并写进 `docs/upstream-defects.md`，CELT 路径有精确差分把守。剩下的按能否自主推进排序：
+
+> 2026-08-24 更新：下方历史清单的第 1 项“让 CI 重新跑起来”已经完成；仓库公开后，
+> PR 常规矩阵与手工六平台发布矩阵分别 16/16、28/28 全绿。当前真正依赖外部输入的工作
+> 从第 2 项真实 corpus 开始；第 1 项正文保留用于解释本地门禁为何建立。
 
 **需要外部输入，我这边无法推进：**
 
@@ -1053,7 +1075,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 
 ### 对照结论（2026-08-15）
 
-逐条对上面七条自评，其中五条已满足、两条未满足：
+逐条对上面七条自评，其中六条已满足、一条部分满足：
 
 | 条件 | 状态 |
 |---|---|
@@ -1061,7 +1083,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 | 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷；2021+/2022+ 的 shader 已实现（见下），其结构正确性由 46 个真实 shader 与 UnityPy 的逐一比对背书；托管差分覆盖的仍是 5.2/5.3，因为托管侧对 2021+ 根本不产出对象 |
 | 代表性真实 corpus 稳定通过 | **部分满足，且已扩到第二款游戏与第二个引擎世代（2026-08-15）**；(1) 一份完整的 Unity 2022.3.62f2 播放器目录（23 文件 / 610,552 对象 / 190,300 个有解析载荷）；(2) 四个真实 UnityFS v8 bundle；(3) **2,778 个 Unity 6000.3.12f1 的 Addressables bundle（926 MB / 243,617 对象）**，全部零错误通过。仍缺的是 Tuanjie / Switch / 更老版本，以及带托管快照的取值比对 |
 | 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
-| 跨平台发布任务通过 | **仍未满足，但已大幅缩小**；Linux 的 x86-64 与 arm64 两个架构上，core+CLI 测试及 release CLI 构建/执行/staging、Python release wheel 构建与两套安装后测试、Node release addon 与 npm tarball 构建/测试均已在容器里实跑通过；Windows 侧验证了编译。CI 已配置 Python wheel、CLI 和可选 Node 包的 Linux/Windows/macOS × x86-64/ARM64 六路发布矩阵，并对 CLI 二进制和 Node release addon 做产物自身 smoke；专用静态门禁现会在任一路被删除、矩阵键重复或必要产物测试消失时失败，但该发布矩阵尚未在 GitHub runner 上实际跑通。缺的仍是 Windows 上的真实运行——本机查过 wine（未安装）、Windows 容器（macOS 上不支持）与 Parallels（只有一个无效的 Debian 虚拟机），都不具备条件，装 wine 属于往你机器上装东西，没有自作主张——以及 CI 发布作业的实际绿色记录 |
+| 跨平台发布任务通过 | **满足（2026-08-24）**；PR run 32659993206 的 16 个主 job 全绿，真实覆盖 Linux/Windows/macOS Rust 运行、三平台 Node、六平台 Python wheel、质量和差分 oracle。workflow_dispatch run 32660298990 进一步 28/28 全绿，额外执行并上传 Linux/Windows/macOS × x86-64/ARM64 的六个 CLI 与六个 Node 制品；CLI staged 二进制、wheel 安装后 API/mypy、Node tarball 临时消费者安装及 JS/TypeScript smoke、许可证/notices 均在对应 runner 验证。专用静态门禁继续防止任何一路或必要产物测试被静默删除 |
 | 导出/解包有界、拒绝穿越与符号链接、原子发布 | **现在才算满足（2026-08-15 修）**；此前这一行写"满足"是**说大了**：主导出与解包路径确实是临时文件加原子发布，但模型同级贴图那条不是——它直接以最终文件名 `create_new` 然后往里写，写到一半失败就留下一张截断的图片，而下一次导出会因为"已存在"跳过它，于是一张坏图会被当成成功的结果永远留在那里。现已改成同目录临时文件、`sync_all`、硬链接 no-clobber 发布，放弃时由 Drop 清掉临时文件。这一行的教训与本文其他几处同源：断言覆盖面时要按路径逐条数，而不是按"这个模块做过这件事"泛化 |
 | C# 仅作历史参考或可选 oracle | 满足 |
 
