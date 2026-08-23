@@ -92,6 +92,26 @@ class CiMatrixAuditTests(unittest.TestCase):
         with self.assertRaises(check_ci_matrix.AuditError):
             check_ci_matrix.validate_workflow(altered)
 
+    def test_merged_run_block_preserves_command_order(self) -> None:
+        stage = (
+            "      - name: Stage binary with license and notices\n"
+            "        run: python tools/stage_cli_artifact.py \"${{ matrix.binary }}\" target/release/artifact\n"
+        )
+        smoke = (
+            "      - name: Smoke-test the staged CLI artifact\n"
+            "        run: ${{ matrix.smoke }}\n"
+        )
+        reversed_block = (
+            "      - name: Reversed combined publication check\n"
+            "        run: |\n"
+            "          ${{ matrix.smoke }}\n"
+            "          python tools/stage_cli_artifact.py \"${{ matrix.binary }}\" target/release/artifact\n"
+        )
+        self.assertIn(stage + smoke, self.workflow)
+        altered = self.workflow.replace(stage + smoke, reversed_block, 1)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
     def test_missing_python_surface_audit_tests_are_rejected(self) -> None:
         altered = self.workflow.replace(
             "        run: python3 tools/test_python_api_surface.py\n",

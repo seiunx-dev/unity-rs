@@ -92,7 +92,7 @@ def require_fragments(block: str, job_name: str, fragments: tuple[str, ...]) -> 
         raise AuditError(f"{job_name} is missing required workflow text: {missing}")
 
 
-def run_commands(block: str) -> list[tuple[int, str]]:
+def run_commands(block: str) -> list[str]:
     """Return executable command lines from this job's YAML ``run`` steps.
 
     The release workflow deliberately uses the small GitHub Actions shape
@@ -103,13 +103,10 @@ def run_commands(block: str) -> list[tuple[int, str]]:
     """
 
     lines = block.splitlines()
-    commands: list[tuple[int, str]] = []
-    step_index = 0
+    commands: list[str] = []
     index = 0
     while index < len(lines):
         line = lines[index]
-        if re.fullmatch(r"      - .+", line):
-            step_index += 1
         match = re.fullmatch(r"        run:\s*(.*)", line)
         if match is None:
             index += 1
@@ -118,7 +115,7 @@ def run_commands(block: str) -> list[tuple[int, str]]:
         value = match.group(1).strip()
         if value not in {"|", "|-", "|+", ">", ">-", ">+"}:
             if value and not value.startswith("#"):
-                commands.append((step_index, value))
+                commands.append(value)
             index += 1
             continue
 
@@ -135,9 +132,9 @@ def run_commands(block: str) -> list[tuple[int, str]]:
             index += 1
         if folded:
             if block_lines:
-                commands.append((step_index, " ".join(block_lines)))
+                commands.append(" ".join(block_lines))
         else:
-            commands.extend((step_index, command) for command in block_lines)
+            commands.extend(block_lines)
     return commands
 
 
@@ -154,16 +151,16 @@ def require_run_commands(
     missing = [
         required
         for required in required_commands
-        if not any(command_matches(command, required) for _, command in commands)
+        if not any(command_matches(command, required) for command in commands)
     ]
     if missing:
         raise AuditError(f"{job_name} is missing required run commands: {missing}")
 
 
-def run_step_index(block: str, job_name: str, required_command: str) -> int:
-    for step_index, command in run_commands(block):
+def run_command_position(block: str, job_name: str, required_command: str) -> int:
+    for position, command in enumerate(run_commands(block)):
         if command_matches(command, required_command):
-            return step_index
+            return position
     raise AuditError(f"{job_name} is missing required run command {required_command!r}")
 
 
@@ -233,10 +230,10 @@ def validate_workflow(workflow: str) -> None:
         ),
     )
     require_fragments(cli_block, "package-cli", ("path: target/release/artifact",))
-    stage = run_step_index(
+    stage = run_command_position(
         cli_block, "package-cli", "python tools/stage_cli_artifact.py"
     )
-    smoke = run_step_index(cli_block, "package-cli", "${{ matrix.smoke }}")
+    smoke = run_command_position(cli_block, "package-cli", "${{ matrix.smoke }}")
     if smoke < stage:
         raise AuditError("package-cli must stage the upload artifact before smoke-testing it")
     node_block = job_block(workflow, "package-node")
@@ -277,12 +274,6 @@ def validate_workflow(workflow: str) -> None:
         (
             'mkdir -p "$HOME/.local/bin"',
             'unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"',
-        ),
-    )
-    require_run_commands(
-        audio_block,
-        "audio-oracle",
-        (
             "python3 -c \"import json, os, subprocess; result = subprocess.run(['vgmstream-cli', '-V'], check=False, capture_output=True, text=True); assert result.returncode == 1, result; assert json.loads(result.stdout)['version'] == os.environ['VGMSTREAM_VERSION']\"",
         ),
     )

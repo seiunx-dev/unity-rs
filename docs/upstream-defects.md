@@ -255,7 +255,7 @@ pre-skip, and compare against `ffmpeg -i` on the same file. Repeat at a bitrate
 that selects CELT to see the difference disappear.
 
 In this repository, `fsb5_opus_silk_tone_divergence_from_libopus_is_bounded`
-pins the exact Linux profile or the bounded earlier profile, while
+pins the exact Linux profile or the exact earlier `(-2, 276)` profile, while
 `fsb5_opus_celt_tone_matches_vgmstream` independently guards the CELT path;
 both need `vgmstream-cli` and run under `--ignored`.
 
