@@ -1,6 +1,6 @@
 //! Bounded projection of Unity `AnimationClip` bindings into Cubism `motion3.json`.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::Write;
 
 use crate::acl::{
@@ -26,6 +26,9 @@ pub struct CubismClipMotionReadLimits {
     pub maximum_curves: usize,
     pub maximum_keyframes: usize,
     pub maximum_events: usize,
+    pub maximum_target_hashes: usize,
+    pub maximum_target_hash_work_bytes: usize,
+    pub maximum_target_index_bytes: usize,
     pub maximum_streamed_frames: usize,
     pub maximum_streamed_keys: usize,
     pub maximum_string_bytes: usize,
@@ -41,6 +44,9 @@ impl Default for CubismClipMotionReadLimits {
             maximum_curves: 1_000_000,
             maximum_keyframes: 10_000_000,
             maximum_events: 1_000_000,
+            maximum_target_hashes: 2_000_000,
+            maximum_target_hash_work_bytes: 512 * 1024 * 1024,
+            maximum_target_index_bytes: 256 * 1024 * 1024,
             maximum_streamed_frames: 2_000_000,
             maximum_streamed_keys: 10_000_000,
             maximum_string_bytes: 16 * 1024 * 1024,
@@ -227,9 +233,9 @@ pub fn project_cubism_clip_motion_with_acl_decoder(
             )
         })
         .transpose()?;
-    let target_index = TargetIndex::build(targets)?;
+    let target_index = TargetIndex::build(targets, &limits)?;
     let layout = BindingLayout::build(&clip.binding_constant.generic_bindings)?;
-    let mut builder = ClipBuilder::new(collection, file_index, limits, target_index, layout)?;
+    let mut builder = ClipBuilder::new(collection, file_index, &limits, target_index, layout)?;
     builder.append_muscle_clip(muscle, decoded_acl.as_ref())?;
     let name = builder.copy_string(&clip.name, "AnimationClip name")?;
     let mut events = Vec::new();
@@ -294,28 +300,58 @@ struct TargetIndex<'a> {
 }
 
 impl<'a> TargetIndex<'a> {
-    fn build(targets: &'a CubismMotionTargetNames) -> Result<Self> {
+    fn build(
+        targets: &'a CubismMotionTargetNames,
+        limits: &CubismClipMotionReadLimits,
+    ) -> Result<Self> {
         let capacity = targets
             .parameters
             .len()
             .checked_add(targets.parts.len())
             .ok_or_else(|| Error::invalid_data("Cubism target count overflowed"))?;
+        if capacity > limits.maximum_curves {
+            return Err(limit_error(
+                "motion target names",
+                capacity,
+                limits.maximum_curves,
+            ));
+        }
+        validate_target_strings(targets, limits)?;
+        check_target_index_budget(capacity, 0, limits.maximum_target_index_bytes)?;
         let mut named = Vec::new();
         named.try_reserve(capacity).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Cubism target names: {error}"))
         })?;
+        let mut seen = HashSet::new();
+        seen.try_reserve(capacity).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate Cubism target-name index: {error}"))
+        })?;
         for id in &targets.parameters {
-            push_named_target(&mut named, "Parameter", id);
+            push_named_target(&mut named, &mut seen, "Parameter", id);
         }
         for id in &targets.parts {
-            push_named_target(&mut named, "PartOpacity", id);
+            push_named_target(&mut named, &mut seen, "PartOpacity", id);
         }
+        drop(seen);
+        let (hash_count, hash_work_bytes) = target_hash_requirements(&named)?;
+        if hash_count > limits.maximum_target_hashes {
+            return Err(limit_error(
+                "motion target hashes",
+                hash_count,
+                limits.maximum_target_hashes,
+            ));
+        }
+        if hash_work_bytes > limits.maximum_target_hash_work_bytes {
+            return Err(Error::invalid_data(format!(
+                "Cubism motion target hashing needs {hash_work_bytes} input bytes, limit is {}",
+                limits.maximum_target_hash_work_bytes
+            )));
+        }
+        check_target_index_budget(capacity, hash_count, limits.maximum_target_index_bytes)?;
         let mut by_hash = HashMap::new();
-        by_hash
-            .try_reserve(named.len().saturating_mul(2))
-            .map_err(|error| {
-                Error::invalid_data(format!("cannot allocate Cubism target hash index: {error}"))
-            })?;
+        by_hash.try_reserve(hash_count).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate Cubism target hash index: {error}"))
+        })?;
         for (index, target) in named.iter().enumerate() {
             let prefix = if target.target == "Parameter" {
                 "Parameters/"
@@ -323,22 +359,26 @@ impl<'a> TargetIndex<'a> {
                 "Parts/"
             };
             let mut path = String::new();
-            path.try_reserve(prefix.len().saturating_add(target.id.len()))
-                .map_err(|error| {
-                    Error::invalid_data(format!("cannot allocate Cubism binding path: {error}"))
-                })?;
+            let path_length = prefix
+                .len()
+                .checked_add(target.id.len())
+                .ok_or_else(|| Error::invalid_data("Cubism binding path length overflowed"))?;
+            path.try_reserve(path_length).map_err(|error| {
+                Error::invalid_data(format!("cannot allocate Cubism binding path: {error}"))
+            })?;
             path.push_str(prefix);
             path.push_str(target.id);
+            let mut suffix = path.as_str();
             loop {
                 insert_target_hash(
                     &mut by_hash,
-                    unity_crc32(path.as_bytes()),
+                    unity_crc32(suffix.as_bytes()),
                     MotionTargetKey::Named(index),
                 );
-                let Some(slash) = path.find('/') else {
+                let Some(slash) = suffix.find('/') else {
                     break;
                 };
-                path.drain(..=slash);
+                suffix = &suffix[slash + 1..];
             }
         }
         Ok(Self { named, by_hash })
@@ -361,13 +401,101 @@ impl<'a> TargetIndex<'a> {
     }
 }
 
-fn push_named_target<'a>(targets: &mut Vec<NamedTarget<'a>>, target: &'static str, id: &'a str) {
-    if !targets
-        .iter()
-        .any(|candidate| candidate.target == target && candidate.id == id)
-    {
+fn push_named_target<'a>(
+    targets: &mut Vec<NamedTarget<'a>>,
+    seen: &mut HashSet<(&'static str, &'a str)>,
+    target: &'static str,
+    id: &'a str,
+) {
+    if seen.insert((target, id)) {
         targets.push(NamedTarget { target, id });
     }
+}
+
+fn validate_target_strings(
+    targets: &CubismMotionTargetNames,
+    limits: &CubismClipMotionReadLimits,
+) -> Result<()> {
+    let mut total = 0_usize;
+    for value in targets.parameters.iter().chain(&targets.parts) {
+        if value.len() > limits.maximum_string_bytes {
+            return Err(Error::invalid_data(format!(
+                "Cubism motion target is {} bytes, exceeding limit {}",
+                value.len(),
+                limits.maximum_string_bytes
+            )));
+        }
+        total = total
+            .checked_add(value.len())
+            .ok_or_else(|| Error::invalid_data("Cubism motion target strings overflowed"))?;
+        if total > limits.maximum_total_string_bytes {
+            return Err(Error::invalid_data(format!(
+                "Cubism motion target strings use {total} bytes, exceeding limit {}",
+                limits.maximum_total_string_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn target_hash_requirements(targets: &[NamedTarget<'_>]) -> Result<(usize, usize)> {
+    let mut count = 0_usize;
+    let mut work_bytes = 0_usize;
+    for target in targets {
+        let prefix_length = if target.target == "Parameter" {
+            "Parameters/".len()
+        } else {
+            "Parts/".len()
+        };
+        let full_length = prefix_length
+            .checked_add(target.id.len())
+            .ok_or_else(|| Error::invalid_data("Cubism target path length overflowed"))?;
+        count = count
+            .checked_add(2)
+            .ok_or_else(|| Error::invalid_data("Cubism target hash count overflowed"))?;
+        work_bytes = work_bytes
+            .checked_add(full_length)
+            .and_then(|value| value.checked_add(target.id.len()))
+            .ok_or_else(|| Error::invalid_data("Cubism target hash work overflowed"))?;
+        for (position, byte) in target.id.bytes().enumerate() {
+            if byte != b'/' {
+                continue;
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_data("Cubism target hash count overflowed"))?;
+            let suffix_length = target
+                .id
+                .len()
+                .checked_sub(position + 1)
+                .ok_or_else(|| Error::invalid_data("Cubism target suffix underflowed"))?;
+            work_bytes = work_bytes
+                .checked_add(suffix_length)
+                .ok_or_else(|| Error::invalid_data("Cubism target hash work overflowed"))?;
+        }
+    }
+    Ok((count, work_bytes))
+}
+
+fn check_target_index_budget(input_count: usize, hash_count: usize, maximum: usize) -> Result<()> {
+    let named_bytes = input_count
+        .checked_mul(std::mem::size_of::<NamedTarget<'_>>())
+        .ok_or_else(|| Error::invalid_data("Cubism target-name index size overflowed"))?;
+    let dedup_bytes = input_count
+        .checked_mul(std::mem::size_of::<(&str, &str)>())
+        .ok_or_else(|| Error::invalid_data("Cubism target dedup index size overflowed"))?;
+    let hash_bytes = hash_count
+        .checked_mul(std::mem::size_of::<(u32, Option<MotionTargetKey>)>())
+        .ok_or_else(|| Error::invalid_data("Cubism target hash index size overflowed"))?;
+    let required = named_bytes
+        .checked_add(dedup_bytes.max(hash_bytes))
+        .ok_or_else(|| Error::invalid_data("Cubism target index size overflowed"))?;
+    if required > maximum {
+        return Err(Error::invalid_data(format!(
+            "Cubism motion target indexes need {required} bytes, limit is {maximum}"
+        )));
+    }
+    Ok(())
 }
 
 fn insert_target_hash(
@@ -465,7 +593,7 @@ impl<'a> ClipBuilder<'a> {
     fn new(
         collection: &'a AssetCollection,
         file_index: usize,
-        limits: CubismClipMotionReadLimits,
+        limits: &CubismClipMotionReadLimits,
         targets: TargetIndex<'a>,
         bindings: BindingLayout,
     ) -> Result<Self> {
@@ -484,7 +612,7 @@ impl<'a> ClipBuilder<'a> {
         Ok(Self {
             collection,
             file_index,
-            limits,
+            limits: *limits,
             targets,
             bindings,
             curves: Vec::new(),
@@ -512,7 +640,7 @@ impl<'a> ClipBuilder<'a> {
             .streamed
             .data
             .read_values(self.limits.clip.maximum_streamed_words)?;
-        let mut frames = parse_streamed_frames(&words, self.limits)?;
+        let mut frames = parse_streamed_frames(&words, &self.limits)?;
         calculate_streamed_in_slopes(&mut frames)?;
         if frames.len() >= 2 {
             for frame in &frames[1..frames.len() - 1] {
@@ -790,7 +918,7 @@ impl<'a> ClipBuilder<'a> {
 
 fn parse_streamed_frames(
     words: &[u32],
-    limits: CubismClipMotionReadLimits,
+    limits: &CubismClipMotionReadLimits,
 ) -> Result<Vec<StreamedFrame>> {
     let mut frames = Vec::new();
     let mut cursor = 0_usize;
@@ -953,18 +1081,160 @@ mod tests {
     #[test]
     fn resolves_parameter_part_suffixes_and_rejects_hash_ambiguity() {
         let targets = CubismMotionTargetNames {
-            parameters: vec!["ParamAngleX".to_owned()],
+            parameters: vec!["Group/ParamAngleX".to_owned()],
             parts: vec!["PartArm".to_owned()],
         };
-        let index = TargetIndex::build(&targets).unwrap();
+        let index = TargetIndex::build(&targets, &CubismClipMotionReadLimits::default()).unwrap();
         assert_eq!(
-            index.by_path(unity_crc32(b"Parameters/ParamAngleX")),
+            index.by_path(unity_crc32(b"Parameters/Group/ParamAngleX")),
+            Some(MotionTargetKey::Named(0))
+        );
+        assert_eq!(
+            index.by_path(unity_crc32(b"Group/ParamAngleX")),
+            Some(MotionTargetKey::Named(0))
+        );
+        assert_eq!(
+            index.by_path(unity_crc32(b"ParamAngleX")),
             Some(MotionTargetKey::Named(0))
         );
         assert_eq!(
             index.by_path(unity_crc32(b"PartArm")),
             Some(MotionTargetKey::Named(1))
         );
+    }
+
+    #[test]
+    fn indexes_large_unique_target_sets_in_source_order() {
+        const TARGET_COUNT: usize = 16_384;
+        let mut parameters = Vec::new();
+        parameters.try_reserve(TARGET_COUNT + 1).unwrap();
+        for index in (0..TARGET_COUNT).rev() {
+            parameters.push(format!("Param{index:05}"));
+        }
+        parameters.push(parameters[123].clone());
+        let targets = CubismMotionTargetNames {
+            parts: vec![parameters[0].clone()],
+            parameters,
+        };
+
+        let index = TargetIndex::build(&targets, &CubismClipMotionReadLimits::default()).unwrap();
+
+        assert_eq!(index.named.len(), TARGET_COUNT + 1);
+        assert_eq!(
+            index.describe(MotionTargetKey::Named(0)),
+            ("Parameter", "Param16383")
+        );
+        assert_eq!(
+            index.describe(MotionTargetKey::Named(TARGET_COUNT - 1)),
+            ("Parameter", "Param00000")
+        );
+        assert_eq!(
+            index.describe(MotionTargetKey::Named(TARGET_COUNT)),
+            ("PartOpacity", "Param16383")
+        );
+        assert_eq!(
+            index.by_path(unity_crc32(b"Parameters/Param08192")),
+            Some(MotionTargetKey::Named(TARGET_COUNT - 1 - 8_192))
+        );
+    }
+
+    #[test]
+    fn enforces_target_count_and_string_budgets() {
+        let targets = CubismMotionTargetNames {
+            parameters: vec!["a/b".to_owned()],
+            parts: Vec::new(),
+        };
+        let defaults = CubismClipMotionReadLimits::default();
+        let error = TargetIndex::build(
+            &targets,
+            &CubismClipMotionReadLimits {
+                maximum_curves: 0,
+                ..defaults
+            },
+        )
+        .err()
+        .expect("target-count budget must reject the target index");
+        assert!(error.to_string().contains("motion target names"));
+        let error = TargetIndex::build(
+            &targets,
+            &CubismClipMotionReadLimits {
+                maximum_string_bytes: 2,
+                ..defaults
+            },
+        )
+        .err()
+        .expect("per-string budget must reject the target index");
+        assert!(error.to_string().contains("motion target is 3 bytes"));
+        let error = TargetIndex::build(
+            &targets,
+            &CubismClipMotionReadLimits {
+                maximum_total_string_bytes: 2,
+                ..defaults
+            },
+        )
+        .err()
+        .expect("total-string budget must reject the target index");
+        assert!(error.to_string().contains("target strings use 3 bytes"));
+    }
+
+    #[test]
+    fn enforces_target_hash_work_and_index_budgets() {
+        let targets = CubismMotionTargetNames {
+            parameters: vec!["a/b".to_owned()],
+            parts: Vec::new(),
+        };
+        let defaults = CubismClipMotionReadLimits::default();
+        let index = TargetIndex::build(&targets, &defaults).unwrap();
+        let (hash_count, work_bytes) = super::target_hash_requirements(&index.named).unwrap();
+        assert_eq!((hash_count, work_bytes), (3, 18));
+
+        let input_count = 1_usize;
+        let named_bytes = input_count * std::mem::size_of::<super::NamedTarget<'_>>();
+        let dedup_bytes = input_count * std::mem::size_of::<(&str, &str)>();
+        let hash_bytes = hash_count * std::mem::size_of::<(u32, Option<super::MotionTargetKey>)>();
+        let index_bytes = named_bytes + dedup_bytes.max(hash_bytes);
+
+        let error = TargetIndex::build(
+            &targets,
+            &CubismClipMotionReadLimits {
+                maximum_target_hashes: hash_count - 1,
+                ..defaults
+            },
+        )
+        .err()
+        .expect("hash-count budget must reject the target index");
+        assert!(error.to_string().contains("motion target hashes"));
+        let error = TargetIndex::build(
+            &targets,
+            &CubismClipMotionReadLimits {
+                maximum_target_hash_work_bytes: work_bytes - 1,
+                ..defaults
+            },
+        )
+        .err()
+        .expect("hash-work budget must reject the target index");
+        assert!(error.to_string().contains("target hashing"));
+        let error = TargetIndex::build(
+            &targets,
+            &CubismClipMotionReadLimits {
+                maximum_target_index_bytes: index_bytes - 1,
+                ..defaults
+            },
+        )
+        .err()
+        .expect("index-byte budget must reject the target index");
+        assert!(error.to_string().contains("target indexes"));
+
+        TargetIndex::build(
+            &targets,
+            &CubismClipMotionReadLimits {
+                maximum_target_hashes: hash_count,
+                maximum_target_hash_work_bytes: work_bytes,
+                maximum_target_index_bytes: index_bytes,
+                ..defaults
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -995,7 +1265,7 @@ mod tests {
             0,
         ];
         let mut frames =
-            parse_streamed_frames(&words, CubismClipMotionReadLimits::default()).unwrap();
+            parse_streamed_frames(&words, &CubismClipMotionReadLimits::default()).unwrap();
         calculate_streamed_in_slopes(&mut frames).unwrap();
         assert_eq!(frames.len(), 4);
         assert_eq!(frames[1].keys[0].value.to_bits(), 5.0_f32.to_bits());
@@ -1009,7 +1279,8 @@ mod tests {
             parameters: vec!["ParamAngleX".to_owned()],
             parts: Vec::new(),
         };
-        let target_index = TargetIndex::build(&targets).unwrap();
+        let target_index =
+            TargetIndex::build(&targets, &CubismClipMotionReadLimits::default()).unwrap();
         let bindings = BindingLayout::build(&[GenericBinding {
             path: unity_crc32(b"Parameters/ParamAngleX"),
             attribute: 0,
@@ -1027,7 +1298,7 @@ mod tests {
         let mut builder = ClipBuilder::new(
             &collection,
             0,
-            CubismClipMotionReadLimits::default(),
+            &CubismClipMotionReadLimits::default(),
             target_index,
             bindings,
         )
