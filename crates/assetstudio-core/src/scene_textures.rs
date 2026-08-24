@@ -313,15 +313,19 @@ impl SceneTextureSet {
 
     /// Adds an already-encoded texture, returning its index.
     ///
+    /// Allocation failure leaves the collection unchanged and is returned to
+    /// the caller instead of aborting inside `Vec::push`.
+    ///
     /// For callers that decoded the image themselves; [`Self::from_model`]
     /// covers resolving them from the collection. [`Self::write_to_directory`]
     /// revalidates the supplied file name as one portable relative component
     /// before it creates a temporary file, so a manually constructed texture
     /// cannot escape the selected output directory.
-    pub fn push_texture(&mut self, texture: SceneTexture) -> usize {
+    pub fn push_texture(&mut self, texture: SceneTexture) -> Result<usize> {
+        reserve_scene_textures(&mut self.textures, 1)?;
         let index = self.textures.len();
         self.textures.push(texture);
-        index
+        Ok(index)
     }
 
     /// Binds a material property to a texture already in this set.
@@ -439,9 +443,7 @@ fn insert_resolved_scene_texture(
     encoded: Vec<u8>,
     format: ImageFormat,
 ) -> Result<usize> {
-    set.textures.try_reserve(1).map_err(|error| {
-        Error::invalid_data(format!("cannot grow resolved model textures: {error}"))
-    })?;
+    reserve_scene_textures(&mut set.textures, 1)?;
     by_object.try_reserve(1).map_err(|error| {
         Error::invalid_data(format!("cannot grow resolved texture index: {error}"))
     })?;
@@ -454,6 +456,12 @@ fn insert_resolved_scene_texture(
     });
     by_object.insert(key, index);
     Ok(index)
+}
+
+fn reserve_scene_textures(textures: &mut Vec<SceneTexture>, additional: usize) -> Result<()> {
+    textures.try_reserve(additional).map_err(|error| {
+        Error::invalid_data(format!("cannot grow model texture collection: {error}"))
+    })
 }
 
 fn append_scene_texture_binding(
@@ -926,7 +934,7 @@ mod tests {
     use super::{
         AssetCollection, ImageFormat, ModelIr, SceneObjectKey, SceneTexture, SceneTextureLimits,
         SceneTextureNames, SceneTextureSet, TEXTURE_2D_CLASS_ID, TextureSlot, TextureTemporaryFile,
-        sanitize_file_stem,
+        reserve_scene_textures, sanitize_file_stem,
     };
     use std::io::Write as _;
 
@@ -1144,6 +1152,31 @@ mod tests {
     }
 
     #[test]
+    fn manual_texture_growth_reports_allocation_failure_transactionally() {
+        let mut textures = Vec::new();
+        let original_capacity = textures.capacity();
+        let error = reserve_scene_textures(&mut textures, usize::MAX).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot grow model texture collection")
+        );
+        assert!(textures.is_empty());
+        assert_eq!(textures.capacity(), original_capacity);
+
+        let mut set = SceneTextureSet::default();
+        let index = set
+            .push_texture(SceneTexture {
+                file_name: "Body.png".to_owned(),
+                object: object(81),
+                encoded: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(set.textures.len(), 1);
+    }
+
+    #[test]
     fn writes_files_without_clobbering_what_is_already_there() {
         let collection = texture_collection("Body");
         let model = model_with_texture_property("_MainTex", 81);
@@ -1216,7 +1249,8 @@ mod tests {
                 file_name,
                 object: object(1),
                 encoded: b"not written".to_vec(),
-            });
+            })
+            .unwrap();
 
             assert!(set.write_to_directory(&directory).is_err());
             assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
@@ -1241,17 +1275,20 @@ mod tests {
             file_name: "first.png".to_owned(),
             object: object(1),
             encoded: b"published before the later failure".to_vec(),
-        });
+        })
+        .unwrap();
         set.push_texture(SceneTexture {
             file_name: "existing.png".to_owned(),
             object: object(2),
             encoded: b"must not replace the existing file".to_vec(),
-        });
+        })
+        .unwrap();
         set.push_texture(SceneTexture {
             file_name: "../invalid.png".to_owned(),
             object: object(3),
             encoded: b"must not be written".to_vec(),
-        });
+        })
+        .unwrap();
 
         let error = set.write_to_directory(&directory).unwrap_err();
         assert!(error.to_string().contains("portable"), "{error}");

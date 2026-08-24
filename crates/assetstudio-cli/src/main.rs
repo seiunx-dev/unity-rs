@@ -4412,8 +4412,12 @@ mod tests {
         let destination = directory.join("model.fbx");
         let mut temporary = closed_fbx_temporary(&directory);
         let mut textures = SceneTextureSet::default();
-        textures.push_texture(scene_texture("first.png", 1));
-        textures.push_texture(scene_texture("../invalid.png", 2));
+        textures
+            .push_texture(scene_texture("first.png", 1))
+            .unwrap();
+        textures
+            .push_texture(scene_texture("../invalid.png", 2))
+            .unwrap();
 
         let error =
             publish_fbx_with_textures(&mut temporary, &destination, &textures, 0, 0, 12, u64::MAX)
@@ -4433,7 +4437,7 @@ mod tests {
         fs::write(&destination, b"existing FBX").unwrap();
         let mut temporary = closed_fbx_temporary(&directory);
         let mut textures = SceneTextureSet::default();
-        textures.push_texture(scene_texture("body.png", 1));
+        textures.push_texture(scene_texture("body.png", 1)).unwrap();
 
         let error =
             publish_fbx_with_textures(&mut temporary, &destination, &textures, 0, 0, 12, u64::MAX)
@@ -4453,7 +4457,7 @@ mod tests {
         let destination = directory.join("model.fbx");
         let mut temporary = closed_fbx_temporary(&directory);
         let mut textures = SceneTextureSet::default();
-        textures.push_texture(scene_texture("body.png", 1));
+        textures.push_texture(scene_texture("body.png", 1)).unwrap();
 
         let error =
             publish_fbx_with_textures(&mut temporary, &destination, &textures, 0, 0, 12, 26)

@@ -1622,11 +1622,13 @@ mod tests {
 
         let model = model_fixture();
         let mut set = SceneTextureSet::default();
-        let texture = set.push_texture(SceneTexture {
-            file_name: "Body.png".to_owned(),
-            object: key(81),
-            encoded: Vec::new(),
-        });
+        let texture = set
+            .push_texture(SceneTexture {
+                file_name: "Body.png".to_owned(),
+                object: key(81),
+                encoded: Vec::new(),
+            })
+            .unwrap();
         // The fixture's renderer has no material slots, so nothing binds and no
         // Texture record should appear; a writer that emitted one anyway would
         // be inventing a reference the scene does not have.
@@ -1657,11 +1659,13 @@ mod tests {
 
         let model = material_model_fixture();
         let mut set = SceneTextureSet::default();
-        let texture = set.push_texture(SceneTexture {
-            file_name: "Body.png".to_owned(),
-            object: key(81),
-            encoded: Vec::new(),
-        });
+        let texture = set
+            .push_texture(SceneTexture {
+                file_name: "Body.png".to_owned(),
+                object: key(81),
+                encoded: Vec::new(),
+            })
+            .unwrap();
         set.bind(
             key(61),
             SceneTextureBinding {
