@@ -64,9 +64,26 @@ MPEG_NAME = "mpeg-layer3-tone.mp3"
 MPEG_TONE = "sine=frequency=440:sample_rate=44100:duration=0.3"
 MPEG_MULTISTREAM_NAME = "fsb5-mpeg-layer3-6ch.fsb"
 MPEG_MULTISTREAM_PAIRS = ((330, 440), (550, 660), (770, 880))
-OPUS_MULTISTREAM_FSB_NAME = "fsb5-opus-celt-6ch.fsb"
-OPUS_MULTISTREAM_OGG_NAME = "opus-celt-6ch.ogg"
-OPUS_MULTISTREAM_FREQUENCIES = (330, 440, 550, 660, 770, 880)
+OPUS_SURROUND_CHANNEL_COUNTS = (3, 4, 5, 6, 7, 8)
+OPUS_SURROUND_LAYOUTS = {
+    3: "3.0",
+    4: "quad",
+    5: "5.0",
+    6: "5.1",
+    7: "6.1",
+    8: "7.1",
+}
+OPUS_SURROUND_MAPPINGS = {
+    3: (2, 1, bytes((0, 2, 1))),
+    4: (2, 2, bytes((0, 1, 2, 3))),
+    5: (3, 2, bytes((0, 4, 1, 2, 3))),
+    6: (4, 2, bytes((0, 4, 1, 2, 3, 5))),
+    7: (4, 3, bytes((0, 4, 1, 2, 3, 5, 6))),
+    8: (5, 3, bytes((0, 6, 1, 2, 3, 4, 5, 7))),
+}
+OPUS_SURROUND_PERIODS = (138, 150, 164, 178, 194, 210, 226, 242)
+OPUS_SURROUND_FRAMES = 5_760
+OPUS_SURROUND_SAMPLE_RATE = 48_000
 VORBIS_SURROUND_CHANNEL_COUNTS = (3, 4, 5, 6, 7, 8)
 VORBIS_SURROUND_PHASE_STEPS = (83, 97, 109, 127, 149, 167, 181, 199)
 VORBIS_SURROUND_FRAMES = 3_840
@@ -254,67 +271,98 @@ def generate_multistream_mpeg(work: Path) -> None:
     )
 
 
-def generate_multistream_opus(work: Path) -> None:
-    """Builds a six-channel FSB5 from a standard family-1 Opus stream."""
-    ogg = work / OPUS_MULTISTREAM_OGG_NAME
-    command = ["ffmpeg", "-v", "error", "-y"]
-    for frequency in OPUS_MULTISTREAM_FREQUENCIES:
-        command.extend(
+def generate_surround_opus(work: Path) -> None:
+    """Builds 3-8 channel FSB5 files from standard family-1 Opus streams."""
+    for channels in OPUS_SURROUND_CHANNEL_COUNTS:
+        fsb_name = f"fsb5-opus-celt-{channels}ch.fsb"
+        ogg_name = f"opus-celt-{channels}ch.ogg"
+        wave_path = work / f"opus-celt-{channels}ch.wav"
+        ogg = work / ogg_name
+        pcm = bytearray(OPUS_SURROUND_FRAMES * channels * 2)
+        cursor = 0
+        for frame in range(OPUS_SURROUND_FRAMES):
+            for period in OPUS_SURROUND_PERIODS[:channels]:
+                half_period = period // 2
+                phase = frame % period
+                if phase < half_period:
+                    sample = -6_000 + 12_000 * phase // half_period
+                else:
+                    sample = 6_000 - 12_000 * (phase - half_period) // half_period
+                struct.pack_into("<h", pcm, cursor, sample)
+                cursor += 2
+        with wave.open(str(wave_path), "wb") as output:
+            output.setnchannels(channels)
+            output.setsampwidth(2)
+            output.setframerate(OPUS_SURROUND_SAMPLE_RATE)
+            output.writeframes(pcm)
+        run(
             [
-                "-f", "lavfi", "-i",
-                f"sine=frequency={frequency}:sample_rate=48000:duration={OPUS_DURATION}",
+                "ffmpeg", "-v", "error", "-y",
+                "-channel_layout", OPUS_SURROUND_LAYOUTS[channels],
+                "-i", str(wave_path),
+                "-c:a", "libopus", "-mapping_family", "1",
+                "-application", "audio", "-b:a", f"{channels * 64}k",
+                "-vbr", "off", "-frame_duration", "20",
+                "-fflags", "+bitexact", "-map_metadata", "-1", str(ogg),
             ]
         )
-    inputs = "".join(f"[{index}:a]" for index in range(6))
-    command.extend(
-        [
-            "-filter_complex", f"{inputs}amerge=inputs=6[a]",
-            "-map", "[a]", "-ac", "6", "-channel_layout", "5.1",
-            "-c:a", "libopus", "-mapping_family", "1",
-            "-application", "audio", "-b:a", "384k", "-vbr", "off",
-            "-frame_duration", "20", "-fflags", "+bitexact",
-            "-map_metadata", "-1", str(ogg),
-        ]
-    )
-    run(command)
-    packets = ogg_packets(ogg)
-    head, audio = packets[0], packets[2:]
-    expected_mapping = bytes((0, 4, 1, 2, 3, 5))
-    if (
-        not head.startswith(b"OpusHead")
-        or len(head) != 27
-        or head[9] != 6
-        or head[18] != 1
-        or head[19] != 4
-        or head[20] != 2
-        or head[21:] != expected_mapping
-    ):
-        raise ValueError("unexpected six-channel Opus mapping-family-1 header")
-    pre_skip = int.from_bytes(head[10:12], "little")
-    if pre_skip != 312:
-        raise ValueError(f"six-channel Opus pre-skip is {pre_skip}, expected 312")
-    frame_count = ogg_last_granule(ogg) - pre_skip
-    if frame_count <= 0:
-        raise ValueError("six-channel Opus stream has no post-skip frames")
+        packets = ogg_packets(ogg)
+        head, audio = packets[0], packets[2:]
+        stream_count, coupled_count, mapping = OPUS_SURROUND_MAPPINGS[channels]
+        if (
+            not head.startswith(b"OpusHead")
+            or len(head) != 21 + channels
+            or head[9] != channels
+            or head[18] != 1
+            or head[19] != stream_count
+            or head[20] != coupled_count
+            or head[21:] != mapping
+        ):
+            raise ValueError(
+                f"unexpected {channels}-channel Opus mapping-family-1 header"
+            )
+        pre_skip = int.from_bytes(head[10:12], "little")
+        if pre_skip != 312:
+            raise ValueError(
+                f"{channels}-channel Opus pre-skip is {pre_skip}, expected 312"
+            )
+        frame_count = ogg_last_granule(ogg) - pre_skip
+        if frame_count != OPUS_SURROUND_FRAMES:
+            raise ValueError(
+                f"{channels}-channel Opus stream has {frame_count} post-skip "
+                f"frames, expected {OPUS_SURROUND_FRAMES}"
+            )
 
-    data = b"".join(len(packet).to_bytes(2, "little") + packet for packet in audio)
-    data += b"\0\0"
-    header = bytearray(0x3C)
-    header[:4] = b"FSB5"
-    header[4:8] = (1).to_bytes(4, "little")
-    header[8:12] = (1).to_bytes(4, "little")
-    header[12:16] = (8).to_bytes(4, "little")
-    header[20:24] = len(data).to_bytes(4, "little")
-    header[24:28] = (17).to_bytes(4, "little")
-    # Compact channel code 2 is six channels; rate code 9 is 48 kHz.
-    sample_mode = (frame_count << 34) | (2 << 5) | (9 << 1)
-    fsb = header + sample_mode.to_bytes(8, "little") + data
-    (FIXTURES / OPUS_MULTISTREAM_FSB_NAME).write_bytes(fsb)
-    (FIXTURES / OPUS_MULTISTREAM_OGG_NAME).write_bytes(ogg.read_bytes())
-    print(
-        f"wrote {OPUS_MULTISTREAM_FSB_NAME} and {OPUS_MULTISTREAM_OGG_NAME}: "
-        f"{len(audio)} packets, {frame_count} frames"
-    )
+        data = b"".join(
+            len(packet).to_bytes(2, "little") + packet for packet in audio
+        ) + b"\0\0"
+        channel_code = {6: 2, 8: 3}.get(channels, 0)
+        has_channel_metadata = channels not in (1, 2, 6, 8)
+        sample_mode = (
+            (frame_count << 34)
+            | (channel_code << 5)
+            | (9 << 1)
+            | int(has_channel_metadata)
+        )
+        metadata = bytearray()
+        if has_channel_metadata:
+            channel_header = (1 << 25) | (1 << 1)
+            metadata.extend(channel_header.to_bytes(4, "little"))
+            metadata.append(channels)
+        sample_headers = sample_mode.to_bytes(8, "little") + metadata
+        header = bytearray(0x3C)
+        header[:4] = b"FSB5"
+        header[4:8] = (1).to_bytes(4, "little")
+        header[8:12] = (1).to_bytes(4, "little")
+        header[12:16] = len(sample_headers).to_bytes(4, "little")
+        header[20:24] = len(data).to_bytes(4, "little")
+        header[24:28] = (17).to_bytes(4, "little")
+        (FIXTURES / fsb_name).write_bytes(header + sample_headers + data)
+        (FIXTURES / ogg_name).write_bytes(ogg.read_bytes())
+        print(
+            f"wrote {fsb_name} and {ogg_name}: {len(audio)} packets, "
+            f"{frame_count} frames"
+        )
 
 
 def generate_surround_vorbis(work: Path) -> None:
@@ -403,7 +451,7 @@ def main() -> None:
             generate_opus(name, options, work)
         generate_mpeg(work)
         generate_multistream_mpeg(work)
-        generate_multistream_opus(work)
+        generate_surround_opus(work)
         generate_surround_vorbis(work)
 
 

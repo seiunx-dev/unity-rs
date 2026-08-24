@@ -82,16 +82,23 @@ the path -- and its test pins the measurement rather than accepting it.
 Both replaced an all-zero fixture that compared framing only, which is how the
 divergence went unnoticed: two decoders agree on silence whatever they do.
 
-`opus-celt-6ch.ogg` is the reproducible multistream counterpart: six distinct
-330/440/550/660/770/880 Hz tones encoded as 5.1, 48 kHz, CELT-only Opus with
-mapping family 1, four streams, two coupled streams, and channel mapping
-`[0, 4, 1, 2, 3, 5]`. `fsb5-opus-celt-6ch.fsb` wraps those exact audio packets
-in FSB5's little-endian length framing and declares 5,760 post-pre-skip frames.
-The regular test proves that all six output channels are non-silent and
-distinct. The ignored oracle decodes the FSB through the Rust implementation
-and the original Ogg through pinned `vgmstream r2117`, compares the complete FSB
-output with the corresponding Ogg prefix, and observes a maximum PCM16 delta of
-four. Because the Ogg retains the authoritative OpusHead, this independently
-checks both self-delimited multistream packet parsing and Vorbis-to-WAVE channel
-ordering; it does not compare the Rust decoder with another header synthesized
-from the same FSB assumptions.
+Each `opus-celt-{3..8}ch.ogg` and matching `fsb5-opus-celt-{3..8}ch.fsb`
+pair contains 5,760 frames of distinct deterministic integer triangle waves at
+48 kHz. The generator labels the input WAVE layout before encoding, requires
+libopus mapping family 1, and checks every stream count, coupled-stream count,
+and mapping byte in the authoritative `OpusHead`. This input-side check matters:
+an earlier generator put `-channel_layout` on FFmpeg's output side and silently
+remixed the third channel of the three-channel fixture to zero; the regular
+per-channel peak and hash assertions rejected it.
+
+Each FSB wraps the exact audio packets from its Ogg counterpart in FSB5's
+little-endian length framing and declares 5,760 post-pre-skip frames. The
+regular test proves that every output channel is non-silent and distinct. The
+ignored oracle decodes the FSB through the Rust implementation and each
+original Ogg through pinned `vgmstream r2117`, compares the complete FSB output
+with the corresponding Ogg prefix, and pins the measured per-layout PCM16
+deltas (the largest is nine for four channels). Because each Ogg retains its
+authoritative `OpusHead`, this independently checks self-delimited multistream
+packet parsing and every standard surround-to-WAVE channel order; it does not
+compare the Rust decoder with another header synthesized from the same FSB
+assumptions.

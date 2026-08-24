@@ -54,8 +54,9 @@ The initial API supports:
   FMOD/Xbox IMA-ADPCM, Nintendo DSP/GC-ADPCM, Sony VAG/PS-ADPCM and HEVAG,
   FMOD FADPCM, MPEG Layer II/III including FSB multistream audio up to 16
   channels with FMOD frame padding, and
-  sample-verified standard 48 kHz FSB Opus from mono through 7.1 with its
-  family-1 multistream mapping and 312-frame encoder delay, plus pure-Rust FSB
+  sample-verified standard 48 kHz FSB Opus from mono through 7.1 with every
+  3-8 channel family-1 multistream mapping checked against an independent
+  decoder and a 312-frame encoder delay, plus pure-Rust FSB
   Vorbis from mono through 7.1 with every 3-8 channel Vorbis-to-WAVE speaker
   permutation checked against an independent decoder and the 161-entry FMOD
   setup-header table; remaining platform codecs are preserved raw until a
