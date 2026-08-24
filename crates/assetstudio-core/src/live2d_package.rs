@@ -1273,19 +1273,22 @@ impl<'a> PackageState<'a> {
         fade_controllers.sort_unstable_by_key(component_identity);
 
         let models = self.select_active_models(&roles, models)?;
+        let nearest_models = NearestParentModelIndex::build(&self.hierarchy, &models)?;
 
-        let renderers_by_model = self.assign_renderers(&models, renderers)?;
-        let pose_parts_by_model = self.assign_auxiliary_components(&models, pose_parts)?;
+        let renderers_by_model = self.assign_renderers(&nearest_models, renderers)?;
+        let pose_parts_by_model = Self::assign_auxiliary_components(&nearest_models, pose_parts)?;
         let display_parameters_by_model =
-            self.assign_auxiliary_components(&models, display_parameters)?;
-        let display_parts_by_model = self.assign_auxiliary_components(&models, display_parts)?;
-        let fade_motions_by_model = self.assign_auxiliary_components(&models, fade_motions)?;
-        let parameters_by_model = self.assign_auxiliary_components(&models, parameters)?;
-        let parts_by_model = self.assign_auxiliary_components(&models, parts)?;
+            Self::assign_auxiliary_components(&nearest_models, display_parameters)?;
+        let display_parts_by_model =
+            Self::assign_auxiliary_components(&nearest_models, display_parts)?;
+        let fade_motions_by_model =
+            Self::assign_auxiliary_components(&nearest_models, fade_motions)?;
+        let parameters_by_model = Self::assign_auxiliary_components(&nearest_models, parameters)?;
+        let parts_by_model = Self::assign_auxiliary_components(&nearest_models, parts)?;
         let eye_blink_parameters_by_model =
-            self.assign_auxiliary_components(&models, eye_blink_parameters)?;
+            Self::assign_auxiliary_components(&nearest_models, eye_blink_parameters)?;
         let mouth_parameters_by_model =
-            self.assign_auxiliary_components(&models, mouth_parameters)?;
+            Self::assign_auxiliary_components(&nearest_models, mouth_parameters)?;
         Ok(ComponentIndexes {
             roles,
             models,
@@ -1305,22 +1308,9 @@ impl<'a> PackageState<'a> {
 
     fn assign_renderers(
         &mut self,
-        models: &[ActiveModel],
+        nearest_models: &NearestParentModelIndex,
         renderers: Vec<ScriptedComponent>,
     ) -> Result<Vec<(SceneObjectKey, Vec<ScriptedComponent>)>> {
-        let mut model_objects = Vec::new();
-        model_objects.try_reserve(models.len()).map_err(|error| {
-            Error::invalid_data(format!(
-                "cannot allocate Live2D model GameObject index: {error}"
-            ))
-        })?;
-        for model in models {
-            if let Some(game_object) = model.component.game_object {
-                model_objects.push((game_object, model.component.object));
-            }
-        }
-        model_objects.sort_unstable();
-
         let mut assignments = Vec::new();
         assignments.try_reserve(renderers.len()).map_err(|error| {
             Error::invalid_data(format!(
@@ -1339,8 +1329,7 @@ impl<'a> PackageState<'a> {
             // AssetStudio's `TryGetModelGameObject` advances to `m_Father`
             // before checking for a model, so a renderer on the model's own
             // GameObject is intentionally not attached here.
-            let Some(model) = nearest_parent_model(&self.hierarchy, game_object, &model_objects)
-            else {
+            let Some(model) = nearest_models.get(game_object) else {
                 self.push_diagnostic(
                     renderer.object,
                     Live2dPackageDiagnosticKind::DetachedRenderer,
@@ -1354,7 +1343,7 @@ impl<'a> PackageState<'a> {
 
         let mut grouped = Vec::new();
         grouped
-            .try_reserve(models.len().min(assignments.len()))
+            .try_reserve(nearest_models.model_count.min(assignments.len()))
             .map_err(|error| {
                 Error::invalid_data(format!("cannot allocate Live2D renderer groups: {error}"))
             })?;
@@ -1378,22 +1367,9 @@ impl<'a> PackageState<'a> {
     }
 
     fn assign_auxiliary_components(
-        &self,
-        models: &[ActiveModel],
+        nearest_models: &NearestParentModelIndex,
         components: Vec<ScriptedComponent>,
     ) -> Result<Vec<(SceneObjectKey, Vec<ScriptedComponent>)>> {
-        let mut model_objects = Vec::new();
-        model_objects.try_reserve(models.len()).map_err(|error| {
-            Error::invalid_data(format!(
-                "cannot allocate Live2D auxiliary model index: {error}"
-            ))
-        })?;
-        for model in models {
-            if let Some(game_object) = model.component.game_object {
-                model_objects.push((game_object, model.component.object));
-            }
-        }
-        model_objects.sort_unstable();
         let mut assignments = Vec::new();
         assignments.try_reserve(components.len()).map_err(|error| {
             Error::invalid_data(format!(
@@ -1404,14 +1380,13 @@ impl<'a> PackageState<'a> {
             let Some(game_object) = component.game_object else {
                 continue;
             };
-            let Some(model) = nearest_parent_model(&self.hierarchy, game_object, &model_objects)
-            else {
+            let Some(model) = nearest_models.get(game_object) else {
                 continue;
             };
             assignments.push((model, component));
         }
         assignments.sort_unstable_by_key(|(model, component)| (*model, component.object));
-        group_component_assignments(models.len(), assignments)
+        group_component_assignments(nearest_models.model_count, assignments)
     }
 
     fn select_active_models(
@@ -3288,22 +3263,121 @@ fn remove_exp3_suffixes(value: &str) -> Result<String> {
     Ok(output)
 }
 
-fn nearest_parent_model(
-    hierarchy: &SceneHierarchy,
-    renderer_game_object: SceneObjectKey,
-    models: &[(SceneObjectKey, SceneObjectKey)],
-) -> Option<SceneObjectKey> {
-    let mut current = hierarchy.node(renderer_game_object)?.parent;
-    while let Some(game_object) = current {
-        let position = models.partition_point(|(candidate, _)| *candidate < game_object);
-        if let Some((candidate, model)) = models.get(position)
-            && *candidate == game_object
-        {
-            return Some(*model);
-        }
-        current = hierarchy.node(game_object)?.parent;
+struct NearestParentModelIndex {
+    by_game_object: HashMap<SceneObjectKey, SceneObjectKey>,
+    model_count: usize,
+}
+
+impl NearestParentModelIndex {
+    fn build(hierarchy: &SceneHierarchy, models: &[ActiveModel]) -> Result<Self> {
+        Self::build_from_pairs(
+            hierarchy,
+            models.len(),
+            models.iter().filter_map(|model| {
+                model
+                    .component
+                    .game_object
+                    .map(|game_object| (game_object, model.component.object))
+            }),
+        )
     }
-    None
+
+    fn build_from_pairs(
+        hierarchy: &SceneHierarchy,
+        model_count: usize,
+        models: impl IntoIterator<Item = (SceneObjectKey, SceneObjectKey)>,
+    ) -> Result<Self> {
+        let mut model_by_game_object = HashMap::new();
+        model_by_game_object
+            .try_reserve(model_count)
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate Live2D model GameObject index: {error}"
+                ))
+            })?;
+        for (game_object, model) in models {
+            model_by_game_object.insert(game_object, model);
+        }
+
+        let mut node_index_by_object = HashMap::new();
+        node_index_by_object
+            .try_reserve(hierarchy.nodes.len())
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate Live2D hierarchy node index: {error}"
+                ))
+            })?;
+        for (node_index, node) in hierarchy.nodes.iter().enumerate() {
+            if node_index_by_object
+                .insert(node.object, node_index)
+                .is_some()
+            {
+                return Err(Error::invalid_data(format!(
+                    "duplicate Live2D hierarchy GameObject {:?}",
+                    node.object
+                )));
+            }
+        }
+
+        let mut by_game_object = HashMap::new();
+        by_game_object
+            .try_reserve(hierarchy.nodes.len())
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate Live2D nearest-model index: {error}"
+                ))
+            })?;
+        let mut pending = Vec::new();
+        pending
+            .try_reserve(hierarchy.nodes.len())
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate Live2D hierarchy traversal: {error}"
+                ))
+            })?;
+        for root in hierarchy.roots.iter().rev() {
+            let node_index = node_index_by_object.get(root).copied().ok_or_else(|| {
+                Error::invalid_data(format!("Live2D hierarchy root {root:?} is absent"))
+            })?;
+            pending.push((node_index, None));
+        }
+
+        let mut visited = 0_usize;
+        while let Some((node_index, inherited_model)) = pending.pop() {
+            let node = &hierarchy.nodes[node_index];
+            let game_object = node.object;
+            visited = visited.checked_add(1).ok_or_else(|| {
+                Error::invalid_data("Live2D hierarchy traversal count overflowed")
+            })?;
+            if let Some(model) = inherited_model {
+                by_game_object.insert(game_object, model);
+            }
+            let child_model = model_by_game_object
+                .get(&game_object)
+                .copied()
+                .or(inherited_model);
+            for child in node.children.iter().rev() {
+                let child_index = node_index_by_object.get(child).copied().ok_or_else(|| {
+                    Error::invalid_data(format!("Live2D hierarchy child {child:?} is absent"))
+                })?;
+                pending.push((child_index, child_model));
+            }
+        }
+        if visited != hierarchy.nodes.len() {
+            return Err(Error::invalid_data(format!(
+                "Live2D hierarchy traversal reached {visited} of {} GameObjects",
+                hierarchy.nodes.len()
+            )));
+        }
+        Ok(Self {
+            by_game_object,
+            model_count: model_by_game_object.len(),
+        })
+    }
+
+    fn get(&self, game_object: SceneObjectKey) -> Option<SceneObjectKey> {
+        self.by_game_object.get(&game_object).copied()
+    }
 }
 
 fn parse_pptr(value: &TypeValue) -> Option<ObjectReference> {
@@ -3593,13 +3667,15 @@ mod tests {
 
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::mono_schema::{MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry};
+    use crate::scene_hierarchy::{SceneHierarchy, SceneHierarchyNode, SceneObjectKey};
     use crate::serialized::{SerializedFile, TypeTree, TypeTreeNode};
     use crate::source::Region;
 
     use super::{
         Live2dPackageDiagnosticKind, Live2dPackageLimits, Live2dPackageMaterializeLimits,
-        PackageState, build_live2d_packages, build_live2d_packages_with_schema_provider,
-        claim_name, materialize_live2d_packages, safe_file_stem,
+        NearestParentModelIndex, PackageState, build_live2d_packages,
+        build_live2d_packages_with_schema_provider, claim_name, materialize_live2d_packages,
+        safe_file_stem,
     };
 
     const GAME_OBJECT: i32 = 1;
@@ -3932,6 +4008,61 @@ mod tests {
         assert_eq!(set.packages[0].model.path_id, 20);
         assert_eq!(set.packages[0].name, "Second");
         assert_eq!(set.packages[0].moc_object.path_id, 30);
+    }
+
+    #[test]
+    fn precomputes_nearest_parent_models_for_a_deep_hierarchy() {
+        const NODE_COUNT: usize = 20_000;
+        let key = |index: usize| SceneObjectKey {
+            file_index: 0,
+            path_id: i64::try_from(index + 1).unwrap(),
+        };
+        let mut nodes = Vec::with_capacity(NODE_COUNT);
+        for index in 0..NODE_COUNT {
+            nodes.push(SceneHierarchyNode {
+                object: key(index),
+                name: String::new(),
+                transform: None,
+                mesh_filter: None,
+                mesh_renderer: None,
+                skinned_mesh_renderer: None,
+                animator: None,
+                parent: (index > 0).then(|| key(index - 1)),
+                children: if index + 1 < NODE_COUNT {
+                    vec![key(index + 1)]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+        let root = key(0);
+        let nested_index = NODE_COUNT / 2;
+        let nested = key(nested_index);
+        let root_model = SceneObjectKey {
+            file_index: 0,
+            path_id: -1,
+        };
+        let nested_model = SceneObjectKey {
+            file_index: 0,
+            path_id: -2,
+        };
+        let hierarchy = SceneHierarchy::from_test_parts(nodes, vec![root]);
+
+        let index = NearestParentModelIndex::build_from_pairs(
+            &hierarchy,
+            2,
+            [(root, root_model), (nested, nested_model)],
+        )
+        .unwrap();
+
+        assert_eq!(index.model_count, 2);
+        assert_eq!(index.get(root), None);
+        for node_index in 1..=nested_index {
+            assert_eq!(index.get(key(node_index)), Some(root_model));
+        }
+        for node_index in nested_index + 1..NODE_COUNT {
+            assert_eq!(index.get(key(node_index)), Some(nested_model));
+        }
     }
 
     #[test]
