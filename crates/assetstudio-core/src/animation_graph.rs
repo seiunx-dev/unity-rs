@@ -36,6 +36,8 @@ pub struct AnimationGraphLimits {
     pub maximum_legacy_animations: usize,
     pub maximum_controllers: usize,
     pub maximum_clips: usize,
+    /// Maximum retained graph references, including the controller clip list
+    /// copied onto every bound Animator for the public managed-model view.
     pub maximum_edges: usize,
     pub maximum_total_name_bytes: usize,
     pub component: AnimationComponentReadLimits,
@@ -171,7 +173,7 @@ pub fn build_animation_graph(
     state.collect_animators(hierarchy)?;
     state.collect_legacy_animations()?;
     state.read_pending_controllers()?;
-    state.attach_managed_bound_clips();
+    state.attach_managed_bound_clips()?;
     state.finish()
 }
 
@@ -410,31 +412,38 @@ impl<'a> GraphBuildState<'a> {
         Ok(())
     }
 
-    fn attach_managed_bound_clips(&mut self) {
+    fn attach_managed_bound_clips(&mut self) -> Result<()> {
+        let additional_edges = self.animators.iter().try_fold(0_usize, |total, binding| {
+            let additional = binding
+                .controller
+                .and_then(|key| {
+                    direct_controller_clips(&self.controllers, &self.controller_index, key)
+                })
+                .map_or(0, <[Option<SceneObjectKey>]>::len);
+            total
+                .checked_add(additional)
+                .ok_or_else(|| Error::invalid_data("Animator bound clip count overflowed"))
+        })?;
+        self.charge_edges(additional_edges, "Animator bound clip copies")?;
+
         for binding in &mut self.animators {
-            let Some(controller_key) = binding.controller else {
+            let Some(clips) = binding.controller.and_then(|key| {
+                direct_controller_clips(&self.controllers, &self.controller_index, key)
+            }) else {
                 continue;
             };
-            let Some(controller_index) = self.controller_index.get(&controller_key).copied() else {
-                continue;
-            };
-            let direct_key = match &self.controllers[controller_index].kind {
-                AnimationControllerKind::AnimatorController { .. } => Some(controller_key),
-                AnimationControllerKind::AnimatorOverrideController {
-                    base_controller, ..
-                } => *base_controller,
-            };
-            let Some(direct_index) =
-                direct_key.and_then(|key| self.controller_index.get(&key).copied())
-            else {
-                continue;
-            };
-            if let AnimationControllerKind::AnimatorController { clips } =
-                &self.controllers[direct_index].kind
-            {
-                binding.bound_clips.clone_from(clips);
-            }
+            binding.bound_clips.clear();
+            binding
+                .bound_clips
+                .try_reserve_exact(clips.len())
+                .map_err(|error| {
+                    Error::invalid_data(format!(
+                        "cannot allocate Animator bound clip copies: {error}"
+                    ))
+                })?;
+            binding.bound_clips.extend_from_slice(clips);
         }
+        Ok(())
     }
 
     fn queue_controller_reference(
@@ -620,6 +629,25 @@ impl<'a> GraphBuildState<'a> {
     }
 }
 
+fn direct_controller_clips<'a>(
+    controllers: &'a [AnimationControllerNode],
+    controller_index: &HashMap<SceneObjectKey, usize>,
+    controller_key: SceneObjectKey,
+) -> Option<&'a [Option<SceneObjectKey>]> {
+    let controller = controllers.get(*controller_index.get(&controller_key)?)?;
+    let direct_key = match &controller.kind {
+        AnimationControllerKind::AnimatorController { .. } => controller_key,
+        AnimationControllerKind::AnimatorOverrideController {
+            base_controller, ..
+        } => (*base_controller)?,
+    };
+    let direct = controllers.get(*controller_index.get(&direct_key)?)?;
+    match &direct.kind {
+        AnimationControllerKind::AnimatorController { clips } => Some(clips),
+        AnimationControllerKind::AnimatorOverrideController { .. } => None,
+    }
+}
+
 fn build_graph_lookup_indexes(
     controllers: &[AnimationControllerNode],
     clips: &[AnimationClipNode],
@@ -791,7 +819,7 @@ mod tests {
     use super::{
         ANIMATION_CLASS_ID, ANIMATION_CLIP_CLASS_ID, ANIMATOR_CONTROLLER_CLASS_ID,
         ANIMATOR_OVERRIDE_CONTROLLER_CLASS_ID, AnimationClipNode, AnimationControllerKind,
-        AnimationControllerNode, AnimationGraphLimits, AnimatorAnimationBinding,
+        AnimationControllerNode, AnimationGraphLimits, AnimatorAnimationBinding, GraphBuildState,
         animator_index_position, animator_index_position_with_probe, build_animation_graph,
         build_animator_index, build_graph_lookup_indexes, key_index_position_with_probe,
     };
@@ -975,6 +1003,71 @@ mod tests {
         assert!(error.to_string().contains("repeat object key"));
     }
 
+    #[test]
+    fn bound_clip_copies_preserve_managed_order_at_the_exact_edge_budget() {
+        let collection = AssetCollection::from_loaded_parts(Vec::new(), Vec::new());
+        let clips = [Some(graph_key(1, 3)), None, Some(graph_key(1, 1))];
+        let mut state = bound_clip_state(&collection, 4, clips.to_vec(), 12);
+
+        state.attach_managed_bound_clips().unwrap();
+
+        assert_eq!(state.edges, 12);
+        assert!(
+            state
+                .animators
+                .iter()
+                .all(|binding| binding.bound_clips == clips)
+        );
+    }
+
+    #[test]
+    fn bound_clip_copy_budget_preflights_animators_times_clips() {
+        const ENTRY_COUNT: usize = 16_384;
+        let collection = AssetCollection::from_loaded_parts(Vec::new(), Vec::new());
+        let clips: Vec<_> = (0..ENTRY_COUNT)
+            .map(|index| Some(graph_key(1, i64::try_from(index + 1).unwrap())))
+            .collect();
+        let mut state = bound_clip_state(&collection, ENTRY_COUNT, clips, ENTRY_COUNT - 1);
+
+        let error = state.attach_managed_bound_clips().unwrap_err();
+
+        assert!(error.to_string().contains("Animator bound clip copies"));
+        assert!(
+            state
+                .animators
+                .iter()
+                .all(|binding| binding.bound_clips.is_empty())
+        );
+    }
+
+    #[test]
+    fn public_graph_builder_charges_managed_bound_clip_copies() {
+        let collection = fixture_collection(false, false);
+        let hierarchy =
+            build_scene_hierarchy(&collection, SceneHierarchyLimits::default()).unwrap();
+        let error = build_animation_graph(
+            &collection,
+            &hierarchy,
+            AnimationGraphLimits {
+                maximum_edges: 10,
+                ..AnimationGraphLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Animator bound clip copies"));
+
+        let graph = build_animation_graph(
+            &collection,
+            &hierarchy,
+            AnimationGraphLimits {
+                maximum_edges: 11,
+                ..AnimationGraphLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(graph.animators[0].bound_clips[0].unwrap().path_id, 4);
+    }
+
     fn reverse_path_id(source_index: usize, length: usize) -> i64 {
         i64::try_from(length - source_index).unwrap()
     }
@@ -1021,6 +1114,36 @@ mod tests {
             controller: None,
             bound_clips: Vec::new(),
         }
+    }
+
+    fn bound_clip_state(
+        collection: &AssetCollection,
+        animator_count: usize,
+        clips: Vec<Option<SceneObjectKey>>,
+        maximum_edges: usize,
+    ) -> GraphBuildState<'_> {
+        let controller_key = graph_key(0, 100);
+        let mut animators: Vec<_> = (0..animator_count)
+            .map(|index| test_animator_binding(i64::try_from(index + 1).unwrap()))
+            .collect();
+        for binding in &mut animators {
+            binding.controller = Some(controller_key);
+        }
+        let mut state = GraphBuildState::new(
+            collection,
+            AnimationGraphLimits {
+                maximum_edges,
+                ..AnimationGraphLimits::default()
+            },
+        );
+        state.animators = animators;
+        state.controllers.push(AnimationControllerNode {
+            object: controller_key,
+            name: String::new(),
+            kind: AnimationControllerKind::AnimatorController { clips },
+        });
+        state.controller_index.insert(controller_key, 0);
+        state
     }
 
     #[test]
