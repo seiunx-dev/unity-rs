@@ -469,6 +469,19 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   公开常规矩阵
   [32768660736](https://github.com/Team-Haruki/unity-rs/actions/runs/32768660736) 为 16/16 验证 job 全绿，
   另两项仅 tag/release 条件 artifact 任务按设计跳过；
+- **FBX 批量输出名称的错误上限与重复扫描已于 2026-08-25 收口**：SplitObjects/Animator
+  规划允许最多 1,000,000 个候选，但 CLI 原先以 `HashSet<String>` 保存名称，并让每个同名
+  候选从无后缀、`~1` 重新扫描；循环还误用“创建临时文件最多尝试 1,024 次”的常量，导致
+  第 1,026 个同名 GameObject 在模型候选、名称字节和总输出预算都未耗尽时仍必然失败。现
+  `FbxBatchNames` 用一张 case-folded `HashMap<String, u64>` 同时保存 claim 和每个 base 的下一
+  未检查后缀；碰撞名后来成为 base 时也从自身 `~1` 开始，显式占用未来候选仍会被重新检查。
+  表在批次开始时按候选数可失败预留，后续增长也用 `try_reserve`，容量失败前不更新 claim/cursor；
+  1,024 常量只继续约束真正的临时文件名尝试。回归锁定 `Face`/`face~1`、显式 `FACE~2` 后
+  继续 `face~3`，不可能容量请求后状态不变，以及 16,384 个同名候选成功得到
+  `Shared~16383` 且恰为 `2 × N - 1` 次探测。提交 `a9b0665` 的 CLI 定向测试、全目标严格
+  Clippy、Rust/Python/Node/typing/oracle 零跳过本地门禁通过；公开常规矩阵
+  [32772105204](https://github.com/Team-Haruki/unity-rs/actions/runs/32772105204) 为 16/16 验证 job 全绿，
+  另两项仅 tag/release 条件 artifact 任务按设计跳过；
 - **SceneHierarchy 的不可失败索引分配已于 2026-08-24 收口**：场景读取本来已经对
   GameObject、组件、Transform 子项、材质、骨骼和层级边执行集合级计数，并对输出 Vec 使用
   `try_reserve`，但 Transform→GameObject owner cache 与最终 GameObject→node lookup 仍是逐项
@@ -1341,9 +1354,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-25 最近一次绿色矩阵验证代码 head 为 `f88cb53`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-25 最近一次绿色矩阵验证代码 head 为 `a9b0665`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32768660736](https://github.com/Team-Haruki/unity-rs/actions/runs/32768660736) 16/16 全绿，
+[32772105204](https://github.com/Team-Haruki/unity-rs/actions/runs/32772105204) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
@@ -1358,6 +1371,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 3A-21 | **已完成模型动画同名 clip 的唯一名称放大治理**：唯一名称表现在把“下一个尚未检查的后缀”保存在既有名称键旁；每个 base 已经跨过的后缀不会在后续 clip 上从零重扫，也不为索引保留第三份输入字符串 | `98a722b`：`Walk`/`Walk_1`/空名交叉碰撞仍按首个空闲后缀命名，最终名称和索引副本继续精确计入累计字符串预算且少一字节拒绝；16,384 个同名 clip 的候选探测不超过 `2 × N`。完整 Core 611 项、畸形输入 6/6、Rust/Python/Node/oracle 零跳过本地门禁及公开常规矩阵 32758905875 全绿。这是 hostile-input 审计的第二十一项完成证据 |
 | 3A-22 | **已完成递归解包叶子/父目录碰撞后缀的重复扫描治理**：叶子保存下一个未检查的 `~N`，冲突父目录保存已解析目录后缀；每次仍验证单调 claims 与当前文件系统状态，游标 key 通过可失败增长并纳入原累计路径预算 | `68fa9e5`：16,384 个同名叶子探测 `N+1` 次；4,096 个被文件占用的父目录后缀和 16,384 个子项合计探测 `4,096+16,384` 次；5/4 字节预算边界证明 claim、cursor、budget 事务性。完整 Core 614 项、畸形输入 6/6、Rust/Python/Node/typing/oracle 零跳过本地门禁及公开矩阵 32764678899 全绿。这是 hostile-input 审计的第二十二项完成证据 |
 | 3A-23 | **已完成 Live2D 包目录/纹理/expression/motion 重名后缀的重复扫描治理**：规范化名称只保留一份并映射到稳定 ID；发生碰撞后按 `(base ID, SceneObjectKey)` 保存下一个未检查 ordinal，仍逐次复验全局 case-insensitive claim | `f88cb53`：原 `Face`/`face` 输出不变，显式 `_2` 交叉占位后稳定跳到 `_3`；不可能容量请求返回错误且不改变 claim/cursor；16,384 个相同 base/身份仅探测 `2 × N - 1` 次且末项为 `_16383`。Live2D 22/22、严格 Core Clippy、Rust/Python/Node/typing/oracle 零跳过本地门禁及公开矩阵 32768660736 全绿。这是 hostile-input 审计的第二十三项完成证据 |
+| 3A-24 | **已完成 SplitObjects/Animator FBX 批量名称的错误 1,024 上限与重复后缀扫描治理**：case-folded 名称表同时保存 claim 和每个 base 的下一未检查 `~N`；临时文件尝试上限不再误用于合法模型数量，交叉占位仍逐项复验 | `a9b0665`：`Face`/`face~1` 与显式 `FACE~2` 后的 `face~3` 保持稳定；不可能容量请求不改变状态；16,384 个同名候选越过旧上限并仅探测 `2 × N - 1` 次，末项为 `Shared~16383`。CLI 定向测试、全目标严格 Clippy、Rust/Python/Node/typing/oracle 零跳过本地门禁及公开矩阵 32772105204 全绿。这是 hostile-input 审计的第二十四项完成证据 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22）**：106 个高层 Core 方法均被机器检查为 102 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；65 个公开 Python 方法和 3 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
 | 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | 默认构建、测试、安装和用户工作流均不需要 .NET；没有 GUI 或旧 C ABI 发布物；七项完成条件均有当前证据，未满足项不得被标成完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
