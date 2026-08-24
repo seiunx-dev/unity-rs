@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
 use crate::loader::AssetCollection;
-use crate::model_ir::ModelIr;
+use crate::material::{MaterialTextureEnvironment, NamedMaterialProperty};
+use crate::model_ir::{ModelIr, ModelMaterial};
 use crate::scene::resolve_object_reference;
 use crate::scene_hierarchy::SceneObjectKey;
 use crate::texture::{TEXTURE_2D_CLASS_ID, TextureReadLimits, read_texture2d};
@@ -98,6 +99,9 @@ pub struct SceneTextureLimits {
     /// A batch export can reuse one [`SceneTextureNames`] across many models,
     /// so this is deliberately independent of the per-model texture count.
     pub maximum_name_index_bytes: u64,
+    /// UTF-8 bytes retained by successful binding property names and skipped
+    /// reference properties/reasons returned in the texture set.
+    pub maximum_metadata_bytes: u64,
     /// Total encoded bytes across every texture in the set.
     pub maximum_total_encoded_bytes: u64,
     pub texture: TextureReadLimits,
@@ -109,6 +113,7 @@ impl Default for SceneTextureLimits {
             maximum_texture_references: 1_000_000,
             maximum_textures: 4_096,
             maximum_name_index_bytes: 64 * 1024 * 1024,
+            maximum_metadata_bytes: 256 * 1024 * 1024,
             maximum_total_encoded_bytes: 2 * 1024 * 1024 * 1024,
             texture: TextureReadLimits::default(),
         }
@@ -198,109 +203,11 @@ impl SceneTextureSet {
         limits: SceneTextureLimits,
         names: &mut SceneTextureNames,
     ) -> Result<Self> {
-        let mut set = Self::default();
-        let mut by_object: HashMap<SceneObjectKey, usize> = HashMap::new();
-        let (mut total_encoded, mut texture_references) = (0_u64, 0_usize);
-
+        let mut builder = SceneTextureBuilder::new(collection, format, limits, names);
         for material in &model.materials {
-            let mut bindings = Vec::new();
-            for property in &material.material.saved_properties.texture_environments {
-                let environment = &property.value;
-                if environment.texture.is_null() {
-                    continue;
-                }
-                charge_scene_texture_reference(
-                    &mut texture_references,
-                    limits.maximum_texture_references,
-                )?;
-                let resolved = match resolve_object_reference(
-                    collection,
-                    material.object.file_index,
-                    environment.texture,
-                ) {
-                    Ok(Some(resolved)) => resolved,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        record_texture_skip(&mut set, material.object, &property.name, error)?;
-                        continue;
-                    }
-                };
-                if resolved.object.class_id != TEXTURE_2D_CLASS_ID {
-                    record_texture_skip(
-                        &mut set,
-                        material.object,
-                        &property.name,
-                        format_args!("class ID {} is not Texture2D", resolved.object.class_id),
-                    )?;
-                    continue;
-                }
-                let key = SceneObjectKey {
-                    file_index: resolved.file_index,
-                    path_id: resolved.object.path_id,
-                };
-                let texture = if let Some(index) = by_object.get(&key) {
-                    *index
-                } else {
-                    // Charge the reference before decoding it. Otherwise a
-                    // caller choosing zero (or an already exhausted count)
-                    // could still make us read, decode and encode one more
-                    // potentially large texture before the limit fired.
-                    if set.textures.len() == limits.maximum_textures {
-                        return Err(Error::invalid_data(format!(
-                            "model references more than {} textures",
-                            limits.maximum_textures
-                        )));
-                    }
-                    let remaining_encoded = limits
-                        .maximum_total_encoded_bytes
-                        .checked_sub(total_encoded)
-                        .ok_or_else(|| {
-                            Error::invalid_data("model texture byte accounting underflowed")
-                        })?;
-                    if remaining_encoded == 0 {
-                        return Err(total_texture_budget_error(limits));
-                    }
-                    match encode_texture(collection, key, format, limits, remaining_encoded) {
-                        Ok((name, encoded)) => {
-                            total_encoded =
-                                total_encoded.checked_add(encoded.len() as u64).ok_or_else(
-                                    || Error::invalid_data("encoded texture size overflowed"),
-                                )?;
-                            if total_encoded > limits.maximum_total_encoded_bytes {
-                                return Err(Error::invalid_data(format!(
-                                    "model textures exceed the {} byte budget",
-                                    limits.maximum_total_encoded_bytes
-                                )));
-                            }
-                            let texture = ResolvedSceneTexture {
-                                key,
-                                name: &name,
-                                encoded,
-                                format,
-                                maximum_name_index_bytes: limits.maximum_name_index_bytes,
-                            };
-                            insert_resolved_scene_texture(&mut set, &mut by_object, names, texture)?
-                        }
-                        Err(TextureEncodeFailure::TotalBudgetExceeded) => {
-                            return Err(total_texture_budget_error(limits));
-                        }
-                        Err(TextureEncodeFailure::Recoverable(error)) => {
-                            record_texture_skip(&mut set, material.object, &property.name, error)?;
-                            continue;
-                        }
-                    }
-                };
-                append_scene_texture_binding(
-                    &mut bindings,
-                    &property.name,
-                    texture,
-                    environment.offset,
-                    environment.scale,
-                )?;
-            }
-            store_scene_texture_bindings(&mut set, material.object, bindings)?;
+            builder.process_material(material)?;
         }
-        Ok(set)
+        Ok(builder.finish())
     }
 
     #[must_use]
@@ -401,6 +308,186 @@ impl SceneTextureSet {
     }
 }
 
+struct SceneTextureBuilder<'a> {
+    collection: &'a AssetCollection,
+    format: ImageFormat,
+    limits: SceneTextureLimits,
+    names: &'a mut SceneTextureNames,
+    set: SceneTextureSet,
+    by_object: HashMap<SceneObjectKey, usize>,
+    total_encoded: u64,
+    metadata_bytes: u64,
+    texture_references: usize,
+}
+
+impl<'a> SceneTextureBuilder<'a> {
+    fn new(
+        collection: &'a AssetCollection,
+        format: ImageFormat,
+        limits: SceneTextureLimits,
+        names: &'a mut SceneTextureNames,
+    ) -> Self {
+        Self {
+            collection,
+            format,
+            limits,
+            names,
+            set: SceneTextureSet::default(),
+            by_object: HashMap::new(),
+            total_encoded: 0,
+            metadata_bytes: 0,
+            texture_references: 0,
+        }
+    }
+
+    fn finish(self) -> SceneTextureSet {
+        self.set
+    }
+
+    fn process_material(&mut self, material: &ModelMaterial) -> Result<()> {
+        let mut bindings = Vec::new();
+        for property in &material.material.saved_properties.texture_environments {
+            self.process_property(material.object, property, &mut bindings)?;
+        }
+        store_scene_texture_bindings(&mut self.set, material.object, bindings)
+    }
+
+    fn process_property(
+        &mut self,
+        material: SceneObjectKey,
+        property: &NamedMaterialProperty<MaterialTextureEnvironment>,
+        bindings: &mut Vec<SceneTextureBinding>,
+    ) -> Result<()> {
+        let environment = &property.value;
+        if environment.texture.is_null() {
+            return Ok(());
+        }
+        charge_scene_texture_reference(
+            &mut self.texture_references,
+            self.limits.maximum_texture_references,
+        )?;
+        let resolved = match resolve_object_reference(
+            self.collection,
+            material.file_index,
+            environment.texture,
+        ) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => return Ok(()),
+            Err(error) => return self.record_skip(material, &property.name, error),
+        };
+        if resolved.object.class_id != TEXTURE_2D_CLASS_ID {
+            return self.record_skip(
+                material,
+                &property.name,
+                format_args!("class ID {} is not Texture2D", resolved.object.class_id),
+            );
+        }
+        ensure_scene_texture_metadata_bytes(
+            self.metadata_bytes,
+            property.name.len(),
+            self.limits.maximum_metadata_bytes,
+        )?;
+        let key = SceneObjectKey {
+            file_index: resolved.file_index,
+            path_id: resolved.object.path_id,
+        };
+        let texture = match self.texture_index(key) {
+            Ok(index) => index,
+            Err(TextureEncodeFailure::Fatal(error)) => return Err(error),
+            Err(TextureEncodeFailure::TotalBudgetExceeded) => {
+                return Err(total_texture_budget_error(self.limits));
+            }
+            Err(TextureEncodeFailure::Recoverable(error)) => {
+                return self.record_skip(material, &property.name, error);
+            }
+        };
+        append_scene_texture_binding(
+            bindings,
+            &property.name,
+            texture,
+            environment.offset,
+            environment.scale,
+            &mut self.metadata_bytes,
+            self.limits.maximum_metadata_bytes,
+        )
+    }
+
+    fn texture_index(
+        &mut self,
+        key: SceneObjectKey,
+    ) -> std::result::Result<usize, TextureEncodeFailure> {
+        if let Some(index) = self.by_object.get(&key) {
+            return Ok(*index);
+        }
+        // Charge the reference before decoding it. Otherwise a caller choosing
+        // zero (or an already exhausted count) could still make us decode one
+        // more potentially large texture before the limit fired.
+        if self.set.textures.len() == self.limits.maximum_textures {
+            return Err(TextureEncodeFailure::Fatal(Error::invalid_data(format!(
+                "model references more than {} textures",
+                self.limits.maximum_textures
+            ))));
+        }
+        let remaining_encoded = self
+            .limits
+            .maximum_total_encoded_bytes
+            .checked_sub(self.total_encoded)
+            .ok_or_else(|| {
+                TextureEncodeFailure::Fatal(Error::invalid_data(
+                    "model texture byte accounting underflowed",
+                ))
+            })?;
+        if remaining_encoded == 0 {
+            return Err(TextureEncodeFailure::TotalBudgetExceeded);
+        }
+        let (name, encoded) = encode_texture(
+            self.collection,
+            key,
+            self.format,
+            self.limits,
+            remaining_encoded,
+        )?;
+        self.total_encoded = self
+            .total_encoded
+            .checked_add(u64::try_from(encoded.len()).map_err(|_| {
+                TextureEncodeFailure::Fatal(Error::invalid_data(
+                    "encoded texture size does not fit in u64",
+                ))
+            })?)
+            .ok_or_else(|| {
+                TextureEncodeFailure::Fatal(Error::invalid_data("encoded texture size overflowed"))
+            })?;
+        if self.total_encoded > self.limits.maximum_total_encoded_bytes {
+            return Err(TextureEncodeFailure::TotalBudgetExceeded);
+        }
+        let texture = ResolvedSceneTexture {
+            key,
+            name: &name,
+            encoded,
+            format: self.format,
+            maximum_name_index_bytes: self.limits.maximum_name_index_bytes,
+        };
+        insert_resolved_scene_texture(&mut self.set, &mut self.by_object, self.names, texture)
+            .map_err(TextureEncodeFailure::Fatal)
+    }
+
+    fn record_skip(
+        &mut self,
+        material: SceneObjectKey,
+        property: &str,
+        reason: impl fmt::Display,
+    ) -> Result<()> {
+        record_texture_skip(
+            &mut self.set,
+            material,
+            property,
+            reason,
+            &mut self.metadata_bytes,
+            self.limits.maximum_metadata_bytes,
+        )
+    }
+}
+
 fn charge_scene_texture_reference(count: &mut usize, maximum: usize) -> Result<()> {
     if *count >= maximum {
         return Err(Error::invalid_data(format!(
@@ -485,7 +572,14 @@ fn append_scene_texture_binding(
     texture: usize,
     offset: [f32; 2],
     scale: [f32; 2],
+    metadata_bytes: &mut u64,
+    maximum_metadata_bytes: u64,
 ) -> Result<()> {
+    let next_metadata_bytes = ensure_scene_texture_metadata_bytes(
+        *metadata_bytes,
+        property.len(),
+        maximum_metadata_bytes,
+    )?;
     bindings.try_reserve(1).map_err(|error| {
         Error::invalid_data(format!("cannot grow model texture bindings: {error}"))
     })?;
@@ -497,6 +591,7 @@ fn append_scene_texture_binding(
         offset,
         scale,
     });
+    *metadata_bytes = next_metadata_bytes;
     Ok(())
 }
 
@@ -577,11 +672,34 @@ fn record_texture_skip(
     material: SceneObjectKey,
     property: &str,
     reason: impl std::fmt::Display,
+    metadata_bytes: &mut u64,
+    maximum_metadata_bytes: u64,
 ) -> Result<()> {
+    let property_total = ensure_scene_texture_metadata_bytes(
+        *metadata_bytes,
+        property.len(),
+        maximum_metadata_bytes,
+    )?;
+    let remaining = maximum_metadata_bytes
+        .checked_sub(property_total)
+        .ok_or_else(|| Error::invalid_data("model texture metadata accounting underflowed"))?;
+    let maximum_reason_bytes = usize::try_from(remaining).unwrap_or(usize::MAX);
+    let mut formatted_reason = BoundedSceneTextureString::new(maximum_reason_bytes);
+    if fmt::write(&mut formatted_reason, format_args!("{reason}")).is_err() {
+        return if formatted_reason.limit_exceeded {
+            Err(scene_texture_metadata_budget_error(maximum_metadata_bytes))
+        } else {
+            Err(Error::invalid_data(
+                "cannot allocate skipped texture reason",
+            ))
+        };
+    }
+    let next_metadata_bytes = ensure_scene_texture_metadata_bytes(
+        property_total,
+        formatted_reason.value.len(),
+        maximum_metadata_bytes,
+    )?;
     let property = copy_scene_texture_string(property, "skipped texture property")?;
-    let mut formatted_reason = FallibleSceneTextureString::default();
-    fmt::write(&mut formatted_reason, format_args!("{reason}"))
-        .map_err(|_| Error::invalid_data("cannot allocate skipped texture reason"))?;
     set.skipped.try_reserve(1).map_err(|error| {
         Error::invalid_data(format!("cannot grow skipped model textures: {error}"))
     })?;
@@ -590,7 +708,32 @@ fn record_texture_skip(
         property,
         reason: formatted_reason.value,
     });
+    *metadata_bytes = next_metadata_bytes;
     Ok(())
+}
+
+fn ensure_scene_texture_metadata_bytes(
+    current: u64,
+    additional: usize,
+    maximum: u64,
+) -> Result<u64> {
+    let additional = u64::try_from(additional)
+        .map_err(|_| Error::invalid_data("model texture metadata bytes do not fit in u64"))?;
+    let next = current
+        .checked_add(additional)
+        .ok_or_else(|| Error::invalid_data("model texture metadata byte count overflowed"))?;
+    if next > maximum {
+        return Err(Error::invalid_data(format!(
+            "model texture metadata requires {next} UTF-8 bytes, exceeding limit {maximum}"
+        )));
+    }
+    Ok(next)
+}
+
+fn scene_texture_metadata_budget_error(maximum: u64) -> Error {
+    Error::invalid_data(format!(
+        "model texture metadata exceeds the {maximum} byte limit"
+    ))
 }
 
 fn encode_texture(
@@ -642,6 +785,7 @@ fn total_texture_budget_error(limits: SceneTextureLimits) -> Error {
 }
 
 enum TextureEncodeFailure {
+    Fatal(Error),
     Recoverable(Error),
     TotalBudgetExceeded,
 }
@@ -1018,6 +1162,40 @@ impl fmt::Write for FallibleSceneTextureString {
     }
 }
 
+struct BoundedSceneTextureString {
+    value: String,
+    maximum: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedSceneTextureString {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            value: String::new(),
+            maximum,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl fmt::Write for BoundedSceneTextureString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let next = self.value.len().checked_add(value.len()).ok_or_else(|| {
+            self.limit_exceeded = true;
+            fmt::Error
+        })?;
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(fmt::Error);
+        }
+        self.value
+            .try_reserve(value.len())
+            .map_err(|_| fmt::Error)?;
+        self.value.push_str(value);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1267,6 +1445,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(set.textures[0].file_name, "Body.rgba");
+    }
+
+    #[test]
+    fn bounds_binding_and_skip_metadata_before_retaining_output() {
+        let mut corrupt = texture_collection("Body");
+        corrupt.serialized_files[0].file.objects[0].byte_size = 1;
+        let model = model_with_texture_property("_MainTex", 81);
+        let mut names = SceneTextureNames::default();
+        let error = SceneTextureSet::from_model_with_names(
+            &corrupt,
+            &model,
+            ImageFormat::RawRgba,
+            SceneTextureLimits {
+                maximum_metadata_bytes: 7,
+                ..SceneTextureLimits::default()
+            },
+            &mut names,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires 8 UTF-8 bytes"));
+        assert!(names.by_object.is_empty());
+        assert!(names.used.is_empty());
+
+        let collection = texture_collection("Body");
+        let set = SceneTextureSet::from_model_with_names(
+            &collection,
+            &model,
+            ImageFormat::RawRgba,
+            SceneTextureLimits {
+                maximum_metadata_bytes: 8,
+                ..SceneTextureLimits::default()
+            },
+            &mut names,
+        )
+        .unwrap();
+        assert_eq!(set.bindings_for(object(61))[0].property, "_MainTex");
+        assert_eq!(set.textures[0].file_name, "Body.rgba");
+
+        let missing = model_with_texture_property("_MainTex", 99);
+        let error = SceneTextureSet::from_model(
+            &collection,
+            &missing,
+            ImageFormat::RawRgba,
+            SceneTextureLimits {
+                maximum_metadata_bytes: 8,
+                ..SceneTextureLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("metadata exceeds the 8 byte limit")
+        );
     }
 
     #[test]

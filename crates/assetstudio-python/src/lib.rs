@@ -1401,6 +1401,7 @@ struct PyModelTextureLimits {
     texture_references: usize,
     textures: usize,
     name_index_bytes: u64,
+    metadata_bytes: u64,
     total_encoded_bytes: u64,
     single_texture_bytes: u64,
 }
@@ -1413,6 +1414,7 @@ impl PyModelTextureLimits {
         maximum_texture_references=1_000_000,
         maximum_textures=4_096,
         maximum_name_index_bytes=67_108_864,
+        maximum_metadata_bytes=268_435_456,
         maximum_total_encoded_bytes=2_147_483_648,
         maximum_single_texture_bytes=536_870_912
     ))]
@@ -1420,6 +1422,7 @@ impl PyModelTextureLimits {
         maximum_texture_references: usize,
         maximum_textures: usize,
         maximum_name_index_bytes: u64,
+        maximum_metadata_bytes: u64,
         maximum_total_encoded_bytes: u64,
         maximum_single_texture_bytes: u64,
     ) -> Self {
@@ -1427,6 +1430,7 @@ impl PyModelTextureLimits {
             texture_references: maximum_texture_references,
             textures: maximum_textures,
             name_index_bytes: maximum_name_index_bytes,
+            metadata_bytes: maximum_metadata_bytes,
             total_encoded_bytes: maximum_total_encoded_bytes,
             single_texture_bytes: maximum_single_texture_bytes,
         }
@@ -1445,6 +1449,11 @@ impl PyModelTextureLimits {
     #[getter]
     const fn maximum_name_index_bytes(&self) -> u64 {
         self.name_index_bytes
+    }
+
+    #[getter]
+    const fn maximum_metadata_bytes(&self) -> u64 {
+        self.metadata_bytes
     }
 
     #[getter]
@@ -1470,6 +1479,7 @@ impl From<PyModelTextureLimits> for SceneTextureLimits {
             maximum_texture_references: value.texture_references,
             maximum_textures: value.textures,
             maximum_name_index_bytes: value.name_index_bytes,
+            maximum_metadata_bytes: value.metadata_bytes,
             maximum_total_encoded_bytes: value.total_encoded_bytes,
             texture,
         }

@@ -894,6 +894,7 @@ pub struct ModelTextureLimits {
     pub maximum_texture_references: Option<u32>,
     pub maximum_textures: Option<u32>,
     pub maximum_name_index_bytes: Option<i64>,
+    pub maximum_metadata_bytes: Option<i64>,
     pub maximum_total_encoded_bytes: Option<i64>,
     pub maximum_single_texture_bytes: Option<i64>,
 }
@@ -1178,6 +1179,11 @@ fn model_texture_limits(options: Option<ModelTextureLimits>) -> Result<SceneText
             options.maximum_name_index_bytes,
             defaults.maximum_name_index_bytes,
             "maximumNameIndexBytes",
+        )?,
+        maximum_metadata_bytes: non_negative_limit(
+            options.maximum_metadata_bytes,
+            defaults.maximum_metadata_bytes,
+            "maximumMetadataBytes",
         )?,
         maximum_total_encoded_bytes: non_negative_limit(
             options.maximum_total_encoded_bytes,
@@ -5241,11 +5247,13 @@ mod tests {
         let defaults = model_texture_limits(None).expect("default texture limits");
         assert_eq!(defaults.maximum_texture_references, 1_000_000);
         assert_eq!(defaults.maximum_name_index_bytes, 64 * 1024 * 1024);
+        assert_eq!(defaults.maximum_metadata_bytes, 256 * 1024 * 1024);
 
         let configured = model_texture_limits(Some(ModelTextureLimits {
             maximum_texture_references: Some(0),
             maximum_textures: None,
             maximum_name_index_bytes: None,
+            maximum_metadata_bytes: None,
             maximum_total_encoded_bytes: None,
             maximum_single_texture_bytes: None,
         }))
@@ -5255,6 +5263,10 @@ mod tests {
         assert_eq!(
             configured.maximum_name_index_bytes,
             defaults.maximum_name_index_bytes
+        );
+        assert_eq!(
+            configured.maximum_metadata_bytes,
+            defaults.maximum_metadata_bytes
         );
     }
 

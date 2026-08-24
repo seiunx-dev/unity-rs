@@ -688,6 +688,7 @@ class ModelTextureLimits:
         maximum_texture_references: int = 1_000_000,
         maximum_textures: int = 4_096,
         maximum_name_index_bytes: int = 67_108_864,
+        maximum_metadata_bytes: int = 268_435_456,
         maximum_total_encoded_bytes: int = 2_147_483_648,
         maximum_single_texture_bytes: int = 536_870_912,
     ) -> ModelTextureLimits: ...
@@ -697,6 +698,8 @@ class ModelTextureLimits:
     def maximum_textures(self) -> int: ...
     @property
     def maximum_name_index_bytes(self) -> int: ...
+    @property
+    def maximum_metadata_bytes(self) -> int: ...
     @property
     def maximum_total_encoded_bytes(self) -> int: ...
     @property
