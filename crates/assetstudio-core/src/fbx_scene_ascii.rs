@@ -3630,11 +3630,13 @@ mod tests {
         use crate::scene_textures::{SceneTexture, SceneTextureBinding};
 
         let mut set = SceneTextureSet::default();
-        let texture = set.push_texture(SceneTexture {
-            file_name: "Body.png".to_owned(),
-            object: key(71),
-            encoded: vec![0x89, b'P', b'N', b'G'],
-        });
+        let texture = set
+            .push_texture(SceneTexture {
+                file_name: "Body.png".to_owned(),
+                object: key(71),
+                encoded: vec![0x89, b'P', b'N', b'G'],
+            })
+            .unwrap();
         set.bind(
             key(61),
             SceneTextureBinding {
