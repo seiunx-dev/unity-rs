@@ -57,6 +57,11 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - Oodle 通过调用方注入的精确长度安全 decoder 接口接入，Core 不链接或分发专有库；
 - Unity 版本解析对齐托管优先级：调用方显式版本 > 仅在 format < 7 时生效的 bundle revision > 文件自身声明；文件版本被 strip 且无覆盖时回退 bundle revision（相对 C# 硬抛的有意偏离，已记录）；
 - 可选的逐输入容错策略：`LoadFailurePolicy::SkipInput` 保留能解析的输入并把跳过项记入 `AssetCollection::diagnostics`，Python 为 `skip_unreadable_inputs`，CLI 默认启用并以部分失败退出码报告。
+- 递归 Loader 会在 UnityFS/legacy bundle/WebData/ZIP 的整批 child 入队之前把条目数计入共享
+  `maximum_discovered_files`，随后对 `VecDeque` 执行可失败预留；超限批次不会先把百万条
+  `PendingInput` 写进队列再在出队时失败。gzip/Brotli 只在成功解压出 child 后收费；最终
+  SerializedFile 与 Resource 表也在每次增长前 `try_reserve(1)`，因此计数合法但内存不足时返回
+  有类型的错误而不是 allocator abort；
 
 ### 资产解析和导出
 
@@ -506,6 +511,19 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过；提交
   `e53210a` 的公开常规矩阵
   [32716234330](https://github.com/Team-Haruki/unity-rs/actions/runs/32716234330) 为 16/16 验证 job 全绿；
+- **Loader 递归待处理队列与最终 collection 表的不可失败增长已于 2026-08-24 收口**：旧实现只在
+  `PendingInput` 出队时递增 `maximum_discovered_files` 计数；一个已经解析出百万目录项的 bundle、
+  WebData 或 ZIP 会先用普通 `VecDeque::push_back` 把整批路径、Region 和版本 hint 留在内存中，
+  直到逐项出队才越界。AssetsFile/ResourceFile 被接受后又分别直接 `push` 到最终 Vec。现根输入和
+  每个容器批次在读取/物化各 child 前先 checked 计算共享 discovered count：超限会保留已发生的
+  work charge、但不调用 reserve；允许的批次一次 `VecDeque::try_reserve(entry_count)` 后才逐项写入，
+  gzip/Brotli 则在成功解压出唯一 child 后执行同一路径。最终 serialized/resource 表也在解析或提交
+  下一项前 `try_reserve(1)`。内部回归锁定允许三项时 root+2 child 精确预留、第四项超限后队列长度和
+  capacity 均不变且共享预算保持越界状态；公开回归用 16,384-entry WebData，证明 root+16,384 的
+  精确上限完整、稳定地产生 16,384 个资源，而低一项在入队前拒绝。Loader 30/30、Core 严格 Clippy
+  和完整 `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过；
+  提交 `e5ee1a4` 的公开常规矩阵
+  [32719238507](https://github.com/Team-Haruki/unity-rs/actions/runs/32719238507) 为 16/16 验证 job 全绿；
 - **`SerializeReference` 身份字符串已于 2026-08-22 纳入现有物化预算**：TypeTree reader
   已经把 `ReferencedManagedType` 的 class/namespace/assembly 三条字符串保留在输出树中，
   但原先为匹配 SerializedFile reference types 又逐条 `clone` 到临时
@@ -1142,9 +1160,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `e53210a`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `e5ee1a4`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32716234330](https://github.com/Team-Haruki/unity-rs/actions/runs/32716234330) 16/16 全绿，
+[32719238507](https://github.com/Team-Haruki/unity-rs/actions/runs/32719238507) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
@@ -1154,7 +1172,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | **已完成（2026-08-24）**：PR run 32659993206 的 16 个主 job 全绿；workflow_dispatch run 32660298990 为 28/28，全量包含六个 CLI artifact、六个 Node artifact 和六个 Python wheel。CLI staged 产物运行 `--help`，wheel 安装后通过公开 API/mypy，Node tarball 从临时消费者安装并核对 JS/TypeScript 运行时表面；法律文件随所有产物校验 |
 | 2 | **扩充代表性真实 corpus**：在现有 Unity 2022.3 与 6000.3 之外，优先加入 Tuanjie 2022.3.x、Nintendo Switch、旧 Unity 4/5/2017 和带完整托管快照的样本 | 私有 manifest 在 release 模式稳定通过；每类至少有对象顺序、PathID/class、名称/container、原始载荷 hash、主要解码结果或明确错误族的版本化快照；专有样本不提交到仓库 |
 | 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
-| 3A | **继续不依赖外部样本的 hostile-input 资源审计**：优先检查“只需一个字段却物化整棵对象”、跨对象重复遍历、累计输出/临时分配、不可失败集合增长和目录工作量放大；本轮已完成 `CubismModel._moc` 的完整校验式根字段投影、`SerializeReference` registry 的类型查找/校验二次方放大治理、模型动画 path/suffix 的 `tracks × nodes`、Avatar fallback 的 `tracks × avatar_paths`、Live2D 散件回退的 `models × roles`、clip fallback 的 `models × animators`、SceneHierarchy 两张百万级索引、AnimationGraph controller/clip/queued 三张百万级构建索引、ModelIr GameObject/Mesh/Material/Avatar 四类构建与最终索引，以及 Loader collection-wide 对象名称/container/MonoScript class 元数据索引的不可失败树分配治理 | 每个确认问题必须有能在旧实现触发预算失败、超线性工作或不可恢复分配失败的合成回归；修复后仍完整消费/校验输入，并通过零跳过的 Rust/Python/Node/oracle 本地门禁和公开常规矩阵。`45e1194` 的低物化预算、截断尾部及 registry/reference-type 投影回归是第一项完成证据；`3f24ff0` 的 16,384 类型规模、重复首声明和两类预分配预算回归是第二项；`df42c67` 的 8,192 同名叶子、任意中段后缀、旧线性 oracle 等价和精确索引预算是第三项；`dac020e` 的 16,384 次 Avatar hash 重复查询、重复首声明、只索引所选 Avatar 及共享 count/byte 预算是第四项；`ee6f668` 的 16,384 条松散角色逆序/重复查询、发现顺序/首项语义和统一字节预算低一字节拒绝是第五项；`b8d0766` 的 16,384 条逆序 Animator、重复首项、重复二分查询和精确索引预算是第六项；`b77192a` 的 16,384 条逆序 GameObject 二分查询、重复身份拒绝、最终索引低一字节拒绝和 Transform-owner 预算前拒绝是第七项；`21ede89` 的 controller/clip 各 16,384 条逆序二分查询、重复身份拒绝、合计索引低一字节拒绝及正式 build 零预算路径是第八项；`01594a2` 的 16,384 条逆序 ModelIr 节点二分查询、重复身份拒绝、合计索引低一字节拒绝及真实共享资产唯一计费是第九项；`e53210a` 的 16,384 条逆序 Loader 元数据二分查询、entry/共享字节预算、公开命名对象拒绝路径及 metadata/MonoScript class last-wins 是第十项完成证据 |
+| 3A | **继续不依赖外部样本的 hostile-input 资源审计**：优先检查“只需一个字段却物化整棵对象”、跨对象重复遍历、累计输出/临时分配、不可失败集合增长和目录工作量放大；本轮已完成 `CubismModel._moc` 的完整校验式根字段投影、`SerializeReference` registry 的类型查找/校验二次方放大治理、模型动画 path/suffix 的 `tracks × nodes`、Avatar fallback 的 `tracks × avatar_paths`、Live2D 散件回退的 `models × roles`、clip fallback 的 `models × animators`、SceneHierarchy 两张百万级索引、AnimationGraph controller/clip/queued 三张百万级构建索引、ModelIr GameObject/Mesh/Material/Avatar 四类构建与最终索引、Loader collection-wide 对象名称/container/MonoScript class 元数据索引，以及递归 PendingInput/final collection 表的不可失败增长治理 | 每个确认问题必须有能在旧实现触发预算失败、超线性工作或不可恢复分配失败的合成回归；修复后仍完整消费/校验输入，并通过零跳过的 Rust/Python/Node/oracle 本地门禁和公开常规矩阵。`45e1194` 的低物化预算、截断尾部及 registry/reference-type 投影回归是第一项完成证据；`3f24ff0` 的 16,384 类型规模、重复首声明和两类预分配预算回归是第二项；`df42c67` 的 8,192 同名叶子、任意中段后缀、旧线性 oracle 等价和精确索引预算是第三项；`dac020e` 的 16,384 次 Avatar hash 重复查询、重复首声明、只索引所选 Avatar 及共享 count/byte 预算是第四项；`ee6f668` 的 16,384 条松散角色逆序/重复查询、发现顺序/首项语义和统一字节预算低一字节拒绝是第五项；`b8d0766` 的 16,384 条逆序 Animator、重复首项、重复二分查询和精确索引预算是第六项；`b77192a` 的 16,384 条逆序 GameObject 二分查询、重复身份拒绝、最终索引低一字节拒绝和 Transform-owner 预算前拒绝是第七项；`21ede89` 的 controller/clip 各 16,384 条逆序二分查询、重复身份拒绝、合计索引低一字节拒绝及正式 build 零预算路径是第八项；`01594a2` 的 16,384 条逆序 ModelIr 节点二分查询、重复身份拒绝、合计索引低一字节拒绝及真实共享资产唯一计费是第九项；`e53210a` 的 16,384 条逆序 Loader 元数据二分查询、entry/共享字节预算、公开命名对象拒绝路径及 metadata/MonoScript class last-wins 是第十项；`e5ee1a4` 的 16,384-entry WebData 精确/低一项 discovered-file 上限、队列拒绝前后 capacity 与最终资源表完整性是第十一项完成证据 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22）**：106 个高层 Core 方法均被机器检查为 102 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；65 个公开 Python 方法和 3 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
 | 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | 默认构建、测试、安装和用户工作流均不需要 .NET；没有 GUI 或旧 C ABI 发布物；七项完成条件均有当前证据，未满足项不得被标成完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
