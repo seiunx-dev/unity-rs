@@ -52,13 +52,20 @@ sample-level defect had nowhere to show.
 Layer III output is not specified bit-exactly, so the tone is compared with a
 one-unit tolerance; the silent cases alongside it still require exact equality.
 
-`fsb5-mpeg-layer3-6ch.fsb` is the multistream counterpart. Three independently
-encoded stereo pairs carry 330/440, 550/660, and 770/880 Hz tones. Their frames
-are padded to 16 bytes and interleaved in FSB5 order, producing one six-channel
-subsound with 13 frames per internal stream. Distinct frequencies make channel
-ordering observable rather than merely proving that six silent channels can be
-written. The ignored oracle test compares every decoded PCM sample with pinned
-`vgmstream r2117` using the same one-unit Layer III tolerance.
+Each `fsb5-mpeg-layer3-{3..16}ch.fsb` is a multistream counterpart. The
+generator writes sixteen distinct deterministic integer triangle-wave channels,
+encodes each adjacent pair as an independent stereo CBR stream, and additionally
+encodes the final channel of every odd layout as mono. It disables the bit
+reservoir and Xing/Info tag so every frame remains independently decodable.
+Each fixture takes the required stream prefix, pads every frame to 16 bytes,
+and interleaves the streams in FSB5 order for 13 frames. The set exercises odd
+mono tails, the compact six/eight-channel modes, explicit channel-count metadata
+for every other layout, and the verified 16-channel limit.
+
+Distinct per-channel peaks and hashes make ordering observable rather than
+merely proving that many silent channels can be written. The ignored oracle
+test compares every decoded PCM sample of all fourteen fixtures with pinned
+`vgmstream r2117`; the one-unit Layer III bound remains sufficient throughout.
 
 # Opus differential fixtures
 

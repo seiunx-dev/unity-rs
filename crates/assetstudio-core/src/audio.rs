@@ -3917,6 +3917,27 @@ mod tests {
         maximum_delta: i32,
     }
 
+    #[derive(Clone, Copy)]
+    struct MpegMultistreamFixture {
+        channels: u16,
+        label: &'static str,
+        fsb: &'static [u8],
+    }
+
+    macro_rules! mpeg_multistream_fixture {
+        ($channels:literal) => {
+            MpegMultistreamFixture {
+                channels: $channels,
+                label: concat!("tone-", stringify!($channels), "ch"),
+                fsb: include_bytes!(concat!(
+                    "../tests/fixtures/audio/fsb5-mpeg-layer3-",
+                    stringify!($channels),
+                    "ch.fsb"
+                )),
+            }
+        };
+    }
+
     const FSB5_VORBIS_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/audio/fsb5-vorbis-stereo.fsb");
     const VORBIS_SURROUND_FIXTURES: &[VorbisSurroundFixture] = &[
@@ -3951,8 +3972,22 @@ mod tests {
             ogg: include_bytes!("../tests/fixtures/audio/vorbis-8ch.ogg"),
         },
     ];
-    const FSB5_MPEG_MULTISTREAM_FIXTURE: &[u8] =
-        include_bytes!("../tests/fixtures/audio/fsb5-mpeg-layer3-6ch.fsb");
+    const MPEG_MULTISTREAM_FIXTURES: &[MpegMultistreamFixture] = &[
+        mpeg_multistream_fixture!(3),
+        mpeg_multistream_fixture!(4),
+        mpeg_multistream_fixture!(5),
+        mpeg_multistream_fixture!(6),
+        mpeg_multistream_fixture!(7),
+        mpeg_multistream_fixture!(8),
+        mpeg_multistream_fixture!(9),
+        mpeg_multistream_fixture!(10),
+        mpeg_multistream_fixture!(11),
+        mpeg_multistream_fixture!(12),
+        mpeg_multistream_fixture!(13),
+        mpeg_multistream_fixture!(14),
+        mpeg_multistream_fixture!(15),
+        mpeg_multistream_fixture!(16),
+    ];
 
     #[test]
     fn writes_little_and_big_endian_fsb5_pcm16() {
@@ -4729,44 +4764,60 @@ mod tests {
     }
 
     #[test]
-    fn decodes_six_channel_multistream_fsb5_mpeg_layer3() {
-        let fsb = Region::from_bytes(FSB5_MPEG_MULTISTREAM_FIXTURE);
-        let stream = parse_fsb5_mpeg(&fsb).unwrap().unwrap();
-        assert_eq!(stream.channels, 6);
-        assert_eq!(stream.sample_rate, 44_100);
-        assert_eq!(stream.frame_count, 13 * 1152);
-        assert_eq!(stream.layer, Fsb5MpegLayer::Layer3);
+    fn decodes_three_through_sixteen_channel_multistream_fsb5_mpeg_layer3() {
+        for fixture in MPEG_MULTISTREAM_FIXTURES {
+            let fsb = Region::from_bytes(fixture.fsb);
+            let stream = parse_fsb5_mpeg(&fsb).unwrap().unwrap();
+            assert_eq!(stream.channels, fixture.channels);
+            assert_eq!(stream.sample_rate, 44_100);
+            assert_eq!(stream.frame_count, 13 * 1152);
+            assert_eq!(stream.layer, Fsb5MpegLayer::Layer3);
 
-        let expected_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
-        let mut wav = Vec::new();
-        assert_eq!(
-            write_direct_wav(
-                &fsb,
-                DirectWavKind::Fsb5Mpeg(stream),
-                expected_size,
-                &mut wav,
-            )
-            .unwrap(),
-            expected_size
-        );
-        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 6);
+            let expected_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
+            let mut wav = Vec::new();
+            assert_eq!(
+                write_direct_wav(
+                    &fsb,
+                    DirectWavKind::Fsb5Mpeg(stream),
+                    expected_size,
+                    &mut wav,
+                )
+                .unwrap(),
+                expected_size
+            );
+            assert_eq!(
+                u16::from_le_bytes(wav[22..24].try_into().unwrap()),
+                fixture.channels
+            );
 
-        let mut channel_hashes = [0xcbf2_9ce4_8422_2325_u64; 6];
-        for frame in wave_data(&wav).chunks_exact(12) {
-            for (channel, sample) in frame.chunks_exact(2).enumerate() {
-                for byte in sample {
-                    channel_hashes[channel] ^= u64::from(*byte);
-                    channel_hashes[channel] =
-                        channel_hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+            let channel_count = usize::from(fixture.channels);
+            let frame_bytes = channel_count * 2;
+            let mut channel_hashes = vec![0xcbf2_9ce4_8422_2325_u64; channel_count];
+            let mut peaks = vec![0_i32; channel_count];
+            for frame in wave_data(&wav).chunks_exact(frame_bytes) {
+                for (channel, sample) in frame.chunks_exact(2).enumerate() {
+                    let value = i32::from(i16::from_le_bytes(sample.try_into().unwrap())).abs();
+                    peaks[channel] = peaks[channel].max(value);
+                    for byte in sample {
+                        channel_hashes[channel] ^= u64::from(*byte);
+                        channel_hashes[channel] =
+                            channel_hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+                    }
                 }
             }
-        }
-        for left in 0..channel_hashes.len() {
-            for right in left + 1..channel_hashes.len() {
-                assert_ne!(
-                    channel_hashes[left], channel_hashes[right],
-                    "fixture channels {left} and {right} stopped carrying distinct signals"
-                );
+            assert!(
+                peaks.iter().all(|peak| *peak > 100),
+                "{}-channel decoded peaks are {peaks:?}",
+                fixture.channels
+            );
+            for left in 0..channel_hashes.len() {
+                for right in left + 1..channel_hashes.len() {
+                    assert_ne!(
+                        channel_hashes[left], channel_hashes[right],
+                        "{}-channel outputs {left} and {right}",
+                        fixture.channels
+                    );
+                }
             }
         }
     }
@@ -4816,7 +4867,7 @@ mod tests {
         let multistream = Region::from_bytes(fsb5_mpeg_silence(6, 2));
         assert!(parse_fsb5_mpeg(&multistream).is_err());
 
-        let mut wrong_stream_channels = FSB5_MPEG_MULTISTREAM_FIXTURE.to_vec();
+        let mut wrong_stream_channels = MPEG_MULTISTREAM_FIXTURES[3].fsb.to_vec();
         let first_header = parse_mpeg_frame_header(u32::from_be_bytes(
             wrong_stream_channels[68..72].try_into().unwrap(),
         ))
@@ -4827,7 +4878,7 @@ mod tests {
         wrong_stream_channels[68 + interleave + 3] |= 0xc0;
         assert!(parse_fsb5_mpeg(&Region::from_bytes(wrong_stream_channels)).is_err());
 
-        let mut wrong_stream_span = FSB5_MPEG_MULTISTREAM_FIXTURE.to_vec();
+        let mut wrong_stream_span = MPEG_MULTISTREAM_FIXTURES[3].fsb.to_vec();
         wrong_stream_span[68 + interleave + 2] =
             (wrong_stream_span[68 + interleave + 2] & 0x0f) | 0x10;
         assert!(parse_fsb5_mpeg(&Region::from_bytes(wrong_stream_span)).is_err());
@@ -4859,12 +4910,14 @@ mod tests {
         // The silent pair verifies framing across both channel counts; the tone
         // is what makes this a decode comparison at all, since two readers
         // agree on zeroes whatever their decoders do with the bits.
-        let cases = [
+        let mut cases = vec![
             ("silence-mono", fsb5_mpeg_silence(1, 2)),
             ("silence-stereo", fsb5_mpeg_silence(2, 2)),
             ("tone-mono", fsb5_mpeg_tone()),
-            ("tone-6ch", FSB5_MPEG_MULTISTREAM_FIXTURE.to_vec()),
         ];
+        for fixture in MPEG_MULTISTREAM_FIXTURES {
+            cases.push((fixture.label, fixture.fsb.to_vec()));
+        }
         for (channels, fsb_bytes) in cases {
             let region = Region::from_bytes(fsb_bytes.clone());
             let kind = detect_direct_wav(&region, Some(16)).unwrap().unwrap();
