@@ -132,7 +132,10 @@ def consume_public_api(
     file_page: list[FileInfo] = studio.file_page()
     object_page: list[ObjectInfo] = studio.object_page(0)
     resource_page: list[ResourceInfo] = studio.resource_page()
-    scene_limits = SceneLimits(maximum_game_objects=100_000)
+    scene_limits = SceneLimits(
+        maximum_game_objects=100_000,
+        maximum_index_bytes=64 * 1024 * 1024,
+    )
     model_texture_limits = ModelTextureLimits(
         maximum_textures=128,
         maximum_total_encoded_bytes=256 * 1024 * 1024,

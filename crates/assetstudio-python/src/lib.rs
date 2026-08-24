@@ -1305,6 +1305,7 @@ struct PySceneLimits {
     total_material_references: usize,
     total_bone_references: usize,
     hierarchy_edges: usize,
+    index_bytes: usize,
 }
 
 #[pymethods]
@@ -1317,7 +1318,8 @@ impl PySceneLimits {
         maximum_total_transform_child_references=10_000_000,
         maximum_total_material_references=10_000_000,
         maximum_total_bone_references=10_000_000,
-        maximum_hierarchy_edges=1_000_000
+        maximum_hierarchy_edges=1_000_000,
+        maximum_index_bytes=268_435_456
     ))]
     const fn new(
         maximum_game_objects: usize,
@@ -1326,6 +1328,7 @@ impl PySceneLimits {
         maximum_total_material_references: usize,
         maximum_total_bone_references: usize,
         maximum_hierarchy_edges: usize,
+        maximum_index_bytes: usize,
     ) -> Self {
         Self {
             game_objects: maximum_game_objects,
@@ -1334,6 +1337,7 @@ impl PySceneLimits {
             total_material_references: maximum_total_material_references,
             total_bone_references: maximum_total_bone_references,
             hierarchy_edges: maximum_hierarchy_edges,
+            index_bytes: maximum_index_bytes,
         }
     }
 
@@ -1366,6 +1370,11 @@ impl PySceneLimits {
     const fn maximum_hierarchy_edges(&self) -> usize {
         self.hierarchy_edges
     }
+
+    #[getter]
+    const fn maximum_index_bytes(&self) -> usize {
+        self.index_bytes
+    }
 }
 
 impl From<PySceneLimits> for SceneHierarchyLimits {
@@ -1377,6 +1386,7 @@ impl From<PySceneLimits> for SceneHierarchyLimits {
             maximum_total_material_references: value.total_material_references,
             maximum_total_bone_references: value.total_bone_references,
             maximum_hierarchy_edges: value.hierarchy_edges,
+            maximum_index_bytes: value.index_bytes,
             ..Self::default()
         }
     }

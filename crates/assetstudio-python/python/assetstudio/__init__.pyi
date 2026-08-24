@@ -664,6 +664,7 @@ class SceneLimits:
         maximum_total_material_references: int = 10_000_000,
         maximum_total_bone_references: int = 10_000_000,
         maximum_hierarchy_edges: int = 1_000_000,
+        maximum_index_bytes: int = 268_435_456,
     ) -> SceneLimits: ...
     @property
     def maximum_game_objects(self) -> int: ...
@@ -677,6 +678,8 @@ class SceneLimits:
     def maximum_total_bone_references(self) -> int: ...
     @property
     def maximum_hierarchy_edges(self) -> int: ...
+    @property
+    def maximum_index_bytes(self) -> int: ...
 
 class ModelTextureLimits:
     def __new__(

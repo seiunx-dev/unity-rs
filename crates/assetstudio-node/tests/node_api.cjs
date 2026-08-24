@@ -2108,6 +2108,7 @@ console.log('node api: settings and version override ok')
     maximumTotalMaterialReferences: 0,
     maximumTotalBoneReferences: 0,
     maximumHierarchyEdges: 0,
+    maximumIndexBytes: 1024,
   })
   assert.deepEqual(limitedNodes, legacyNodes)
   assert.equal(limitedNodes.length, 1)
@@ -2115,6 +2116,10 @@ console.log('node api: settings and version override ok')
   assert.throws(
     () => populatedScene.sceneWithLimits({ maximumGameObjects: 0 }),
     /GameObject|limit/i,
+  )
+  assert.throws(
+    () => populatedScene.sceneWithLimits({ maximumIndexBytes: 0 }),
+    /index bytes|limit/i,
   )
 }
 
