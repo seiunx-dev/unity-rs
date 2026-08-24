@@ -92,6 +92,12 @@ pub struct SceneTextureLimits {
     /// unresolved, unsupported or repeat an already decoded texture.
     pub maximum_texture_references: usize,
     pub maximum_textures: usize,
+    /// UTF-8 bytes retained by the shared object-to-file-name and
+    /// case-folded collision indexes.
+    ///
+    /// A batch export can reuse one [`SceneTextureNames`] across many models,
+    /// so this is deliberately independent of the per-model texture count.
+    pub maximum_name_index_bytes: u64,
     /// Total encoded bytes across every texture in the set.
     pub maximum_total_encoded_bytes: u64,
     pub texture: TextureReadLimits,
@@ -102,6 +108,7 @@ impl Default for SceneTextureLimits {
         Self {
             maximum_texture_references: 1_000_000,
             maximum_textures: 4_096,
+            maximum_name_index_bytes: 64 * 1024 * 1024,
             maximum_total_encoded_bytes: 2 * 1024 * 1024 * 1024,
             texture: TextureReadLimits::default(),
         }
@@ -193,8 +200,7 @@ impl SceneTextureSet {
     ) -> Result<Self> {
         let mut set = Self::default();
         let mut by_object: HashMap<SceneObjectKey, usize> = HashMap::new();
-        let mut total_encoded = 0_u64;
-        let mut texture_references = 0_usize;
+        let (mut total_encoded, mut texture_references) = (0_u64, 0_usize);
 
         for material in &model.materials {
             let mut bindings = Vec::new();
@@ -266,15 +272,14 @@ impl SceneTextureSet {
                                     limits.maximum_total_encoded_bytes
                                 )));
                             }
-                            insert_resolved_scene_texture(
-                                &mut set,
-                                &mut by_object,
-                                names,
+                            let texture = ResolvedSceneTexture {
                                 key,
-                                &name,
+                                name: &name,
                                 encoded,
                                 format,
-                            )?
+                                maximum_name_index_bytes: limits.maximum_name_index_bytes,
+                            };
+                            insert_resolved_scene_texture(&mut set, &mut by_object, names, texture)?
                         }
                         Err(TextureEncodeFailure::TotalBudgetExceeded) => {
                             return Err(total_texture_budget_error(limits));
@@ -434,27 +439,37 @@ fn remove_scene_texture_outputs(paths: &[PathBuf]) -> Result<()> {
     first_error.map_or(Ok(()), |error| Err(error.into()))
 }
 
+struct ResolvedSceneTexture<'a> {
+    key: SceneObjectKey,
+    name: &'a str,
+    encoded: Vec<u8>,
+    format: ImageFormat,
+    maximum_name_index_bytes: u64,
+}
+
 fn insert_resolved_scene_texture(
     set: &mut SceneTextureSet,
     by_object: &mut HashMap<SceneObjectKey, usize>,
     names: &mut SceneTextureNames,
-    key: SceneObjectKey,
-    name: &str,
-    encoded: Vec<u8>,
-    format: ImageFormat,
+    texture: ResolvedSceneTexture<'_>,
 ) -> Result<usize> {
     reserve_scene_textures(&mut set.textures, 1)?;
     by_object.try_reserve(1).map_err(|error| {
         Error::invalid_data(format!("cannot grow resolved texture index: {error}"))
     })?;
-    let file_name = names.allocate(key, name, format)?;
+    let file_name = names.allocate(
+        texture.key,
+        texture.name,
+        texture.format,
+        texture.maximum_name_index_bytes,
+    )?;
     let index = set.textures.len();
     set.textures.push(SceneTexture {
         file_name,
-        object: key,
-        encoded,
+        object: texture.key,
+        encoded: texture.encoded,
     });
-    by_object.insert(key, index);
+    by_object.insert(texture.key, index);
     Ok(index)
 }
 
@@ -679,9 +694,12 @@ impl Write for FallibleEncodedTexture {
 #[derive(Debug, Clone, Default)]
 pub struct SceneTextureNames {
     by_object: HashMap<SceneObjectKey, String>,
-    /// Claimed file names. The value is where the next ` (n)` search for that
-    /// name should start, so a name repeated many times stays linear.
+    /// Unicode-lowercased claimed file names. The value is where the next
+    /// ` (n)` search for that name should start, so a name repeated many times
+    /// stays linear and names that collide on common case-insensitive file
+    /// systems cannot silently overwrite one another.
     used: HashMap<String, usize>,
+    retained_name_bytes: u64,
 }
 
 impl SceneTextureNames {
@@ -696,7 +714,14 @@ impl SceneTextureNames {
         object: SceneObjectKey,
         name: &str,
         format: ImageFormat,
+        maximum_name_index_bytes: u64,
     ) -> Result<String> {
+        if self.retained_name_bytes > maximum_name_index_bytes {
+            return Err(scene_texture_name_budget_error(
+                self.retained_name_bytes,
+                maximum_name_index_bytes,
+            ));
+        }
         if let Some(existing) = self.by_object.get(&object) {
             return copy_scene_texture_string(existing, "existing model texture name");
         }
@@ -707,8 +732,9 @@ impl SceneTextureNames {
             MAXIMUM_SCENE_TEXTURE_COMPONENT_BYTES,
             "model texture file name",
         )?;
-        let allocated = if self.used.contains_key(&candidate) {
-            let mut next = self.used.get(&candidate).copied().unwrap_or(1);
+        let candidate_key = portable_scene_texture_key(&candidate)?;
+        let allocated = if self.used.contains_key(&candidate_key) {
+            let mut next = self.used.get(&candidate_key).copied().unwrap_or(1);
             loop {
                 let mut suffix = FallibleSceneTextureString::default();
                 fmt::write(&mut suffix, format_args!(" ({next})"))
@@ -718,10 +744,19 @@ impl SceneTextureNames {
                     MAXIMUM_SCENE_TEXTURE_COMPONENT_BYTES,
                     "colliding model texture file name",
                 )?;
+                let attempt_key = portable_scene_texture_key(&attempt)?;
                 next = next
                     .checked_add(1)
                     .ok_or_else(|| Error::invalid_data("texture collision counter overflowed"))?;
-                if !self.used.contains_key(&attempt) {
+                if !self.used.contains_key(&attempt_key) {
+                    let retained_name_bytes = charge_scene_texture_name_bytes(
+                        self.retained_name_bytes,
+                        attempt_key.len(),
+                        attempt.len(),
+                        maximum_name_index_bytes,
+                    )?;
+                    let object_name =
+                        copy_scene_texture_string(&attempt, "model texture object name")?;
                     self.used.try_reserve(1).map_err(|error| {
                         Error::invalid_data(format!(
                             "cannot grow used model texture names: {error}"
@@ -732,32 +767,86 @@ impl SceneTextureNames {
                             "cannot grow model texture object names: {error}"
                         ))
                     })?;
-                    let used_name = copy_scene_texture_string(&attempt, "used model texture name")?;
-                    let object_name =
-                        copy_scene_texture_string(&attempt, "model texture object name")?;
-                    self.used.insert(candidate, next);
-                    self.used.insert(used_name, 1);
+                    let base_cursor = self.used.get_mut(&candidate_key).ok_or_else(|| {
+                        Error::invalid_data("model texture collision base disappeared")
+                    })?;
+                    *base_cursor = next;
+                    self.used.insert(attempt_key, 1);
                     self.by_object.insert(object, object_name);
+                    self.retained_name_bytes = retained_name_bytes;
                     break attempt;
                 }
             }
         } else {
+            let retained_name_bytes = charge_scene_texture_name_bytes(
+                self.retained_name_bytes,
+                candidate_key.len(),
+                candidate.len(),
+                maximum_name_index_bytes,
+            )?;
+            let object_name = copy_scene_texture_string(&candidate, "model texture object name")?;
             self.used.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!("cannot grow used model texture names: {error}"))
             })?;
             self.by_object.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!("cannot grow model texture object names: {error}"))
             })?;
-            let object_name = copy_scene_texture_string(&candidate, "model texture object name")?;
-            self.used.insert(
-                copy_scene_texture_string(&candidate, "used model texture name")?,
-                1,
-            );
+            self.used.insert(candidate_key, 1);
             self.by_object.insert(object, object_name);
+            self.retained_name_bytes = retained_name_bytes;
             candidate
         };
         Ok(allocated)
     }
+}
+
+fn portable_scene_texture_key(value: &str) -> Result<String> {
+    let length = value.chars().try_fold(0_usize, |length, character| {
+        character
+            .to_lowercase()
+            .try_fold(length, |length, lowercase| {
+                length
+                    .checked_add(lowercase.len_utf8())
+                    .ok_or_else(|| Error::invalid_data("model texture name key length overflowed"))
+            })
+    })?;
+    let mut key = String::new();
+    key.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate case-folded model texture name: {error}"
+        ))
+    })?;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        key.push(character);
+    }
+    debug_assert_eq!(key.len(), length);
+    Ok(key)
+}
+
+fn charge_scene_texture_name_bytes(
+    current: u64,
+    key_bytes: usize,
+    object_name_bytes: usize,
+    maximum: u64,
+) -> Result<u64> {
+    let additional = key_bytes
+        .checked_add(object_name_bytes)
+        .ok_or_else(|| Error::invalid_data("model texture name byte count overflowed"))?;
+    let additional = u64::try_from(additional)
+        .map_err(|_| Error::invalid_data("model texture name bytes do not fit in u64"))?;
+    let next = current
+        .checked_add(additional)
+        .ok_or_else(|| Error::invalid_data("model texture name byte budget overflowed"))?;
+    if next > maximum {
+        return Err(scene_texture_name_budget_error(next, maximum));
+    }
+    Ok(next)
+}
+
+fn scene_texture_name_budget_error(requested: u64, maximum: u64) -> Error {
+    Error::invalid_data(format!(
+        "model texture name indexes require {requested} UTF-8 bytes, exceeding limit {maximum}"
+    ))
 }
 
 /// Keeps a name usable as a single file-name component.
@@ -1152,6 +1241,35 @@ mod tests {
     }
 
     #[test]
+    fn public_model_reader_applies_the_shared_name_index_budget() {
+        let collection = texture_collection("Body");
+        let model = model_with_texture_property("_MainTex", 81);
+        let error = SceneTextureSet::from_model(
+            &collection,
+            &model,
+            ImageFormat::RawRgba,
+            SceneTextureLimits {
+                maximum_name_index_bytes: 17,
+                ..SceneTextureLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("require 18 UTF-8 bytes"));
+
+        let set = SceneTextureSet::from_model(
+            &collection,
+            &model,
+            ImageFormat::RawRgba,
+            SceneTextureLimits {
+                maximum_name_index_bytes: 18,
+                ..SceneTextureLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(set.textures[0].file_name, "Body.rgba");
+    }
+
+    #[test]
     fn manual_texture_growth_reports_allocation_failure_transactionally() {
         let mut textures = Vec::new();
         let original_capacity = textures.capacity();
@@ -1456,21 +1574,27 @@ mod tests {
     fn gives_colliding_names_distinct_files() {
         let mut names = SceneTextureNames::default();
         assert_eq!(
-            names.allocate(object(1), "Body", ImageFormat::Png).unwrap(),
+            names
+                .allocate(object(1), "Body", ImageFormat::Png, u64::MAX)
+                .unwrap(),
             "Body.png"
         );
         assert_eq!(
-            names.allocate(object(2), "Body", ImageFormat::Png).unwrap(),
+            names
+                .allocate(object(2), "Body", ImageFormat::Png, u64::MAX)
+                .unwrap(),
             "Body (1).png"
         );
         assert_eq!(
-            names.allocate(object(3), "Body", ImageFormat::Png).unwrap(),
+            names
+                .allocate(object(3), "Body", ImageFormat::Png, u64::MAX)
+                .unwrap(),
             "Body (2).png"
         );
         // A name that only collides after sanitising still gets its own file.
         assert_eq!(
             names
-                .allocate(object(4), "Body/", ImageFormat::Png)
+                .allocate(object(4), "Body/", ImageFormat::Png, u64::MAX)
                 .unwrap(),
             "Body_.png"
         );
@@ -1482,17 +1606,69 @@ mod tests {
         // a second model must not claim a second file.
         let mut names = SceneTextureNames::default();
         assert_eq!(
-            names.allocate(object(7), "Body", ImageFormat::Png).unwrap(),
+            names
+                .allocate(object(7), "Body", ImageFormat::Png, u64::MAX)
+                .unwrap(),
             "Body.png"
         );
         assert_eq!(
-            names.allocate(object(7), "Body", ImageFormat::Png).unwrap(),
+            names
+                .allocate(object(7), "Body", ImageFormat::Png, u64::MAX)
+                .unwrap(),
             "Body.png"
         );
         // A different object with the same Unity name still gets its own file.
         assert_eq!(
-            names.allocate(object(8), "Body", ImageFormat::Png).unwrap(),
+            names
+                .allocate(object(8), "Body", ImageFormat::Png, u64::MAX)
+                .unwrap(),
             "Body (1).png"
         );
+    }
+
+    #[test]
+    fn case_folds_and_bounds_shared_name_indexes_transactionally() {
+        let mut names = SceneTextureNames::default();
+        assert_eq!(
+            names
+                .allocate(object(1), "Body", ImageFormat::Png, 16)
+                .unwrap(),
+            "Body.png"
+        );
+        assert_eq!(names.retained_name_bytes, 16);
+
+        // The second name differs only by case. It must get a distinct file on
+        // Windows and default macOS volumes, and its folded key plus object
+        // mapping need another 24 retained bytes.
+        let error = names
+            .allocate(object(2), "body", ImageFormat::Png, 39)
+            .unwrap_err();
+        assert!(error.to_string().contains("require 40 UTF-8 bytes"));
+        assert_eq!(names.retained_name_bytes, 16);
+        assert_eq!(names.used.len(), 1);
+        assert_eq!(names.by_object.len(), 1);
+        assert_eq!(names.used.get("body.png"), Some(&1));
+
+        assert_eq!(
+            names
+                .allocate(object(2), "body", ImageFormat::Png, 40)
+                .unwrap(),
+            "body (1).png"
+        );
+        assert_eq!(names.retained_name_bytes, 40);
+        assert_eq!(names.used.len(), 2);
+        assert_eq!(names.by_object.len(), 2);
+
+        // Unicode lowercasing can expand: `İ.png` is six source bytes but its
+        // retained lowercase key is seven bytes. Reject it before insertion
+        // when the exact two-copy index budget is one byte short.
+        let mut unicode = SceneTextureNames::default();
+        let error = unicode
+            .allocate(object(3), "İ", ImageFormat::Png, 12)
+            .unwrap_err();
+        assert!(error.to_string().contains("require 13 UTF-8 bytes"));
+        assert_eq!(unicode.retained_name_bytes, 0);
+        assert!(unicode.used.is_empty());
+        assert!(unicode.by_object.is_empty());
     }
 }
