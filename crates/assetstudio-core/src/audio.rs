@@ -3909,6 +3909,14 @@ mod tests {
         ogg: &'static [u8],
     }
 
+    #[derive(Clone, Copy)]
+    struct OpusSurroundFixture {
+        channels: u16,
+        fsb: &'static [u8],
+        ogg: &'static [u8],
+        maximum_delta: i32,
+    }
+
     const FSB5_VORBIS_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/audio/fsb5-vorbis-stereo.fsb");
     const VORBIS_SURROUND_FIXTURES: &[VorbisSurroundFixture] = &[
@@ -4939,52 +4947,68 @@ mod tests {
     }
 
     #[test]
-    fn decodes_six_channel_multistream_fsb5_opus() {
-        let region = Region::from_bytes(OPUS_MULTISTREAM_CELT_FSB.to_vec());
-        let stream = parse_fsb5_opus(&region).unwrap().unwrap();
-        assert_eq!(stream.channels, 6);
-        assert_eq!(stream.sample_rate, 48_000);
-        assert_eq!(stream.frame_count, OPUS_MULTISTREAM_CELT_FRAMES);
-        assert_eq!(stream.encoder_delay, 312);
+    fn decodes_three_through_eight_channel_multistream_fsb5_opus() {
+        for fixture in OPUS_SURROUND_FIXTURES {
+            let region = Region::from_bytes(fixture.fsb.to_vec());
+            let stream = parse_fsb5_opus(&region).unwrap().unwrap();
+            assert_eq!(stream.channels, fixture.channels);
+            assert_eq!(stream.sample_rate, 48_000);
+            assert_eq!(stream.frame_count, OPUS_MULTISTREAM_CELT_FRAMES);
+            assert_eq!(stream.encoder_delay, 312);
 
-        let expected_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
-        let mut wav = Vec::new();
-        assert_eq!(
-            write_direct_wav(
-                &region,
-                DirectWavKind::Fsb5Opus(stream),
-                expected_size,
-                &mut wav,
-            )
-            .unwrap(),
-            expected_size
-        );
-        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 6);
-        let pcm = wave_data(&wav);
-        assert_eq!(pcm.len(), usize::try_from(stream.frame_count).unwrap() * 12);
+            let expected_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
+            let mut wav = Vec::new();
+            assert_eq!(
+                write_direct_wav(
+                    &region,
+                    DirectWavKind::Fsb5Opus(stream),
+                    expected_size,
+                    &mut wav,
+                )
+                .unwrap(),
+                expected_size
+            );
+            assert_eq!(
+                u16::from_le_bytes(wav[22..24].try_into().unwrap()),
+                fixture.channels
+            );
+            let pcm = wave_data(&wav);
+            let channel_count = usize::from(fixture.channels);
+            let frame_bytes = channel_count * 2;
+            assert_eq!(
+                pcm.len(),
+                usize::try_from(stream.frame_count).unwrap() * frame_bytes
+            );
 
-        // Every source channel uses a different sine frequency. Distinct,
-        // nontrivial hashes ensure the multistream mapping did not duplicate,
-        // silence, or collapse channels while still producing the right size.
-        let mut hashes = [0xcbf2_9ce4_8422_2325_u64; 6];
-        let mut peaks = [0_i32; 6];
-        for frame in pcm.chunks_exact(12) {
-            for channel in 0..6 {
-                let bytes: [u8; 2] = frame[channel * 2..channel * 2 + 2].try_into().unwrap();
-                peaks[channel] = peaks[channel].max(i32::from(i16::from_le_bytes(bytes)).abs());
-                for byte in bytes {
-                    hashes[channel] ^= u64::from(byte);
-                    hashes[channel] = hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+            // Every source channel uses a different deterministic integer
+            // signal. Distinct, nontrivial hashes ensure the multistream
+            // mapping did not duplicate, silence, or collapse channels while
+            // still producing the right size.
+            let mut hashes = vec![0xcbf2_9ce4_8422_2325_u64; channel_count];
+            let mut peaks = vec![0_i32; channel_count];
+            for frame in pcm.chunks_exact(frame_bytes) {
+                for channel in 0..channel_count {
+                    let bytes: [u8; 2] = frame[channel * 2..channel * 2 + 2].try_into().unwrap();
+                    peaks[channel] = peaks[channel].max(i32::from(i16::from_le_bytes(bytes)).abs());
+                    for byte in bytes {
+                        hashes[channel] ^= u64::from(byte);
+                        hashes[channel] = hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+                    }
                 }
             }
-        }
-        assert!(
-            peaks.into_iter().all(|peak| peak > 100),
-            "decoded channel peaks are {peaks:?}"
-        );
-        for left in 0..hashes.len() {
-            for right in left + 1..hashes.len() {
-                assert_ne!(hashes[left], hashes[right], "channels {left} and {right}");
+            assert!(
+                peaks.iter().all(|peak| *peak > 100),
+                "{}-channel decoded peaks are {peaks:?}",
+                fixture.channels
+            );
+            for left in 0..hashes.len() {
+                for right in left + 1..hashes.len() {
+                    assert_ne!(
+                        hashes[left], hashes[right],
+                        "{}-channel outputs {left} and {right}",
+                        fixture.channels
+                    );
+                }
             }
         }
     }
@@ -5018,7 +5042,7 @@ mod tests {
         assert!(parse_fsb5_opus(&Region::from_bytes(fsb5_opus(6, 2))).is_err());
         assert!(parse_fsb5_opus(&Region::from_bytes(fsb5_opus(9, 2))).is_err());
 
-        let mut mismatched_duration = OPUS_MULTISTREAM_CELT_FSB.to_vec();
+        let mut mismatched_duration = OPUS_SURROUND_FIXTURES[3].fsb.to_vec();
         let valid = Region::from_bytes(mismatched_duration.clone());
         let multistream = parse_fsb5_opus(&valid).unwrap().unwrap();
         let packet_start = usize::try_from(multistream.data_offset).unwrap() + 2;
@@ -5679,10 +5703,44 @@ mod tests {
     const OPUS_TONE: &[u8] = include_bytes!("../tests/fixtures/audio/opus-tone-packets.bin");
     const OPUS_TONE_CELT: &[u8] =
         include_bytes!("../tests/fixtures/audio/opus-tone-celt-packets.bin");
-    const OPUS_MULTISTREAM_CELT_FSB: &[u8] =
-        include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-6ch.fsb");
-    const OPUS_MULTISTREAM_CELT_OGG: &[u8] =
-        include_bytes!("../tests/fixtures/audio/opus-celt-6ch.ogg");
+    const OPUS_SURROUND_FIXTURES: &[OpusSurroundFixture] = &[
+        OpusSurroundFixture {
+            channels: 3,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-3ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/opus-celt-3ch.ogg"),
+            maximum_delta: 3,
+        },
+        OpusSurroundFixture {
+            channels: 4,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-4ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/opus-celt-4ch.ogg"),
+            maximum_delta: 9,
+        },
+        OpusSurroundFixture {
+            channels: 5,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-5ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/opus-celt-5ch.ogg"),
+            maximum_delta: 4,
+        },
+        OpusSurroundFixture {
+            channels: 6,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-6ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/opus-celt-6ch.ogg"),
+            maximum_delta: 3,
+        },
+        OpusSurroundFixture {
+            channels: 7,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-7ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/opus-celt-7ch.ogg"),
+            maximum_delta: 3,
+        },
+        OpusSurroundFixture {
+            channels: 8,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-opus-celt-8ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/opus-celt-8ch.ogg"),
+            maximum_delta: 3,
+        },
+    ];
     /// Seven packets at 960 samples each, less the encoder delay FSB5 hides.
     const OPUS_TONE_FRAMES: u64 = 7 * 960 - 312;
     const OPUS_MULTISTREAM_CELT_FRAMES: u64 = 5_760;
@@ -5781,67 +5839,72 @@ mod tests {
     /// packet-framing mistake and a Vorbis-to-WAVE channel-order mistake.
     #[test]
     #[ignore = "requires the optional vgmstream-cli decoder oracle"]
-    fn fsb5_multistream_opus_celt_matches_vgmstream_ogg_oracle() {
+    fn fsb5_surround_opus_celt_matches_vgmstream_ogg_oracle() {
         use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let region = Region::from_bytes(OPUS_MULTISTREAM_CELT_FSB.to_vec());
-        let kind = detect_direct_wav(&region, Some(16)).unwrap().unwrap();
-        let mut actual = Vec::new();
-        write_direct_wav(&region, kind, 1024 * 1024, &mut actual).unwrap();
+        for fixture in OPUS_SURROUND_FIXTURES {
+            let region = Region::from_bytes(fixture.fsb.to_vec());
+            let kind = detect_direct_wav(&region, Some(16)).unwrap().unwrap();
+            let mut actual = Vec::new();
+            write_direct_wav(&region, kind, 1024 * 1024, &mut actual).unwrap();
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let input = std::env::temp_dir().join(format!(
-            "assetstudio-fsb5-opus-multistream-{}-{unique}.ogg",
-            std::process::id()
-        ));
-        let output = input.with_extension("wav");
-        std::fs::write(&input, OPUS_MULTISTREAM_CELT_OGG).unwrap();
-        let status = Command::new("vgmstream-cli")
-            .arg("-o")
-            .arg(&output)
-            .arg(&input)
-            .status()
-            .expect("vgmstream-cli must be installed to run this ignored oracle test");
-        assert!(status.success());
-        let expected = std::fs::read(&output).unwrap();
-        std::fs::remove_file(input).unwrap();
-        std::fs::remove_file(output).unwrap();
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let input = std::env::temp_dir().join(format!(
+                "assetstudio-fsb5-opus-{}ch-{}-{unique}.ogg",
+                fixture.channels,
+                std::process::id()
+            ));
+            let output = input.with_extension("wav");
+            std::fs::write(&input, fixture.ogg).unwrap();
+            let status = Command::new("vgmstream-cli")
+                .arg("-o")
+                .arg(&output)
+                .arg(&input)
+                .status()
+                .expect("vgmstream-cli must be installed to run this ignored oracle test");
+            assert!(status.success());
+            let expected = std::fs::read(&output).unwrap();
+            std::fs::remove_file(input).unwrap();
+            std::fs::remove_file(output).unwrap();
 
-        let rust = wave_data(&actual);
-        let oracle = wave_data(&expected);
-        // Ogg preserves an encoder-tail granule after the original 0.12-second
-        // signal. FSB's declared frame count trims that tail, so its complete
-        // output must equal the corresponding prefix of the oracle.
-        assert!(oracle.len() >= rust.len());
-        let oracle = &oracle[..rust.len()];
-        assert!(oracle.chunks_exact(2).any(|sample| {
-            i16::from_le_bytes(sample.try_into().unwrap()).unsigned_abs() > 1_000
-        }));
-        let mut worst = (0_i32, 0_usize, 0_i32, 0_i32);
-        for (index, (rust, oracle)) in rust.chunks_exact(2).zip(oracle.chunks_exact(2)).enumerate()
-        {
-            let rust = i32::from(i16::from_le_bytes(rust.try_into().unwrap()));
-            let oracle = i32::from(i16::from_le_bytes(oracle.try_into().unwrap()));
-            let difference = (rust - oracle).abs();
-            if difference > worst.0 {
-                worst = (difference, index, rust, oracle);
+            let rust = wave_data(&actual);
+            let oracle = wave_data(&expected);
+            // Ogg preserves an encoder-tail granule after the original signal.
+            // FSB's declared frame count trims that tail, so its complete
+            // output must equal the corresponding prefix of the oracle.
+            assert!(oracle.len() >= rust.len());
+            let oracle = &oracle[..rust.len()];
+            assert!(oracle.chunks_exact(2).any(|sample| {
+                i16::from_le_bytes(sample.try_into().unwrap()).unsigned_abs() > 1_000
+            }));
+            let mut worst = (0_i32, 0_usize, 0_i32, 0_i32);
+            for (index, (rust, oracle)) in
+                rust.chunks_exact(2).zip(oracle.chunks_exact(2)).enumerate()
+            {
+                let rust = i32::from(i16::from_le_bytes(rust.try_into().unwrap()));
+                let oracle = i32::from(i16::from_le_bytes(oracle.try_into().unwrap()));
+                let difference = (rust - oracle).abs();
+                if difference > worst.0 {
+                    worst = (difference, index, rust, oracle);
+                }
             }
+            // Each fixture pins the observed maximum from the independently
+            // rounded elementary decoder paths. These are measured bounds for
+            // the exact committed CELT packets, not a general codec tolerance.
+            assert!(
+                worst.0 <= fixture.maximum_delta,
+                "{}-channel Opus worst sample {}: {} vs {} (difference {})",
+                fixture.channels,
+                worst.1,
+                worst.2,
+                worst.3,
+                worst.0
+            );
         }
-        // With these exact packets the four independently rounded elementary
-        // decoder paths differ from libopus by at most four PCM16 units. This
-        // is the measured fixture bound, not a general codec tolerance.
-        assert!(
-            worst.0 <= 4,
-            "multistream Opus worst sample {}: {} vs {} (difference {})",
-            worst.1,
-            worst.2,
-            worst.3,
-            worst.0
-        );
     }
 
     /// Records the two measured SILK/hybrid Opus oracle profiles.
