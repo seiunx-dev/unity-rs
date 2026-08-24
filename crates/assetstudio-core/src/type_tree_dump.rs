@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use crate::managed_number::ManagedNumber;
 use crate::serialized::{TypeTree, TypeTreeNode};
-use crate::type_tree::{TypeField, TypeMapEntry, TypeValue, is_array_parent};
+use crate::type_tree::{TypeField, TypeMapEntry, TypeTreeLayout, TypeValue, is_array_parent};
 use crate::{Error, Result};
 
 /// Writes the legacy `TypeTreeHelper.ReadTypeString` representation.
@@ -20,9 +20,11 @@ pub fn write_type_tree_dump(
     if tree.nodes.is_empty() {
         return Err(Error::unsupported("cannot dump an empty TypeTree"));
     }
+    let layout = TypeTreeLayout::new(&tree.nodes)?;
     let mut output = BoundedDumpWriter::new(output, maximum_output_bytes);
     let result = DumpFormatter {
         nodes: &tree.nodes,
+        layout: &layout,
         output: &mut output,
     }
     .write_node(0, value);
@@ -43,6 +45,7 @@ pub fn write_type_tree_dump(
 
 struct DumpFormatter<'a, W> {
     nodes: &'a [TypeTreeNode],
+    layout: &'a TypeTreeLayout,
     output: &'a mut W,
 }
 
@@ -54,22 +57,22 @@ impl<W: Write> DumpFormatter<'_, W> {
         match value {
             TypeValue::String(value) => {
                 require_type(node, "string", "string")?;
-                array_shape(self.nodes, index)?;
+                array_shape(self.nodes, self.layout, index)?;
                 self.write_prefix(node.level)?;
                 write!(
                     self.output,
                     "{} {} = \"{}\"\r\n",
                     node.type_name, node.field_name, value
                 )?;
-                Ok(subtree_end(self.nodes, index))
+                Ok(self.layout.subtree_end(index))
             }
             TypeValue::TypelessData { size, .. } => {
                 require_type(node, "TypelessData", "TypelessData")?;
-                typeless_shape(self.nodes, index)?;
+                typeless_shape(self.nodes, self.layout, index)?;
                 self.write_container(node)?;
                 self.write_prefix(node.level)?;
                 writeln_crlf(self.output, format_args!("int size = {size}"))?;
-                Ok(subtree_end(self.nodes, index))
+                Ok(self.layout.subtree_end(index))
             }
             TypeValue::Array(values) => self.write_array(index, node, values),
             TypeValue::Map(entries) => {
@@ -102,7 +105,7 @@ impl<W: Write> DumpFormatter<'_, W> {
             }
             primitive => {
                 validate_primitive(node, primitive)?;
-                if subtree_end(self.nodes, index) != index + 1 {
+                if self.layout.subtree_end(index) != index + 1 {
                     return Err(Error::invalid_data(format!(
                         "TypeTree primitive {} {} has child nodes",
                         node.type_name, node.field_name
@@ -124,7 +127,7 @@ impl<W: Write> DumpFormatter<'_, W> {
         fields: &[TypeField],
     ) -> Result<usize> {
         self.write_container(node)?;
-        let end = subtree_end(self.nodes, index);
+        let end = self.layout.subtree_end(index);
         let expected_level = node
             .level
             .checked_add(1)
@@ -151,7 +154,7 @@ impl<W: Write> DumpFormatter<'_, W> {
                 )));
             }
             self.write_node(child_index, &field.value)?;
-            child_index = subtree_end(self.nodes, child_index);
+            child_index = self.layout.subtree_end(child_index);
         }
         if child_index != end {
             return Err(Error::invalid_data(format!(
@@ -168,7 +171,7 @@ impl<W: Write> DumpFormatter<'_, W> {
         node: &TypeTreeNode,
         values: &[TypeValue],
     ) -> Result<usize> {
-        let data_index = array_shape(self.nodes, index)?;
+        let data_index = array_shape(self.nodes, self.layout, index)?;
         let array_level = checked_level(node.level, 1)?;
         let element_level = checked_level(node.level, 2)?;
         self.write_container(node)?;
@@ -181,7 +184,7 @@ impl<W: Write> DumpFormatter<'_, W> {
             writeln_crlf(self.output, format_args!("[{element_index}]"))?;
             self.write_node(data_index, value)?;
         }
-        Ok(subtree_end(self.nodes, index))
+        Ok(self.layout.subtree_end(index))
     }
 
     fn write_map(
@@ -190,7 +193,7 @@ impl<W: Write> DumpFormatter<'_, W> {
         node: &TypeTreeNode,
         entries: &[TypeMapEntry],
     ) -> Result<usize> {
-        let (first_index, second_index) = map_shape(self.nodes, index)?;
+        let (first_index, second_index) = map_shape(self.nodes, self.layout, index)?;
         let array_level = checked_level(node.level, 1)?;
         let element_level = checked_level(node.level, 2)?;
         self.write_container(node)?;
@@ -206,7 +209,7 @@ impl<W: Write> DumpFormatter<'_, W> {
             self.write_node(first_index, &entry.key)?;
             self.write_node(second_index, &entry.value)?;
         }
-        Ok(subtree_end(self.nodes, index))
+        Ok(self.layout.subtree_end(index))
     }
 
     fn write_container(&mut self, node: &TypeTreeNode) -> io::Result<()> {
@@ -301,7 +304,7 @@ fn write_non_finite(
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<usize> {
+fn array_shape(nodes: &[TypeTreeNode], layout: &TypeTreeLayout, index: usize) -> Result<usize> {
     let node = &nodes[index];
     let array_level = checked_level(node.level, 1)?;
     let array_index = index + 1;
@@ -311,14 +314,14 @@ fn array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<usize> {
     if array.level != array_level || array.type_name != "Array" {
         return Err(Error::invalid_data("TypeTree array child is not Array"));
     }
-    if subtree_end(nodes, array_index) != subtree_end(nodes, index) {
+    if layout.subtree_end(array_index) != layout.subtree_end(index) {
         return Err(Error::invalid_data("TypeTree array has sibling fields"));
     }
     let size_index = array_index + 1;
     let size = nodes
         .get(size_index)
         .ok_or_else(|| Error::invalid_data("TypeTree Array has no size child"))?;
-    let data_index = subtree_end(nodes, size_index);
+    let data_index = layout.subtree_end(size_index);
     let data = nodes
         .get(data_index)
         .ok_or_else(|| Error::invalid_data("TypeTree Array has no data child"))?;
@@ -327,7 +330,7 @@ fn array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<usize> {
         || data.level != child_level
         || size.field_name != "size"
         || data.field_name != "data"
-        || subtree_end(nodes, data_index) != subtree_end(nodes, array_index)
+        || layout.subtree_end(data_index) != layout.subtree_end(array_index)
     {
         return Err(Error::invalid_data(
             "TypeTree Array children are not size and data",
@@ -336,7 +339,11 @@ fn array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<usize> {
     Ok(data_index)
 }
 
-fn map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<(usize, usize)> {
+fn map_shape(
+    nodes: &[TypeTreeNode],
+    layout: &TypeTreeLayout,
+    index: usize,
+) -> Result<(usize, usize)> {
     let node = &nodes[index];
     let array_level = checked_level(node.level, 1)?;
     let array_index = index + 1;
@@ -350,7 +357,7 @@ fn map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<(usize, usize)> {
     let size = nodes
         .get(size_index)
         .ok_or_else(|| Error::invalid_data("TypeTree map has no size child"))?;
-    let pair_index = subtree_end(nodes, size_index);
+    let pair_index = layout.subtree_end(size_index);
     let pair = nodes
         .get(pair_index)
         .ok_or_else(|| Error::invalid_data("TypeTree map has no pair child"))?;
@@ -358,8 +365,8 @@ fn map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<(usize, usize)> {
     if size.level != array_child_level
         || pair.level != array_child_level
         || size.field_name != "size"
-        || subtree_end(nodes, pair_index) != subtree_end(nodes, array_index)
-        || subtree_end(nodes, array_index) != subtree_end(nodes, index)
+        || layout.subtree_end(pair_index) != layout.subtree_end(array_index)
+        || layout.subtree_end(array_index) != layout.subtree_end(index)
     {
         return Err(Error::invalid_data(
             "TypeTree map Array does not have size and pair children",
@@ -369,14 +376,14 @@ fn map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<(usize, usize)> {
     let first = nodes
         .get(first_index)
         .ok_or_else(|| Error::invalid_data("TypeTree map pair has no first child"))?;
-    let second_index = subtree_end(nodes, first_index);
+    let second_index = layout.subtree_end(first_index);
     let second = nodes
         .get(second_index)
         .ok_or_else(|| Error::invalid_data("TypeTree map pair has no second child"))?;
     let pair_child_level = checked_level(pair.level, 1)?;
     if first.level != pair_child_level
         || second.level != pair_child_level
-        || subtree_end(nodes, second_index) != subtree_end(nodes, pair_index)
+        || layout.subtree_end(second_index) != layout.subtree_end(pair_index)
     {
         return Err(Error::invalid_data(
             "TypeTree map pair does not have first and second children",
@@ -385,7 +392,7 @@ fn map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<(usize, usize)> {
     Ok((first_index, second_index))
 }
 
-fn typeless_shape(nodes: &[TypeTreeNode], index: usize) -> Result<()> {
+fn typeless_shape(nodes: &[TypeTreeNode], layout: &TypeTreeLayout, index: usize) -> Result<()> {
     let node = &nodes[index];
     let child_level = checked_level(node.level, 1)?;
     let size_index = index
@@ -406,7 +413,7 @@ fn typeless_shape(nodes: &[TypeTreeNode], index: usize) -> Result<()> {
         || data.level != child_level
         || !matches!(data.type_name.as_str(), "UInt8" | "SInt8" | "char")
         || data.field_name != "data"
-        || subtree_end(nodes, data_index) != subtree_end(nodes, index)
+        || layout.subtree_end(data_index) != layout.subtree_end(index)
     {
         return Err(Error::invalid_data(
             "TypeTree TypelessData children are not size and byte data",
@@ -491,14 +498,6 @@ fn checked_level(level: u32, additional: u32) -> Result<u32> {
     level
         .checked_add(additional)
         .ok_or_else(|| Error::invalid_data("TypeTree dump level overflowed"))
-}
-
-fn subtree_end(nodes: &[TypeTreeNode], index: usize) -> usize {
-    let level = nodes[index].level;
-    nodes[index + 1..]
-        .iter()
-        .position(|node| node.level <= level)
-        .map_or(nodes.len(), |offset| index + 1 + offset)
 }
 
 fn writeln_crlf(output: &mut impl Write, arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
