@@ -430,6 +430,33 @@ fn split_objects_and_legacy_mode_export_independent_model_files() {
 }
 
 #[test]
+fn split_objects_bounds_the_retained_output_name_index() {
+    let root = TestDirectory::new("split-name-index-budget");
+    let input = root.path().join("model.assets");
+    let output = root.path().join("split");
+    fs::write(&input, synthetic_model([0.0, 0.0, 0.0, 1.0])).unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "split-objects".into(),
+            "--maximum-name-index-bytes".into(),
+            "3".into(),
+            input.as_os_str().into(),
+            output.as_os_str().into(),
+        ],
+    );
+    assert_eq!(result.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("require 4 UTF-8 bytes"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.join("root.fbx").exists());
+    assert_no_fbx_temporary_files(&output);
+}
+
+#[test]
 fn animator_batch_reports_no_candidates_without_creating_output() {
     let root = TestDirectory::new("animator-empty");
     let input = root.path().join("model.assets");

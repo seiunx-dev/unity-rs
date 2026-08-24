@@ -67,6 +67,8 @@ const MAX_FBX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FBX_TEMPORARY_ATTEMPTS: u64 = 1_024;
 const MAX_FBX_BATCH_CANDIDATES: usize = 1_000_000;
 const MAX_FBX_BATCH_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const DEFAULT_FBX_BATCH_NAME_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FBX_BATCH_NAME_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_LIVE2D_PACKAGE_OUTPUTS: usize = 100_000;
 const MAX_LIVE2D_PACKAGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_LIVE2D_PACKAGE_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -869,6 +871,7 @@ fn parse_legacy_fbx_batch(
             FbxBatchMode::SplitObjects
         },
         maximum_file_bytes: DEFAULT_FBX_OUTPUT_BYTES,
+        maximum_name_index_bytes: DEFAULT_FBX_BATCH_NAME_INDEX_BYTES,
         include_animations: animator,
         textures: true,
         texture_format: ImageFormat::Png,
@@ -953,6 +956,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          .obj the export command writes, which mirrors the managed writer exactly.\n  \
          It takes the same options as fbx, except --binary: OBJ has one encoding.\n\n\
          Batch FBX options:\n  --maximum-output-bytes <N>  Per-file limit\n  \
+         --maximum-name-index-bytes <N>  Lowercase output-name index budget; default 67108864\n  \
          --no-animations               Omit selected animation clips\n  \
          --no-textures                 Write the models without their textures\n  \
          --texture-format <FORMAT>     As above; textures are shared across the batch\n\n\
@@ -1023,6 +1027,7 @@ struct FbxBatchCommand {
     output: PathBuf,
     mode: FbxBatchMode,
     maximum_file_bytes: u64,
+    maximum_name_index_bytes: u64,
     include_animations: bool,
     textures: bool,
     texture_format: ImageFormat,
@@ -1157,6 +1162,7 @@ fn parse_fbx_batch_arguments(
     };
     let mut positional = positional_path_table(command_name)?;
     let mut maximum_file_bytes = DEFAULT_FBX_OUTPUT_BYTES;
+    let mut maximum_name_index_bytes = DEFAULT_FBX_BATCH_NAME_INDEX_BYTES;
     let mut include_animations = mode == FbxBatchMode::Animator;
     let mut textures = true;
     let mut texture_format = ImageFormat::Png;
@@ -1183,6 +1189,23 @@ fn parse_fbx_batch_arguments(
             }
         } else if parse_options && argument == "--no-animations" {
             include_animations = false;
+        } else if parse_options && argument == "--maximum-name-index-bytes" {
+            index += 1;
+            let value = arguments.get(index).ok_or_else(|| {
+                Error::invalid_data("--maximum-name-index-bytes requires a value")
+            })?;
+            maximum_name_index_bytes = value
+                .to_str()
+                .ok_or_else(|| Error::invalid_data("name-index limit must be UTF-8 digits"))?
+                .parse::<u64>()
+                .map_err(|_| {
+                    Error::invalid_data("name-index limit must be a non-negative integer")
+                })?;
+            if maximum_name_index_bytes > MAX_FBX_BATCH_NAME_INDEX_BYTES {
+                return Err(Error::invalid_data(format!(
+                    "--maximum-name-index-bytes must not exceed {MAX_FBX_BATCH_NAME_INDEX_BYTES}"
+                )));
+            }
         } else if parse_options && argument == "--no-textures" {
             textures = false;
         } else if parse_options && argument == "--texture-format" {
@@ -1215,6 +1238,7 @@ fn parse_fbx_batch_arguments(
         output: positional.remove(0),
         mode,
         maximum_file_bytes,
+        maximum_name_index_bytes,
         include_animations,
         textures,
         texture_format,
@@ -1874,8 +1898,11 @@ fn export_fbx_batch(
         .then(|| build_animation_graph(&collection, &hierarchy, AnimationGraphLimits::default()))
         .transpose()?;
     let parent = prepare_fbx_output_parent(&command.output.join("placeholder"))?;
-    let mut names = FbxBatchNames::default();
-    names.try_reserve(candidates.len())?;
+    let mut names = FbxBatchNames::new(command.maximum_name_index_bytes);
+    let reservable_names = candidates
+        .len()
+        .min(usize::try_from(command.maximum_name_index_bytes).unwrap_or(usize::MAX));
+    names.try_reserve(reservable_names)?;
     let mut succeeded = 0_usize;
     let mut failures = 0_usize;
     let mut total_bytes = 0_u64;
@@ -2026,19 +2053,56 @@ fn write_fbx_batch_candidate(
     Ok((publication.written_bytes, publication.total_output_bytes))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FbxBatchNames {
     /// Case-folded claimed names. A base entry stores the next unchecked
     /// suffix; a name that has only appeared as a suffix starts at one in case
     /// it later becomes a base itself.
     used: HashMap<String, u64>,
+    retained_name_bytes: u64,
+    maximum_name_bytes: u64,
+}
+
+impl Default for FbxBatchNames {
+    fn default() -> Self {
+        Self::new(DEFAULT_FBX_BATCH_NAME_INDEX_BYTES)
+    }
 }
 
 impl FbxBatchNames {
+    fn new(maximum_name_bytes: u64) -> Self {
+        Self {
+            used: HashMap::new(),
+            retained_name_bytes: 0,
+            maximum_name_bytes,
+        }
+    }
+
     fn try_reserve(&mut self, additional: usize) -> Result<()> {
         self.used.try_reserve(additional).map_err(|error| {
             Error::invalid_data(format!("cannot allocate FBX output-name index: {error}"))
         })
+    }
+
+    fn next_name_bytes(&self, name: &str) -> Result<u64> {
+        let name_bytes = u64::try_from(name.len())
+            .map_err(|_| Error::invalid_data("FBX output-name length does not fit in u64"))?;
+        let next = self
+            .retained_name_bytes
+            .checked_add(name_bytes)
+            .ok_or_else(|| Error::invalid_data("FBX output-name byte count overflowed"))?;
+        if next > self.maximum_name_bytes {
+            return Err(Error::invalid_data(format!(
+                "FBX output-name indexes require {next} UTF-8 bytes, exceeding limit {}",
+                self.maximum_name_bytes
+            )));
+        }
+        Ok(next)
+    }
+
+    fn commit_claim(&mut self, name: String, next_suffix: u64, next_name_bytes: u64) {
+        self.used.insert(name, next_suffix);
+        self.retained_name_bytes = next_name_bytes;
     }
 }
 
@@ -2058,11 +2122,12 @@ fn allocate_fbx_batch_name_with_probe(
     let portable_base = fallible_lowercase(&base, "FBX portable output name")?;
     probe();
     let Some(&next_suffix) = names.used.get(&portable_base) else {
+        let next_name_bytes = names.next_name_bytes(&portable_base)?;
         let value = fallible_fbx_name(&base)?;
         names.used.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!("cannot grow FBX output-name index: {error}"))
         })?;
-        names.used.insert(portable_base, 1);
+        names.commit_claim(portable_base, 1, next_name_bytes);
         return Ok(value);
     };
 
@@ -2081,6 +2146,7 @@ fn allocate_fbx_batch_name_with_probe(
         let following_suffix = suffix
             .checked_add(1)
             .ok_or_else(|| Error::invalid_data("FBX output-name suffix overflowed"))?;
+        let next_name_bytes = names.next_name_bytes(&portable)?;
         names.used.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!("cannot grow FBX output-name index: {error}"))
         })?;
@@ -2089,7 +2155,7 @@ fn allocate_fbx_batch_name_with_probe(
             .get_mut(&portable_base)
             .expect("the base entry remains present while allocating its suffix") =
             following_suffix;
-        names.used.insert(portable, 1);
+        names.commit_claim(portable, 1, next_name_bytes);
         return Ok(value);
     }
 }
@@ -4326,6 +4392,39 @@ mod tests {
     }
 
     #[test]
+    fn fbx_batch_name_bytes_bound_casefolded_claims_transactionally() {
+        let candidate = fbx_candidate("Face", 1);
+        let mut too_small = FbxBatchNames::new(3);
+        let error = allocate_fbx_batch_name(&candidate, &mut too_small).unwrap_err();
+        assert!(error.to_string().contains("require 4 UTF-8 bytes"));
+        assert!(too_small.used.is_empty());
+        assert_eq!(too_small.retained_name_bytes, 0);
+
+        let mut names = FbxBatchNames::new(9);
+        assert_eq!(
+            allocate_fbx_batch_name(&candidate, &mut names).unwrap(),
+            "Face"
+        );
+        let error = allocate_fbx_batch_name(&fbx_candidate("face", 2), &mut names).unwrap_err();
+        assert!(error.to_string().contains("require 10 UTF-8 bytes"));
+        assert_eq!(names.used.len(), 1);
+        assert_eq!(names.used.get("face"), Some(&1));
+        assert_eq!(names.retained_name_bytes, 4);
+
+        names.maximum_name_bytes = 10;
+        assert_eq!(
+            allocate_fbx_batch_name(&fbx_candidate("face", 2), &mut names).unwrap(),
+            "face~1"
+        );
+        assert_eq!(names.retained_name_bytes, 10);
+
+        let mut unicode = FbxBatchNames::new(2);
+        let error = allocate_fbx_batch_name(&fbx_candidate("İ", 3), &mut unicode).unwrap_err();
+        assert!(error.to_string().contains("require 3 UTF-8 bytes"));
+        assert!(unicode.used.is_empty());
+    }
+
+    #[test]
     fn repeated_fbx_batch_names_exceed_the_old_cap_with_linear_probes() {
         let count = 16_384_usize;
         let mut names = FbxBatchNames::default();
@@ -4759,6 +4858,40 @@ mod tests {
             );
             assert_eq!(parsed.texture_format, ImageFormat::Png);
         }
+    }
+
+    #[test]
+    fn batch_model_commands_expose_the_name_index_budget() {
+        let parsed = parse_cli_arguments(&arguments(&[
+            "split-objects",
+            "--maximum-name-index-bytes",
+            "0",
+            "input.assets",
+            "output",
+        ]))
+        .unwrap();
+        let CliCommand::FbxBatch(parsed) = parsed else {
+            panic!("expected a batch FBX command");
+        };
+        assert_eq!(parsed.maximum_name_index_bytes, 0);
+
+        let default =
+            parse_cli_arguments(&arguments(&["animator", "input.assets", "output"])).unwrap();
+        let CliCommand::FbxBatch(default) = default else {
+            panic!("expected an animator batch command");
+        };
+        assert_eq!(default.maximum_name_index_bytes, 64 * 1024 * 1024);
+
+        assert!(
+            parse_cli_arguments(&arguments(&[
+                "split-objects",
+                "--maximum-name-index-bytes",
+                "536870913",
+                "input.assets",
+                "output",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
