@@ -96,6 +96,11 @@ Manual Rust construction is fallible as well: `SceneTextureSet::push_texture`
 returns `Result<usize>` and leaves the collection unchanged when capacity
 cannot be reserved, matching the existing fallible `bind` operation.
 
+The CLI's `split-objects` and `animator` batches retain one case-folded output
+name index across every candidate. `--maximum-name-index-bytes` bounds the
+exact UTF-8 bytes stored by that hidden index (64 MiB by default, configurable
+through 512 MiB); a rejected claim does not advance its collision suffix.
+
 ## Build and test
 
 Everything the CI workflow runs is also runnable here, on any platform:
