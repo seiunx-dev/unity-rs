@@ -88,6 +88,9 @@ impl TextureSlot {
 /// Bounds on how much texture data a model may pull in.
 #[derive(Debug, Clone, Copy)]
 pub struct SceneTextureLimits {
+    /// Non-null material texture references, including references that are
+    /// unresolved, unsupported or repeat an already decoded texture.
+    pub maximum_texture_references: usize,
     pub maximum_textures: usize,
     /// Total encoded bytes across every texture in the set.
     pub maximum_total_encoded_bytes: u64,
@@ -97,6 +100,7 @@ pub struct SceneTextureLimits {
 impl Default for SceneTextureLimits {
     fn default() -> Self {
         Self {
+            maximum_texture_references: 1_000_000,
             maximum_textures: 4_096,
             maximum_total_encoded_bytes: 2 * 1024 * 1024 * 1024,
             texture: TextureReadLimits::default(),
@@ -190,6 +194,7 @@ impl SceneTextureSet {
         let mut set = Self::default();
         let mut by_object: HashMap<SceneObjectKey, usize> = HashMap::new();
         let mut total_encoded = 0_u64;
+        let mut texture_references = 0_usize;
 
         for material in &model.materials {
             let mut bindings = Vec::new();
@@ -198,6 +203,10 @@ impl SceneTextureSet {
                 if environment.texture.is_null() {
                     continue;
                 }
+                charge_scene_texture_reference(
+                    &mut texture_references,
+                    limits.maximum_texture_references,
+                )?;
                 let resolved = match resolve_object_reference(
                     collection,
                     material.object.file_index,
@@ -284,12 +293,7 @@ impl SceneTextureSet {
                     environment.scale,
                 )?;
             }
-            if !bindings.is_empty() {
-                set.bindings.try_reserve(1).map_err(|error| {
-                    Error::invalid_data(format!("cannot grow material texture bindings: {error}"))
-                })?;
-                set.bindings.insert(material.object, bindings);
-            }
+            store_scene_texture_bindings(&mut set, material.object, bindings)?;
         }
         Ok(set)
     }
@@ -386,6 +390,31 @@ impl SceneTextureSet {
         }
         Ok(written)
     }
+}
+
+fn charge_scene_texture_reference(count: &mut usize, maximum: usize) -> Result<()> {
+    if *count >= maximum {
+        return Err(Error::invalid_data(format!(
+            "model has more than {maximum} non-null texture references"
+        )));
+    }
+    *count += 1;
+    Ok(())
+}
+
+fn store_scene_texture_bindings(
+    set: &mut SceneTextureSet,
+    material: SceneObjectKey,
+    bindings: Vec<SceneTextureBinding>,
+) -> Result<()> {
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    set.bindings.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow material texture bindings: {error}"))
+    })?;
+    set.bindings.insert(material, bindings);
+    Ok(())
 }
 
 fn remove_scene_texture_outputs(paths: &[PathBuf]) -> Result<()> {
@@ -1051,6 +1080,48 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("more than 0 textures"));
+    }
+
+    #[test]
+    fn bounds_repeated_and_skipped_texture_references_independently() {
+        const REPEATED: usize = 16_384;
+
+        let collection = texture_collection("Body");
+        for path_id in [81, 99] {
+            let mut model = model_with_texture_property("_MainTex", path_id);
+            let duplicate = model.materials[0]
+                .material
+                .saved_properties
+                .texture_environments[0]
+                .clone();
+            let environments = &mut model.materials[0]
+                .material
+                .saved_properties
+                .texture_environments;
+            environments.try_reserve_exact(REPEATED - 1).unwrap();
+            for _ in 1..REPEATED {
+                environments.push(duplicate.clone());
+            }
+
+            let error = SceneTextureSet::from_model(
+                &collection,
+                &model,
+                ImageFormat::Png,
+                SceneTextureLimits {
+                    maximum_texture_references: REPEATED - 1,
+                    maximum_textures: 1,
+                    ..SceneTextureLimits::default()
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("more than 16383 non-null texture references"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

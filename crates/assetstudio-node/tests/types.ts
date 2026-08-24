@@ -87,6 +87,7 @@ const sceneLimits: SceneLimits = {
 };
 const scene: SceneNode[] = studio.sceneWithLimits(sceneLimits);
 const textureLimits: ModelTextureLimits = {
+  maximumTextureReferences: 1_024,
   maximumTextures: 128,
   maximumTotalEncodedBytes: 256 * 1024 * 1024,
   maximumSingleTextureBytes: 64 * 1024 * 1024,

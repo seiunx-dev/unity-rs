@@ -830,6 +830,7 @@ export interface ModelObj {
 
 /** Caller-configurable budgets for textures returned beside a model. */
 export interface ModelTextureLimits {
+  maximumTextureReferences?: number
   maximumTextures?: number
   maximumTotalEncodedBytes?: number
   maximumSingleTextureBytes?: number
