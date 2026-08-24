@@ -147,7 +147,7 @@ pub fn write_model_ir_fbx_binary_full<W: Write>(
     output: &mut W,
     maximum_output_bytes: u64,
 ) -> Result<u64> {
-    let scene = StaticScene::from_model(model, animations, textures)?;
+    let scene = StaticScene::from_model(model, animations, textures, maximum_output_bytes)?;
     let mut strings = SceneStringBudget::new(maximum_output_bytes);
     let roots = build_scene_nodes(&scene, &mut strings)?;
     let bytes = crate::fbx_binary::read_fbx_binary(&roots, maximum_output_bytes)?;
