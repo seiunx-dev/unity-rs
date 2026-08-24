@@ -1647,7 +1647,13 @@ impl<'a> PackageState<'a> {
             });
         let name = safe_file_stem(source_name)?;
         self.charge_name(&name)?;
-        let directory_name = claim_name(&name, model.object, claimed_directories)?;
+        let directory_name = claim_name(
+            &name,
+            model.object,
+            claimed_directories,
+            &mut self.name_bytes,
+            self.limits.maximum_total_name_bytes,
+        )?;
         self.charge_name(&directory_name)?;
         let moc_file_name = concatenate(&name, ".moc3", "Live2D MOC file name")?;
         let manifest_file_name = concatenate(&name, ".model3.json", "Live2D manifest file name")?;
@@ -1876,7 +1882,13 @@ impl<'a> PackageState<'a> {
         })?;
         for (object, texture) in candidates {
             let stem = safe_file_stem(&texture.name)?;
-            let claimed_name = claim_name(&stem, object, &mut claimed)?;
+            let claimed_name = claim_name(
+                &stem,
+                object,
+                &mut claimed,
+                &mut self.name_bytes,
+                self.limits.maximum_total_name_bytes,
+            )?;
             let texture_path =
                 concatenate("textures/", &claimed_name, "Live2D texture relative path")?;
             let file_name = concatenate(&texture_path, ".png", "Live2D texture file name")?;
@@ -2040,7 +2052,13 @@ impl<'a> PackageState<'a> {
         )?;
         let stem = remove_exp3_suffixes(&expression.source_name)?;
         let stem = safe_file_stem(&stem)?;
-        let name = claim_name(&stem, object, claimed_names)?;
+        let name = claim_name(
+            &stem,
+            object,
+            claimed_names,
+            &mut self.name_bytes,
+            self.limits.maximum_total_name_bytes,
+        )?;
         let prefix = concatenate("expressions/", &name, "Live2D expression path")?;
         let file_name = concatenate(&prefix, ".exp3.json", "Live2D expression file name")?;
         self.charge_name(&name)?;
@@ -2325,7 +2343,13 @@ impl<'a> PackageState<'a> {
             "Live2D motion JSON bytes",
         )?;
         let stem = safe_file_stem(portable_file_stem(&motion.source_name))?;
-        let name = claim_name(&stem, key, claimed)?;
+        let name = claim_name(
+            &stem,
+            key,
+            claimed,
+            &mut self.name_bytes,
+            self.limits.maximum_total_name_bytes,
+        )?;
         let prefix = concatenate("motions/", &name, "Live2D motion path")?;
         let file_name = concatenate(&prefix, ".motion3.json", "Live2D motion file name")?;
         self.charge_name(&name)?;
@@ -2446,7 +2470,13 @@ impl<'a> PackageState<'a> {
             "Live2D motion JSON bytes",
         )?;
         let stem = safe_file_stem(portable_file_stem(&motion.name))?;
-        let name = claim_name(&stem, key, claimed)?;
+        let name = claim_name(
+            &stem,
+            key,
+            claimed,
+            &mut self.name_bytes,
+            self.limits.maximum_total_name_bytes,
+        )?;
         let prefix = concatenate("motions/", &name, "Live2D motion path")?;
         let file_name = concatenate(&prefix, ".motion3.json", "Live2D motion file name")?;
         self.charge_name(&name)?;
@@ -2775,7 +2805,9 @@ impl<'a> PackageState<'a> {
                 Some(display_name) if !display_name.is_empty() => display_name,
                 _ => info.name,
             };
-            entries.push((lowercase_key(&id)?, CubismDisplayEntry { id, name }));
+            let identity = lowercase_key(&id, self.limits.maximum_total_name_bytes)?;
+            self.charge_name(&identity)?;
+            entries.push((identity, CubismDisplayEntry { id, name }));
         }
         entries.sort_by(|left, right| {
             left.0
@@ -3566,25 +3598,47 @@ impl ClaimedNames {
     }
 }
 
-fn claim_name(base: &str, object: SceneObjectKey, claimed: &mut ClaimedNames) -> Result<String> {
-    claim_name_with_probe(base, object, claimed, || {})
+fn claim_name(
+    base: &str,
+    object: SceneObjectKey,
+    claimed: &mut ClaimedNames,
+    retained_name_bytes: &mut usize,
+    maximum_name_bytes: usize,
+) -> Result<String> {
+    claim_name_with_probe(
+        base,
+        object,
+        claimed,
+        retained_name_bytes,
+        maximum_name_bytes,
+        || {},
+    )
 }
 
 fn claim_name_with_probe(
     base: &str,
     object: SceneObjectKey,
     claimed: &mut ClaimedNames,
+    retained_name_bytes: &mut usize,
+    maximum_name_bytes: usize,
     mut probe: impl FnMut(),
 ) -> Result<String> {
     probe();
-    let base_identity = lowercase_key(base)?;
+    let base_identity = lowercase_key(base, maximum_name_bytes)?;
     let Some(&base_id) = claimed.names.get(&base_identity) else {
+        let next_name_bytes = charge_usize(
+            *retained_name_bytes,
+            base_identity.len(),
+            maximum_name_bytes,
+            "Live2D names",
+        )?;
         let candidate = copy_string(base, "Live2D claimed file name")?;
         claimed.names.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!("cannot grow Live2D claimed-name index: {error}"))
         })?;
         let base_id = claimed.names.len();
         claimed.names.insert(base_identity, base_id);
+        *retained_name_bytes = next_name_bytes;
         return Ok(candidate);
     };
 
@@ -3593,7 +3647,7 @@ fn claim_name_with_probe(
     loop {
         probe();
         let candidate = collision_name(base, object, ordinal)?;
-        let identity = lowercase_key(&candidate)?;
+        let identity = lowercase_key(&candidate, maximum_name_bytes)?;
         if claimed.names.contains_key(&identity) {
             ordinal = ordinal.checked_add(1).ok_or_else(|| {
                 Error::invalid_data("Live2D collision file-name ordinal overflowed")
@@ -3604,6 +3658,12 @@ fn claim_name_with_probe(
         let next_ordinal = ordinal
             .checked_add(1)
             .ok_or_else(|| Error::invalid_data("Live2D collision file-name ordinal overflowed"))?;
+        let next_name_bytes = charge_usize(
+            *retained_name_bytes,
+            identity.len(),
+            maximum_name_bytes,
+            "Live2D names",
+        )?;
         claimed.names.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!("cannot grow Live2D claimed-name index: {error}"))
         })?;
@@ -3617,6 +3677,7 @@ fn claim_name_with_probe(
         let name_id = claimed.names.len();
         claimed.names.insert(identity, name_id);
         claimed.cursors.insert(cursor_key, next_ordinal);
+        *retained_name_bytes = next_name_bytes;
         return Ok(candidate);
     }
 }
@@ -3659,7 +3720,7 @@ fn collision_name(base: &str, object: SceneObjectKey, ordinal: u64) -> Result<St
     Ok(candidate)
 }
 
-fn lowercase_key(value: &str) -> Result<String> {
+fn lowercase_key(value: &str, maximum_name_bytes: usize) -> Result<String> {
     let capacity = value.chars().try_fold(0_usize, |length, character| {
         character
             .to_lowercase()
@@ -3669,6 +3730,11 @@ fn lowercase_key(value: &str) -> Result<String> {
     });
     let capacity = capacity
         .ok_or_else(|| Error::invalid_data("Live2D lowercase file-name length overflowed"))?;
+    if capacity > maximum_name_bytes {
+        return Err(Error::invalid_data(format!(
+            "Live2D lowercase file name has {capacity} bytes, exceeding name limit {maximum_name_bytes}"
+        )));
+    }
     let mut key = String::new();
     key.try_reserve_exact(capacity).map_err(|error| {
         Error::invalid_data(format!(
@@ -4584,6 +4650,7 @@ mod tests {
     #[test]
     fn sanitizes_and_disambiguates_names_deterministically() {
         let mut claimed = ClaimedNames::default();
+        let mut retained_name_bytes = 0_usize;
         let first = super::SceneObjectKey {
             file_index: 0,
             path_id: 7,
@@ -4593,13 +4660,37 @@ mod tests {
             path_id: 9,
         };
         assert_eq!(safe_file_stem("../bad:name").unwrap(), "_bad_name");
-        assert_eq!(claim_name("Face", first, &mut claimed).unwrap(), "Face");
         assert_eq!(
-            claim_name("face", second, &mut claimed).unwrap(),
+            claim_name(
+                "Face",
+                first,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
+            "Face"
+        );
+        assert_eq!(
+            claim_name(
+                "face",
+                second,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
             "face @f1_p9"
         );
         assert_eq!(
-            claim_name("face", second, &mut claimed).unwrap(),
+            claim_name(
+                "face",
+                second,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
             "face @f1_p9_2"
         );
     }
@@ -4607,6 +4698,7 @@ mod tests {
     #[test]
     fn name_cursor_rechecks_cross_collisions_before_advancing() {
         let mut claimed = ClaimedNames::default();
+        let mut retained_name_bytes = 0_usize;
         let first = SceneObjectKey {
             file_index: 0,
             path_id: 7,
@@ -4620,17 +4712,48 @@ mod tests {
             path_id: 11,
         };
 
-        assert_eq!(claim_name("Face", first, &mut claimed).unwrap(), "Face");
         assert_eq!(
-            claim_name("face", repeated, &mut claimed).unwrap(),
+            claim_name(
+                "Face",
+                first,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
+            "Face"
+        );
+        assert_eq!(
+            claim_name(
+                "face",
+                repeated,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
             "face @f1_p9"
         );
         assert_eq!(
-            claim_name("FACE @F1_P9_2", blocker, &mut claimed).unwrap(),
+            claim_name(
+                "FACE @F1_P9_2",
+                blocker,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
             "FACE @F1_P9_2"
         );
         assert_eq!(
-            claim_name("face", repeated, &mut claimed).unwrap(),
+            claim_name(
+                "face",
+                repeated,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
             "face @f1_p9_3"
         );
     }
@@ -4638,12 +4761,23 @@ mod tests {
     #[test]
     fn claimed_name_reservation_failure_preserves_existing_state() {
         let mut claimed = ClaimedNames::default();
+        let mut retained_name_bytes = 0_usize;
         let object = SceneObjectKey {
             file_index: 1,
             path_id: 9,
         };
 
-        assert_eq!(claim_name("Face", object, &mut claimed).unwrap(), "Face");
+        assert_eq!(
+            claim_name(
+                "Face",
+                object,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
+            "Face"
+        );
         assert!(
             claimed
                 .try_reserve(usize::MAX, "impossible Live2D name index")
@@ -4652,15 +4786,57 @@ mod tests {
         assert_eq!(claimed.names.len(), 1);
         assert!(claimed.cursors.is_empty());
         assert_eq!(
-            claim_name("face", object, &mut claimed).unwrap(),
+            claim_name(
+                "face",
+                object,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+            )
+            .unwrap(),
             "face @f1_p9"
         );
+    }
+
+    #[test]
+    fn claimed_name_keys_share_the_total_name_budget_transactionally() {
+        let mut claimed = ClaimedNames::default();
+        let mut retained_name_bytes = 0_usize;
+        let first = SceneObjectKey {
+            file_index: 0,
+            path_id: 1,
+        };
+        let second = SceneObjectKey {
+            file_index: 0,
+            path_id: 2,
+        };
+
+        assert_eq!(
+            claim_name("Face", first, &mut claimed, &mut retained_name_bytes, 8,).unwrap(),
+            "Face"
+        );
+        assert_eq!(retained_name_bytes, 4);
+        let error =
+            claim_name("Other", second, &mut claimed, &mut retained_name_bytes, 8).unwrap_err();
+        assert!(error.to_string().contains("total 9 exceeds limit 8"));
+        assert_eq!(retained_name_bytes, 4);
+        assert_eq!(claimed.names.len(), 1);
+        assert!(claimed.cursors.is_empty());
+
+        let mut unicode_claimed = ClaimedNames::default();
+        let mut unicode_bytes = 0_usize;
+        let error =
+            claim_name("İ", first, &mut unicode_claimed, &mut unicode_bytes, 2).unwrap_err();
+        assert!(error.to_string().contains("has 3 bytes"));
+        assert_eq!(unicode_bytes, 0);
+        assert!(unicode_claimed.names.is_empty());
     }
 
     #[test]
     fn repeated_identity_name_collisions_have_linear_probe_growth() {
         let count = 16_384_usize;
         let mut claimed = ClaimedNames::default();
+        let mut retained_name_bytes = 0_usize;
         claimed
             .try_reserve(count, "test Live2D claimed names")
             .unwrap();
@@ -4671,7 +4847,15 @@ mod tests {
         let mut probes = 0_usize;
         let mut last = String::new();
         for _ in 0..count {
-            last = claim_name_with_probe("Shared", object, &mut claimed, || probes += 1).unwrap();
+            last = claim_name_with_probe(
+                "Shared",
+                object,
+                &mut claimed,
+                &mut retained_name_bytes,
+                usize::MAX,
+                || probes += 1,
+            )
+            .unwrap();
         }
 
         let last_ordinal = count - 1;
