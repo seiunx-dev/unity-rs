@@ -1,6 +1,6 @@
 //! General, deterministic static ASCII FBX 7.4 scene emission.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -1217,7 +1217,7 @@ fn build_material_plans<'a>(
     // Only textures a used material actually binds become objects; the set is
     // built from every material in the model, which is a superset of the
     // materials this scene renders with.
-    let mut emitted: BTreeMap<usize, i64> = BTreeMap::new();
+    let mut emitted: HashMap<usize, i64> = HashMap::new();
     for reference in references {
         let entry = match reference {
             MaterialReference::Default => None,
@@ -1233,7 +1233,14 @@ fn build_material_plans<'a>(
             validate_name(&material.name, "material")?;
         }
         MaterialProperties::from_material(material).validate()?;
-        let mut material_textures = Vec::new();
+        let binding_count = entry.zip(textures).map_or(0, |(entry, textures)| {
+            textures
+                .bindings_for(entry.object)
+                .iter()
+                .filter(|binding| binding.slot.is_some())
+                .count()
+        });
+        let mut material_textures = reserve_vec(binding_count, "FBX material texture bindings")?;
         if let (Some(entry), Some(textures)) = (entry, textures) {
             for binding in textures.bindings_for(entry.object) {
                 let Some(slot) = binding.slot else {
@@ -1248,6 +1255,14 @@ fn build_material_plans<'a>(
                     validate_name(&texture.file_name, "texture")?;
                     let index = texture_plans.len();
                     let id = indexed_id(TEXTURE_ID_BASE, index, "FBX texture")?;
+                    emitted.try_reserve(1).map_err(|error| {
+                        Error::invalid_data(format!(
+                            "cannot grow FBX emitted-texture index: {error}"
+                        ))
+                    })?;
+                    texture_plans.try_reserve(1).map_err(|error| {
+                        Error::invalid_data(format!("cannot grow FBX texture plans: {error}"))
+                    })?;
                     texture_plans.push(TexturePlan {
                         id,
                         video_id: indexed_id(VIDEO_ID_BASE, index, "FBX video")?,
@@ -2863,7 +2878,7 @@ mod tests {
     use crate::scene_textures::{SceneTextureSet, TextureSlot};
 
     use super::{
-        ConvertedTransform, GeometryPlan, quaternion_to_euler_degrees, validate_mesh,
+        ConvertedTransform, GeometryPlan, StaticScene, quaternion_to_euler_degrees, validate_mesh,
         write_geometry, write_model_ir_fbx_ascii, write_model_ir_fbx_ascii_with_animations,
         write_model_ir_fbx_ascii_with_textures,
     };
@@ -3493,6 +3508,48 @@ mod tests {
         // diffuse property.
         assert!(text.contains("C: \"OO\",14000000000,13000000000"));
         assert!(text.contains("C: \"OP\",13000000000,3000000000, \"DiffuseColor\""));
+    }
+
+    #[test]
+    fn plans_large_repeated_texture_bindings_with_one_first_binding_texture() {
+        use crate::scene_textures::SceneTextureBinding;
+
+        const BINDING_COUNT: usize = 16_384;
+        let model = textured_model_fixture();
+        let mut set = texture_set(Some(TextureSlot::Diffuse));
+        for _ in 1..BINDING_COUNT {
+            set.bind(
+                key(61),
+                SceneTextureBinding {
+                    property: String::new(),
+                    texture: 0,
+                    slot: Some(TextureSlot::Diffuse),
+                    offset: [9.0, 9.0],
+                    scale: [8.0, 8.0],
+                },
+            )
+            .unwrap();
+        }
+
+        let scene = StaticScene::from_model(&model, None, Some(&set)).unwrap();
+        assert_eq!(scene.materials.len(), 1);
+        assert_eq!(scene.materials[0].textures.len(), BINDING_COUNT);
+        assert_eq!(scene.textures.len(), 1);
+        assert_eq!(
+            scene.textures[0].translation.map(f32::to_bits),
+            [0.25_f32.to_bits(), 0.5_f32.to_bits()]
+        );
+        assert_eq!(
+            scene.textures[0].scaling.map(f32::to_bits),
+            [2.0_f32.to_bits(), 4.0_f32.to_bits()]
+        );
+        assert!(
+            scene.materials[0]
+                .textures
+                .iter()
+                .all(|binding| binding.texture_id == scene.textures[0].id
+                    && binding.slot == TextureSlot::Diffuse)
+        );
     }
 
     #[test]
