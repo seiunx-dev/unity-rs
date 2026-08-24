@@ -263,7 +263,12 @@ struct AnimationBuildState {
     paths: ModelPathIndex,
     avatar_path_indexes: AvatarPathIndexes,
     clips: Vec<ModelAnimationClip>,
-    used_names: HashSet<String>,
+    /// Used names and the next unchecked suffix for each exact base name.
+    ///
+    /// Keeping the suffix cursor beside the existing owned index key avoids
+    /// restarting at zero for every duplicate clip without retaining a third
+    /// copy of any input-derived name.
+    used_names: HashMap<String, usize>,
     total_tracks: usize,
     total_keyframes: usize,
     total_streamed_words: usize,
@@ -287,7 +292,7 @@ impl AnimationBuildState {
             paths,
             avatar_path_indexes,
             clips: Vec::new(),
-            used_names: HashSet::new(),
+            used_names: HashMap::new(),
             total_tracks: 0,
             total_keyframes: 0,
             total_streamed_words: 0,
@@ -334,6 +339,10 @@ impl AnimationBuildState {
     }
 
     fn unique_name(&mut self, source: &str) -> Result<String> {
+        self.unique_name_with_probe(source, || {})
+    }
+
+    fn unique_name_with_probe(&mut self, source: &str, mut probe: impl FnMut()) -> Result<String> {
         if source.len() > self.limits.maximum_name_bytes {
             return Err(Error::invalid_data(format!(
                 "animation name is {} bytes, exceeding limit {}",
@@ -342,14 +351,23 @@ impl AnimationBuildState {
             )));
         }
         let base = if source.is_empty() { "Take" } else { source };
-        let mut suffix = 0_usize;
+        probe();
+        let Some(mut suffix) = self.used_names.get(base).copied() else {
+            let candidate = fallible_string(base, "animation name")?;
+            if candidate.len() > self.limits.maximum_name_bytes {
+                return Err(Error::invalid_data(format!(
+                    "animation name is {} bytes, exceeding limit {}",
+                    candidate.len(),
+                    self.limits.maximum_name_bytes
+                )));
+            }
+            self.retain_unique_name(candidate.as_str(), 1)?;
+            return Ok(candidate);
+        };
         loop {
-            let candidate = if suffix == 0 {
-                fallible_string(base, "animation name")?
-            } else {
-                fallible_format_name(base, suffix)?
-            };
-            if !self.used_names.contains(&candidate) {
+            let candidate = fallible_format_name(base, suffix)?;
+            probe();
+            if !self.used_names.contains_key(candidate.as_str()) {
                 if candidate.len() > self.limits.maximum_name_bytes {
                     return Err(Error::invalid_data(format!(
                         "animation name is {} bytes, exceeding limit {}",
@@ -357,20 +375,38 @@ impl AnimationBuildState {
                         self.limits.maximum_name_bytes
                     )));
                 }
-                self.charge_string(candidate.len().checked_mul(2).ok_or_else(|| {
-                    Error::invalid_data("animation name allocation budget overflowed")
-                })?)?;
-                self.used_names.try_reserve(1).map_err(|error| {
-                    Error::invalid_data(format!("cannot grow used animation names: {error}"))
+                let next_suffix = suffix
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invalid_data("animation name suffix overflowed"))?;
+                self.retain_unique_name(candidate.as_str(), 1)?;
+                let base_entry = self.used_names.get_mut(base).ok_or_else(|| {
+                    Error::invalid_data("animation name base vanished from uniqueness index")
                 })?;
-                self.used_names
-                    .insert(fallible_string(&candidate, "used animation name")?);
+                *base_entry = next_suffix;
                 return Ok(candidate);
             }
             suffix = suffix
                 .checked_add(1)
                 .ok_or_else(|| Error::invalid_data("animation name suffix overflowed"))?;
         }
+    }
+
+    fn retain_unique_name(&mut self, name: &str, next_suffix: usize) -> Result<()> {
+        self.charge_string(
+            name.len().checked_mul(2).ok_or_else(|| {
+                Error::invalid_data("animation name allocation budget overflowed")
+            })?,
+        )?;
+        self.used_names.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow used animation names: {error}"))
+        })?;
+        let indexed_name = fallible_string(name, "used animation name")?;
+        if self.used_names.insert(indexed_name, next_suffix).is_some() {
+            return Err(Error::invalid_data(
+                "animation name uniqueness index replaced an existing entry",
+            ));
+        }
+        Ok(())
     }
 
     fn convert_explicit_curves(
@@ -2501,6 +2537,7 @@ fn fallible_format_name(base: &str, suffix: usize) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use crate::acl::AclDecodedClip;
@@ -2557,6 +2594,81 @@ mod tests {
             Err(crate::Error::InvalidData(message))
                 if message.contains("animation string byte budget overflowed")
         ));
+    }
+
+    #[test]
+    fn unique_animation_names_preserve_first_free_suffix_and_exact_string_budget() {
+        let expected = [
+            "Walk", "Walk_1", "Walk_1_1", "Walk_2", "Take", "Take_1", "Take_1_1", "Take_2",
+        ];
+        let required = expected.iter().map(|name| name.len() * 2).sum();
+        let mut state = animation_name_state(ModelAnimationLimits {
+            maximum_total_string_bytes: required,
+            ..ModelAnimationLimits::default()
+        });
+        let sources = ["Walk", "Walk", "Walk_1", "Walk", "", "", "Take_1", ""];
+        for (source, expected) in sources.into_iter().zip(expected) {
+            assert_eq!(state.unique_name(source).unwrap(), expected);
+        }
+        assert_eq!(state.total_string_bytes, required);
+        assert_eq!(state.used_names.len(), expected.len());
+
+        let mut short = animation_name_state(ModelAnimationLimits {
+            maximum_total_string_bytes: required - 1,
+            ..ModelAnimationLimits::default()
+        });
+        for source in sources.into_iter().take(sources.len() - 1) {
+            short.unique_name(source).unwrap();
+        }
+        let error = short.unique_name(sources[sources.len() - 1]).unwrap_err();
+        assert!(
+            error.to_string().contains("animation strings use"),
+            "{error}"
+        );
+
+        let mut short_default = animation_name_state(ModelAnimationLimits {
+            maximum_name_bytes: 3,
+            ..ModelAnimationLimits::default()
+        });
+        let error = short_default.unique_name("").unwrap_err();
+        assert!(error.to_string().contains("4 bytes"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_animation_names_do_not_restart_suffix_search() {
+        const CLIPS: usize = 16_384;
+        let probes = Cell::new(0_usize);
+        let mut state = animation_name_state(ModelAnimationLimits::default());
+        let mut last = String::new();
+        for _ in 0..CLIPS {
+            last = state
+                .unique_name_with_probe("Shared", || probes.set(probes.get() + 1))
+                .unwrap();
+        }
+        assert_eq!(last, format!("Shared_{}", CLIPS - 1));
+        assert_eq!(state.used_names.len(), CLIPS);
+        assert!(
+            probes.get() <= CLIPS * 2,
+            "{} candidate probes for {CLIPS} duplicate names",
+            probes.get()
+        );
+    }
+
+    fn animation_name_state(limits: ModelAnimationLimits) -> AnimationBuildState {
+        let paths = ModelPathIndex {
+            entries: Vec::new(),
+            entries_by_key: Vec::new(),
+            suffixes: PathSuffixIndex {
+                reversed_entries: Vec::new(),
+                name_groups: Vec::new(),
+                range_minimums: Vec::new(),
+            },
+            hash_nodes: HashMap::new(),
+            path_hash_count: 0,
+            path_index_bytes: 0,
+            total_string_bytes: 0,
+        };
+        AnimationBuildState::new(limits, paths, AvatarPathIndexes::default(), 0).unwrap()
     }
 
     #[test]
