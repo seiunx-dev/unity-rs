@@ -1398,6 +1398,7 @@ impl From<PySceneLimits> for SceneHierarchyLimits {
 #[pyclass(name = "ModelTextureLimits", frozen, skip_from_py_object)]
 #[derive(Debug, Clone, Copy)]
 struct PyModelTextureLimits {
+    texture_references: usize,
     textures: usize,
     total_encoded_bytes: u64,
     single_texture_bytes: u64,
@@ -1408,20 +1409,28 @@ impl PyModelTextureLimits {
     #[new]
     #[pyo3(signature = (
         *,
+        maximum_texture_references=1_000_000,
         maximum_textures=4_096,
         maximum_total_encoded_bytes=2_147_483_648,
         maximum_single_texture_bytes=536_870_912
     ))]
     const fn new(
+        maximum_texture_references: usize,
         maximum_textures: usize,
         maximum_total_encoded_bytes: u64,
         maximum_single_texture_bytes: u64,
     ) -> Self {
         Self {
+            texture_references: maximum_texture_references,
             textures: maximum_textures,
             total_encoded_bytes: maximum_total_encoded_bytes,
             single_texture_bytes: maximum_single_texture_bytes,
         }
+    }
+
+    #[getter]
+    const fn maximum_texture_references(&self) -> usize {
+        self.texture_references
     }
 
     #[getter]
@@ -1449,6 +1458,7 @@ impl From<PyModelTextureLimits> for SceneTextureLimits {
             ..TextureReadLimits::default()
         };
         Self {
+            maximum_texture_references: value.texture_references,
             maximum_textures: value.textures,
             maximum_total_encoded_bytes: value.total_encoded_bytes,
             texture,

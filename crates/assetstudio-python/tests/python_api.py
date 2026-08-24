@@ -3172,6 +3172,7 @@ def main() -> None:
         assert raw_model.textures[0].file_name.endswith(".rgba")
         assert raw_model.textures[0].data.startswith(b"HARUKI_RGBAIR_V1")
         default_texture_limits = ModelTextureLimits()
+        assert default_texture_limits.maximum_texture_references == 1_000_000
         assert default_texture_limits.maximum_textures == 4_096
         assert default_texture_limits.maximum_total_encoded_bytes == 2_147_483_648
         assert default_texture_limits.maximum_single_texture_bytes == 536_870_912
@@ -3185,6 +3186,16 @@ def main() -> None:
             assert "more than 0 textures" in str(error)
         else:
             raise AssertionError("the model texture-count budget must be enforced")
+        try:
+            AssetStudio(textured_model_path).read_model_obj(
+                texture_format="raw-rgba",
+                maximum_bytes=128 * 1024,
+                texture_limits=ModelTextureLimits(maximum_texture_references=0),
+            )
+        except ValueError as error:
+            assert "non-null texture references" in str(error)
+        else:
+            raise AssertionError("the model texture-reference budget must be enforced")
         try:
             AssetStudio(textured_model_path).read_fbx_with_textures(
                 texture_format="raw-rgba",
