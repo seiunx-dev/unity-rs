@@ -215,9 +215,13 @@ impl<'a> CatalogState<'a> {
                 self.limits.maximum_total_model_object_bytes,
                 "CubismModel object bytes",
             )?;
-            match file.read_type_tree_value_with_limits(object_index, self.limits.type_tree) {
+            match file.read_type_tree_root_field_with_limits(
+                object_index,
+                "_moc",
+                self.limits.type_tree,
+            ) {
                 Ok(value) => (
-                    find_pptr_field(&value, "_moc").and_then(|reference| {
+                    value.as_ref().and_then(parse_pptr).and_then(|reference| {
                         self.references.try_resolve_key(
                             self.collection,
                             file_index,
@@ -559,6 +563,7 @@ fn portable_file_name(path: &str) -> &str {
     component.rsplit(['/', '\\']).next().unwrap_or(component)
 }
 
+#[cfg(test)]
 fn find_pptr_field(value: &TypeValue, field_name: &str) -> Option<ObjectReference> {
     let TypeValue::Object(fields) = value else {
         return None;
@@ -773,6 +778,48 @@ mod tests {
     }
 
     #[test]
+    fn catalog_projects_moc_without_materializing_unrelated_model_arrays() {
+        let objects = vec![
+            (7, 0, mono_behaviour_with_noise(10, 8, 128)),
+            (8, 0, mono_behaviour(9, 0)),
+            (9, 1, mono_script("CubismMoc")),
+            (10, 1, mono_script("CubismModel")),
+        ];
+        let bytes =
+            synthetic_v22_with_behaviour_tree(&objects, &[], &mono_behaviour_tree_with_noise());
+        let file = SerializedFile::open(Region::from_bytes(bytes)).unwrap();
+        let type_tree = crate::type_tree::TypeTreeReadLimits {
+            maximum_materialized_bytes: 1_024,
+            ..crate::type_tree::TypeTreeReadLimits::default()
+        };
+        let full_error = file
+            .read_type_tree_value_with_limits(0, type_tree)
+            .unwrap_err();
+        assert!(
+            full_error
+                .to_string()
+                .contains("materialized type tree bytes")
+        );
+        let collection = AssetCollection::from_loaded_parts(
+            vec![LoadedSerializedFile {
+                path: "projected-live2d.assets".to_owned(),
+                file,
+            }],
+            Vec::new(),
+        );
+        let limits = Live2dCatalogLimits {
+            type_tree,
+            ..Live2dCatalogLimits::default()
+        };
+
+        let catalog = build_live2d_catalog(&collection, limits).unwrap();
+
+        assert_eq!(catalog.components[0].object.path_id, 7);
+        assert_eq!(catalog.components[0].moc.map(|key| key.path_id), Some(8));
+        assert!(!catalog.components[0].model_schema_missing);
+    }
+
+    #[test]
     fn resolves_cross_file_scripts_and_moc_with_portable_ascii_names() {
         let source_objects = vec![(7, 0, mono_behaviour_with_references(1, 10, 1, 8))];
         let target_objects = vec![
@@ -898,6 +945,25 @@ mod tests {
         output
     }
 
+    fn mono_behaviour_with_noise(
+        script_path_id: i64,
+        moc_path_id: i64,
+        noise_count: i32,
+    ) -> Vec<u8> {
+        let mut output = Vec::new();
+        push_pptr(&mut output, 0, 0);
+        output.push(1);
+        align(&mut output, 4);
+        push_pptr(&mut output, 0, script_path_id);
+        push_aligned_string(&mut output, "Component");
+        output.extend_from_slice(&noise_count.to_le_bytes());
+        for value in 0..noise_count {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        push_pptr(&mut output, 0, moc_path_id);
+        output
+    }
+
     fn mono_script(class_name: &str) -> Vec<u8> {
         let mut output = Vec::new();
         push_aligned_string(&mut output, "Cubism script");
@@ -910,13 +976,21 @@ mod tests {
     }
 
     fn synthetic_v22(objects: &[(i64, i32, Vec<u8>)], externals: &[&str]) -> Vec<u8> {
+        synthetic_v22_with_behaviour_tree(objects, externals, &mono_behaviour_tree())
+    }
+
+    fn synthetic_v22_with_behaviour_tree(
+        objects: &[(i64, i32, Vec<u8>)],
+        externals: &[&str],
+        behaviour_tree: &[TestNode],
+    ) -> Vec<u8> {
         let mut metadata = Vec::new();
         metadata.extend_from_slice(b"2022.3.62f1\0");
         metadata.extend_from_slice(&13_i32.to_le_bytes());
         metadata.push(1);
         metadata.extend_from_slice(&2_i32.to_le_bytes());
-        push_type(&mut metadata, MONO_BEHAVIOUR_CLASS_ID, true);
-        push_type(&mut metadata, MONO_SCRIPT_CLASS_ID, false);
+        push_type(&mut metadata, MONO_BEHAVIOUR_CLASS_ID, Some(behaviour_tree));
+        push_type(&mut metadata, MONO_SCRIPT_CLASS_ID, None);
 
         metadata.extend_from_slice(&i32::try_from(objects.len()).unwrap().to_le_bytes());
         let mut data = Vec::new();
@@ -959,7 +1033,8 @@ mod tests {
         output
     }
 
-    fn push_type(output: &mut Vec<u8>, class_id: i32, behaviour: bool) {
+    fn push_type(output: &mut Vec<u8>, class_id: i32, behaviour_tree: Option<&[TestNode]>) {
+        let behaviour = behaviour_tree.is_some();
         output.extend_from_slice(&class_id.to_le_bytes());
         output.push(0);
         output.extend_from_slice(&(-1_i16).to_le_bytes());
@@ -967,8 +1042,8 @@ mod tests {
             output.extend_from_slice(&[0x11; 16]);
         }
         output.extend_from_slice(&[0x22; 16]);
-        if behaviour {
-            push_blob_tree(output, &mono_behaviour_tree());
+        if let Some(tree) = behaviour_tree {
+            push_blob_tree(output, tree);
         } else {
             output.extend_from_slice(&0_i32.to_le_bytes());
             output.extend_from_slice(&0_i32.to_le_bytes());
@@ -1012,6 +1087,31 @@ mod tests {
             node("Array", "Array", 2, true),
             node("int", "size", 3, false),
             node("char", "data", 3, false),
+            node("PPtr<MonoBehaviour>", "_moc", 1, false),
+            node("int", "m_FileID", 2, false),
+            node("SInt64", "m_PathID", 2, false),
+        ]
+    }
+
+    fn mono_behaviour_tree_with_noise() -> Vec<TestNode> {
+        vec![
+            node("MonoBehaviour", "Base", 0, false),
+            node("PPtr<GameObject>", "m_GameObject", 1, false),
+            node("int", "m_FileID", 2, false),
+            node("SInt64", "m_PathID", 2, false),
+            node("UInt8", "m_Enabled", 1, true),
+            node("PPtr<MonoScript>", "m_Script", 1, false),
+            node("int", "m_FileID", 2, false),
+            node("SInt64", "m_PathID", 2, false),
+            node("string", "m_Name", 1, false),
+            node("Array", "Array", 2, true),
+            node("int", "size", 3, false),
+            node("char", "data", 3, false),
+            node("vector", "m_Unrelated", 1, false),
+            node("Array", "Array", 2, false),
+            node("int", "size", 3, false),
+            node("Unrelated", "data", 3, false),
+            node("int", "unrelated_value", 4, false),
             node("PPtr<MonoBehaviour>", "_moc", 1, false),
             node("int", "m_FileID", 2, false),
             node("SInt64", "m_PathID", 2, false),
