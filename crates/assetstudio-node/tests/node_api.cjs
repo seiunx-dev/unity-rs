@@ -1684,6 +1684,15 @@ assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
     ),
     /byte budget/i,
   )
+  assert.throws(
+    () => modelStudio.readModelObj(
+      undefined,
+      128 * 1024,
+      'raw-rgba',
+      { maximumMetadataBytes: 7 },
+    ),
+    /metadata requires 8 UTF-8 bytes/i,
+  )
   const textureNameIndexBytes = Buffer.byteLength(rawModel.textures[0].fileName) * 2
   assert.throws(
     () => modelStudio.readModelObj(
@@ -1720,6 +1729,15 @@ assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
       { maximumNameIndexBytes: -1 },
     ),
     /maximumNameIndexBytes must be non-negative/i,
+  )
+  assert.throws(
+    () => modelStudio.readModelObj(
+      undefined,
+      128 * 1024,
+      'png',
+      { maximumMetadataBytes: -1 },
+    ),
+    /maximumMetadataBytes must be non-negative/i,
   )
 
   const texturedFbx = modelStudio.readFbxWithTextures(128 * 1024, 'TGA')

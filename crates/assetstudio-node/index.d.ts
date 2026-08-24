@@ -833,6 +833,7 @@ export interface ModelTextureLimits {
   maximumTextureReferences?: number
   maximumTextures?: number
   maximumNameIndexBytes?: number
+  maximumMetadataBytes?: number
   maximumTotalEncodedBytes?: number
   maximumSingleTextureBytes?: number
 }
