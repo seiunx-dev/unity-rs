@@ -1022,6 +1022,12 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   无效元素证明节点数闸门发生在元素转换之前，再把 Python 线程切换间隔提高到 1,000 秒，
   证明辅助线程在进入 Rust 构造器前没有运行，并要求它在 100,000 节点 schema 构造期间
   取得 GIL；release wheel、sdist、由 sdist 重建的 wheel 以及完整 API 测试均已通过。
+  macOS x64 / Python 3.14 的公开 runner 随后暴露了“只给辅助线程一次调度窗口”造成的偶发
+  误报；`3ca4c20` 把探针改为最多八个有界的 detached 构造窗口，同时继续把 Python 线程
+  切换间隔保持在 1,000 秒，因此真正持有 GIL 的实现仍无法通过，正确释放 GIL 的实现则不再
+  依赖单个操作系统调度瞬间。公开矩阵
+  [32760790292](https://github.com/Team-Haruki/unity-rs/actions/runs/32760790292) 已在六平台
+  Rust/Python/Node 作业中验证该探针；
   当前工作树随后执行 `tools/local_ci.py --fail-on-skip quality rust python node typing`
   全绿，零组跳过；
 - **Python 调用方列表与 ACL adapter 输出的前置预算已于 2026-08-22 收口**：继续扫
@@ -1311,9 +1317,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-25 最近一次绿色矩阵验证代码 head 为 `98a722b`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-25 最近一次绿色矩阵验证代码 head 为 `3ca4c20`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32758905875](https://github.com/Team-Haruki/unity-rs/actions/runs/32758905875) 16/16 全绿，
+[32760790292](https://github.com/Team-Haruki/unity-rs/actions/runs/32760790292) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
