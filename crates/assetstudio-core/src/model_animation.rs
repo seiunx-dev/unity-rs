@@ -32,6 +32,10 @@ pub struct ModelAnimationLimits {
     pub maximum_total_sample_values: usize,
     pub maximum_path_bytes: usize,
     pub maximum_path_hashes: usize,
+    /// Bytes available to the exact-key and suffix lookup indexes built over
+    /// materialized model paths. This is separate from the retained path
+    /// strings and bounds all auxiliary `Vec` storage before allocation.
+    pub maximum_path_index_bytes: usize,
     pub maximum_blend_shape_channels: usize,
     pub maximum_name_bytes: usize,
     pub maximum_total_string_bytes: usize,
@@ -48,6 +52,7 @@ impl Default for ModelAnimationLimits {
             maximum_total_sample_values: 128 * 1024 * 1024,
             maximum_path_bytes: 16 * 1024 * 1024,
             maximum_path_hashes: 10_000_000,
+            maximum_path_index_bytes: 256 * 1024 * 1024,
             maximum_blend_shape_channels: 10_000_000,
             maximum_name_bytes: 16 * 1024 * 1024,
             maximum_total_string_bytes: 256 * 1024 * 1024,
@@ -1708,8 +1713,43 @@ struct ModelPathEntry {
     path: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PathNameGroup {
+    name_entry_index: usize,
+    name_start: usize,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathSortRange {
+    start: usize,
+    end: usize,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PathRadixKey {
+    LeafName,
+    ReversedPath,
+}
+
+struct PathSuffixIndex {
+    /// Entry indexes ordered first by exact leaf name and then by the bytes of
+    /// the complete path in reverse order. A suffix therefore becomes one
+    /// contiguous prefix range without copying any reversed path strings.
+    reversed_entries: Vec<usize>,
+    name_groups: Vec<PathNameGroup>,
+    /// Iterative range-min tree over `reversed_entries`. Its value is the
+    /// smallest source traversal index, which preserves managed first-hit
+    /// behavior even though the lookup order is different.
+    range_minimums: Vec<usize>,
+}
+
 struct ModelPathIndex {
     entries: Vec<ModelPathEntry>,
+    entries_by_key: Vec<(SceneObjectKey, usize)>,
+    suffixes: PathSuffixIndex,
     hash_nodes: HashMap<u32, SceneObjectKey>,
     total_string_bytes: usize,
 }
@@ -1727,28 +1767,49 @@ impl ModelPathIndex {
         for root in &model.roots {
             builder.visit(*root, None)?;
         }
-        let hash_nodes = build_path_hash_index(&builder.entries, limits.maximum_path_hashes)?;
+        let path_hash_count = count_path_hashes(&builder.entries, limits.maximum_path_hashes)?;
+        let path_index_bytes = path_index_allocation_bytes(builder.entries.len())?;
+        if path_index_bytes > limits.maximum_path_index_bytes {
+            return Err(Error::invalid_data(format!(
+                "animation path indexes need {path_index_bytes} bytes, exceeding limit {}",
+                limits.maximum_path_index_bytes
+            )));
+        }
+        let entries_by_key = build_path_key_index(&builder.entries)?;
+        let suffixes = PathSuffixIndex::build(&builder.entries)?;
+        let hash_nodes = build_path_hash_index(&builder.entries, path_hash_count)?;
         Ok(Self {
             entries: builder.entries,
+            entries_by_key,
+            suffixes,
             hash_nodes,
             total_string_bytes: builder.total_bytes,
         })
     }
 
     fn path(&self, key: SceneObjectKey) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|entry| entry.key == key)
+        let position = self
+            .entries_by_key
+            .partition_point(|(candidate, _)| *candidate < key);
+        self.entries_by_key
+            .get(position)
+            .filter(|(candidate, _)| *candidate == key)
+            .and_then(|(_, entry_index)| self.entries.get(*entry_index))
             .map(|entry| entry.path.as_str())
     }
 
     fn resolve_suffix(&self, suffix: &str) -> Option<SceneObjectKey> {
-        let name = suffix.rsplit('/').next()?;
-        self.entries
-            .iter()
-            .find(|entry| {
-                entry.path.ends_with(suffix) && entry.path.rsplit('/').next() == Some(name)
-            })
+        self.resolve_suffix_counted(suffix, &mut 0)
+    }
+
+    fn resolve_suffix_counted(
+        &self,
+        suffix: &str,
+        comparisons: &mut usize,
+    ) -> Option<SceneObjectKey> {
+        self.suffixes
+            .resolve(&self.entries, suffix, comparisons)
+            .and_then(|entry_index| self.entries.get(entry_index))
             .map(|entry| entry.key)
     }
 
@@ -1766,10 +1827,309 @@ impl ModelPathIndex {
     }
 }
 
-fn build_path_hash_index(
+impl PathSuffixIndex {
+    fn build(entries: &[ModelPathEntry]) -> Result<Self> {
+        let count = entries.len();
+        let mut reversed_entries = Vec::new();
+        reversed_entries.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate animation reversed-path index: {error}"
+            ))
+        })?;
+        reversed_entries.extend(0..count);
+
+        let mut name_starts = Vec::new();
+        name_starts.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate animation path-name offsets: {error}"
+            ))
+        })?;
+        name_starts.extend(
+            entries
+                .iter()
+                .map(|entry| entry.path.rfind('/').map_or(0, |slash| slash + 1)),
+        );
+
+        let mut stack = Vec::new();
+        stack.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate animation path-index sort stack: {error}"
+            ))
+        })?;
+        radix_sort_path_entries(
+            &mut reversed_entries,
+            entries,
+            &name_starts,
+            PathRadixKey::LeafName,
+            &mut stack,
+        )?;
+
+        let mut name_groups = Vec::new();
+        name_groups.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate animation path-name groups: {error}"
+            ))
+        })?;
+        let mut start = 0_usize;
+        while start < count {
+            let name_entry_index = reversed_entries[start];
+            let name_start = name_starts[name_entry_index];
+            let name = &entries[name_entry_index].path[name_start..];
+            let mut end = start + 1;
+            while end < count {
+                let candidate_index = reversed_entries[end];
+                let candidate = &entries[candidate_index].path[name_starts[candidate_index]..];
+                if candidate != name {
+                    break;
+                }
+                end += 1;
+            }
+            radix_sort_path_entries(
+                &mut reversed_entries[start..end],
+                entries,
+                &name_starts,
+                PathRadixKey::ReversedPath,
+                &mut stack,
+            )?;
+            name_groups.push(PathNameGroup {
+                name_entry_index,
+                name_start,
+                start,
+                end,
+            });
+            start = end;
+        }
+
+        let tree_length = count
+            .checked_mul(2)
+            .ok_or_else(|| Error::invalid_data("animation suffix range index overflowed"))?;
+        let mut range_minimums = Vec::new();
+        range_minimums
+            .try_reserve_exact(tree_length)
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate animation suffix range index: {error}"
+                ))
+            })?;
+        range_minimums.resize(tree_length, usize::MAX);
+        for (position, entry_index) in reversed_entries.iter().copied().enumerate() {
+            range_minimums[count + position] = entry_index;
+        }
+        for index in (1..count).rev() {
+            range_minimums[index] = range_minimums[index * 2].min(range_minimums[index * 2 + 1]);
+        }
+
+        Ok(Self {
+            reversed_entries,
+            name_groups,
+            range_minimums,
+        })
+    }
+
+    fn resolve(
+        &self,
+        entries: &[ModelPathEntry],
+        suffix: &str,
+        comparisons: &mut usize,
+    ) -> Option<usize> {
+        let name = suffix.rsplit('/').next()?;
+        let group_position = self.name_groups.partition_point(|group| {
+            *comparisons = comparisons.saturating_add(1);
+            path_group_name(entries, group) < name
+        });
+        let group = self.name_groups.get(group_position)?;
+        *comparisons = comparisons.saturating_add(1);
+        if path_group_name(entries, group) != name {
+            return None;
+        }
+        let ordered = &self.reversed_entries[group.start..group.end];
+        let lower = ordered.partition_point(|entry_index| {
+            *comparisons = comparisons.saturating_add(1);
+            compare_reversed_path_prefix(&entries[*entry_index].path, suffix)
+                == std::cmp::Ordering::Less
+        });
+        let upper = ordered.partition_point(|entry_index| {
+            *comparisons = comparisons.saturating_add(1);
+            compare_reversed_path_prefix(&entries[*entry_index].path, suffix)
+                != std::cmp::Ordering::Greater
+        });
+        (lower < upper).then(|| self.range_min(group.start + lower, group.start + upper))
+    }
+
+    fn range_min(&self, mut start: usize, mut end: usize) -> usize {
+        let leaf_count = self.reversed_entries.len();
+        start += leaf_count;
+        end += leaf_count;
+        let mut minimum = usize::MAX;
+        while start < end {
+            if start & 1 != 0 {
+                minimum = minimum.min(self.range_minimums[start]);
+                start += 1;
+            }
+            if end & 1 != 0 {
+                end -= 1;
+                minimum = minimum.min(self.range_minimums[end]);
+            }
+            start /= 2;
+            end /= 2;
+        }
+        minimum
+    }
+}
+
+fn path_group_name<'a>(entries: &'a [ModelPathEntry], group: &PathNameGroup) -> &'a str {
+    &entries[group.name_entry_index].path[group.name_start..]
+}
+
+fn compare_reversed_path_prefix(path: &str, suffix: &str) -> std::cmp::Ordering {
+    let mut path = path.as_bytes().iter().rev();
+    for suffix_byte in suffix.as_bytes().iter().rev() {
+        let Some(path_byte) = path.next() else {
+            return std::cmp::Ordering::Less;
+        };
+        match path_byte.cmp(suffix_byte) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn build_path_key_index(entries: &[ModelPathEntry]) -> Result<Vec<(SceneObjectKey, usize)>> {
+    let mut index = Vec::new();
+    index.try_reserve_exact(entries.len()).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate animation path-key index: {error}"))
+    })?;
+    index.extend(
+        entries
+            .iter()
+            .enumerate()
+            .map(|(entry_index, entry)| (entry.key, entry_index)),
+    );
+    index.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    Ok(index)
+}
+
+fn path_index_allocation_bytes(count: usize) -> Result<usize> {
+    let range_entries = count
+        .checked_mul(2)
+        .ok_or_else(|| Error::invalid_data("animation path-index count overflowed"))?;
+    [
+        count
+            .checked_mul(std::mem::size_of::<(SceneObjectKey, usize)>())
+            .ok_or_else(|| Error::invalid_data("animation path-key index size overflowed"))?,
+        count
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| Error::invalid_data("animation reversed-path index size overflowed"))?,
+        count
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| Error::invalid_data("animation path-name offset size overflowed"))?,
+        count
+            .checked_mul(std::mem::size_of::<PathSortRange>())
+            .ok_or_else(|| Error::invalid_data("animation path-sort stack size overflowed"))?,
+        count
+            .checked_mul(std::mem::size_of::<PathNameGroup>())
+            .ok_or_else(|| Error::invalid_data("animation path-name group size overflowed"))?,
+        range_entries
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| Error::invalid_data("animation suffix range index size overflowed"))?,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| Error::invalid_data("animation path-index byte budget overflowed"))
+    })
+}
+
+fn radix_sort_path_entries(
+    indices: &mut [usize],
     entries: &[ModelPathEntry],
-    maximum: usize,
-) -> Result<HashMap<u32, SceneObjectKey>> {
+    name_starts: &[usize],
+    key: PathRadixKey,
+    stack: &mut Vec<PathSortRange>,
+) -> Result<()> {
+    const BUCKETS: usize = 257;
+    stack.clear();
+    if indices.len() > 1 {
+        stack.push(PathSortRange {
+            start: 0,
+            end: indices.len(),
+            depth: 0,
+        });
+    }
+    while let Some(range) = stack.pop() {
+        let mut counts = [0_usize; BUCKETS];
+        for entry_index in &indices[range.start..range.end] {
+            let bucket = path_radix_bucket(entries, name_starts, *entry_index, range.depth, key);
+            counts[bucket] += 1;
+        }
+        let mut starts = [0_usize; BUCKETS];
+        let mut ends = [0_usize; BUCKETS];
+        let mut cursor = range.start;
+        for bucket in 0..BUCKETS {
+            starts[bucket] = cursor;
+            cursor = cursor.checked_add(counts[bucket]).ok_or_else(|| {
+                Error::invalid_data("animation path radix bucket range overflowed")
+            })?;
+            ends[bucket] = cursor;
+        }
+        let mut next = starts;
+        for bucket in 0..BUCKETS {
+            while next[bucket] < ends[bucket] {
+                let position = next[bucket];
+                let current =
+                    path_radix_bucket(entries, name_starts, indices[position], range.depth, key);
+                if current == bucket {
+                    next[bucket] += 1;
+                } else {
+                    let target = next[current];
+                    if target >= ends[current] {
+                        return Err(Error::invalid_data(
+                            "animation path radix distribution became inconsistent",
+                        ));
+                    }
+                    indices.swap(position, target);
+                    next[current] += 1;
+                }
+            }
+        }
+        for bucket in (1..BUCKETS).rev() {
+            if ends[bucket] - starts[bucket] > 1 {
+                stack.push(PathSortRange {
+                    start: starts[bucket],
+                    end: ends[bucket],
+                    depth: range.depth.checked_add(1).ok_or_else(|| {
+                        Error::invalid_data("animation path radix depth overflowed")
+                    })?,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_radix_bucket(
+    entries: &[ModelPathEntry],
+    name_starts: &[usize],
+    entry_index: usize,
+    depth: usize,
+    key: PathRadixKey,
+) -> usize {
+    let bytes = entries[entry_index].path.as_bytes();
+    let byte = match key {
+        PathRadixKey::LeafName => name_starts[entry_index]
+            .checked_add(depth)
+            .and_then(|index| bytes.get(index)),
+        PathRadixKey::ReversedPath => depth
+            .checked_add(1)
+            .and_then(|consumed| bytes.len().checked_sub(consumed))
+            .and_then(|index| bytes.get(index)),
+    };
+    byte.map_or(0, |byte| usize::from(*byte) + 1)
+}
+
+fn count_path_hashes(entries: &[ModelPathEntry], maximum: usize) -> Result<usize> {
     let mut count = 0_usize;
     for entry in entries {
         count = count
@@ -1781,6 +2141,13 @@ fn build_path_hash_index(
             )));
         }
     }
+    Ok(count)
+}
+
+fn build_path_hash_index(
+    entries: &[ModelPathEntry],
+    count: usize,
+) -> Result<HashMap<u32, SceneObjectKey>> {
     let mut output = HashMap::new();
     output.try_reserve(count).map_err(|error| {
         Error::invalid_data(format!("cannot allocate animation path hashes: {error}"))
@@ -1925,16 +2292,23 @@ mod tests {
 
     use super::{
         AnimationBuildState, BindingLayout, BlendShapeIndex, CurveBuildContext,
-        ExplicitCurveSlices, ModelAnimationLimits, ModelPathIndex, MuscleBuildContext,
-        append_bound_sample, append_compressed_quaternion_keys, blend_shape_crc32,
-        convert_explicit_blend_shapes, convert_explicit_curve_slices, convert_muscle_clip,
-        convert_muscle_clip_with_acl, join_legacy_path, select_clips, unity_crc32,
+        ExplicitCurveSlices, ModelAnimationLimits, ModelPathEntry, ModelPathIndex,
+        MuscleBuildContext, PathSuffixIndex, append_bound_sample,
+        append_compressed_quaternion_keys, blend_shape_crc32, convert_explicit_blend_shapes,
+        convert_explicit_curve_slices, convert_muscle_clip, convert_muscle_clip_with_acl,
+        join_legacy_path, path_index_allocation_bytes, select_clips, unity_crc32,
     };
 
     #[test]
     fn animation_state_rejects_combined_string_budget_overflow() {
         let paths = ModelPathIndex {
             entries: Vec::new(),
+            entries_by_key: Vec::new(),
+            suffixes: PathSuffixIndex {
+                reversed_entries: Vec::new(),
+                name_groups: Vec::new(),
+                range_minimums: Vec::new(),
+            },
             hash_nodes: HashMap::new(),
             total_string_bytes: usize::MAX,
         };
@@ -2055,6 +2429,116 @@ mod tests {
         );
         assert_eq!(total_tracks, 1);
         assert_eq!(total_keyframes, 4);
+    }
+
+    #[test]
+    fn suffix_index_matches_linear_first_hit_for_all_utf8_suffixes() {
+        let paths = [
+            "Root/Arm",
+            "Root/Charm",
+            "Other/Body/Arm",
+            "Root/目录/臂",
+            "Root/Body/Arm",
+            "Root/Body/Arm",
+            "Root/",
+            "",
+        ];
+        let entries = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| ModelPathEntry {
+                key: key(i64::try_from(index + 1).unwrap()),
+                path: (*path).to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let index = PathSuffixIndex::build(&entries).unwrap();
+        let mut suffixes = vec!["rm", "Arm", "dy/Arm", "不存在", ""];
+        for path in paths {
+            suffixes.extend(
+                path.char_indices()
+                    .map(|(offset, _)| &path[offset..])
+                    .chain(std::iter::once(&path[path.len()..])),
+            );
+        }
+        for suffix in suffixes {
+            let name = suffix.rsplit('/').next().unwrap();
+            let expected = entries.iter().position(|entry| {
+                entry.path.ends_with(suffix)
+                    && entry
+                        .path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|leaf| leaf == name)
+            });
+            let mut comparisons = 0;
+            assert_eq!(
+                index.resolve(&entries, suffix, &mut comparisons),
+                expected,
+                "suffix {suffix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexes_many_same_leaf_paths_without_scanning_the_model_per_query() {
+        const BRANCHES: usize = 8_192;
+        let model = repeated_leaf_model(BRANCHES);
+        let paths = ModelPathIndex::build(&model, &ModelAnimationLimits::default()).unwrap();
+        let last_path_id = i64::try_from(3 + (BRANCHES - 1) * 2).unwrap();
+        assert_eq!(paths.path(key(last_path_id)), Some("Root/Branch08191/Arm"));
+
+        let mut comparisons = 0;
+        assert_eq!(
+            paths.resolve_suffix_counted("Arm", &mut comparisons),
+            Some(key(3))
+        );
+        assert!(comparisons < 128, "{comparisons} indexed comparisons");
+
+        comparisons = 0;
+        assert_eq!(
+            paths.resolve_suffix_counted("ch08191/Arm", &mut comparisons),
+            Some(key(last_path_id)),
+            "mid-component suffixes are part of the managed EndsWith contract"
+        );
+        assert!(comparisons < 128, "{comparisons} indexed comparisons");
+        assert_eq!(paths.resolve_suffix("rm"), None, "leaf names are exact");
+    }
+
+    #[test]
+    fn rejects_path_lookup_index_storage_before_allocation() {
+        let model = model_fixture();
+        let required = path_index_allocation_bytes(model.nodes.len()).unwrap();
+        let hash_error = match ModelPathIndex::build(
+            &model,
+            &ModelAnimationLimits {
+                maximum_path_hashes: 1,
+                maximum_path_index_bytes: 0,
+                ..ModelAnimationLimits::default()
+            },
+        ) {
+            Ok(_) => panic!("path hashes unexpectedly fit below their declared count"),
+            Err(error) => error,
+        };
+        assert!(
+            hash_error
+                .to_string()
+                .contains("path hashes exceed limit 1"),
+            "{hash_error}"
+        );
+        let mut limits = ModelAnimationLimits {
+            maximum_path_index_bytes: required - 1,
+            ..ModelAnimationLimits::default()
+        };
+        let error = match ModelPathIndex::build(&model, &limits) {
+            Ok(_) => panic!("path index unexpectedly fit below its exact storage requirement"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("animation path indexes need"),
+            "{error}"
+        );
+        limits.maximum_path_index_bytes = required;
+        ModelPathIndex::build(&model, &limits).unwrap();
     }
 
     #[test]
@@ -2698,6 +3182,49 @@ mod tests {
             },
         };
         ModelIr::from_test_parts(nodes, vec![key(1)], vec![mesh], Vec::new())
+    }
+
+    fn repeated_leaf_model(branches: usize) -> ModelIr {
+        let mut root_children = Vec::with_capacity(branches);
+        let mut nodes = Vec::with_capacity(1 + branches * 2);
+        for index in 0..branches {
+            root_children.push(key(i64::try_from(2 + index * 2).unwrap()));
+        }
+        nodes.push(ModelNode {
+            object: key(1),
+            name: "Root".to_owned(),
+            export_content: true,
+            parent: None,
+            children: root_children,
+            transform: None,
+            renderers: Vec::new(),
+            animator: None,
+        });
+        for index in 0..branches {
+            let branch = key(i64::try_from(2 + index * 2).unwrap());
+            let leaf = key(i64::try_from(3 + index * 2).unwrap());
+            nodes.push(ModelNode {
+                object: branch,
+                name: format!("Branch{index:05}"),
+                export_content: true,
+                parent: Some(key(1)),
+                children: vec![leaf],
+                transform: None,
+                renderers: Vec::new(),
+                animator: None,
+            });
+            nodes.push(ModelNode {
+                object: leaf,
+                name: "Arm".to_owned(),
+                export_content: true,
+                parent: Some(branch),
+                children: Vec::new(),
+                transform: None,
+                renderers: Vec::new(),
+                animator: None,
+            });
+        }
+        ModelIr::from_test_parts(nodes, vec![key(1)], Vec::new(), Vec::new())
     }
 
     fn model_fixture() -> ModelIr {
