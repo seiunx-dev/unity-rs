@@ -27,6 +27,8 @@ const AVATAR_CLASS_ID: i32 = 90;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnimationGraphLimits {
     pub maximum_animator_bindings: usize,
+    /// Maximum bytes retained by the sorted `GameObject` to Animator index.
+    pub maximum_animator_index_bytes: usize,
     pub maximum_legacy_animations: usize,
     pub maximum_controllers: usize,
     pub maximum_clips: usize,
@@ -41,6 +43,7 @@ impl Default for AnimationGraphLimits {
     fn default() -> Self {
         Self {
             maximum_animator_bindings: 1_000_000,
+            maximum_animator_index_bytes: 64 * 1024 * 1024,
             maximum_legacy_animations: 1_000_000,
             maximum_controllers: 1_000_000,
             maximum_clips: 2_000_000,
@@ -109,11 +112,18 @@ pub struct AnimationGraph {
     pub legacy_animations: Vec<LegacyAnimationBinding>,
     pub controllers: Vec<AnimationControllerNode>,
     pub clips: Vec<AnimationClipNode>,
+    animator_index: Vec<(SceneObjectKey, usize)>,
     controller_index: BTreeMap<SceneObjectKey, usize>,
     clip_index: BTreeMap<SceneObjectKey, usize>,
 }
 
 impl AnimationGraph {
+    #[must_use]
+    pub fn animator(&self, game_object: SceneObjectKey) -> Option<&AnimatorAnimationBinding> {
+        animator_index_position(&self.animator_index, game_object)
+            .and_then(|index| self.animators.get(index))
+    }
+
     #[must_use]
     pub fn controller(&self, key: SceneObjectKey) -> Option<&AnimationControllerNode> {
         self.controller_index
@@ -133,11 +143,14 @@ impl AnimationGraph {
         animators: Vec<AnimatorAnimationBinding>,
         legacy_animations: Vec<LegacyAnimationBinding>,
     ) -> Self {
+        let animator_index = build_animator_index(&animators, usize::MAX)
+            .expect("test Animator bindings should fit their lookup index");
         Self {
             animators,
             legacy_animations,
             controllers: Vec::new(),
             clips: Vec::new(),
+            animator_index,
             controller_index: BTreeMap::new(),
             clip_index: BTreeMap::new(),
         }
@@ -155,7 +168,7 @@ pub fn build_animation_graph(
     state.collect_legacy_animations()?;
     state.read_pending_controllers()?;
     state.attach_managed_bound_clips();
-    Ok(state.finish())
+    state.finish()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -534,16 +547,63 @@ impl<'a> GraphBuildState<'a> {
         Ok(())
     }
 
-    fn finish(self) -> AnimationGraph {
-        AnimationGraph {
+    fn finish(self) -> Result<AnimationGraph> {
+        let animator_index =
+            build_animator_index(&self.animators, self.limits.maximum_animator_index_bytes)?;
+        Ok(AnimationGraph {
             animators: self.animators,
             legacy_animations: self.legacy_animations,
             controllers: self.controllers,
             clips: self.clips,
+            animator_index,
             controller_index: self.controller_index,
             clip_index: self.clip_index,
-        }
+        })
     }
+}
+
+fn build_animator_index(
+    animators: &[AnimatorAnimationBinding],
+    maximum_bytes: usize,
+) -> Result<Vec<(SceneObjectKey, usize)>> {
+    let required = animators
+        .len()
+        .checked_mul(std::mem::size_of::<(SceneObjectKey, usize)>())
+        .ok_or_else(|| Error::invalid_data("Animator lookup index size overflowed"))?;
+    if required > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "Animator lookup index requires {required} bytes, limit is {maximum_bytes}"
+        )));
+    }
+    let mut index = reserve_vec(animators.len(), "Animator lookup entries")?;
+    index.extend(
+        animators
+            .iter()
+            .enumerate()
+            .map(|(source_index, binding)| (binding.game_object, source_index)),
+    );
+    index.sort_unstable_by_key(|(game_object, source_index)| (*game_object, *source_index));
+    Ok(index)
+}
+
+fn animator_index_position(
+    index: &[(SceneObjectKey, usize)],
+    game_object: SceneObjectKey,
+) -> Option<usize> {
+    animator_index_position_with_probe(index, game_object, || {})
+}
+
+fn animator_index_position_with_probe(
+    index: &[(SceneObjectKey, usize)],
+    game_object: SceneObjectKey,
+    mut probe: impl FnMut(),
+) -> Option<usize> {
+    let position = index.partition_point(|(candidate, _)| {
+        probe();
+        *candidate < game_object
+    });
+    let &(candidate, source_index) = index.get(position)?;
+    (candidate == game_object).then_some(source_index)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -582,14 +642,15 @@ fn reserve_vec<T>(length: usize, field: &str) -> Result<Vec<T>> {
 mod tests {
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::scene::{ANIMATOR_CLASS_ID, GAME_OBJECT_CLASS_ID};
-    use crate::scene_hierarchy::{SceneHierarchyLimits, build_scene_hierarchy};
+    use crate::scene_hierarchy::{SceneHierarchyLimits, SceneObjectKey, build_scene_hierarchy};
     use crate::serialized::SerializedFile;
     use crate::source::Region;
 
     use super::{
         ANIMATION_CLASS_ID, ANIMATION_CLIP_CLASS_ID, ANIMATOR_CONTROLLER_CLASS_ID,
         ANIMATOR_OVERRIDE_CONTROLLER_CLASS_ID, AnimationControllerKind, AnimationGraphLimits,
-        build_animation_graph,
+        AnimatorAnimationBinding, animator_index_position, animator_index_position_with_probe,
+        build_animation_graph, build_animator_index,
     };
 
     #[test]
@@ -605,6 +666,17 @@ mod tests {
         assert_eq!(graph.animators[0].game_object.path_id, 1);
         assert_eq!(graph.animators[0].animator.path_id, 2);
         assert_eq!(graph.animators[0].controller.unwrap().path_id, 5);
+        assert_eq!(
+            graph
+                .animator(SceneObjectKey {
+                    file_index: 0,
+                    path_id: 1,
+                })
+                .unwrap()
+                .animator
+                .path_id,
+            2
+        );
         assert_eq!(
             graph.animators[0]
                 .bound_clips
@@ -654,6 +726,76 @@ mod tests {
     }
 
     #[test]
+    fn animator_index_preserves_first_duplicate_with_logarithmic_queries() {
+        const ENTRY_COUNT: usize = 16_384;
+        let mut animators: Vec<_> = (0..ENTRY_COUNT)
+            .map(|source_index| {
+                let path_id = i64::try_from(ENTRY_COUNT - source_index).unwrap();
+                test_animator_binding(path_id)
+            })
+            .collect();
+        let target = SceneObjectKey {
+            file_index: 0,
+            path_id: 7,
+        };
+        let first_source_index = ENTRY_COUNT - 7;
+        animators.push(test_animator_binding(target.path_id));
+        let exact = animators
+            .len()
+            .checked_mul(std::mem::size_of::<(SceneObjectKey, usize)>())
+            .unwrap();
+        let index = build_animator_index(&animators, exact).unwrap();
+
+        assert_eq!(
+            animator_index_position(&index, target),
+            Some(first_source_index)
+        );
+        assert_eq!(
+            animator_index_position(
+                &index,
+                SceneObjectKey {
+                    file_index: 1,
+                    path_id: 7,
+                }
+            ),
+            None
+        );
+
+        let mut comparisons = 0_usize;
+        for _ in 0..ENTRY_COUNT {
+            assert_eq!(
+                animator_index_position_with_probe(&index, target, || comparisons += 1),
+                Some(first_source_index)
+            );
+        }
+        assert!(comparisons < ENTRY_COUNT * 20, "{comparisons}");
+    }
+
+    #[test]
+    fn animator_index_budget_rejects_one_byte_before_allocation() {
+        let animators = [test_animator_binding(1)];
+        let exact = std::mem::size_of::<(SceneObjectKey, usize)>();
+
+        build_animator_index(&animators, exact).unwrap();
+        let error = build_animator_index(&animators, exact - 1).unwrap_err();
+        assert!(error.to_string().contains("Animator lookup index requires"));
+    }
+
+    fn test_animator_binding(path_id: i64) -> AnimatorAnimationBinding {
+        let game_object = SceneObjectKey {
+            file_index: 0,
+            path_id,
+        };
+        AnimatorAnimationBinding {
+            game_object,
+            animator: game_object,
+            avatar: None,
+            controller: None,
+            bound_clips: Vec::new(),
+        }
+    }
+
+    #[test]
     fn applies_try_get_semantics_but_rejects_resolved_corruption_and_budgets() {
         let missing = fixture_collection(true, false);
         let hierarchy = build_scene_hierarchy(&missing, SceneHierarchyLimits::default()).unwrap();
@@ -666,6 +808,10 @@ mod tests {
         let hierarchy =
             build_scene_hierarchy(&collection, SceneHierarchyLimits::default()).unwrap();
         for limits in [
+            AnimationGraphLimits {
+                maximum_animator_index_bytes: 0,
+                ..AnimationGraphLimits::default()
+            },
             AnimationGraphLimits {
                 maximum_edges: 1,
                 ..AnimationGraphLimits::default()

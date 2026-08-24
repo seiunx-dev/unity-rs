@@ -2351,11 +2351,7 @@ impl<'a> PackageState<'a> {
             .animation_graph
             .as_ref()
             .expect("animation graph was initialized");
-        let Some(binding) = graph
-            .animators
-            .iter()
-            .find(|binding| binding.game_object == game_object)
-        else {
+        let Some(binding) = graph.animator(game_object) else {
             return Ok(Vec::new());
         };
         let mut keys = Vec::new();
