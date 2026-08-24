@@ -924,7 +924,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - **MPEG/Opus 的全零 fixture 已换成真实音频（2026-08-15）**：此前两边比的都是静音，解码器无论怎么处理比特两边都会一致地得到零，等于只验证了分帧。现在各自嵌入一段真实编码的正弦——MPEG 是 6 帧 MP3，Opus 是 libopus 编的 6 个包（FSB5 的 MPEG 帧按 4 字节对齐、Opus 包带 u16 长度前缀并以零长度收尾，这两条框架细节也因此第一次被真实数据验证）。MPEG 换成有内容之后仍然对得上，容差 1（实测得来，不是猜的）。
    - **FSB5 multistream MPEG 已完成（2026-08-24）**：总声道数大于 2 时，FSB 不是把一个 MPEG frame 扩成任意多声道，而是把若干个独立的 1/2 声道码流按帧交织；每个 frame 的槽位从 4 字节对齐扩大到 16 字节。实现为每条码流保留独立的 Symphonia decoder 状态，逐帧同步后再按原声道顺序重组 PCM，最多 16 声道（与固定 oracle 的验证范围一致）；输出和 scratch 都在写入前做 checked/bounded/fallible 分配。新增的 6 声道 fixture 由三组不同频率的 stereo CBR MP3 组成，六个声道可观测地互不相同，公开 CI 用固定 `vgmstream r2117` 逐样本比较，最大差仍只有 Layer III 已测得的 1。另有回归拒绝截断 block、内部码流声道不一致、frame span 变化和超过验证上限，不会用补零伪装损坏流。
    - **FSB5 multistream Opus 已完成（2026-08-24）**：FSB 省略标准 `OpusHead`，实现现按 mapping family 1 的标准表恢复 1–8 声道对应的 stream/coupled 数、self-delimited elementary stream framing 与 WAVE 声道顺序，mono/stereo 也统一走同一个纯 Rust multistream decoder。新的六声道 fixture 是 330/440/550/660/770/880 Hz 六个可区分信号，原始 Ogg 保留权威的 `OpusHead`，FSB fixture 则只复用同一批音频包，因此 oracle 不是拿两份同一假设生成的 FSB 头互相印证。常规回归锁定 5,760 帧、六个非静音且互异声道、输出预算、伪造普通 stereo packet、stream duration 不一致、截断与九声道拒绝；固定 `vgmstream r2117` 解原始 Ogg 后与 Rust 解 FSB 的完整输出逐样本比较，实测最大 PCM16 差为 4。Core 当前 553 项常规测试与 11 项音频 oracle 全绿，`tools/local_ci.py --fail-on-skip quality rust audio` 全部通过、零跳过。现剩余音频缺口是没有可验证纯 Rust decoder 的平台 codec，不再包括标准 multistream Opus。
-   - **FSB5 multichannel Vorbis 的声道顺序已修正（2026-08-24）**：reader 早已声明接受 1–8 声道，却只有 stereo fixture；`lewton` 返回 Vorbis I 的 speaker order，旧 writer 直接按该顺序交织进 WAVE。新的 6 声道 32 kHz fixture 由 `oggenc 1.4.3`/`libvorbis 1.3.7` 编码六个不同频率，setup CRC `0x6aad13bc` 本来就在 161 项 FMOD 字典里，不为测试扩充生产 header 表；原始 Ogg 与 FSB 复用完全相同的 audio packets。首次把 Rust FSB 输出和固定 `vgmstream r2117` 的 Ogg 输出逐样本比较，长度正确但最大差 8,396，实证不是 decoder 精度而是 FC/FR/LFE/rear channel 排列错误。writer 现按标准 1–8 声道 Vorbis→WAVE 表重排，完整六声道输出最大差回到独立 decoder 的实测 1；常规测试另锁定 3,840 帧和六个互异信号。Core 当前 554 项常规测试、12 项音频 oracle 全绿。
+   - **FSB5 multichannel Vorbis 的声道顺序已修正并逐布局验收（2026-08-24）**：reader 早已声明接受 1–8 声道，却只有 stereo fixture；`lewton` 返回 Vorbis I 的 speaker order，旧 writer 直接按该顺序交织进 WAVE。先加入的 6 声道 32 kHz fixture 使用 setup CRC `0x6aad13bc`（本来就在 161 项 FMOD 字典里，不为测试扩充生产 header 表），原始 Ogg 与 FSB 复用完全相同的 audio packets。首次把 Rust FSB 输出和固定 `vgmstream r2117` 的 Ogg 输出逐样本比较，长度正确但最大差 8,396，实证不是 decoder 精度而是 FC/FR/LFE/rear channel 排列错误。writer 按标准 1–8 声道 Vorbis→WAVE 表重排后，六声道最大差回到 1；随后又把 3、4、5、7、8 声道全部做成同样的真实 Ogg/FSB 对，每个布局都由独立 decoder 的 channel mask 定义顺序，完整 PCM16 最大差均不超过 1。生成器直接用 Python 标准库写确定性的整数 PCM，不依赖平台浮点正弦或 FFmpeg 的 channel remap；逐声道 hash 还实际抓住并拒绝过一版把四声道后两路复制成相同信号的 `amerge` 生成链。连续两次生成的整个 fixture 目录逐字节一致。Core 当前 554 项常规测试、12 项音频 oracle 全绿。
    - **Opus 偏离已定位到上游 `ruopus` 0.1.2 的 SILK 路径（2026-08-15）**：换成有内容 fixture 后先暴露出偏离，再把它从本项目的 FSB5 代码里摘出来复现——直接把同一批包喂给解码器、按流自己声明的 pre-skip 裁掉前导，不经过本项目任何一行代码，偏离照旧；而 `ffmpeg` 与 `vgmstream` 两个 libopus 实现彼此差 1 以内。分模式实测（峰值都在 4200 附近）：
 
      | 包模式 | 偏移 | 最大差 |
@@ -989,9 +989,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-24 的绿色矩阵验证代码 head 为 `a07642e`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `1c12d98`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32659993206](https://github.com/Team-Haruki/unity-rs/actions/runs/32659993206) 16/16 全绿，
+[32681007265](https://github.com/Team-Haruki/unity-rs/actions/runs/32681007265) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 

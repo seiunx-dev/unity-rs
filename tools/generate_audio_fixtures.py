@@ -29,8 +29,10 @@ Usage, from the repository root, with `ffmpeg` (built with libopus), `lame`, and
 from __future__ import annotations
 
 import subprocess
+import struct
 import sys
 import tempfile
+import wave
 import zlib
 from pathlib import Path
 
@@ -65,11 +67,11 @@ MPEG_MULTISTREAM_PAIRS = ((330, 440), (550, 660), (770, 880))
 OPUS_MULTISTREAM_FSB_NAME = "fsb5-opus-celt-6ch.fsb"
 OPUS_MULTISTREAM_OGG_NAME = "opus-celt-6ch.ogg"
 OPUS_MULTISTREAM_FREQUENCIES = (330, 440, 550, 660, 770, 880)
-VORBIS_MULTISTREAM_FSB_NAME = "fsb5-vorbis-6ch.fsb"
-VORBIS_MULTISTREAM_OGG_NAME = "vorbis-6ch.ogg"
-VORBIS_MULTISTREAM_FREQUENCIES = OPUS_MULTISTREAM_FREQUENCIES
-VORBIS_MULTISTREAM_SAMPLE_RATE = 32_000
-VORBIS_MULTISTREAM_SETUP_CRC = 0x6AAD13BC
+VORBIS_SURROUND_CHANNEL_COUNTS = (3, 4, 5, 6, 7, 8)
+VORBIS_SURROUND_PHASE_STEPS = (83, 97, 109, 127, 149, 167, 181, 199)
+VORBIS_SURROUND_FRAMES = 3_840
+VORBIS_SURROUND_SAMPLE_RATE = 32_000
+VORBIS_SURROUND_SETUP_CRC = 0x6AAD13BC
 
 
 def run(command: list[str]) -> None:
@@ -315,82 +317,80 @@ def generate_multistream_opus(work: Path) -> None:
     )
 
 
-def generate_multistream_vorbis(work: Path) -> None:
-    """Builds a six-channel FSB5 from a standard libvorbis stream."""
-    wave = work / "vorbis-6ch.wav"
-    ogg = work / VORBIS_MULTISTREAM_OGG_NAME
-    command = ["ffmpeg", "-v", "error", "-y"]
-    for frequency in VORBIS_MULTISTREAM_FREQUENCIES:
-        command.extend(
+def generate_surround_vorbis(work: Path) -> None:
+    """Builds 3-8 channel FSB5 files from standard libvorbis streams."""
+    for channels in VORBIS_SURROUND_CHANNEL_COUNTS:
+        fsb_name = f"fsb5-vorbis-{channels}ch.fsb"
+        ogg_name = f"vorbis-{channels}ch.ogg"
+        wave_path = work / f"vorbis-{channels}ch.wav"
+        ogg = work / ogg_name
+        pcm = bytearray(VORBIS_SURROUND_FRAMES * channels * 2)
+        cursor = 0
+        for frame in range(VORBIS_SURROUND_FRAMES):
+            for phase_step in VORBIS_SURROUND_PHASE_STEPS[:channels]:
+                sample = (frame * phase_step) % 8_001 - 4_000
+                struct.pack_into("<h", pcm, cursor, sample)
+                cursor += 2
+        with wave.open(str(wave_path), "wb") as output:
+            output.setnchannels(channels)
+            output.setsampwidth(2)
+            output.setframerate(VORBIS_SURROUND_SAMPLE_RATE)
+            output.writeframes(pcm)
+        run(
             [
-                "-f", "lavfi", "-i",
-                (
-                    f"sine=frequency={frequency}:"
-                    f"sample_rate={VORBIS_MULTISTREAM_SAMPLE_RATE}:duration=0.12"
-                ),
+                "oggenc", "--quiet", "--serial", "1", "--discard-comments",
+                "--quality", "4", "--output", str(ogg), str(wave_path),
             ]
         )
-    inputs = "".join(f"[{index}:a]" for index in range(6))
-    command.extend(
-        [
-            "-filter_complex", f"{inputs}amerge=inputs=6[a]",
-            "-map", "[a]", "-ac", "6", "-channel_layout", "5.1",
-            "-c:a", "pcm_s16le", str(wave),
-        ]
-    )
-    run(command)
-    run(
-        [
-            "oggenc", "--quiet", "--serial", "1", "--discard-comments",
-            "--quality", "4",
-            "--output", str(ogg), str(wave),
-        ]
-    )
-    packets = ogg_packets(ogg)
-    identification, setup, audio = packets[0], packets[2], packets[3:]
-    if (
-        not identification.startswith(b"\x01vorbis")
-        or len(identification) != 30
-        or identification[11] != 6
-        or int.from_bytes(identification[12:16], "little")
-        != VORBIS_MULTISTREAM_SAMPLE_RATE
-    ):
-        raise ValueError("unexpected six-channel Vorbis identification header")
-    setup_crc = zlib.crc32(setup) & 0xFFFF_FFFF
-    if setup_crc != VORBIS_MULTISTREAM_SETUP_CRC:
-        raise ValueError(
-            f"six-channel Vorbis setup CRC is {setup_crc:08x}, "
-            f"expected {VORBIS_MULTISTREAM_SETUP_CRC:08x}"
+        packets = ogg_packets(ogg)
+        identification, setup, audio = packets[0], packets[2], packets[3:]
+        if (
+            not identification.startswith(b"\x01vorbis")
+            or len(identification) != 30
+            or identification[11] != channels
+            or int.from_bytes(identification[12:16], "little")
+            != VORBIS_SURROUND_SAMPLE_RATE
+        ):
+            raise ValueError(
+                f"unexpected {channels}-channel Vorbis identification header"
+            )
+        setup_crc = zlib.crc32(setup) & 0xFFFF_FFFF
+        if setup_crc != VORBIS_SURROUND_SETUP_CRC:
+            raise ValueError(
+                f"{channels}-channel Vorbis setup CRC is {setup_crc:08x}, "
+                f"expected {VORBIS_SURROUND_SETUP_CRC:08x}"
+            )
+        frame_count = ogg_last_granule(ogg)
+        if frame_count <= 0:
+            raise ValueError(f"{channels}-channel Vorbis stream has no sample frames")
+        data = b"".join(
+            len(packet).to_bytes(2, "little") + packet for packet in audio
+        ) + b"\0\0"
+        channel_code = {6: 2, 8: 3}.get(channels, 0)
+        sample_mode = (frame_count << 34) | (channel_code << 5) | (7 << 1) | 1
+        metadata = bytearray()
+        if channels not in (1, 2, 6, 8):
+            channel_header = (1 << 25) | (1 << 1) | 1
+            metadata.extend(channel_header.to_bytes(4, "little"))
+            metadata.append(channels)
+        vorbis_header = (11 << 25) | (8 << 1)
+        metadata.extend(vorbis_header.to_bytes(4, "little"))
+        metadata.extend(setup_crc.to_bytes(4, "little"))
+        metadata.extend(b"\0\0\0\0")
+        sample_headers = sample_mode.to_bytes(8, "little") + metadata
+        header = bytearray(0x3C)
+        header[:4] = b"FSB5"
+        header[4:8] = (1).to_bytes(4, "little")
+        header[8:12] = (1).to_bytes(4, "little")
+        header[12:16] = len(sample_headers).to_bytes(4, "little")
+        header[20:24] = len(data).to_bytes(4, "little")
+        header[24:28] = (15).to_bytes(4, "little")
+        (FIXTURES / fsb_name).write_bytes(header + sample_headers + data)
+        (FIXTURES / ogg_name).write_bytes(ogg.read_bytes())
+        print(
+            f"wrote {fsb_name} and {ogg_name}: {len(audio)} packets, "
+            f"{frame_count} frames"
         )
-    frame_count = ogg_last_granule(ogg)
-    if frame_count <= 0:
-        raise ValueError("six-channel Vorbis stream has no sample frames")
-    data = b"".join(len(packet).to_bytes(2, "little") + packet for packet in audio)
-    data += b"\0\0"
-    sample_mode = (frame_count << 34) | (2 << 5) | (7 << 1) | 1
-    metadata_header = (11 << 25) | (8 << 1)
-    sample_headers = (
-        sample_mode.to_bytes(8, "little")
-        + metadata_header.to_bytes(4, "little")
-        + setup_crc.to_bytes(4, "little")
-        + b"\0\0\0\0"
-    )
-    header = bytearray(0x3C)
-    header[:4] = b"FSB5"
-    header[4:8] = (1).to_bytes(4, "little")
-    header[8:12] = (1).to_bytes(4, "little")
-    header[12:16] = len(sample_headers).to_bytes(4, "little")
-    header[20:24] = len(data).to_bytes(4, "little")
-    header[24:28] = (15).to_bytes(4, "little")
-    (FIXTURES / VORBIS_MULTISTREAM_FSB_NAME).write_bytes(
-        header + sample_headers + data
-    )
-    (FIXTURES / VORBIS_MULTISTREAM_OGG_NAME).write_bytes(ogg.read_bytes())
-    print(
-        f"wrote {VORBIS_MULTISTREAM_FSB_NAME} and "
-        f"{VORBIS_MULTISTREAM_OGG_NAME}: {len(audio)} packets, "
-        f"{frame_count} frames"
-    )
 
 
 def main() -> None:
@@ -404,7 +404,7 @@ def main() -> None:
         generate_mpeg(work)
         generate_multistream_mpeg(work)
         generate_multistream_opus(work)
-        generate_multistream_vorbis(work)
+        generate_surround_vorbis(work)
 
 
 if __name__ == "__main__":

@@ -3902,11 +3902,47 @@ mod tests {
 
     type SampleSpec = (u64, u16, u32, Option<(u16, u32)>);
 
+    #[derive(Clone, Copy)]
+    struct VorbisSurroundFixture {
+        channels: u16,
+        fsb: &'static [u8],
+        ogg: &'static [u8],
+    }
+
     const FSB5_VORBIS_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/audio/fsb5-vorbis-stereo.fsb");
-    const FSB5_VORBIS_MULTISTREAM_FIXTURE: &[u8] =
-        include_bytes!("../tests/fixtures/audio/fsb5-vorbis-6ch.fsb");
-    const VORBIS_MULTISTREAM_OGG: &[u8] = include_bytes!("../tests/fixtures/audio/vorbis-6ch.ogg");
+    const VORBIS_SURROUND_FIXTURES: &[VorbisSurroundFixture] = &[
+        VorbisSurroundFixture {
+            channels: 3,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-vorbis-3ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/vorbis-3ch.ogg"),
+        },
+        VorbisSurroundFixture {
+            channels: 4,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-vorbis-4ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/vorbis-4ch.ogg"),
+        },
+        VorbisSurroundFixture {
+            channels: 5,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-vorbis-5ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/vorbis-5ch.ogg"),
+        },
+        VorbisSurroundFixture {
+            channels: 6,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-vorbis-6ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/vorbis-6ch.ogg"),
+        },
+        VorbisSurroundFixture {
+            channels: 7,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-vorbis-7ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/vorbis-7ch.ogg"),
+        },
+        VorbisSurroundFixture {
+            channels: 8,
+            fsb: include_bytes!("../tests/fixtures/audio/fsb5-vorbis-8ch.fsb"),
+            ogg: include_bytes!("../tests/fixtures/audio/vorbis-8ch.ogg"),
+        },
+    ];
     const FSB5_MPEG_MULTISTREAM_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/audio/fsb5-mpeg-layer3-6ch.fsb");
 
@@ -5096,42 +5132,52 @@ mod tests {
     }
 
     #[test]
-    fn decodes_six_channel_fsb5_vorbis() {
-        let fsb = Region::from_bytes(FSB5_VORBIS_MULTISTREAM_FIXTURE.to_vec());
-        let stream = parse_fsb5_vorbis(&fsb).unwrap().unwrap();
-        assert_eq!(
-            (
-                stream.channels,
-                stream.sample_rate,
-                stream.frame_count,
-                stream.setup_crc,
-            ),
-            (6, 32_000, 3_840, 0x6aad_13bc)
-        );
-        let output_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
-        let mut wav = Vec::new();
-        write_direct_wav(
-            &fsb,
-            DirectWavKind::Fsb5Vorbis(stream),
-            output_size,
-            &mut wav,
-        )
-        .unwrap();
-        assert_eq!(wav.len(), usize::try_from(output_size).unwrap());
-        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 6);
-        let pcm = wave_data(&wav);
-        let mut hashes = [0xcbf2_9ce4_8422_2325_u64; 6];
-        for frame in pcm.chunks_exact(12) {
-            for channel in 0..6 {
-                for byte in &frame[channel * 2..channel * 2 + 2] {
-                    hashes[channel] ^= u64::from(*byte);
-                    hashes[channel] = hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+    fn decodes_three_through_eight_channel_fsb5_vorbis() {
+        for fixture in VORBIS_SURROUND_FIXTURES {
+            let fsb = Region::from_bytes(fixture.fsb.to_vec());
+            let stream = parse_fsb5_vorbis(&fsb).unwrap().unwrap();
+            assert_eq!(
+                (
+                    stream.channels,
+                    stream.sample_rate,
+                    stream.frame_count,
+                    stream.setup_crc,
+                ),
+                (fixture.channels, 32_000, 3_840, 0x6aad_13bc)
+            );
+            let output_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
+            let mut wav = Vec::new();
+            write_direct_wav(
+                &fsb,
+                DirectWavKind::Fsb5Vorbis(stream),
+                output_size,
+                &mut wav,
+            )
+            .unwrap();
+            assert_eq!(wav.len(), usize::try_from(output_size).unwrap());
+            assert_eq!(
+                u16::from_le_bytes(wav[22..24].try_into().unwrap()),
+                fixture.channels
+            );
+            let channel_count = usize::from(fixture.channels);
+            let pcm = wave_data(&wav);
+            let mut hashes = vec![0xcbf2_9ce4_8422_2325_u64; channel_count];
+            for frame in pcm.chunks_exact(channel_count * 2) {
+                for (channel, hash) in hashes.iter_mut().enumerate() {
+                    for byte in &frame[channel * 2..channel * 2 + 2] {
+                        *hash ^= u64::from(*byte);
+                        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
                 }
             }
-        }
-        for left in 0..hashes.len() {
-            for right in left + 1..hashes.len() {
-                assert_ne!(hashes[left], hashes[right], "channels {left} and {right}");
+            for left in 0..hashes.len() {
+                for right in left + 1..hashes.len() {
+                    assert_ne!(
+                        hashes[left], hashes[right],
+                        "{}-channel fixture duplicates channels {left} and {right}",
+                        fixture.channels
+                    );
+                }
             }
         }
     }
@@ -5214,58 +5260,62 @@ mod tests {
         std::fs::remove_file(output).unwrap();
     }
 
-    /// The original Ogg header is the independent authority for the six
+    /// The original Ogg headers are the independent authority for each 3-8
     /// channel speaker order. FSB keeps the same audio packets but replaces
-    /// that header with only a setup CRC and a channel count.
+    /// those headers with only a setup CRC and a channel count.
     #[test]
     #[ignore = "requires the optional vgmstream-cli decoder oracle"]
-    fn fsb5_multistream_vorbis_matches_vgmstream_ogg_oracle() {
+    fn fsb5_surround_vorbis_matches_vgmstream_ogg_oracle() {
         use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let fsb = Region::from_bytes(FSB5_VORBIS_MULTISTREAM_FIXTURE.to_vec());
-        let kind = detect_direct_wav(&fsb, Some(16)).unwrap().unwrap();
-        let mut actual = Vec::new();
-        write_direct_wav(&fsb, kind, 1024 * 1024, &mut actual).unwrap();
+        for fixture in VORBIS_SURROUND_FIXTURES {
+            let fsb = Region::from_bytes(fixture.fsb.to_vec());
+            let kind = detect_direct_wav(&fsb, Some(16)).unwrap().unwrap();
+            let mut actual = Vec::new();
+            write_direct_wav(&fsb, kind, 1024 * 1024, &mut actual).unwrap();
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let input = std::env::temp_dir().join(format!(
-            "assetstudio-fsb5-vorbis-multistream-{}-{unique}.ogg",
-            std::process::id()
-        ));
-        let output = input.with_extension("wav");
-        std::fs::write(&input, VORBIS_MULTISTREAM_OGG).unwrap();
-        let status = Command::new("vgmstream-cli")
-            .arg("-o")
-            .arg(&output)
-            .arg(&input)
-            .status()
-            .expect("vgmstream-cli must be installed to run this ignored oracle test");
-        assert!(status.success());
-        let expected = std::fs::read(&output).unwrap();
-        std::fs::remove_file(input).unwrap();
-        std::fs::remove_file(output).unwrap();
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let input = std::env::temp_dir().join(format!(
+                "assetstudio-fsb5-vorbis-{}ch-{}-{unique}.ogg",
+                fixture.channels,
+                std::process::id()
+            ));
+            let output = input.with_extension("wav");
+            std::fs::write(&input, fixture.ogg).unwrap();
+            let status = Command::new("vgmstream-cli")
+                .arg("-o")
+                .arg(&output)
+                .arg(&input)
+                .status()
+                .expect("vgmstream-cli must be installed to run this ignored oracle test");
+            assert!(status.success());
+            let expected = std::fs::read(&output).unwrap();
+            std::fs::remove_file(input).unwrap();
+            std::fs::remove_file(output).unwrap();
 
-        let rust = wave_data(&actual);
-        let oracle = wave_data(&expected);
-        assert_eq!(rust.len(), oracle.len());
-        let maximum_delta = rust
-            .chunks_exact(2)
-            .zip(oracle.chunks_exact(2))
-            .map(|(rust, oracle)| {
-                let rust = i16::from_le_bytes(rust.try_into().unwrap());
-                let oracle = i16::from_le_bytes(oracle.try_into().unwrap());
-                i32::from(rust).abs_diff(i32::from(oracle))
-            })
-            .max()
-            .unwrap_or(0);
-        assert!(
-            maximum_delta <= 1,
-            "multistream Vorbis maximum PCM16 delta is {maximum_delta}"
-        );
+            let rust = wave_data(&actual);
+            let oracle = wave_data(&expected);
+            assert_eq!(rust.len(), oracle.len());
+            let maximum_delta = rust
+                .chunks_exact(2)
+                .zip(oracle.chunks_exact(2))
+                .map(|(rust, oracle)| {
+                    let rust = i16::from_le_bytes(rust.try_into().unwrap());
+                    let oracle = i16::from_le_bytes(oracle.try_into().unwrap());
+                    i32::from(rust).abs_diff(i32::from(oracle))
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                maximum_delta <= 1,
+                "{}-channel Vorbis maximum PCM16 delta is {maximum_delta}",
+                fixture.channels
+            );
+        }
     }
 
     fn fsb5(version: u32, codec: u32, flags: u32, samples: &[SampleSpec], data: &[u8]) -> Vec<u8> {
