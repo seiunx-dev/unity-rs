@@ -1874,12 +1874,8 @@ fn export_fbx_batch(
         .then(|| build_animation_graph(&collection, &hierarchy, AnimationGraphLimits::default()))
         .transpose()?;
     let parent = prepare_fbx_output_parent(&command.output.join("placeholder"))?;
-    let mut names = HashSet::new();
-    names.try_reserve(candidates.len()).map_err(|error| {
-        CliError::Runtime(Error::invalid_data(format!(
-            "cannot allocate FBX output-name index: {error}"
-        )))
-    })?;
+    let mut names = FbxBatchNames::default();
+    names.try_reserve(candidates.len())?;
     let mut succeeded = 0_usize;
     let mut failures = 0_usize;
     let mut total_bytes = 0_u64;
@@ -2030,30 +2026,72 @@ fn write_fbx_batch_candidate(
     Ok((publication.written_bytes, publication.total_output_bytes))
 }
 
+#[derive(Debug, Default)]
+struct FbxBatchNames {
+    /// Case-folded claimed names. A base entry stores the next unchecked
+    /// suffix; a name that has only appeared as a suffix starts at one in case
+    /// it later becomes a base itself.
+    used: HashMap<String, u64>,
+}
+
+impl FbxBatchNames {
+    fn try_reserve(&mut self, additional: usize) -> Result<()> {
+        self.used.try_reserve(additional).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate FBX output-name index: {error}"))
+        })
+    }
+}
+
 fn allocate_fbx_batch_name(
     candidate: &ModelExportCandidate,
-    names: &mut HashSet<String>,
+    names: &mut FbxBatchNames,
+) -> Result<String> {
+    allocate_fbx_batch_name_with_probe(candidate, names, || {})
+}
+
+fn allocate_fbx_batch_name_with_probe(
+    candidate: &ModelExportCandidate,
+    names: &mut FbxBatchNames,
+    mut probe: impl FnMut(),
 ) -> Result<String> {
     let base = sanitize_live2d_base_name(&candidate.name)?;
-    for suffix in 0_u64..=MAX_FBX_TEMPORARY_ATTEMPTS {
-        let value = if suffix == 0 {
-            fallible_fbx_name(&base)?
-        } else {
-            fallible_fbx_suffixed_name(&base, suffix)?
-        };
+    let portable_base = fallible_lowercase(&base, "FBX portable output name")?;
+    probe();
+    let Some(&next_suffix) = names.used.get(&portable_base) else {
+        let value = fallible_fbx_name(&base)?;
+        names.used.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow FBX output-name index: {error}"))
+        })?;
+        names.used.insert(portable_base, 1);
+        return Ok(value);
+    };
+
+    let mut suffix = next_suffix;
+    loop {
+        probe();
+        let value = fallible_fbx_suffixed_name(&base, suffix)?;
         let portable = fallible_lowercase(&value, "FBX portable output name")?;
-        if !names.contains(&portable) {
-            names.try_reserve(1).map_err(|error| {
-                Error::invalid_data(format!("cannot grow FBX output-name index: {error}"))
-            })?;
-            names.insert(portable);
-            return Ok(value);
+        if names.used.contains_key(&portable) {
+            suffix = suffix
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_data("FBX output-name suffix overflowed"))?;
+            continue;
         }
+
+        let following_suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("FBX output-name suffix overflowed"))?;
+        names.used.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow FBX output-name index: {error}"))
+        })?;
+        *names
+            .used
+            .get_mut(&portable_base)
+            .expect("the base entry remains present while allocating its suffix") =
+            following_suffix;
+        names.used.insert(portable, 1);
+        return Ok(value);
     }
-    Err(Error::invalid_data(format!(
-        "cannot allocate a unique FBX name for {:?}",
-        candidate.game_object
-    )))
 }
 
 fn fallible_fbx_name(base: &str) -> Result<String> {
@@ -4207,11 +4245,12 @@ fn class_name_suffix(class_id: i32) -> &'static str {
 mod tests {
     use super::{
         AudioExportFormat, CliArgumentDisplay, CliArgumentLimits, CliCommand, CliError,
-        EscapedOsStr, ExportMode, FbxTemporaryFile, FilenameFormat, ImageFormat,
+        EscapedOsStr, ExportMode, FbxBatchNames, FbxTemporaryFile, FilenameFormat, ImageFormat,
         InspectLabelComponent, InspectPathBudget, Live2dCommand, Live2dExportState,
         Live2dPublicationLock, LoadOptions, LossyOsStr, MAX_LIVE2D_OUTPUT_MODELS,
-        MAX_LIVE2D_TOTAL_OUTPUT_BYTES, MAX_MONO_SCHEMA_DOCUMENTS, MonoSchemaDocumentBudget,
-        NestedInspectLabel, SceneObjectKey, charge_live2d_model, collect_cli_arguments_with_limits,
+        MAX_LIVE2D_TOTAL_OUTPUT_BYTES, MAX_MONO_SCHEMA_DOCUMENTS, ModelExportCandidate,
+        MonoSchemaDocumentBudget, NestedInspectLabel, SceneObjectKey, allocate_fbx_batch_name,
+        allocate_fbx_batch_name_with_probe, charge_live2d_model, collect_cli_arguments_with_limits,
         copy_inspect_path, copy_path_argument, escape_text, fallible_lowercase,
         increment_class_count, increment_string_count, join_inspect_path,
         obj_material_library_name, parse_cli_arguments, parse_export_arguments,
@@ -4236,6 +4275,73 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn fbx_candidate(name: &str, path_id: i64) -> ModelExportCandidate {
+        ModelExportCandidate {
+            game_object: SceneObjectKey {
+                file_index: 0,
+                path_id,
+            },
+            animator: None,
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn fbx_batch_name_cursor_rechecks_case_insensitive_cross_collisions() {
+        let mut names = FbxBatchNames::default();
+        assert_eq!(
+            allocate_fbx_batch_name(&fbx_candidate("Face", 1), &mut names).unwrap(),
+            "Face"
+        );
+        assert_eq!(
+            allocate_fbx_batch_name(&fbx_candidate("face", 2), &mut names).unwrap(),
+            "face~1"
+        );
+        assert_eq!(
+            allocate_fbx_batch_name(&fbx_candidate("FACE~2", 3), &mut names).unwrap(),
+            "FACE~2"
+        );
+        assert_eq!(
+            allocate_fbx_batch_name(&fbx_candidate("face", 4), &mut names).unwrap(),
+            "face~3"
+        );
+    }
+
+    #[test]
+    fn fbx_batch_name_reservation_failure_preserves_claims() {
+        let mut names = FbxBatchNames::default();
+        let candidate = fbx_candidate("Shared", 1);
+        assert_eq!(
+            allocate_fbx_batch_name(&candidate, &mut names).unwrap(),
+            "Shared"
+        );
+        assert!(names.try_reserve(usize::MAX).is_err());
+        assert_eq!(names.used.len(), 1);
+        assert_eq!(
+            allocate_fbx_batch_name(&candidate, &mut names).unwrap(),
+            "Shared~1"
+        );
+    }
+
+    #[test]
+    fn repeated_fbx_batch_names_exceed_the_old_cap_with_linear_probes() {
+        let count = 16_384_usize;
+        let mut names = FbxBatchNames::default();
+        names.try_reserve(count).unwrap();
+        let candidate = fbx_candidate("Shared", 1);
+        let mut probes = 0_usize;
+        let mut last = String::new();
+        for _ in 0..count {
+            last =
+                allocate_fbx_batch_name_with_probe(&candidate, &mut names, || probes += 1).unwrap();
+        }
+
+        let last_suffix = count - 1;
+        assert_eq!(last, format!("Shared~{last_suffix}"));
+        assert_eq!(probes, count * 2 - 1);
+        assert_eq!(names.used.len(), count);
     }
 
     #[test]
