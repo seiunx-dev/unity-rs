@@ -1318,7 +1318,8 @@ impl<'a> PackageState<'a> {
         packages.try_reserve(selected.len()).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Live2D package list: {error}"))
         })?;
-        let mut claimed_directories = HashSet::new();
+        let mut claimed_directories = ClaimedNames::default();
+        claimed_directories.try_reserve(selected.len(), "Live2D package directory names")?;
         for selected_model in selected {
             let model = &indexes.models[selected_model.model_index];
             let moc = self.read_moc(selected_model.moc_identity)?;
@@ -1632,7 +1633,7 @@ impl<'a> PackageState<'a> {
         moc_key: SceneObjectKey,
         moc: CubismMoc,
         indexes: &ComponentIndexes,
-        claimed_directories: &mut HashSet<String>,
+        claimed_directories: &mut ClaimedNames,
     ) -> Result<Live2dPackage> {
         let model = &active_model.component;
         let source_name = model
@@ -1867,11 +1868,9 @@ impl<'a> PackageState<'a> {
         &mut self,
         candidates: Vec<(SceneObjectKey, Texture2D)>,
     ) -> Result<Vec<Live2dPackageTexture>> {
-        let mut claimed = HashSet::new();
+        let mut claimed = ClaimedNames::default();
         let mut textures = Vec::new();
-        claimed.try_reserve(candidates.len()).map_err(|error| {
-            Error::invalid_data(format!("cannot allocate Live2D texture names: {error}"))
-        })?;
+        claimed.try_reserve(candidates.len(), "Live2D texture names")?;
         textures.try_reserve(candidates.len()).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Live2D texture plan: {error}"))
         })?;
@@ -1947,18 +1946,14 @@ impl<'a> PackageState<'a> {
     ) -> Result<Vec<Live2dPackageExpression>> {
         let mut expressions = Vec::new();
         let mut seen = HashSet::new();
-        let mut claimed_names = HashSet::new();
+        let mut claimed_names = ClaimedNames::default();
         expressions.try_reserve(references.len()).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Live2D expressions: {error}"))
         })?;
         seen.try_reserve(references.len()).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Live2D expression index: {error}"))
         })?;
-        claimed_names
-            .try_reserve(references.len())
-            .map_err(|error| {
-                Error::invalid_data(format!("cannot allocate Live2D expression names: {error}"))
-            })?;
+        claimed_names.try_reserve(references.len(), "Live2D expression names")?;
         for reference in references {
             let Some(target) = self.resolve_required_target(
                 owner.object,
@@ -1991,7 +1986,7 @@ impl<'a> PackageState<'a> {
     fn project_expression_target(
         &mut self,
         target: &crate::scene::ResolvedObject<'a>,
-        claimed_names: &mut HashSet<String>,
+        claimed_names: &mut ClaimedNames,
     ) -> Result<Option<Live2dPackageExpression>> {
         self.expressions = charge_usize(
             self.expressions,
@@ -2176,13 +2171,11 @@ impl<'a> PackageState<'a> {
             identities
         };
         let mut motions = Vec::new();
-        let mut claimed = HashSet::new();
+        let mut claimed = ClaimedNames::default();
         motions.try_reserve(identities.len()).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Live2D motion plan: {error}"))
         })?;
-        claimed.try_reserve(identities.len()).map_err(|error| {
-            Error::invalid_data(format!("cannot allocate Live2D motion names: {error}"))
-        })?;
+        claimed.try_reserve(identities.len(), "Live2D motion names")?;
         for identity in identities {
             if let Some(motion) = self.project_motion(identity, target_index, &mut claimed)? {
                 motions.push(motion);
@@ -2268,7 +2261,7 @@ impl<'a> PackageState<'a> {
         &mut self,
         identity: (usize, usize),
         target_index: &CubismMotionTargetIndex<'_>,
-        claimed: &mut HashSet<String>,
+        claimed: &mut ClaimedNames,
     ) -> Result<Option<Live2dPackageMotion>> {
         self.motions = charge_usize(
             self.motions,
@@ -2352,13 +2345,11 @@ impl<'a> PackageState<'a> {
     ) -> Result<Vec<Live2dPackageMotion>> {
         let clip_keys = self.model_clip_keys(game_object)?;
         let mut motions = Vec::new();
-        let mut claimed = HashSet::new();
+        let mut claimed = ClaimedNames::default();
         motions.try_reserve(clip_keys.len()).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Live2D clip motions: {error}"))
         })?;
-        claimed.try_reserve(clip_keys.len()).map_err(|error| {
-            Error::invalid_data(format!("cannot allocate Live2D clip-motion names: {error}"))
-        })?;
+        claimed.try_reserve(clip_keys.len(), "Live2D clip-motion names")?;
         for key in clip_keys {
             if let Some(motion) = self.project_clip_motion(key, targets, &mut claimed)? {
                 motions.push(motion);
@@ -2405,7 +2396,7 @@ impl<'a> PackageState<'a> {
         &mut self,
         key: SceneObjectKey,
         targets: &CubismMotionTargetNames,
-        claimed: &mut HashSet<String>,
+        claimed: &mut ClaimedNames,
     ) -> Result<Option<Live2dPackageMotion>> {
         self.motions = charge_usize(
             self.motions,
@@ -2490,15 +2481,11 @@ impl<'a> PackageState<'a> {
             "Live2D motions",
         )?;
         let mut motions = Vec::new();
-        let mut claimed = HashSet::new();
+        let mut claimed = ClaimedNames::default();
         motions.try_reserve(count).map_err(|error| {
             Error::invalid_data(format!("cannot allocate loose Live2D motions: {error}"))
         })?;
-        claimed.try_reserve(count).map_err(|error| {
-            Error::invalid_data(format!(
-                "cannot allocate loose Live2D motion names: {error}"
-            ))
-        })?;
+        claimed.try_reserve(count, "loose Live2D motion names")?;
         for entry in entries {
             if let Some(motion) =
                 self.project_motion(entry.identity(), target_index, &mut claimed)?
@@ -2546,15 +2533,11 @@ impl<'a> PackageState<'a> {
             "Live2D expressions",
         )?;
         let mut expressions = Vec::new();
-        let mut claimed_names = HashSet::new();
+        let mut claimed_names = ClaimedNames::default();
         expressions.try_reserve(count).map_err(|error| {
             Error::invalid_data(format!("cannot allocate loose Live2D expressions: {error}"))
         })?;
-        claimed_names.try_reserve(count).map_err(|error| {
-            Error::invalid_data(format!(
-                "cannot allocate loose Live2D expression names: {error}"
-            ))
-        })?;
+        claimed_names.try_reserve(count, "loose Live2D expression names")?;
         for entry in entries {
             let (file_index, object_index) = entry.identity();
             let loaded = self
@@ -3560,56 +3543,120 @@ fn safe_file_stem(value: &str) -> Result<String> {
     }
 }
 
-fn claim_name(base: &str, object: SceneObjectKey, claimed: &mut HashSet<String>) -> Result<String> {
-    for ordinal in 0_u64.. {
-        let suffix_bytes = if ordinal == 0 {
-            0
-        } else {
-            3_usize
-                .checked_add(decimal_digits_u128(object.file_index as u128))
-                .and_then(|value| value.checked_add(2))
-                .and_then(|value| value.checked_add(decimal_digits_i64(object.path_id)))
-                .and_then(|value| {
-                    if ordinal == 1 {
-                        Some(value)
-                    } else {
-                        value.checked_add(1).and_then(|value| {
-                            value.checked_add(decimal_digits_u128(ordinal.into()))
-                        })
-                    }
-                })
-                .ok_or_else(|| Error::invalid_data("Live2D collision suffix length overflowed"))?
-        };
-        let capacity = base
-            .len()
-            .checked_add(suffix_bytes)
-            .ok_or_else(|| Error::invalid_data("Live2D collision file-name length overflowed"))?;
-        let mut candidate = String::new();
-        candidate.try_reserve_exact(capacity).map_err(|error| {
-            Error::invalid_data(format!(
-                "cannot allocate Live2D collision file name: {error}"
-            ))
-        })?;
-        candidate.push_str(base);
-        if ordinal != 0 {
-            use std::fmt::Write as _;
-            write!(candidate, " @f{}_p{}", object.file_index, object.path_id)
-                .expect("reserved String writes cannot fail");
-            if ordinal > 1 {
-                write!(candidate, "_{ordinal}").expect("reserved String writes cannot fail");
-            }
-        }
-        debug_assert_eq!(candidate.len(), capacity);
-        let identity = lowercase_key(&candidate)?;
-        if !claimed.contains(&identity) {
-            claimed.try_reserve(1).map_err(|error| {
-                Error::invalid_data(format!("cannot grow Live2D claimed-name index: {error}"))
-            })?;
-            claimed.insert(identity);
-            return Ok(candidate);
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ClaimedNameCursorKey {
+    base_id: usize,
+    object: SceneObjectKey,
+}
+
+#[derive(Debug, Default)]
+struct ClaimedNames {
+    /// Case-folded names mapped to stable identifiers. The identifiers let the
+    /// cursor table avoid retaining another copy of every potentially long base.
+    names: HashMap<String, usize>,
+    /// Next unchecked ordinal for repeated collisions of one base/object pair.
+    cursors: HashMap<ClaimedNameCursorKey, u64>,
+}
+
+impl ClaimedNames {
+    fn try_reserve(&mut self, additional: usize, label: &str) -> Result<()> {
+        self.names
+            .try_reserve(additional)
+            .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))
     }
-    unreachable!("the unbounded ordinal supplies a unique file name")
+}
+
+fn claim_name(base: &str, object: SceneObjectKey, claimed: &mut ClaimedNames) -> Result<String> {
+    claim_name_with_probe(base, object, claimed, || {})
+}
+
+fn claim_name_with_probe(
+    base: &str,
+    object: SceneObjectKey,
+    claimed: &mut ClaimedNames,
+    mut probe: impl FnMut(),
+) -> Result<String> {
+    probe();
+    let base_identity = lowercase_key(base)?;
+    let Some(&base_id) = claimed.names.get(&base_identity) else {
+        let candidate = copy_string(base, "Live2D claimed file name")?;
+        claimed.names.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow Live2D claimed-name index: {error}"))
+        })?;
+        let base_id = claimed.names.len();
+        claimed.names.insert(base_identity, base_id);
+        return Ok(candidate);
+    };
+
+    let cursor_key = ClaimedNameCursorKey { base_id, object };
+    let mut ordinal = claimed.cursors.get(&cursor_key).copied().unwrap_or(1);
+    loop {
+        probe();
+        let candidate = collision_name(base, object, ordinal)?;
+        let identity = lowercase_key(&candidate)?;
+        if claimed.names.contains_key(&identity) {
+            ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                Error::invalid_data("Live2D collision file-name ordinal overflowed")
+            })?;
+            continue;
+        }
+
+        let next_ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("Live2D collision file-name ordinal overflowed"))?;
+        claimed.names.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow Live2D claimed-name index: {error}"))
+        })?;
+        if !claimed.cursors.contains_key(&cursor_key) {
+            claimed.cursors.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot grow Live2D claimed-name cursor index: {error}"
+                ))
+            })?;
+        }
+        let name_id = claimed.names.len();
+        claimed.names.insert(identity, name_id);
+        claimed.cursors.insert(cursor_key, next_ordinal);
+        return Ok(candidate);
+    }
+}
+
+fn collision_name(base: &str, object: SceneObjectKey, ordinal: u64) -> Result<String> {
+    use std::fmt::Write as _;
+
+    debug_assert_ne!(ordinal, 0);
+    let suffix_bytes = 3_usize
+        .checked_add(decimal_digits_u128(object.file_index as u128))
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(decimal_digits_i64(object.path_id)))
+        .and_then(|value| {
+            if ordinal == 1 {
+                Some(value)
+            } else {
+                value
+                    .checked_add(1)
+                    .and_then(|value| value.checked_add(decimal_digits_u128(ordinal.into())))
+            }
+        })
+        .ok_or_else(|| Error::invalid_data("Live2D collision suffix length overflowed"))?;
+    let capacity = base
+        .len()
+        .checked_add(suffix_bytes)
+        .ok_or_else(|| Error::invalid_data("Live2D collision file-name length overflowed"))?;
+    let mut candidate = String::new();
+    candidate.try_reserve_exact(capacity).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate Live2D collision file name: {error}"
+        ))
+    })?;
+    candidate.push_str(base);
+    write!(candidate, " @f{}_p{}", object.file_index, object.path_id)
+        .expect("reserved String writes cannot fail");
+    if ordinal > 1 {
+        write!(candidate, "_{ordinal}").expect("reserved String writes cannot fail");
+    }
+    debug_assert_eq!(candidate.len(), capacity);
+    Ok(candidate)
 }
 
 fn lowercase_key(value: &str) -> Result<String> {
@@ -3789,8 +3836,6 @@ impl<W: Write> Write for BoundedWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::mono_schema::{MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry};
     use crate::scene_hierarchy::{SceneHierarchy, SceneHierarchyNode, SceneObjectKey};
@@ -3798,10 +3843,11 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        Live2dPackageDiagnosticKind, Live2dPackageLimits, Live2dPackageMaterializeLimits,
-        LooseRoleEntry, LooseRoleIndex, NearestParentModelIndex, PackageState,
-        build_live2d_packages, build_live2d_packages_with_schema_provider, claim_name,
-        materialize_live2d_packages, safe_file_stem, validate_role_index_budget,
+        ClaimedNames, Live2dPackageDiagnosticKind, Live2dPackageLimits,
+        Live2dPackageMaterializeLimits, LooseRoleEntry, LooseRoleIndex, NearestParentModelIndex,
+        PackageState, build_live2d_packages, build_live2d_packages_with_schema_provider,
+        claim_name, claim_name_with_probe, materialize_live2d_packages, safe_file_stem,
+        validate_role_index_budget,
     };
     use crate::live2d::CubismRole;
 
@@ -4537,7 +4583,7 @@ mod tests {
 
     #[test]
     fn sanitizes_and_disambiguates_names_deterministically() {
-        let mut claimed = HashSet::new();
+        let mut claimed = ClaimedNames::default();
         let first = super::SceneObjectKey {
             file_index: 0,
             path_id: 7,
@@ -4556,6 +4602,83 @@ mod tests {
             claim_name("face", second, &mut claimed).unwrap(),
             "face @f1_p9_2"
         );
+    }
+
+    #[test]
+    fn name_cursor_rechecks_cross_collisions_before_advancing() {
+        let mut claimed = ClaimedNames::default();
+        let first = SceneObjectKey {
+            file_index: 0,
+            path_id: 7,
+        };
+        let repeated = SceneObjectKey {
+            file_index: 1,
+            path_id: 9,
+        };
+        let blocker = SceneObjectKey {
+            file_index: 2,
+            path_id: 11,
+        };
+
+        assert_eq!(claim_name("Face", first, &mut claimed).unwrap(), "Face");
+        assert_eq!(
+            claim_name("face", repeated, &mut claimed).unwrap(),
+            "face @f1_p9"
+        );
+        assert_eq!(
+            claim_name("FACE @F1_P9_2", blocker, &mut claimed).unwrap(),
+            "FACE @F1_P9_2"
+        );
+        assert_eq!(
+            claim_name("face", repeated, &mut claimed).unwrap(),
+            "face @f1_p9_3"
+        );
+    }
+
+    #[test]
+    fn claimed_name_reservation_failure_preserves_existing_state() {
+        let mut claimed = ClaimedNames::default();
+        let object = SceneObjectKey {
+            file_index: 1,
+            path_id: 9,
+        };
+
+        assert_eq!(claim_name("Face", object, &mut claimed).unwrap(), "Face");
+        assert!(
+            claimed
+                .try_reserve(usize::MAX, "impossible Live2D name index")
+                .is_err()
+        );
+        assert_eq!(claimed.names.len(), 1);
+        assert!(claimed.cursors.is_empty());
+        assert_eq!(
+            claim_name("face", object, &mut claimed).unwrap(),
+            "face @f1_p9"
+        );
+    }
+
+    #[test]
+    fn repeated_identity_name_collisions_have_linear_probe_growth() {
+        let count = 16_384_usize;
+        let mut claimed = ClaimedNames::default();
+        claimed
+            .try_reserve(count, "test Live2D claimed names")
+            .unwrap();
+        let object = SceneObjectKey {
+            file_index: 7,
+            path_id: 9,
+        };
+        let mut probes = 0_usize;
+        let mut last = String::new();
+        for _ in 0..count {
+            last = claim_name_with_probe("Shared", object, &mut claimed, || probes += 1).unwrap();
+        }
+
+        let last_ordinal = count - 1;
+        assert_eq!(last, format!("Shared @f7_p9_{last_ordinal}"));
+        assert_eq!(probes, count * 2 - 1);
+        assert_eq!(claimed.names.len(), count);
+        assert_eq!(claimed.cursors.len(), 1);
     }
 
     fn synthetic_collection(model_tree: bool, renderer_tree: bool) -> AssetCollection {
