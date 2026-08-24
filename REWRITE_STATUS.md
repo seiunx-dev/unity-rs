@@ -1382,9 +1382,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-25 最近一次绿色矩阵验证代码 head 为 `7726bdb`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-25 最近一次绿色矩阵验证代码 head 为 `117f5a8`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32788921665](https://github.com/Team-Haruki/unity-rs/actions/runs/32788921665) 16/16 全绿，
+[32790889498](https://github.com/Team-Haruki/unity-rs/actions/runs/32790889498) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
@@ -1405,6 +1405,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 3A-27 | **已完成 Live2D 隐藏 lowercase 名称索引的累计驻留预算治理**：包目录、纹理、expression、motion 的 collision claim key 与 display-info 去重 key 现在和来源/最终名称共用 `maximum_total_name_bytes`；Unicode lowercase 扩张在分配前按精确字节数检查，失败不改变 claim、suffix cursor 或预算 | `f8f630e`：已保留 4 字节后再申请 5 字节、总预算 8 字节时稳定拒绝并保持原状态；`İ` 的 2→3 字节 lowercase 扩张在分配前拒绝。Live2D 23/23、严格 Core Clippy及完整 `quality rust python node typing oracle` 本地门禁零跳过；公开常规矩阵 32781978836 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第二十七项完成证据 |
 | 3A-28 | **已完成模型贴图共享名称索引的累计驻留与跨平台大小写碰撞治理**：`SceneTextureNames` 的实际对象文件名与 lowercase collision key 受独立累计字节预算约束，跨模型复用不会重置；同名不同大小写在发布前分配稳定后缀，而不是依赖目标文件系统是否区分大小写 | `31d1288`：`Body.rgba` 17/18 字节公开读取边界，`Body.png`/`body.png` 39/40 字节事务边界，`İ.png` 6+7 字节扩张；Python/Node 安装后测试按真实 fixture 名称验证少一字节拒绝，类型桩/声明显式消费 `maximum_name_index_bytes`/`maximumNameIndexBytes`。Core 16/16、严格 workspace Clippy及完整 `quality rust python node typing oracle` 本地门禁零跳过；公开常规矩阵 32785686979 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第二十八项完成证据 |
 | 3A-29 | **已完成模型贴图 binding/skip 返回 metadata 的累计驻留治理**：`SceneTextureLimits.maximum_metadata_bytes`、Python `ModelTextureLimits.maximum_metadata_bytes` 与 Node `maximumMetadataBytes` 共同限制成功绑定 property 和跳过项 property/reason 的精确 UTF-8 字节；成功路径在解码和共享名称 claim 前预检，失败原因通过有界 formatter 构造，确定性超限不会消耗共享名称状态 | `7726bdb`：`_MainTex` 在 7/8 字节边界拒绝/成功，且 7 字节拒绝发生于损坏 Texture2D 解码之前并保持共享名称表为空；悬空 PPtr 在 property 恰好占满 8 字节后因 reason 无空间稳定拒绝。Core 17/17、workspace 严格 Clippy、Python wheel/sdist 真实安装、Node debug/release addon/npm、严格 typing 与完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 32788921665 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第二十九项完成证据 |
+| 3A-30 | **已完成 SplitObjects/Animator FBX 批量隐藏 lowercase 名称索引的累计驻留治理**：候选数上限和 fallible HashMap 增长之外，新增精确 UTF-8 key 字节预算；现代 CLI 通过 `--maximum-name-index-bytes` 暴露 0–512 MiB 配置，默认 64 MiB，legacy WorkMode 使用同一默认值。按预算可容纳的最小 claim 数限制批次开始时的预留，低预算不会先按百万候选分配整张表 | `117f5a8`：首个 `Face` 的 3/4 字节边界；已有 `face` 后 `face~1` 的总计 9/10 字节事务边界，失败不改变 claim、retained bytes 或 suffix cursor；`İ` 的 2→3 字节 lowercase 扩张；真实 `split-objects` 进程在 3 字节上限下于发布 `root.fbx` 前拒绝且无临时文件。CLI 单元/进程测试、workspace 严格 Clippy 与完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 32790889498 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十项完成证据 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22）**：106 个高层 Core 方法均被机器检查为 102 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；65 个公开 Python 方法和 3 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
 | 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | 默认构建、测试、安装和用户工作流均不需要 .NET；没有 GUI 或旧 C ABI 发布物；七项完成条件均有当前证据，未满足项不得被标成完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
