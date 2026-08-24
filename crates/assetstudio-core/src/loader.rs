@@ -23,6 +23,8 @@ use crate::serialized::{
     RESOURCE_MANAGER_CLASS_ID, SerializedFile, SerializedOpenOptions,
 };
 use crate::source::Region;
+use crate::sprite::SPRITE_CLASS_ID;
+use crate::sprite_atlas::{SPRITE_ATLAS_CLASS_ID, SpriteAtlasReadLimits, read_sprite_atlas};
 use crate::unity_cn::UnityCnKey;
 use crate::unity_version::UnityVersion;
 use crate::web_file::{WebFile, WebParseLimits};
@@ -61,6 +63,9 @@ pub struct AssetLoadLimits {
     pub maximum_reference_index_entries: usize,
     /// Maximum combined full-path and portable-name entries in the resource lookup index.
     pub maximum_resource_index_entries: usize,
+    /// Maximum retained `SpriteAtlas` records plus resolved `packedSprites`
+    /// assignments in the collection-wide Sprite lookup index.
+    pub maximum_sprite_atlas_index_entries: usize,
     pub container_metadata: ContainerMetadataReadLimits,
     pub object_names: ObjectNameReadLimits,
     pub compression: CompressionLimits,
@@ -85,6 +90,7 @@ impl Default for AssetLoadLimits {
             maximum_object_metadata_index_bytes: 1024 * 1024 * 1024,
             maximum_reference_index_entries: 10_000_000,
             maximum_resource_index_entries: 2_000_000,
+            maximum_sprite_atlas_index_entries: 10_000_000,
             container_metadata: ContainerMetadataReadLimits::default(),
             object_names: ObjectNameReadLimits::default(),
             compression: CompressionLimits::default(),
@@ -207,6 +213,7 @@ pub struct AssetCollection {
     pub(crate) object_metadata: Vec<ObjectMetadataEntry>,
     reference_index: Option<AssetReferenceIndex>,
     resource_index: Option<AssetResourceIndex>,
+    sprite_atlas_index: Option<SpriteAtlasIndex>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,6 +236,28 @@ struct AssetResourceIndex {
     by_full_path: Vec<usize>,
     /// Resource indices sorted by portable file name, then discovery order.
     by_portable_name: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IndexedSpriteAtlas {
+    pub(crate) file_index: usize,
+    pub(crate) object_index: usize,
+    pub(crate) is_variant: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpriteAtlasAssignment {
+    pub(crate) sprite_file: usize,
+    pub(crate) sprite_object: usize,
+    pub(crate) atlas: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SpriteAtlasIndex {
+    /// Successfully parsed atlases in stable file/object discovery order.
+    atlases: Vec<IndexedSpriteAtlas>,
+    /// Packed-Sprite assignments sorted by Sprite identity, then atlas order.
+    assignments: Vec<SpriteAtlasAssignment>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -269,9 +298,9 @@ impl AssetCollection {
     /// Builds an unindexed collection from owned parts.
     ///
     /// Object metadata and lookup indexes are derived state and start empty.
-    /// Call [`Self::resolve_object_metadata`], [`Self::rebuild_reference_index`]
-    /// or [`Self::rebuild_resource_index`] as appropriate before repeated
-    /// lookups.
+    /// Call [`Self::resolve_object_metadata`], [`Self::rebuild_reference_index`],
+    /// [`Self::rebuild_resource_index`] or [`Self::rebuild_sprite_atlas_index`]
+    /// as appropriate before repeated lookups.
     #[must_use]
     pub fn from_parts(parts: AssetCollectionParts) -> Self {
         let AssetCollectionParts {
@@ -286,6 +315,7 @@ impl AssetCollection {
             object_metadata: Vec::new(),
             reference_index: None,
             resource_index: None,
+            sprite_atlas_index: None,
         }
     }
 
@@ -724,6 +754,24 @@ impl AssetCollection {
         }
     }
 
+    /// Rebuilds the collection-wide Sprite-to-SpriteAtlas assignment index.
+    ///
+    /// Invalid or unsupported atlas objects are omitted, matching the managed
+    /// construction pass. A failed index allocation or collection budget
+    /// leaves Sprite decoding on its safe linear compatibility fallback.
+    pub fn rebuild_sprite_atlas_index(&mut self, limits: AssetLoadLimits) -> Result<()> {
+        match SpriteAtlasIndex::build(self, &limits) {
+            Ok(index) => {
+                self.sprite_atlas_index = Some(index);
+                Ok(())
+            }
+            Err(error) => {
+                self.sprite_atlas_index = None;
+                Err(error)
+            }
+        }
+    }
+
     /// Loads one root, honouring the configured failure policy.
     fn load_root_with_policy(
         &mut self,
@@ -777,6 +825,7 @@ impl AssetCollection {
     fn rebuild_object_metadata(&mut self, limits: &AssetLoadLimits) -> Result<()> {
         self.rebuild_reference_index(*limits)?;
         self.rebuild_resource_index(*limits)?;
+        self.rebuild_sprite_atlas_index(*limits)?;
         let mut metadata = ObjectMetadataBuilder::default();
         let mut pending_names = PendingObjectNames::default();
         let mut assignment_count = 0_usize;
@@ -916,6 +965,15 @@ impl AssetCollection {
         source_file_index: usize,
         reference: ObjectReference,
     ) -> Option<(usize, i64)> {
+        let (target_file_index, _) = self.resolve_object_location(source_file_index, reference)?;
+        Some((target_file_index, reference.path_id))
+    }
+
+    fn resolve_object_location(
+        &self,
+        source_file_index: usize,
+        reference: ObjectReference,
+    ) -> Option<(usize, usize)> {
         if reference.is_null() {
             return None;
         }
@@ -929,9 +987,8 @@ impl AssetCollection {
                 .get(external_index)?;
             self.serialized_file_index_by_portable_name(portable_file_name(&external.path))?
         };
-        self.object_index_by_path_id(target_file_index, reference.path_id)
-            .is_some()
-            .then_some((target_file_index, reference.path_id))
+        let object_index = self.object_index_by_path_id(target_file_index, reference.path_id)?;
+        Some((target_file_index, object_index))
     }
 
     pub(crate) fn serialized_file_index_by_portable_name(
@@ -1016,6 +1073,37 @@ impl AssetCollection {
             .iter()
             .position(|resource| resource_path_matches(&resource.path, requested_path))
     }
+
+    pub(crate) fn indexed_sprite_atlas(
+        &self,
+        file_index: usize,
+        object_index: usize,
+    ) -> Option<IndexedSpriteAtlas> {
+        self.sprite_atlas_index
+            .as_ref()?
+            .atlas(file_index, object_index)
+    }
+
+    pub(crate) fn indexed_sprite_atlas_by_index(
+        &self,
+        atlas_index: usize,
+    ) -> Option<IndexedSpriteAtlas> {
+        self.sprite_atlas_index
+            .as_ref()?
+            .atlases
+            .get(atlas_index)
+            .copied()
+    }
+
+    pub(crate) fn indexed_sprite_atlas_assignments(
+        &self,
+        sprite_file_index: usize,
+        sprite_object_index: usize,
+    ) -> Option<&[SpriteAtlasAssignment]> {
+        self.sprite_atlas_index
+            .as_ref()
+            .map(|index| index.assignments(sprite_file_index, sprite_object_index, || {}))
+    }
 }
 
 impl AssetReferenceIndex {
@@ -1086,6 +1174,159 @@ impl AssetReferenceIndex {
             files_by_portable_name,
             objects_by_file,
         })
+    }
+}
+
+impl SpriteAtlasIndex {
+    fn build(collection: &AssetCollection, limits: &AssetLoadLimits) -> Result<Self> {
+        let atlas_object_count = Self::object_count(collection)?;
+        let mut atlases = Vec::new();
+        atlases
+            .try_reserve_exact(atlas_object_count.min(limits.maximum_sprite_atlas_index_entries))
+            .map_err(|error| {
+                Error::invalid_data(format!("cannot allocate SpriteAtlas object index: {error}"))
+            })?;
+        let mut assignments = Vec::new();
+        let mut retained_entries = 0_usize;
+
+        for (file_index, loaded) in collection.serialized_files.iter().enumerate() {
+            for (object_index, object) in loaded.file.objects.iter().enumerate() {
+                if object.class_id != SPRITE_ATLAS_CLASS_ID {
+                    continue;
+                }
+                let Ok(atlas) =
+                    read_sprite_atlas(&loaded.file, object_index, SpriteAtlasReadLimits::default())
+                else {
+                    // Managed construction failures do not participate in
+                    // AssetsManager.ProcessAssets either.
+                    continue;
+                };
+
+                let resolved_count = atlas
+                    .packed_sprites
+                    .iter()
+                    .filter(|reference| {
+                        collection
+                            .resolve_object_location(file_index, **reference)
+                            .and_then(|(target_file_index, target_object_index)| {
+                                collection
+                                    .serialized_files
+                                    .get(target_file_index)?
+                                    .file
+                                    .objects
+                                    .get(target_object_index)
+                                    .filter(|target| target.class_id == SPRITE_CLASS_ID)
+                                    .map(|_| ())
+                            })
+                            .is_some()
+                    })
+                    .count();
+                let next_entries = retained_entries
+                    .checked_add(1)
+                    .and_then(|count| count.checked_add(resolved_count))
+                    .ok_or_else(|| {
+                        Error::invalid_data("SpriteAtlas lookup index entry count overflowed")
+                    })?;
+                if next_entries > limits.maximum_sprite_atlas_index_entries {
+                    return Err(Error::invalid_data(format!(
+                        "SpriteAtlas lookup index needs {next_entries} entries, exceeding limit {}",
+                        limits.maximum_sprite_atlas_index_entries
+                    )));
+                }
+                atlases.try_reserve(1).map_err(|error| {
+                    Error::invalid_data(format!("cannot grow SpriteAtlas object index: {error}"))
+                })?;
+                assignments.try_reserve(resolved_count).map_err(|error| {
+                    Error::invalid_data(format!(
+                        "cannot grow SpriteAtlas assignment index: {error}"
+                    ))
+                })?;
+
+                let atlas_index = atlases.len();
+                atlases.push(IndexedSpriteAtlas {
+                    file_index,
+                    object_index,
+                    is_variant: atlas.is_variant,
+                });
+                for reference in atlas.packed_sprites {
+                    let Some((sprite_file_index, sprite_object_index)) =
+                        collection.resolve_object_location(file_index, reference)
+                    else {
+                        continue;
+                    };
+                    let Some(sprite_object) = collection
+                        .serialized_files
+                        .get(sprite_file_index)
+                        .and_then(|target| target.file.objects.get(sprite_object_index))
+                    else {
+                        continue;
+                    };
+                    if sprite_object.class_id != SPRITE_CLASS_ID {
+                        continue;
+                    }
+                    assignments.push(SpriteAtlasAssignment {
+                        sprite_file: sprite_file_index,
+                        sprite_object: sprite_object_index,
+                        atlas: atlas_index,
+                    });
+                }
+                retained_entries = next_entries;
+            }
+        }
+
+        assignments
+            .sort_unstable_by_key(|entry| (entry.sprite_file, entry.sprite_object, entry.atlas));
+        Ok(Self {
+            atlases,
+            assignments,
+        })
+    }
+
+    fn object_count(collection: &AssetCollection) -> Result<usize> {
+        collection
+            .serialized_files
+            .iter()
+            .try_fold(0_usize, |count, loaded| {
+                loaded
+                    .file
+                    .objects
+                    .iter()
+                    .filter(|object| object.class_id == SPRITE_ATLAS_CLASS_ID)
+                    .try_fold(count, |count, _| {
+                        count.checked_add(1).ok_or_else(|| {
+                            Error::invalid_data("SpriteAtlas object count overflowed")
+                        })
+                    })
+            })
+    }
+
+    fn atlas(&self, file_index: usize, object_index: usize) -> Option<IndexedSpriteAtlas> {
+        let target = (file_index, object_index);
+        let index = self
+            .atlases
+            .partition_point(|atlas| (atlas.file_index, atlas.object_index) < target);
+        self.atlases
+            .get(index)
+            .copied()
+            .filter(|atlas| (atlas.file_index, atlas.object_index) == target)
+    }
+
+    fn assignments(
+        &self,
+        sprite_file_index: usize,
+        sprite_object_index: usize,
+        mut probe: impl FnMut(),
+    ) -> &[SpriteAtlasAssignment] {
+        let target = (sprite_file_index, sprite_object_index);
+        let start = self.assignments.partition_point(|entry| {
+            probe();
+            (entry.sprite_file, entry.sprite_object) < target
+        });
+        let width = self.assignments[start..].partition_point(|entry| {
+            probe();
+            (entry.sprite_file, entry.sprite_object) == target
+        });
+        &self.assignments[start..start + width]
     }
 }
 
@@ -2224,8 +2465,35 @@ mod tests {
         AssetCollection, AssetLoadBudget, AssetLoadLimits, AssetLoadOptions, LoadDiagnostic,
         LoadFailurePolicy, LoadPath, LoadedResource, LoadedSerializedFile, ObjectMetadataBuilder,
         ObjectMetadataEntry, ObjectMetadataIndexBudget, ObjectMetadataKey, PendingInput,
-        PendingObjectNames, charge_pending_inputs, object_metadata_position_with_probe,
+        PendingObjectNames, SpriteAtlasAssignment, SpriteAtlasIndex, charge_pending_inputs,
+        object_metadata_position_with_probe,
     };
+
+    #[test]
+    fn sprite_atlas_assignment_lookup_scales_with_logarithmic_queries() {
+        const ENTRY_COUNT: usize = 16_384;
+        let assignments = (0..ENTRY_COUNT)
+            .map(|sprite_object_index| SpriteAtlasAssignment {
+                sprite_file: 0,
+                sprite_object: sprite_object_index,
+                atlas: sprite_object_index,
+            })
+            .collect();
+        let index = SpriteAtlasIndex {
+            atlases: Vec::new(),
+            assignments,
+        };
+        let mut probes = 0_usize;
+        for sprite_object_index in (0..ENTRY_COUNT).rev() {
+            let matches = index.assignments(0, sprite_object_index, || probes += 1);
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].atlas, sprite_object_index);
+        }
+        assert!(
+            probes < ENTRY_COUNT * 40,
+            "{probes} boundary probes exceeded logarithmic lookup budget"
+        );
+    }
 
     #[test]
     fn loads_the_streamed_companions_beside_a_single_file_input() {
