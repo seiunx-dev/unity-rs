@@ -67,7 +67,7 @@ use crate::simple_assets::{
     read_movie_texture, read_video_clip,
 };
 use crate::source::Region;
-use crate::sprite::{Sprite, SpriteReadLimits, decode_sprite_rgba8, read_sprite};
+use crate::sprite::{Sprite, SpriteReadLimits, decode_sprite_rgba8_by_file_index, read_sprite};
 use crate::sprite_atlas::{SpriteAtlas, SpriteAtlasReadLimits, read_sprite_atlas};
 use crate::texture::{RgbaImage, TextureReadLimits, read_texture2d};
 use crate::texture_array::{TextureArrayReadLimits, read_texture2d_array};
@@ -1160,9 +1160,9 @@ impl StudioObject<'_> {
         texture_limits: TextureReadLimits,
     ) -> Result<RgbaImage> {
         let sprite = read_sprite(&self.loaded().file, self.object_index, sprite_limits)?;
-        decode_sprite_rgba8(
+        decode_sprite_rgba8_by_file_index(
             &self.studio.collection,
-            &self.loaded().file,
+            self.file_index,
             &sprite,
             sprite_limits,
             texture_limits,

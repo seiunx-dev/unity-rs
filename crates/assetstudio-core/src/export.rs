@@ -25,7 +25,9 @@ use crate::simple_assets::{
     read_font, read_movie_texture, read_video_clip, write_direct_wav,
 };
 use crate::source::Region;
-use crate::sprite::{SPRITE_CLASS_ID, SpriteReadLimits, decode_sprite_rgba8, read_sprite};
+use crate::sprite::{
+    SPRITE_CLASS_ID, SpriteReadLimits, decode_sprite_rgba8_by_file_index, read_sprite,
+};
 use crate::texture::{RgbaImage, TEXTURE_2D_CLASS_ID, TextureReadLimits, read_texture2d};
 use crate::texture_array::{
     TEXTURE_2D_ARRAY_CLASS_ID, Texture2DArray, TextureArrayReadLimits, read_texture2d_array,
@@ -632,8 +634,13 @@ fn select_auto_export_payload(
                 ..TextureReadLimits::default()
             };
             let sprite = read_sprite(file, object_index, sprite_limits)?;
-            let image =
-                decode_sprite_rgba8(collection, file, &sprite, sprite_limits, texture_limits)?;
+            let image = decode_sprite_rgba8_by_file_index(
+                collection,
+                file_index,
+                &sprite,
+                sprite_limits,
+                texture_limits,
+            )?;
             (
                 sprite.name,
                 options.image_format.extension().to_owned(),

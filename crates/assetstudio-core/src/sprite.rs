@@ -289,18 +289,66 @@ pub fn decode_sprite_rgba8(
             collection,
             sprite,
             atlas.file,
+            atlas.file_index,
             atlas.object_index,
             limits,
             texture_limits,
         );
     }
 
-    decode_sprite_from_resident_data(collection, file, sprite, limits, texture_limits)
+    decode_sprite_from_resident_data(collection, file, None, sprite, limits, texture_limits)
+}
+
+/// Resolves and decodes one Sprite whose source file is identified by its
+/// stable collection index.
+///
+/// Collections opened through the loader use their prebuilt `SpriteAtlas`
+/// assignment index here, so decoding many Sprites does not repeatedly scan
+/// every atlas and every `packedSprites` array. Low-level collections that did
+/// not rebuild derived indexes retain the compatibility scan.
+pub fn decode_sprite_rgba8_by_file_index(
+    collection: &AssetCollection,
+    file_index: usize,
+    sprite: &Sprite,
+    limits: SpriteReadLimits,
+    texture_limits: TextureReadLimits,
+) -> Result<RgbaImage> {
+    let file = collection
+        .serialized_files()
+        .get(file_index)
+        .map(|loaded| &loaded.file)
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "Sprite source serialized-file index {file_index} is out of range"
+            ))
+        })?;
+    if let Some(atlas) =
+        effective_sprite_atlas_by_file_index(collection, file_index, sprite, limits)?
+    {
+        return decode_sprite_from_atlas(
+            collection,
+            sprite,
+            atlas.file,
+            atlas.file_index,
+            atlas.object_index,
+            limits,
+            texture_limits,
+        );
+    }
+    decode_sprite_from_resident_data(
+        collection,
+        file,
+        Some(file_index),
+        sprite,
+        limits,
+        texture_limits,
+    )
 }
 
 #[derive(Clone, Copy)]
 struct SelectedSpriteAtlas<'a> {
     file: &'a SerializedFile,
+    file_index: Option<usize>,
     object_index: usize,
     is_variant: Option<bool>,
 }
@@ -322,6 +370,7 @@ fn effective_sprite_atlas<'a>(
         resolve_object_target(
             collection,
             sprite_file,
+            None,
             sprite.sprite_atlas,
             SPRITE_ATLAS_CLASS_ID,
             "SpriteAtlas",
@@ -330,6 +379,7 @@ fn effective_sprite_atlas<'a>(
         .ok()
         .map(|(file, object_index)| SelectedSpriteAtlas {
             file,
+            file_index: None,
             object_index,
             is_variant: read_sprite_atlas(file, object_index, atlas_read_limits(limits))
                 .ok()
@@ -337,7 +387,7 @@ fn effective_sprite_atlas<'a>(
         })
     };
 
-    for loaded in &collection.serialized_files {
+    for (file_index, loaded) in collection.serialized_files().iter().enumerate() {
         for (object_index, object) in loaded.file.objects.iter().enumerate() {
             if object.class_id != SPRITE_ATLAS_CLASS_ID {
                 continue;
@@ -353,6 +403,7 @@ fn effective_sprite_atlas<'a>(
                 resolve_serialized_object_reference(
                     collection,
                     &loaded.file,
+                    Some(file_index),
                     *reference,
                     SPRITE_CLASS_ID,
                 )
@@ -369,6 +420,7 @@ fn effective_sprite_atlas<'a>(
             if replace {
                 selected = Some(SelectedSpriteAtlas {
                     file: &loaded.file,
+                    file_index: Some(file_index),
                     object_index,
                     is_variant: Some(atlas.is_variant),
                 });
@@ -378,15 +430,75 @@ fn effective_sprite_atlas<'a>(
     Ok(selected)
 }
 
+fn effective_sprite_atlas_by_file_index<'a>(
+    collection: &'a AssetCollection,
+    sprite_file_index: usize,
+    sprite: &Sprite,
+    limits: SpriteReadLimits,
+) -> Result<Option<SelectedSpriteAtlas<'a>>> {
+    let Some(assignments) =
+        collection.indexed_sprite_atlas_assignments(sprite_file_index, sprite.object_index)
+    else {
+        let file = &collection.serialized_files()[sprite_file_index].file;
+        return effective_sprite_atlas(collection, file, sprite, limits);
+    };
+
+    let mut selected = if sprite.sprite_atlas.is_null() {
+        None
+    } else {
+        crate::scene::resolve_typed_object_reference(
+            collection,
+            sprite_file_index,
+            crate::serialized::ObjectReference {
+                file_id: sprite.sprite_atlas.file_id,
+                path_id: sprite.sprite_atlas.path_id,
+            },
+            SPRITE_ATLAS_CLASS_ID,
+        )
+        .ok()
+        .flatten()
+        .map(|resolved| SelectedSpriteAtlas {
+            file: resolved.file,
+            file_index: Some(resolved.file_index),
+            object_index: resolved.object_index,
+            is_variant: collection
+                .indexed_sprite_atlas(resolved.file_index, resolved.object_index)
+                .map(|atlas| atlas.is_variant),
+        })
+    };
+
+    for assignment in assignments {
+        let atlas = collection
+            .indexed_sprite_atlas_by_index(assignment.atlas)
+            .ok_or_else(|| Error::invalid_data("SpriteAtlas assignment index is inconsistent"))?;
+        let replace = selected.is_none_or(|current| current.is_variant != Some(false));
+        if replace {
+            let loaded = collection
+                .serialized_files()
+                .get(atlas.file_index)
+                .ok_or_else(|| Error::invalid_data("indexed SpriteAtlas file is out of range"))?;
+            selected = Some(SelectedSpriteAtlas {
+                file: &loaded.file,
+                file_index: Some(atlas.file_index),
+                object_index: atlas.object_index,
+                is_variant: Some(atlas.is_variant),
+            });
+        }
+    }
+    Ok(selected)
+}
+
 fn resolve_serialized_object_reference<'a>(
     collection: &'a AssetCollection,
     file: &'a SerializedFile,
+    file_index: Option<usize>,
     reference: crate::serialized::ObjectReference,
     expected_class_id: i32,
 ) -> Option<(&'a SerializedFile, usize)> {
     resolve_object_target(
         collection,
         file,
+        file_index,
         ObjectReference {
             file_id: reference.file_id,
             path_id: reference.path_id,
@@ -401,6 +513,7 @@ fn resolve_serialized_object_reference<'a>(
 fn decode_sprite_from_resident_data(
     collection: &AssetCollection,
     file: &SerializedFile,
+    file_index: Option<usize>,
     sprite: &Sprite,
     limits: SpriteReadLimits,
     texture_limits: TextureReadLimits,
@@ -412,6 +525,7 @@ fn decode_sprite_from_resident_data(
     let texture = resolve_texture_reference(
         collection,
         file,
+        file_index,
         sprite.render_data.texture,
         texture_limits,
         "Sprite texture",
@@ -431,6 +545,7 @@ fn decode_sprite_from_resident_data(
         let alpha_texture = resolve_texture_reference(
             collection,
             file,
+            file_index,
             sprite.render_data.alpha_texture,
             texture_limits,
             "Sprite alpha texture",
@@ -468,6 +583,7 @@ fn decode_sprite_from_atlas(
     collection: &AssetCollection,
     sprite: &Sprite,
     atlas_file: &SerializedFile,
+    atlas_file_index: Option<usize>,
     atlas_index: usize,
     limits: SpriteReadLimits,
     texture_limits: TextureReadLimits,
@@ -484,12 +600,21 @@ fn decode_sprite_from_atlas(
                 atlas.path_id
             ))
         })?;
-    decode_sprite_atlas_data(collection, atlas_file, sprite, data, limits, texture_limits)
+    decode_sprite_atlas_data(
+        collection,
+        atlas_file,
+        atlas_file_index,
+        sprite,
+        data,
+        limits,
+        texture_limits,
+    )
 }
 
 fn decode_sprite_atlas_data(
     collection: &AssetCollection,
     atlas_file: &SerializedFile,
+    atlas_file_index: Option<usize>,
     sprite: &Sprite,
     data: &SpriteAtlasData,
     limits: SpriteReadLimits,
@@ -500,6 +625,7 @@ fn decode_sprite_atlas_data(
     let texture = resolve_texture_reference(
         collection,
         atlas_file,
+        atlas_file_index,
         ObjectReference {
             file_id: data.texture.file_id,
             path_id: data.texture.path_id,
@@ -556,6 +682,7 @@ fn validate_renderable(settings: SpriteSettings, downscale: f32) -> Result<()> {
 fn resolve_texture_reference(
     collection: &AssetCollection,
     file: &SerializedFile,
+    file_index: Option<usize>,
     reference: ObjectReference,
     limits: TextureReadLimits,
     field: &str,
@@ -563,6 +690,7 @@ fn resolve_texture_reference(
     let (target_file, index) = resolve_object_target(
         collection,
         file,
+        file_index,
         reference,
         TEXTURE_2D_CLASS_ID,
         "Texture2D",
@@ -574,6 +702,7 @@ fn resolve_texture_reference(
 fn resolve_object_target<'a>(
     collection: &'a AssetCollection,
     file: &'a SerializedFile,
+    file_index: Option<usize>,
     reference: ObjectReference,
     expected_class_id: i32,
     expected_class_name: &str,
@@ -587,6 +716,20 @@ fn resolve_object_target<'a>(
         // Addressables build splits sprites and their textures across bundles,
         // so reading one bundle at a time meets this constantly.
         return Err(Error::unsupported(format!("{field} reference is null")));
+    }
+
+    if let Some(file_index) = file_index {
+        let resolved = crate::scene::resolve_typed_object_reference(
+            collection,
+            file_index,
+            crate::serialized::ObjectReference {
+                file_id: reference.file_id,
+                path_id: reference.path_id,
+            },
+            expected_class_id,
+        )?
+        .ok_or_else(|| Error::unsupported(format!("{field} reference is null")))?;
+        return Ok((resolved.file, resolved.object_index));
     }
 
     let target_file = if reference.file_id == 0 {
@@ -2197,15 +2340,16 @@ fn reserve_vec<T>(count: usize, field: &str) -> Result<Vec<T>> {
 #[cfg(test)]
 mod tests {
     use crate::error::Error;
-    use crate::loader::{AssetCollection, LoadedSerializedFile};
+    use crate::loader::{AssetCollection, AssetLoadLimits, LoadedSerializedFile};
     use crate::serialized::SerializedFile;
     use crate::source::Region;
     use crate::sprite_atlas::SPRITE_ATLAS_CLASS_ID;
     use crate::texture::{RgbaImage, TextureFormat, TextureReadLimits};
 
     use super::{
-        SPRITE_CLASS_ID, SpritePackingMode, SpriteReadLimits, decode_sprite_rgba8, is_convex_quad,
-        read_sprite, resize_bicubic_rgba8, shared_edge_quad, sprite_resize_dimensions,
+        SPRITE_CLASS_ID, SpritePackingMode, SpriteReadLimits, decode_sprite_rgba8,
+        decode_sprite_rgba8_by_file_index, is_convex_quad, read_sprite, resize_bicubic_rgba8,
+        shared_edge_quad, sprite_resize_dimensions,
     };
 
     /// The coverage fast path may only skip masking for shapes it has proved
@@ -3018,6 +3162,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(image.pixels, [30, 0, 0, 255]);
+    }
+
+    #[test]
+    fn indexed_backfill_preserves_master_selection_and_enforces_build_budget() {
+        let sprite_object = modern_sprite_object(
+            2,
+            0,
+            [0.0, 0.0, 1.0, 1.0],
+            2,
+            ObjectReferenceFields::default(),
+        );
+        let variant = sprite_atlas_object(AtlasFixtureFields {
+            texture_path: 3,
+            is_variant: true,
+            ..AtlasFixtureFields::default()
+        });
+        let master = sprite_atlas_object(AtlasFixtureFields {
+            texture_path: 4,
+            ..AtlasFixtureFields::default()
+        });
+        let file = parse_asset(
+            "2022.3.62f1",
+            &[
+                (SPRITE_CLASS_ID, 1, sprite_object),
+                (28, 2, texture_object(1, 1, &[1, 2, 3, 255])),
+                (28, 3, texture_object(1, 1, &[30, 0, 0, 255])),
+                (28, 4, texture_object(1, 1, &[40, 0, 0, 255])),
+                (SPRITE_ATLAS_CLASS_ID, 9, variant),
+                (SPRITE_ATLAS_CLASS_ID, 10, master),
+            ],
+        );
+
+        let mut collection = collection_with(file.clone());
+        collection
+            .resolve_object_metadata(AssetLoadLimits::default())
+            .unwrap();
+        let assignments = collection
+            .indexed_sprite_atlas_assignments(0, 0)
+            .expect("metadata resolution builds the atlas index");
+        assert_eq!(assignments.len(), 2);
+        let sprite = read_sprite(
+            &collection.serialized_files()[0].file,
+            0,
+            SpriteReadLimits::default(),
+        )
+        .unwrap();
+        let image = decode_sprite_rgba8_by_file_index(
+            &collection,
+            0,
+            &sprite,
+            SpriteReadLimits::default(),
+            TextureReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(image.pixels, [40, 0, 0, 255]);
+
+        let mut limited = collection_with(file);
+        let error = limited
+            .resolve_object_metadata(AssetLoadLimits {
+                maximum_sprite_atlas_index_entries: 3,
+                ..AssetLoadLimits::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("needs 4 entries"));
+        assert!(limited.indexed_sprite_atlas_assignments(0, 0).is_none());
     }
 
     #[test]
