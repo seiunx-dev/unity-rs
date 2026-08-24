@@ -59,7 +59,7 @@ pub(crate) fn write_model_ir_fbx_ascii_with_textures<W: Write>(
     output: &mut W,
     maximum_output_bytes: u64,
 ) -> Result<u64> {
-    let scene = StaticScene::from_model(model, animations, textures)?;
+    let scene = StaticScene::from_model(model, animations, textures, maximum_output_bytes)?;
     let mut bounded = BoundedWriter::new(output, maximum_output_bytes);
     let result = scene.write(&mut bounded);
     if bounded.limit_exceeded {
@@ -210,6 +210,7 @@ impl<'a> StaticScene<'a> {
         model: &'a ModelIr,
         animations: Option<&'a ModelAnimationSet>,
         textures: Option<&'a SceneTextureSet>,
+        maximum_output_bytes: u64,
     ) -> Result<Self> {
         if model.coordinate_convention != ModelCoordinateConvention::UnitySource {
             return Err(Error::unsupported(
@@ -295,7 +296,9 @@ impl<'a> StaticScene<'a> {
         let materials = build_material_plans(model, &used_materials, textures, &mut texture_plans)?;
         let animations = animations.map_or_else(
             || Ok(Vec::new()),
-            |animations| build_animation_plans(model, &geometries, animations),
+            |animations| {
+                build_animation_plans(model, &geometries, animations, maximum_output_bytes)
+            },
         )?;
         Ok(Self {
             nodes,
@@ -1340,13 +1343,98 @@ struct AnimationIdState {
     curves: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MorphChannelLookup<'a> {
+    model_id: i64,
+    name: &'a str,
+    channel_id: i64,
+    source_order: usize,
+}
+
+#[derive(Debug, Default)]
+struct MorphChannelIndex<'a> {
+    entries: Vec<MorphChannelLookup<'a>>,
+}
+
+impl<'a> MorphChannelIndex<'a> {
+    fn build(geometries: &[GeometryPlan<'a>], maximum_output_bytes: u64) -> Result<Self> {
+        let entry_count = geometries.iter().try_fold(0_usize, |total, geometry| {
+            total
+                .checked_add(
+                    geometry
+                        .morph
+                        .as_ref()
+                        .map_or(0, |morph| morph.channels.len()),
+                )
+                .ok_or_else(|| Error::invalid_data("FBX morph-channel index count overflowed"))
+        })?;
+        let index_bytes = entry_count
+            .checked_mul(std::mem::size_of::<MorphChannelLookup<'_>>())
+            .ok_or_else(|| Error::invalid_data("FBX morph-channel index size overflowed"))?;
+        let index_bytes_u64 = u64::try_from(index_bytes)
+            .map_err(|_| Error::invalid_data("FBX morph-channel index size overflowed"))?;
+        if index_bytes_u64 > maximum_output_bytes {
+            return Err(Error::invalid_data(format!(
+                "FBX morph-channel index needs {index_bytes_u64} bytes, exceeding the {maximum_output_bytes} byte output limit"
+            )));
+        }
+
+        let mut entries = reserve_vec(entry_count, "FBX morph-channel lookup index")?;
+        for geometry in geometries {
+            let Some(morph) = &geometry.morph else {
+                continue;
+            };
+            for channel in &morph.channels {
+                entries.push(MorphChannelLookup {
+                    model_id: geometry.model_id,
+                    name: channel.name,
+                    channel_id: channel.id,
+                    source_order: entries.len(),
+                });
+            }
+        }
+        entries.sort_unstable_by(|left, right| {
+            left.model_id
+                .cmp(&right.model_id)
+                .then_with(|| left.name.cmp(right.name))
+                .then_with(|| left.source_order.cmp(&right.source_order))
+        });
+        Ok(Self { entries })
+    }
+
+    fn find(&self, model_id: i64, name: &str) -> Option<i64> {
+        self.find_with_probe(model_id, name, || {})
+    }
+
+    fn find_with_probe(&self, model_id: i64, name: &str, mut probe: impl FnMut()) -> Option<i64> {
+        let start = self.entries.partition_point(|entry| {
+            probe();
+            entry.model_id < model_id || (entry.model_id == model_id && entry.name < name)
+        });
+        self.entries
+            .get(start)
+            .filter(|entry| entry.model_id == model_id && entry.name == name)
+            .map(|entry| entry.channel_id)
+    }
+}
+
 fn build_animation_plans<'a>(
     model: &ModelIr,
     geometries: &[GeometryPlan<'_>],
     animations: &'a ModelAnimationSet,
+    maximum_output_bytes: u64,
 ) -> Result<Vec<AnimationPlan<'a>>> {
     let mut plans = reserve_vec(animations.clips.len(), "FBX animation plans")?;
     let mut ids = AnimationIdState::default();
+    let morph_channels = if animations
+        .clips
+        .iter()
+        .any(|clip| !clip.blend_shapes.is_empty())
+    {
+        MorphChannelIndex::build(geometries, maximum_output_bytes)?
+    } else {
+        MorphChannelIndex::default()
+    };
     for (clip_index, clip) in animations.clips.iter().enumerate() {
         validate_name(&clip.name, "animation")?;
         if !clip.sample_rate.is_finite() || clip.sample_rate <= 0.0 {
@@ -1370,7 +1458,10 @@ fn build_animation_plans<'a>(
         )?;
         for track in &clip.blend_shapes {
             blend_shapes.push(build_blend_shape_animation(
-                model, geometries, track, &mut ids,
+                model,
+                &morph_channels,
+                track,
+                &mut ids,
             )?);
         }
         let mut stop_time = 0_i64;
@@ -1394,7 +1485,7 @@ fn build_animation_plans<'a>(
 
 fn build_blend_shape_animation<'a>(
     model: &ModelIr,
-    geometries: &[GeometryPlan<'_>],
+    morph_channels: &MorphChannelIndex<'_>,
     track: &'a ModelBlendShapeTrack,
     ids: &mut AnimationIdState,
 ) -> Result<AnimationBlendShapePlan<'a>> {
@@ -1404,13 +1495,8 @@ fn build_blend_shape_animation<'a>(
         Error::invalid_data("FBX blend-shape animation targets a missing model node")
     })?;
     let model_id = indexed_id(MODEL_ID_BASE, node_index, "FBX animated model")?;
-    let channel_id = geometries
-        .iter()
-        .filter(|geometry| geometry.model_id == model_id)
-        .filter_map(|geometry| geometry.morph.as_ref())
-        .flat_map(|morph| &morph.channels)
-        .find(|channel| channel.name == track.channel)
-        .map(|channel| channel.id)
+    let channel_id = morph_channels
+        .find(model_id, &track.channel)
         .ok_or_else(|| {
             Error::invalid_data(format!(
                 "FBX blend-shape animation channel {} is absent from its model geometry",
@@ -2878,8 +2964,9 @@ mod tests {
     use crate::scene_textures::{SceneTextureSet, TextureSlot};
 
     use super::{
-        ConvertedTransform, GeometryPlan, StaticScene, quaternion_to_euler_degrees, validate_mesh,
-        write_geometry, write_model_ir_fbx_ascii, write_model_ir_fbx_ascii_with_animations,
+        ConvertedTransform, GeometryPlan, MorphChannelIndex, MorphChannelLookup, MorphChannelPlan,
+        MorphPlan, StaticScene, quaternion_to_euler_degrees, validate_mesh, write_geometry,
+        write_model_ir_fbx_ascii, write_model_ir_fbx_ascii_with_animations,
         write_model_ir_fbx_ascii_with_textures,
     };
 
@@ -3217,6 +3304,83 @@ mod tests {
         assert!(text.contains("KeyValueFloat: *2 {\n            a: 0,75"));
         assert!(text.contains("C: \"OP\",8000000003,11000000000,\"DeformPercent\""));
         assert!(text.contains("C: \"OP\",9000000009,8000000003,\"d|DeformPercent\""));
+
+        let index_bytes = u64::try_from(std::mem::size_of::<MorphChannelLookup<'_>>()).unwrap();
+        let error = write_model_ir_fbx_ascii_with_animations(
+            &model,
+            Some(&animations),
+            &mut Vec::new(),
+            index_bytes - 1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("morph-channel index"));
+    }
+
+    #[test]
+    fn indexes_many_morph_channels_once_and_preserves_first_duplicate() {
+        const CHANNEL_COUNT: usize = 16_384;
+        let model = skinned_model_fixture();
+        let mut specifications = Vec::new();
+        specifications.try_reserve_exact(CHANNEL_COUNT + 1).unwrap();
+        for value in (0..CHANNEL_COUNT).rev() {
+            specifications.push((
+                format!("channel-{value:05}"),
+                super::BLEND_SHAPE_CHANNEL_ID_BASE + i64::try_from(value).unwrap(),
+            ));
+        }
+        specifications.push(("channel-00000".to_owned(), i64::MAX));
+        let channels = specifications
+            .iter()
+            .map(|(name, id)| MorphChannelPlan {
+                id: *id,
+                name,
+                full_weights: &[],
+                shapes: Vec::new(),
+            })
+            .collect();
+        let geometries = [GeometryPlan {
+            id: super::GEOMETRY_ID_BASE,
+            model_id: super::MODEL_ID_BASE,
+            mesh: &model.meshes[0].mesh,
+            material_ids: Vec::new(),
+            submesh_material_slots: Vec::new(),
+            skin: None,
+            morph: Some(MorphPlan {
+                id: super::BLEND_SHAPE_ID_BASE,
+                name: "morph",
+                channels,
+            }),
+        }];
+        let index_bytes = (CHANNEL_COUNT + 1)
+            .checked_mul(std::mem::size_of::<MorphChannelLookup<'_>>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap();
+        let error = MorphChannelIndex::build(&geometries, index_bytes - 1).unwrap_err();
+        assert!(error.to_string().contains("morph-channel index"));
+
+        let index = MorphChannelIndex::build(&geometries, index_bytes).unwrap();
+        let probes = std::cell::Cell::new(0_usize);
+        for value in (0..CHANNEL_COUNT).rev() {
+            let specification_index = CHANNEL_COUNT - 1 - value;
+            let name = &specifications[specification_index].0;
+            let expected = super::BLEND_SHAPE_CHANNEL_ID_BASE + i64::try_from(value).unwrap();
+            assert_eq!(
+                index.find_with_probe(super::MODEL_ID_BASE, name, || {
+                    probes.set(probes.get() + 1);
+                }),
+                Some(expected)
+            );
+        }
+        assert!(
+            probes.get() < CHANNEL_COUNT * 20,
+            "{} binary-search probes exceeded the logarithmic bound",
+            probes.get()
+        );
+        assert_eq!(
+            index.find(super::MODEL_ID_BASE, "channel-00000"),
+            Some(super::BLEND_SHAPE_CHANNEL_ID_BASE)
+        );
+        assert_eq!(index.find(super::MODEL_ID_BASE, "missing"), None);
     }
 
     fn animation_fixture() -> ModelAnimationSet {
@@ -3531,7 +3695,7 @@ mod tests {
             .unwrap();
         }
 
-        let scene = StaticScene::from_model(&model, None, Some(&set)).unwrap();
+        let scene = StaticScene::from_model(&model, None, Some(&set), u64::MAX).unwrap();
         assert_eq!(scene.materials.len(), 1);
         assert_eq!(scene.materials[0].textures.len(), BINDING_COUNT);
         assert_eq!(scene.textures.len(), 1);
