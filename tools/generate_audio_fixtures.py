@@ -62,8 +62,13 @@ OPUS_VARIANTS = {
 
 MPEG_NAME = "mpeg-layer3-tone.mp3"
 MPEG_TONE = "sine=frequency=440:sample_rate=44100:duration=0.3"
-MPEG_MULTISTREAM_NAME = "fsb5-mpeg-layer3-6ch.fsb"
-MPEG_MULTISTREAM_PAIRS = ((330, 440), (550, 660), (770, 880))
+MPEG_MULTISTREAM_CHANNEL_COUNTS = tuple(range(3, 17))
+MPEG_MULTISTREAM_PERIODS = (
+    94, 106, 118, 130, 142, 154, 166, 178,
+    190, 202, 214, 226, 238, 250, 262, 274,
+)
+MPEG_MULTISTREAM_FRAMES = 13_230
+MPEG_MULTISTREAM_SAMPLE_RATE = 44_100
 OPUS_SURROUND_CHANNEL_COUNTS = (3, 4, 5, 6, 7, 8)
 OPUS_SURROUND_LAYOUTS = {
     3: "3.0",
@@ -93,6 +98,32 @@ VORBIS_SURROUND_SETUP_CRC = 0x6AAD13BC
 
 def run(command: list[str]) -> None:
     subprocess.run(command, check=True, capture_output=True)
+
+
+def write_triangle_wave(
+    path: Path,
+    frames: int,
+    sample_rate: int,
+    periods: tuple[int, ...],
+) -> None:
+    """Writes deterministic, distinct integer PCM16 triangle-wave channels."""
+    pcm = bytearray(frames * len(periods) * 2)
+    cursor = 0
+    for frame in range(frames):
+        for period in periods:
+            half_period = period // 2
+            phase = frame % period
+            if phase < half_period:
+                sample = -6_000 + 12_000 * phase // half_period
+            else:
+                sample = 6_000 - 12_000 * (phase - half_period) // half_period
+            struct.pack_into("<h", pcm, cursor, sample)
+            cursor += 2
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(len(periods))
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(pcm)
 
 
 def ogg_packets(path: Path) -> list[bytes]:
@@ -218,21 +249,16 @@ def mpeg_layer3_frames(data: bytes) -> list[bytes]:
 
 
 def generate_multistream_mpeg(work: Path) -> None:
-    """Builds a six-channel FSB5 from three independently encoded stereo streams."""
-    streams: list[list[bytes]] = []
-    for index, (left, right) in enumerate(MPEG_MULTISTREAM_PAIRS):
+    """Builds 3-16 channel FSB5 files from independent mono/stereo streams."""
+    stereo_streams: list[list[bytes]] = []
+    for index in range(8):
         raw = work / f"mpeg-pair-{index}.wav"
         encoded = work / f"mpeg-pair-{index}.mp3"
-        run(
-            [
-                "ffmpeg", "-v", "error", "-y",
-                "-f", "lavfi", "-i",
-                f"sine=frequency={left}:sample_rate=44100:duration=0.3",
-                "-f", "lavfi", "-i",
-                f"sine=frequency={right}:sample_rate=44100:duration=0.3",
-                "-filter_complex", "[0:a][1:a]amerge=inputs=2[a]",
-                "-map", "[a]", "-ac", "2", str(raw),
-            ]
+        write_triangle_wave(
+            raw,
+            MPEG_MULTISTREAM_FRAMES,
+            MPEG_MULTISTREAM_SAMPLE_RATE,
+            MPEG_MULTISTREAM_PERIODS[index * 2 : index * 2 + 2],
         )
         run(
             [
@@ -240,35 +266,73 @@ def generate_multistream_mpeg(work: Path) -> None:
                 "--nores", "-t", str(raw), str(encoded),
             ]
         )
-        streams.append(mpeg_layer3_frames(encoded.read_bytes()))
+        stereo_streams.append(mpeg_layer3_frames(encoded.read_bytes()))
 
-    frame_count = len(streams[0])
-    if frame_count == 0 or any(len(stream) != frame_count for stream in streams):
-        raise ValueError("multistream MPEG encoders produced different frame counts")
-    data = bytearray()
-    for frames in zip(*streams):
-        interleave = (len(frames[0]) + 15) & ~15
-        for frame in frames:
-            if (len(frame) + 15) & ~15 != interleave:
-                raise ValueError("multistream MPEG frames have different padded spans")
-            data.extend(frame)
-            data.extend(b"\0" * (interleave - len(frame)))
+    mono_streams: dict[int, list[bytes]] = {}
+    for channel in range(2, 16, 2):
+        raw = work / f"mpeg-mono-{channel}.wav"
+        encoded = work / f"mpeg-mono-{channel}.mp3"
+        write_triangle_wave(
+            raw,
+            MPEG_MULTISTREAM_FRAMES,
+            MPEG_MULTISTREAM_SAMPLE_RATE,
+            (MPEG_MULTISTREAM_PERIODS[channel],),
+        )
+        run(
+            [
+                "lame", "--quiet", "-b", "128", "--cbr", "-m", "m",
+                "--nores", "-t", str(raw), str(encoded),
+            ]
+        )
+        mono_streams[channel] = mpeg_layer3_frames(encoded.read_bytes())
 
-    header = bytearray(0x3C)
-    header[:4] = b"FSB5"
-    header[4:8] = (1).to_bytes(4, "little")
-    header[8:12] = (1).to_bytes(4, "little")
-    header[12:16] = (8).to_bytes(4, "little")
-    header[20:24] = len(data).to_bytes(4, "little")
-    header[24:28] = (11).to_bytes(4, "little")
-    # Compact channel code 2 is six channels; rate code 8 is 44.1 kHz.
-    sample_mode = (frame_count * 1152 << 34) | (2 << 5) | (8 << 1)
-    output = header + sample_mode.to_bytes(8, "little") + data
-    (FIXTURES / MPEG_MULTISTREAM_NAME).write_bytes(output)
-    print(
-        f"wrote {MPEG_MULTISTREAM_NAME}: {frame_count} frames per stream, "
-        f"{len(output)} bytes"
-    )
+    for channels in MPEG_MULTISTREAM_CHANNEL_COUNTS:
+        streams = list(stereo_streams[: channels // 2])
+        if channels % 2:
+            streams.append(mono_streams[channels - 1])
+        frame_count = len(streams[0])
+        if frame_count == 0 or any(len(stream) != frame_count for stream in streams):
+            raise ValueError(
+                f"{channels}-channel MPEG encoders produced different frame counts"
+            )
+        data = bytearray()
+        for frames in zip(*streams):
+            interleave = (len(frames[0]) + 15) & ~15
+            for frame in frames:
+                if (len(frame) + 15) & ~15 != interleave:
+                    raise ValueError(
+                        f"{channels}-channel MPEG frames have different padded spans"
+                    )
+                data.extend(frame)
+                data.extend(b"\0" * (interleave - len(frame)))
+
+        channel_code = {6: 2, 8: 3}.get(channels, 0)
+        has_channel_metadata = channels not in (1, 2, 6, 8)
+        sample_mode = (
+            (frame_count * 1152 << 34)
+            | (channel_code << 5)
+            | (8 << 1)
+            | int(has_channel_metadata)
+        )
+        metadata = bytearray()
+        if has_channel_metadata:
+            channel_header = (1 << 25) | (1 << 1)
+            metadata.extend(channel_header.to_bytes(4, "little"))
+            metadata.append(channels)
+        sample_headers = sample_mode.to_bytes(8, "little") + metadata
+        header = bytearray(0x3C)
+        header[:4] = b"FSB5"
+        header[4:8] = (1).to_bytes(4, "little")
+        header[8:12] = (1).to_bytes(4, "little")
+        header[12:16] = len(sample_headers).to_bytes(4, "little")
+        header[20:24] = len(data).to_bytes(4, "little")
+        header[24:28] = (11).to_bytes(4, "little")
+        name = f"fsb5-mpeg-layer3-{channels}ch.fsb"
+        output = header + sample_headers + data
+        (FIXTURES / name).write_bytes(output)
+        print(
+            f"wrote {name}: {frame_count} frames per stream, {len(output)} bytes"
+        )
 
 
 def generate_surround_opus(work: Path) -> None:
@@ -278,23 +342,12 @@ def generate_surround_opus(work: Path) -> None:
         ogg_name = f"opus-celt-{channels}ch.ogg"
         wave_path = work / f"opus-celt-{channels}ch.wav"
         ogg = work / ogg_name
-        pcm = bytearray(OPUS_SURROUND_FRAMES * channels * 2)
-        cursor = 0
-        for frame in range(OPUS_SURROUND_FRAMES):
-            for period in OPUS_SURROUND_PERIODS[:channels]:
-                half_period = period // 2
-                phase = frame % period
-                if phase < half_period:
-                    sample = -6_000 + 12_000 * phase // half_period
-                else:
-                    sample = 6_000 - 12_000 * (phase - half_period) // half_period
-                struct.pack_into("<h", pcm, cursor, sample)
-                cursor += 2
-        with wave.open(str(wave_path), "wb") as output:
-            output.setnchannels(channels)
-            output.setsampwidth(2)
-            output.setframerate(OPUS_SURROUND_SAMPLE_RATE)
-            output.writeframes(pcm)
+        write_triangle_wave(
+            wave_path,
+            OPUS_SURROUND_FRAMES,
+            OPUS_SURROUND_SAMPLE_RATE,
+            OPUS_SURROUND_PERIODS[:channels],
+        )
         run(
             [
                 "ffmpeg", "-v", "error", "-y",
