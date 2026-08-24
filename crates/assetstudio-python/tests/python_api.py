@@ -3029,6 +3029,7 @@ def main() -> None:
         scene_limits = SceneLimits(maximum_game_objects=1)
         assert scene_limits.maximum_game_objects == 1
         assert scene_limits.maximum_total_components == 10_000_000
+        assert scene_limits.maximum_index_bytes == 268_435_456
         scene_studio = AssetStudio(scene_path)
         scene = scene_studio.scene(limits=scene_limits)
         assert len(scene) == 1
@@ -3050,6 +3051,12 @@ def main() -> None:
             pass
         else:
             raise AssertionError("scene GameObject limit should be enforced")
+        try:
+            scene_studio.scene(limits=SceneLimits(maximum_index_bytes=0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("scene index-byte limit should be enforced")
 
         model_path = Path(directory) / "model.assets"
         model_path.write_bytes(synthetic_static_model())

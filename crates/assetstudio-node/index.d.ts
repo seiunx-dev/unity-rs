@@ -977,6 +977,7 @@ export interface SceneLimits {
   maximumTotalMaterialReferences?: number
   maximumTotalBoneReferences?: number
   maximumHierarchyEdges?: number
+  maximumIndexBytes?: number
 }
 
 /**

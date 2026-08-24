@@ -6,7 +6,9 @@
 //! ownership follows `Transform.m_GameObject`, and cycles are rejected before
 //! callers recurse the tree.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::mem::size_of;
 
 use crate::loader::AssetCollection;
 use crate::material::MATERIAL_CLASS_ID;
@@ -84,15 +86,13 @@ pub struct SceneHierarchyNode {
 pub struct SceneHierarchy {
     pub nodes: Vec<SceneHierarchyNode>,
     pub roots: Vec<SceneObjectKey>,
-    index_by_object: BTreeMap<SceneObjectKey, usize>,
+    index_by_object: Vec<(SceneObjectKey, usize)>,
 }
 
 impl SceneHierarchy {
     #[must_use]
     pub fn node(&self, key: SceneObjectKey) -> Option<&SceneHierarchyNode> {
-        self.index_by_object
-            .get(&key)
-            .and_then(|index| self.nodes.get(*index))
+        find_node_index(&self.index_by_object, key).and_then(|index| self.nodes.get(index))
     }
 
     #[cfg(test)]
@@ -100,11 +100,8 @@ impl SceneHierarchy {
         nodes: Vec<SceneHierarchyNode>,
         roots: Vec<SceneObjectKey>,
     ) -> Self {
-        let index_by_object = nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| (node.object, index))
-            .collect();
+        let index_by_object = build_node_index(&nodes, usize::MAX)
+            .expect("test SceneHierarchy nodes have a valid lookup index");
         Self {
             nodes,
             roots,
@@ -121,6 +118,10 @@ pub struct SceneHierarchyLimits {
     pub maximum_total_material_references: usize,
     pub maximum_total_bone_references: usize,
     pub maximum_hierarchy_edges: usize,
+    /// Combined logical bytes retained by the Transform-owner cache and the
+    /// final `GameObject` lookup index. Allocator overhead is additionally
+    /// guarded by fallible reservations.
+    pub maximum_index_bytes: usize,
     pub scene: SceneReadLimits,
     pub renderer: RendererReadLimits,
 }
@@ -134,6 +135,7 @@ impl Default for SceneHierarchyLimits {
             maximum_total_material_references: 10_000_000,
             maximum_total_bone_references: 10_000_000,
             maximum_hierarchy_edges: 1_000_000,
+            maximum_index_bytes: 256 * 1024 * 1024,
             scene: SceneReadLimits::default(),
             renderer: RendererReadLimits::default(),
         }
@@ -171,7 +173,12 @@ pub fn build_scene_hierarchy(
             nodes.push(node);
         }
     }
-    finish_hierarchy(nodes, limits.maximum_hierarchy_edges)
+    let remaining_index_bytes = limits
+        .maximum_index_bytes
+        .checked_sub(state.index_bytes)
+        .ok_or_else(|| Error::invalid_data("scene hierarchy index byte budget was exceeded"))?;
+    drop(state);
+    finish_hierarchy(nodes, limits.maximum_hierarchy_edges, remaining_index_bytes)
 }
 
 #[derive(Default)]
@@ -180,7 +187,8 @@ struct SceneBuildState {
     total_transform_children: usize,
     total_materials: usize,
     total_bones: usize,
-    transform_owners: BTreeMap<SceneObjectKey, Option<SceneObjectKey>>,
+    index_bytes: usize,
+    transform_owners: HashMap<SceneObjectKey, Option<SceneObjectKey>>,
 }
 
 fn read_scene_node(
@@ -295,7 +303,7 @@ fn bind_transform(
         transform.component.game_object,
         &[GAME_OBJECT_CLASS_ID],
     );
-    state.transform_owners.insert(key, owner);
+    insert_transform_owner(state, key, owner, limits.maximum_index_bytes)?;
     let parent_transform =
         try_resolve_transform_key(collection, target.file_index, transform.father);
     node.parent = resolve_transform_owner(collection, parent_transform, limits, state)?;
@@ -387,16 +395,9 @@ fn bind_skinned_renderer(
 fn finish_hierarchy(
     mut nodes: Vec<SceneHierarchyNode>,
     maximum_hierarchy_edges: usize,
+    maximum_index_bytes: usize,
 ) -> Result<SceneHierarchy> {
-    let mut index_by_object = BTreeMap::new();
-    for (index, node) in nodes.iter().enumerate() {
-        if index_by_object.insert(node.object, index).is_some() {
-            return Err(Error::invalid_data(format!(
-                "duplicate GameObject identity {:?}",
-                node.object
-            )));
-        }
-    }
+    let index_by_object = build_node_index(&nodes, maximum_index_bytes)?;
 
     let mut parents = Vec::new();
     parents
@@ -406,7 +407,7 @@ fn finish_hierarchy(
         let parent = node
             .parent
             .map(|parent_object| {
-                index_by_object.get(&parent_object).copied().ok_or_else(|| {
+                find_node_index(&index_by_object, parent_object).ok_or_else(|| {
                     Error::invalid_data(format!(
                         "parent GameObject {parent_object:?} is absent from the loaded hierarchy"
                     ))
@@ -534,8 +535,79 @@ fn resolve_transform_owner(
         transform.component.game_object,
         &[GAME_OBJECT_CLASS_ID],
     );
-    state.transform_owners.insert(transform_key, owner);
+    insert_transform_owner(state, transform_key, owner, limits.maximum_index_bytes)?;
     Ok(owner)
+}
+
+fn insert_transform_owner(
+    state: &mut SceneBuildState,
+    key: SceneObjectKey,
+    owner: Option<SceneObjectKey>,
+    maximum_index_bytes: usize,
+) -> Result<()> {
+    if !state.transform_owners.contains_key(&key) {
+        state.index_bytes = charge_total(
+            state.index_bytes,
+            size_of::<(SceneObjectKey, Option<SceneObjectKey>)>(),
+            maximum_index_bytes,
+            "scene Transform-owner index bytes",
+        )?;
+        state.transform_owners.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow scene Transform-owner index: {error}"))
+        })?;
+    }
+    state.transform_owners.insert(key, owner);
+    Ok(())
+}
+
+fn build_node_index(
+    nodes: &[SceneHierarchyNode],
+    maximum_index_bytes: usize,
+) -> Result<Vec<(SceneObjectKey, usize)>> {
+    let required = nodes
+        .len()
+        .checked_mul(size_of::<(SceneObjectKey, usize)>())
+        .ok_or_else(|| Error::invalid_data("scene GameObject index byte count overflowed"))?;
+    if required > maximum_index_bytes {
+        return Err(Error::invalid_data(format!(
+            "scene GameObject index needs {required} bytes, exceeding remaining limit {maximum_index_bytes}"
+        )));
+    }
+    let mut index = Vec::new();
+    index.try_reserve_exact(nodes.len()).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate scene GameObject index: {error}"))
+    })?;
+    index.extend(
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(node_index, node)| (node.object, node_index)),
+    );
+    index.sort_unstable();
+    if let Some(window) = index.windows(2).find(|window| window[0].0 == window[1].0) {
+        return Err(Error::invalid_data(format!(
+            "duplicate GameObject identity {:?}",
+            window[0].0
+        )));
+    }
+    Ok(index)
+}
+
+fn find_node_index(index: &[(SceneObjectKey, usize)], key: SceneObjectKey) -> Option<usize> {
+    find_node_index_by(index, key, SceneObjectKey::cmp)
+}
+
+fn find_node_index_by(
+    index: &[(SceneObjectKey, usize)],
+    key: SceneObjectKey,
+    mut compare: impl FnMut(&SceneObjectKey, &SceneObjectKey) -> Ordering,
+) -> Option<usize> {
+    let position =
+        index.partition_point(|(candidate, _)| compare(candidate, &key) == Ordering::Less);
+    index
+        .get(position)
+        .filter(|(candidate, _)| *candidate == key)
+        .map(|(_, node_index)| *node_index)
 }
 
 fn try_resolve_transform_key(
@@ -602,6 +674,8 @@ fn reserve_vec<T>(length: usize, field: &str) -> Result<Vec<T>> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::material::MATERIAL_CLASS_ID;
     use crate::mesh::MESH_CLASS_ID;
@@ -610,7 +684,10 @@ mod tests {
     use crate::serialized::{ObjectReference, SerializedFile};
     use crate::source::Region;
 
-    use super::{SceneHierarchyLimits, SceneObjectKey, build_scene_hierarchy};
+    use super::{
+        SceneBuildState, SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey,
+        build_node_index, build_scene_hierarchy, find_node_index_by, insert_transform_owner,
+    };
 
     const NULL: ObjectReference = ObjectReference {
         file_id: 0,
@@ -832,6 +909,13 @@ mod tests {
                 },
                 "edges",
             ),
+            (
+                SceneHierarchyLimits {
+                    maximum_index_bytes: 0,
+                    ..SceneHierarchyLimits::default()
+                },
+                "index bytes",
+            ),
         ];
         for (limits, expected) in cases {
             let error = build_scene_hierarchy(&collection, limits).unwrap_err();
@@ -839,6 +923,92 @@ mod tests {
                 error.to_string().contains(expected),
                 "expected {expected:?} in {error}"
             );
+        }
+    }
+
+    #[test]
+    fn builds_a_bounded_binary_game_object_index() {
+        const COUNT: usize = 16_384;
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(COUNT).unwrap();
+        for path_id in (0..COUNT).rev() {
+            nodes.push(empty_node(SceneObjectKey {
+                file_index: path_id % 3,
+                path_id: i64::try_from(path_id).unwrap(),
+            }));
+        }
+        let required = COUNT
+            .checked_mul(size_of::<(SceneObjectKey, usize)>())
+            .unwrap();
+        let index = build_node_index(&nodes, required).unwrap();
+        assert_eq!(index.len(), COUNT);
+
+        let mut comparisons = 0_usize;
+        for node in &nodes {
+            let resolved = find_node_index_by(&index, node.object, |left, right| {
+                comparisons += 1;
+                left.cmp(right)
+            })
+            .unwrap();
+            assert_eq!(nodes[resolved].object, node.object);
+        }
+        assert!(comparisons < COUNT * 20, "used {comparisons} comparisons");
+
+        let error = build_node_index(&nodes, required - 1).unwrap_err();
+        assert!(error.to_string().contains("needs"));
+        assert!(error.to_string().contains("remaining limit"));
+
+        let duplicate = vec![empty_node(nodes[0].object), empty_node(nodes[0].object)];
+        assert!(
+            build_node_index(&duplicate, usize::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate GameObject identity")
+        );
+    }
+
+    #[test]
+    fn charges_transform_owner_entries_before_growing_the_map() {
+        let mut state = SceneBuildState::default();
+        let key = SceneObjectKey {
+            file_index: 0,
+            path_id: 1,
+        };
+        let owner = SceneObjectKey {
+            file_index: 0,
+            path_id: 2,
+        };
+        let exact = size_of::<(SceneObjectKey, Option<SceneObjectKey>)>();
+        insert_transform_owner(&mut state, key, None, exact).unwrap();
+        insert_transform_owner(&mut state, key, Some(owner), exact).unwrap();
+        assert_eq!(state.index_bytes, exact);
+        assert_eq!(state.transform_owners.get(&key), Some(&Some(owner)));
+
+        let error = insert_transform_owner(
+            &mut state,
+            SceneObjectKey {
+                file_index: 1,
+                path_id: 3,
+            },
+            None,
+            exact,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("index bytes"));
+        assert_eq!(state.transform_owners.len(), 1);
+    }
+
+    fn empty_node(object: SceneObjectKey) -> SceneHierarchyNode {
+        SceneHierarchyNode {
+            object,
+            name: String::new(),
+            transform: None,
+            mesh_filter: None,
+            mesh_renderer: None,
+            skinned_mesh_renderer: None,
+            animator: None,
+            parent: None,
+            children: Vec::new(),
         }
     }
 

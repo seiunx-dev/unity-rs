@@ -83,6 +83,7 @@ const opened: Promise<AssetStudio> = AssetStudio.openWithOodle(
 const sceneLimits: SceneLimits = {
   maximumGameObjects: 100_000,
   maximumTotalComponents: 1_000_000,
+  maximumIndexBytes: 64 * 1024 * 1024,
 };
 const scene: SceneNode[] = studio.sceneWithLimits(sceneLimits);
 const textureLimits: ModelTextureLimits = {

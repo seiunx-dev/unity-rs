@@ -883,6 +883,7 @@ pub struct SceneLimits {
     pub maximum_total_material_references: Option<u32>,
     pub maximum_total_bone_references: Option<u32>,
     pub maximum_hierarchy_edges: Option<u32>,
+    pub maximum_index_bytes: Option<u32>,
 }
 
 /// Caller-configurable budgets for textures returned beside a model.
@@ -1148,6 +1149,7 @@ fn scene_limits(options: Option<SceneLimits>) -> SceneHierarchyLimits {
             options.maximum_hierarchy_edges,
             defaults.maximum_hierarchy_edges,
         ),
+        maximum_index_bytes: count_limit(options.maximum_index_bytes, defaults.maximum_index_bytes),
         ..defaults
     }
 }
