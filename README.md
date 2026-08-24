@@ -78,10 +78,16 @@ and their automated audits are recorded in
 | WinForms GUI | Intentionally out of scope |
 
 `ModelTextureLimits` independently bounds non-null material texture references,
-unique decoded textures, cumulative encoded bytes, and each texture's
-payload/output/decoder workspace. The reference limit also charges repeated
-references to one texture and references that become skipped diagnostics, so
-neither path can bypass the unique-texture limit in Rust, Python, or Node.
+unique decoded textures, the shared object/file-name and lowercase collision
+indexes, cumulative encoded bytes, and each texture's payload/output/decoder
+workspace. The reference limit also charges repeated references to one texture
+and references that become skipped diagnostics, so neither path can bypass the
+unique-texture limit in Rust, Python, or Node. The name-index limit remains
+cumulative when one allocator is shared across an FBX batch; each retained
+output name and lowercase identity is charged by its exact UTF-8 length, and a
+rejected claim leaves the allocator unchanged. Names that differ only by case
+therefore get distinct portable files rather than silently aliasing on common
+Windows and macOS file systems.
 Manual Rust construction is fallible as well: `SceneTextureSet::push_texture`
 returns `Result<usize>` and leaves the collection unchanged when capacity
 cannot be reserved, matching the existing fallible `bind` operation.
