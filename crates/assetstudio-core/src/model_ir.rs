@@ -5,7 +5,8 @@
 //! source skin data), material, and avatar readers into a stable graph that a
 //! writer can consume without resolving Unity pointers again.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 
 use crate::animation_component::ANIMATOR_OVERRIDE_CONTROLLER_CLASS_ID;
 use crate::animator_controller::ANIMATOR_CONTROLLER_CLASS_ID;
@@ -42,6 +43,9 @@ pub struct ModelIrLimits {
     pub maximum_meshes: usize,
     pub maximum_materials: usize,
     pub maximum_avatars: usize,
+    /// Maximum logical bytes retained by build-time or final object lookup
+    /// indexes. Build maps are released before the final sorted tables exist.
+    pub maximum_index_bytes: usize,
     pub maximum_mesh_vertices: usize,
     pub maximum_mesh_indices: usize,
     pub maximum_mesh_sub_meshes: usize,
@@ -65,6 +69,7 @@ impl Default for ModelIrLimits {
             maximum_meshes: 1_000_000,
             maximum_materials: 1_000_000,
             maximum_avatars: 1_000_000,
+            maximum_index_bytes: 256 * 1024 * 1024,
             maximum_mesh_vertices: 100_000_000,
             maximum_mesh_indices: 300_000_000,
             maximum_mesh_sub_meshes: 10_000_000,
@@ -143,8 +148,10 @@ pub struct ModelAvatar {
     pub avatar: Avatar,
 }
 
+type ModelIndex = Vec<(SceneObjectKey, usize)>;
+
 /// Stable static model graph. Asset vectors are ordered by first reference
-/// while walking `nodes`; lookup maps do not affect observable ordering.
+/// while walking `nodes`; lookup indexes do not affect observable ordering.
 #[derive(Debug, Clone)]
 pub struct ModelIr {
     pub coordinate_convention: ModelCoordinateConvention,
@@ -153,57 +160,51 @@ pub struct ModelIr {
     pub meshes: Vec<ModelMesh>,
     pub materials: Vec<ModelMaterial>,
     pub avatars: Vec<ModelAvatar>,
-    node_index: BTreeMap<SceneObjectKey, usize>,
-    mesh_index: BTreeMap<SceneObjectKey, usize>,
-    material_index: BTreeMap<SceneObjectKey, usize>,
-    avatar_index: BTreeMap<SceneObjectKey, usize>,
+    node_index: ModelIndex,
+    mesh_index: ModelIndex,
+    material_index: ModelIndex,
+    avatar_index: ModelIndex,
 }
 
 impl ModelIr {
     /// Returns the deterministic node-vector index for a stable object key.
     #[must_use]
     pub fn node_index(&self, key: SceneObjectKey) -> Option<usize> {
-        self.node_index.get(&key).copied()
+        model_index_position(&self.node_index, key)
     }
 
     #[must_use]
     pub fn node(&self, key: SceneObjectKey) -> Option<&ModelNode> {
-        self.node_index
-            .get(&key)
-            .and_then(|index| self.nodes.get(*index))
+        self.node_index(key).and_then(|index| self.nodes.get(index))
     }
 
     #[must_use]
     pub fn mesh(&self, key: SceneObjectKey) -> Option<&ModelMesh> {
-        self.mesh_index
-            .get(&key)
-            .and_then(|index| self.meshes.get(*index))
+        self.mesh_index(key)
+            .and_then(|index| self.meshes.get(index))
     }
 
     /// Returns the deterministic mesh-vector index for a stable object key.
     #[must_use]
     pub fn mesh_index(&self, key: SceneObjectKey) -> Option<usize> {
-        self.mesh_index.get(&key).copied()
+        model_index_position(&self.mesh_index, key)
     }
 
     #[must_use]
     pub fn material(&self, key: SceneObjectKey) -> Option<&ModelMaterial> {
-        self.material_index
-            .get(&key)
-            .and_then(|index| self.materials.get(*index))
+        self.material_index(key)
+            .and_then(|index| self.materials.get(index))
     }
 
     /// Returns the deterministic material-vector index for a stable object key.
     #[must_use]
     pub fn material_index(&self, key: SceneObjectKey) -> Option<usize> {
-        self.material_index.get(&key).copied()
+        model_index_position(&self.material_index, key)
     }
 
     #[must_use]
     pub fn avatar(&self, key: SceneObjectKey) -> Option<&ModelAvatar> {
-        self.avatar_index
-            .get(&key)
-            .and_then(|index| self.avatars.get(*index))
+        model_index_position(&self.avatar_index, key).and_then(|index| self.avatars.get(index))
     }
 
     #[cfg(test)]
@@ -213,32 +214,20 @@ impl ModelIr {
         meshes: Vec<ModelMesh>,
         materials: Vec<ModelMaterial>,
     ) -> Self {
-        let node_index = nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| (node.object, index))
-            .collect();
-        let mesh_index = meshes
-            .iter()
-            .enumerate()
-            .map(|(index, mesh)| (mesh.object, index))
-            .collect();
-        let material_index = materials
-            .iter()
-            .enumerate()
-            .map(|(index, material)| (material.object, index))
-            .collect();
+        let avatars = Vec::new();
+        let indexes = build_model_indexes(&nodes, &meshes, &materials, &avatars, usize::MAX)
+            .expect("test model parts should have unique lookup keys");
         Self {
             coordinate_convention: ModelCoordinateConvention::UnitySource,
             nodes,
             roots,
             meshes,
             materials,
-            avatars: Vec::new(),
-            node_index,
-            mesh_index,
-            material_index,
-            avatar_index: BTreeMap::new(),
+            avatars,
+            node_index: indexes.nodes,
+            mesh_index: indexes.meshes,
+            material_index: indexes.materials,
+            avatar_index: indexes.avatars,
         }
     }
 }
@@ -255,7 +244,7 @@ pub fn build_model_ir(
 ) -> Result<ModelIr> {
     let mut state = ModelBuildState::new(collection, &limits);
     state.copy_hierarchy(hierarchy)?;
-    Ok(state.finish())
+    state.finish()
 }
 
 /// Builds the model branch rooted at one `GameObject`.
@@ -272,7 +261,7 @@ pub fn build_model_ir_for_game_object(
     let selection = HierarchySelection::build(hierarchy, game_object, limits.maximum_nodes)?;
     let mut state = ModelBuildState::new(collection, &limits);
     state.copy_selected_hierarchy(hierarchy, &selection)?;
-    Ok(state.finish())
+    state.finish()
 }
 
 struct HierarchySelection {
@@ -382,6 +371,7 @@ struct ModelTotals {
     material_entries: usize,
     avatar_elements: usize,
     string_bytes: usize,
+    index_bytes: usize,
 }
 
 struct ModelBuildState<'a> {
@@ -392,10 +382,10 @@ struct ModelBuildState<'a> {
     meshes: Vec<ModelMesh>,
     materials: Vec<ModelMaterial>,
     avatars: Vec<ModelAvatar>,
-    node_index: BTreeMap<SceneObjectKey, usize>,
-    mesh_index: BTreeMap<SceneObjectKey, usize>,
-    material_index: BTreeMap<SceneObjectKey, usize>,
-    avatar_index: BTreeMap<SceneObjectKey, usize>,
+    node_index: HashMap<SceneObjectKey, usize>,
+    mesh_index: HashMap<SceneObjectKey, usize>,
+    material_index: HashMap<SceneObjectKey, usize>,
+    avatar_index: HashMap<SceneObjectKey, usize>,
     totals: ModelTotals,
 }
 
@@ -409,10 +399,10 @@ impl<'a> ModelBuildState<'a> {
             meshes: Vec::new(),
             materials: Vec::new(),
             avatars: Vec::new(),
-            node_index: BTreeMap::new(),
-            mesh_index: BTreeMap::new(),
-            material_index: BTreeMap::new(),
-            avatar_index: BTreeMap::new(),
+            node_index: HashMap::new(),
+            mesh_index: HashMap::new(),
+            material_index: HashMap::new(),
+            avatar_index: HashMap::new(),
             totals: ModelTotals::default(),
         }
     }
@@ -481,6 +471,18 @@ impl<'a> ModelBuildState<'a> {
         children: &[SceneObjectKey],
         include_components: bool,
     ) -> Result<()> {
+        if self.node_index.contains_key(&source.object) {
+            return Err(Error::invalid_data(format!(
+                "duplicate model GameObject identity {:?}",
+                source.object
+            )));
+        }
+        reserve_model_index_entry(
+            &mut self.totals.index_bytes,
+            &mut self.node_index,
+            self.limits.maximum_index_bytes,
+            "model GameObject build index",
+        )?;
         self.charge_string(source.name.len(), "GameObject name")?;
         self.charge_total(
             TotalKind::HierarchyEdges,
@@ -540,12 +542,7 @@ impl<'a> ModelBuildState<'a> {
                 .transpose()?;
         }
         let index = self.nodes.len();
-        if self.node_index.insert(source.object, index).is_some() {
-            return Err(Error::invalid_data(format!(
-                "duplicate model GameObject identity {:?}",
-                source.object
-            )));
-        }
+        self.node_index.insert(source.object, index);
         self.nodes.push(ModelNode {
             object: source.object,
             name: clone_string(&source.name, "GameObject name")?,
@@ -672,8 +669,17 @@ impl<'a> ModelBuildState<'a> {
             "model Mesh submeshes",
         )?;
         let index = self.meshes.len();
-        self.meshes.push(ModelMesh { object: key, mesh });
+        reserve_model_index_entry(
+            &mut self.totals.index_bytes,
+            &mut self.mesh_index,
+            self.limits.maximum_index_bytes,
+            "model Mesh build index",
+        )?;
+        self.meshes.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow model Mesh assets: {error}"))
+        })?;
         self.mesh_index.insert(key, index);
+        self.meshes.push(ModelMesh { object: key, mesh });
         Ok(())
     }
 
@@ -697,11 +703,20 @@ impl<'a> ModelBuildState<'a> {
             "model Material entries",
         )?;
         let index = self.materials.len();
+        reserve_model_index_entry(
+            &mut self.totals.index_bytes,
+            &mut self.material_index,
+            self.limits.maximum_index_bytes,
+            "model Material build index",
+        )?;
+        self.materials.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow model Material assets: {error}"))
+        })?;
+        self.material_index.insert(key, index);
         self.materials.push(ModelMaterial {
             object: key,
             material,
         });
-        self.material_index.insert(key, index);
         Ok(())
     }
 
@@ -725,11 +740,20 @@ impl<'a> ModelBuildState<'a> {
             "model Avatar elements",
         )?;
         let index = self.avatars.len();
+        reserve_model_index_entry(
+            &mut self.totals.index_bytes,
+            &mut self.avatar_index,
+            self.limits.maximum_index_bytes,
+            "model Avatar build index",
+        )?;
+        self.avatars.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow model Avatar assets: {error}"))
+        })?;
+        self.avatar_index.insert(key, index);
         self.avatars.push(ModelAvatar {
             object: key,
             avatar,
         });
-        self.avatar_index.insert(key, index);
         Ok(())
     }
 
@@ -778,20 +802,146 @@ impl<'a> ModelBuildState<'a> {
         Ok(())
     }
 
-    fn finish(self) -> ModelIr {
-        ModelIr {
+    fn finish(self) -> Result<ModelIr> {
+        let Self {
+            nodes,
+            roots,
+            meshes,
+            materials,
+            avatars,
+            node_index,
+            mesh_index,
+            material_index,
+            avatar_index,
+            limits,
+            ..
+        } = self;
+        drop((node_index, mesh_index, material_index, avatar_index));
+        let indexes = build_model_indexes(
+            &nodes,
+            &meshes,
+            &materials,
+            &avatars,
+            limits.maximum_index_bytes,
+        )?;
+        Ok(ModelIr {
             coordinate_convention: ModelCoordinateConvention::UnitySource,
-            nodes: self.nodes,
-            roots: self.roots,
-            meshes: self.meshes,
-            materials: self.materials,
-            avatars: self.avatars,
-            node_index: self.node_index,
-            mesh_index: self.mesh_index,
-            material_index: self.material_index,
-            avatar_index: self.avatar_index,
-        }
+            nodes,
+            roots,
+            meshes,
+            materials,
+            avatars,
+            node_index: indexes.nodes,
+            mesh_index: indexes.meshes,
+            material_index: indexes.materials,
+            avatar_index: indexes.avatars,
+        })
     }
+}
+
+#[derive(Debug)]
+struct ModelIndexes {
+    nodes: ModelIndex,
+    meshes: ModelIndex,
+    materials: ModelIndex,
+    avatars: ModelIndex,
+}
+
+fn build_model_indexes(
+    nodes: &[ModelNode],
+    meshes: &[ModelMesh],
+    materials: &[ModelMaterial],
+    avatars: &[ModelAvatar],
+    maximum_bytes: usize,
+) -> Result<ModelIndexes> {
+    let entry_count = [nodes.len(), meshes.len(), materials.len(), avatars.len()]
+        .into_iter()
+        .try_fold(0_usize, usize::checked_add)
+        .ok_or_else(|| Error::invalid_data("model lookup entry count overflowed"))?;
+    let required = entry_count
+        .checked_mul(size_of::<(SceneObjectKey, usize)>())
+        .ok_or_else(|| Error::invalid_data("model lookup index size overflowed"))?;
+    if required > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "model lookup indexes require {required} bytes, limit is {maximum_bytes}"
+        )));
+    }
+    Ok(ModelIndexes {
+        nodes: build_model_index(
+            nodes.iter().map(|node| node.object),
+            "model GameObject lookup entries",
+        )?,
+        meshes: build_model_index(
+            meshes.iter().map(|mesh| mesh.object),
+            "model Mesh lookup entries",
+        )?,
+        materials: build_model_index(
+            materials.iter().map(|material| material.object),
+            "model Material lookup entries",
+        )?,
+        avatars: build_model_index(
+            avatars.iter().map(|avatar| avatar.object),
+            "model Avatar lookup entries",
+        )?,
+    })
+}
+
+fn build_model_index(
+    keys: impl ExactSizeIterator<Item = SceneObjectKey>,
+    field: &str,
+) -> Result<ModelIndex> {
+    let length = keys.len();
+    let mut index = reserve_vec(length, field)?;
+    index.extend(
+        keys.enumerate()
+            .map(|(source_index, key)| (key, source_index)),
+    );
+    index.sort_unstable();
+    if let Some(duplicate) = index.windows(2).find(|window| window[0].0 == window[1].0) {
+        return Err(Error::invalid_data(format!(
+            "{field} repeat object key {:?}",
+            duplicate[0].0
+        )));
+    }
+    Ok(index)
+}
+
+fn model_index_position(index: &[(SceneObjectKey, usize)], key: SceneObjectKey) -> Option<usize> {
+    model_index_position_with_probe(index, key, || {})
+}
+
+fn model_index_position_with_probe(
+    index: &[(SceneObjectKey, usize)],
+    key: SceneObjectKey,
+    mut probe: impl FnMut(),
+) -> Option<usize> {
+    let position = index.partition_point(|(candidate, _)| {
+        probe();
+        *candidate < key
+    });
+    let &(candidate, source_index) = index.get(position)?;
+    (candidate == key).then_some(source_index)
+}
+
+fn reserve_model_index_entry(
+    current_bytes: &mut usize,
+    index: &mut HashMap<SceneObjectKey, usize>,
+    maximum_bytes: usize,
+    field: &str,
+) -> Result<()> {
+    let next = current_bytes
+        .checked_add(size_of::<(SceneObjectKey, usize)>())
+        .ok_or_else(|| Error::invalid_data("model lookup index bytes overflowed"))?;
+    if next > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "{field} raises lookup indexes to {next} bytes, exceeding limit {maximum_bytes}"
+        )));
+    }
+    index
+        .try_reserve(1)
+        .map_err(|error| Error::invalid_data(format!("cannot grow {field}: {error}")))?;
+    *current_bytes = next;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1063,8 +1213,9 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        ModelCoordinateConvention, ModelIrLimits, ModelRendererKind, build_model_ir,
-        build_model_ir_for_game_object,
+        ModelCoordinateConvention, ModelIrLimits, ModelNode, ModelRendererKind,
+        build_model_indexes, build_model_ir, build_model_ir_for_game_object,
+        model_index_position_with_probe,
     };
 
     const NULL: ObjectReference = ObjectReference {
@@ -1295,6 +1446,94 @@ mod tests {
     }
 
     #[test]
+    fn model_node_index_scales_and_preserves_source_positions() {
+        const ENTRY_COUNT: usize = 16_384;
+        let nodes: Vec<_> = (0..ENTRY_COUNT)
+            .map(|source_index| test_model_node(i64::try_from(ENTRY_COUNT - source_index).unwrap()))
+            .collect();
+        let exact = model_index_bytes(nodes.len());
+        let indexes = build_model_indexes(&nodes, &[], &[], &[], exact).unwrap();
+
+        let mut comparisons = 0_usize;
+        for path_id in 1..=i64::try_from(ENTRY_COUNT).unwrap() {
+            let expected = ENTRY_COUNT - usize::try_from(path_id).unwrap();
+            assert_eq!(
+                model_index_position_with_probe(&indexes.nodes, key(path_id), || {
+                    comparisons += 1;
+                }),
+                Some(expected)
+            );
+        }
+        assert!(comparisons < ENTRY_COUNT * 20, "{comparisons}");
+    }
+
+    #[test]
+    fn model_index_budget_is_exact_and_duplicate_nodes_are_rejected() {
+        let nodes = [test_model_node(2), test_model_node(1)];
+        let exact = model_index_bytes(nodes.len());
+
+        build_model_indexes(&nodes, &[], &[], &[], exact).unwrap();
+        let error = build_model_indexes(&nodes, &[], &[], &[], exact - 1).unwrap_err();
+        assert!(error.to_string().contains("lookup indexes require"));
+
+        let duplicate = [test_model_node(1), test_model_node(1)];
+        let error = build_model_indexes(&duplicate, &[], &[], &[], exact).unwrap_err();
+        assert!(error.to_string().contains("repeat object key"));
+    }
+
+    #[test]
+    fn model_build_index_budget_counts_unique_assets() {
+        let collection = fixture(Corrupt::None, false);
+        let hierarchy =
+            build_scene_hierarchy(&collection, SceneHierarchyLimits::default()).unwrap();
+        let exact = model_index_bytes(5);
+
+        let model = build_model_ir(
+            &collection,
+            &hierarchy,
+            ModelIrLimits {
+                maximum_index_bytes: exact,
+                ..ModelIrLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            model.nodes.len() + model.meshes.len() + model.materials.len() + model.avatars.len(),
+            5
+        );
+
+        let error = build_model_ir(
+            &collection,
+            &hierarchy,
+            ModelIrLimits {
+                maximum_index_bytes: exact - 1,
+                ..ModelIrLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("lookup index"));
+    }
+
+    fn test_model_node(path_id: i64) -> ModelNode {
+        ModelNode {
+            object: key(path_id),
+            name: String::new(),
+            export_content: false,
+            parent: None,
+            children: Vec::new(),
+            transform: None,
+            renderers: Vec::new(),
+            animator: None,
+        }
+    }
+
+    fn model_index_bytes(entry_count: usize) -> usize {
+        entry_count
+            .checked_mul(std::mem::size_of::<(SceneObjectKey, usize)>())
+            .unwrap()
+    }
+
+    #[test]
     fn enforces_every_collection_wide_budget() {
         let collection = fixture(Corrupt::None, false);
         let hierarchy =
@@ -1335,6 +1574,10 @@ mod tests {
             },
             ModelIrLimits {
                 maximum_avatars: 0,
+                ..defaults
+            },
+            ModelIrLimits {
+                maximum_index_bytes: 0,
                 ..defaults
             },
             ModelIrLimits {
