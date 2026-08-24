@@ -266,7 +266,8 @@ pub fn read_type_tree_from_reader_with_reference_types<R: Read + Seek>(
         values_read: 0,
         materialized_bytes: 0,
         reference_types,
-        validated_reference_types: Vec::new(),
+        reference_type_lookup: None,
+        validated_reference_types: None,
         has_registry: false,
     };
     let (value, next) = parser.read_node(0, 0)?;
@@ -312,7 +313,8 @@ fn read_type_tree_root_field_from_reader_with_reference_types<R: Read + Seek>(
         values_read: 0,
         materialized_bytes: 0,
         reference_types,
-        validated_reference_types: Vec::new(),
+        reference_type_lookup: None,
+        validated_reference_types: None,
         has_registry: false,
     };
     let (value, next) = parser.read_root_field(0, field_name)?;
@@ -333,6 +335,20 @@ fn read_type_tree_root_field_from_reader_with_reference_types<R: Read + Seek>(
     Ok(value)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReferenceTypeLookupEntry<'a> {
+    class_name: &'a str,
+    namespace: &'a str,
+    assembly_name: &'a str,
+    index: usize,
+}
+
+impl ReferenceTypeLookupEntry<'_> {
+    fn key(&self) -> (&str, &str, &str) {
+        (self.class_name, self.namespace, self.assembly_name)
+    }
+}
+
 struct TypeTreeValueReader<'a, R> {
     nodes: &'a [TypeTreeNode],
     reader: EndianReader<R>,
@@ -343,17 +359,22 @@ struct TypeTreeValueReader<'a, R> {
     /// The file's reference types, which is where the layout of a
     /// `SerializeReference` value comes from.
     reference_types: &'a [SerializedType],
-    /// Indices of the reference-type trees whose shape has been checked.
-    /// Checking is per tree rather than per use: an object can hold thousands
-    /// of `rid`s naming the same handful of types.
-    validated_reference_types: Vec<usize>,
+    /// Built only when a registry entry names a non-null type. Entries are
+    /// sorted by identity and then source index, so binary lookup preserves the
+    /// old first-declaration-wins behavior without scanning all reference types
+    /// for every `rid`.
+    reference_type_lookup: Option<Vec<ReferenceTypeLookupEntry<'a>>>,
+    /// One bit per reference type, built lazily. A sorted `Vec<usize>` still
+    /// makes files whose entries each name a distinct type quadratic when
+    /// checking whether that type's tree has already been validated.
+    validated_reference_types: Option<Vec<bool>>,
     /// Unity writes one registry per object, at the outermost level. A
     /// reference type's own tree can declare another, and reading that one
     /// would consume bytes that are not there.
     has_registry: bool,
 }
 
-impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
+impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
     fn read_node(&mut self, index: usize, depth: usize) -> Result<(TypeValue, usize)> {
         self.visit_node(depth, true)?;
 
@@ -662,6 +683,7 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
     }
 
     fn skip_reference_type(&mut self, tree_index: usize, depth: usize) -> Result<()> {
+        self.ensure_reference_type_validation_cache()?;
         let tree = self.reference_types[tree_index]
             .type_tree
             .as_ref()
@@ -671,14 +693,15 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
                      value has no stated layout"
                 ))
             })?;
-        if !self.validated_reference_types.contains(&tree_index) {
+        let already_validated = self
+            .validated_reference_types
+            .as_ref()
+            .is_some_and(|validated| validated[tree_index]);
+        if !already_validated {
             validate_tree_shape(&tree.nodes)?;
             self.validated_reference_types
-                .try_reserve(1)
-                .map_err(|error| {
-                    Error::invalid_data(format!("cannot record a checked reference type: {error}"))
-                })?;
-            self.validated_reference_types.push(tree_index);
+                .as_mut()
+                .expect("reference-type validation cache was initialized")[tree_index] = true;
         }
         let outer = self.nodes;
         self.nodes = &tree.nodes;
@@ -841,34 +864,101 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
 
     /// Finds the reference type an entry names, or `None` for a null entry.
     fn reference_type_index(
-        &self,
+        &mut self,
         (class_name, namespace, assembly_name): (&str, &str, &str),
     ) -> Result<Option<usize>> {
         if class_name.is_empty() {
             return Ok(None);
         }
-        self.reference_types
-            .iter()
-            .position(|kind| {
-                kind.class_name.as_deref() == Some(class_name)
-                    && kind.namespace.as_deref() == Some(namespace)
-                    && kind.assembly_name.as_deref() == Some(assembly_name)
-            })
-            .map(Some)
-            .ok_or_else(|| {
+        self.ensure_reference_type_lookup()?;
+        let lookup = self
+            .reference_type_lookup
+            .as_ref()
+            .expect("reference-type lookup was initialized");
+        let key = (class_name, namespace, assembly_name);
+        let offset = lookup.partition_point(|entry| entry.key() < key);
+        match lookup.get(offset).filter(|entry| entry.key() == key) {
+            Some(entry) => Ok(Some(entry.index)),
+            None => {
                 // Declining rather than skipping: the entry's bytes are in the
                 // stream and their length is only known from the layout, so
                 // there is no way to step over what cannot be read.
-                Error::unsupported(format!(
+                Err(Error::unsupported(format!(
                     "managed reference names an undeclared type (namespace {} bytes, class {} bytes, assembly {} bytes), which the file does not declare",
                     namespace.len(),
                     class_name.len(),
                     assembly_name.len()
-                ))
+                )))
+            }
+        }
+    }
+
+    fn ensure_reference_type_lookup(&mut self) -> Result<()> {
+        if self.reference_type_lookup.is_some() {
+            return Ok(());
+        }
+        let count = self
+            .reference_types
+            .iter()
+            .filter(|kind| {
+                kind.class_name.is_some()
+                    && kind.namespace.is_some()
+                    && kind.assembly_name.is_some()
             })
+            .count();
+        self.charge_capacity::<ReferenceTypeLookupEntry<'a>>(
+            count,
+            "reference-type lookup storage",
+        )?;
+        let mut lookup = Vec::new();
+        lookup.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate {count} reference-type lookup entries: {error}"
+            ))
+        })?;
+        for (index, kind) in self.reference_types.iter().enumerate() {
+            let (Some(class_name), Some(namespace), Some(assembly_name)) = (
+                kind.class_name.as_deref(),
+                kind.namespace.as_deref(),
+                kind.assembly_name.as_deref(),
+            ) else {
+                continue;
+            };
+            lookup.push(ReferenceTypeLookupEntry {
+                class_name,
+                namespace,
+                assembly_name,
+                index,
+            });
+        }
+        lookup.sort_unstable_by(|left, right| {
+            left.key()
+                .cmp(&right.key())
+                .then_with(|| left.index.cmp(&right.index))
+        });
+        self.reference_type_lookup = Some(lookup);
+        Ok(())
+    }
+
+    fn ensure_reference_type_validation_cache(&mut self) -> Result<()> {
+        if self.validated_reference_types.is_some() {
+            return Ok(());
+        }
+        let count = self.reference_types.len();
+        self.charge_capacity::<bool>(count, "reference-type validation cache")?;
+        let mut validated = Vec::new();
+        validated.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate {count} reference-type validation entries: {error}"
+            ))
+        })?;
+        validated.resize(count, false);
+        self.validated_reference_types = Some(validated);
+        Ok(())
     }
 
     fn read_reference_type(&mut self, tree_index: usize, depth: usize) -> Result<TypeValue> {
+        self.ensure_reference_type_validation_cache()?;
         let tree = self.reference_types[tree_index]
             .type_tree
             .as_ref()
@@ -878,14 +968,15 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
                      value has no stated layout"
                 ))
             })?;
-        if !self.validated_reference_types.contains(&tree_index) {
+        let already_validated = self
+            .validated_reference_types
+            .as_ref()
+            .is_some_and(|validated| validated[tree_index]);
+        if !already_validated {
             validate_tree_shape(&tree.nodes)?;
             self.validated_reference_types
-                .try_reserve(1)
-                .map_err(|error| {
-                    Error::invalid_data(format!("cannot record a checked reference type: {error}"))
-                })?;
-            self.validated_reference_types.push(tree_index);
+                .as_mut()
+                .expect("reference-type validation cache was initialized")[tree_index] = true;
         }
         // The stored value is laid out by another tree entirely, so the node
         // slice is swapped for the duration and put back however this ends.
@@ -1246,8 +1337,8 @@ mod tests {
     use crate::serialized::{SerializedType, TypeTree, TypeTreeNode};
 
     use super::{
-        TypeField, TypeTreeReadLimits, TypeValue, read_type_tree_from_reader,
-        read_type_tree_from_reader_with_reference_types,
+        ReferenceTypeLookupEntry, TypeField, TypeTreeReadLimits, TypeTreeValueReader, TypeValue,
+        read_type_tree_from_reader, read_type_tree_from_reader_with_reference_types,
         read_type_tree_root_field_from_reader_with_reference_types,
     };
 
@@ -1602,6 +1693,135 @@ mod tests {
             .is_err(),
             "projection must validate the skipped tail after the selected field"
         );
+    }
+
+    #[test]
+    fn indexes_many_reference_types_once_and_preserves_first_declaration() {
+        const REFERENCE_COUNT: usize = 16_384;
+        let first_target = REFERENCE_COUNT - 2;
+        let mut references = Vec::new();
+        references.reserve_exact(REFERENCE_COUNT);
+        for index in 0..first_target {
+            references.push(reference_type(
+                &format!("NearMiss{index:05}"),
+                vec![node("int", "value", 0, false)],
+            ));
+        }
+        references.push(reference_type(
+            "Target",
+            vec![node("int", "value", 0, false)],
+        ));
+        references.push(reference_type(
+            "Target",
+            vec![node("int", "duplicate_layout", 0, false)],
+        ));
+        let payload = vec![0_u8; REFERENCE_COUNT * std::mem::size_of::<i32>()];
+        let mut parser = TypeTreeValueReader {
+            nodes: &[],
+            reader: EndianReader::new(Cursor::new(payload), Endian::Little),
+            absolute_start: 0,
+            limits: TypeTreeReadLimits::default(),
+            values_read: 0,
+            materialized_bytes: 0,
+            reference_types: &references,
+            reference_type_lookup: None,
+            validated_reference_types: None,
+            has_registry: false,
+        };
+
+        assert_eq!(
+            parser
+                .reference_type_index(("Target", "Game", "Game.dll"))
+                .unwrap(),
+            Some(first_target)
+        );
+        let lookup_bytes = parser.materialized_bytes;
+        for _ in 1..REFERENCE_COUNT {
+            assert_eq!(
+                parser
+                    .reference_type_index(("Target", "Game", "Game.dll"))
+                    .unwrap(),
+                Some(first_target)
+            );
+        }
+        assert_eq!(parser.materialized_bytes, lookup_bytes);
+        assert_eq!(
+            parser.reference_type_lookup.as_ref().map(Vec::len),
+            Some(REFERENCE_COUNT)
+        );
+
+        for index in 0..REFERENCE_COUNT {
+            assert_eq!(
+                parser.read_reference_type(index, 0).unwrap(),
+                TypeValue::Signed(0)
+            );
+        }
+        assert!(
+            parser
+                .validated_reference_types
+                .as_ref()
+                .is_some_and(|validated| validated.iter().all(|value| *value))
+        );
+    }
+
+    #[test]
+    fn bounds_reference_type_lookup_and_validation_storage_before_allocation() {
+        let references = (0..8)
+            .map(|index| {
+                reference_type(
+                    &format!("Type{index}"),
+                    vec![node("int", "value", 0, false)],
+                )
+            })
+            .collect::<Vec<_>>();
+        let lookup_bytes = references.len() * std::mem::size_of::<ReferenceTypeLookupEntry<'_>>();
+        let mut lookup_parser = TypeTreeValueReader {
+            nodes: &[],
+            reader: EndianReader::new(Cursor::new(Vec::new()), Endian::Little),
+            absolute_start: 0,
+            limits: TypeTreeReadLimits {
+                maximum_materialized_bytes: lookup_bytes - 1,
+                ..TypeTreeReadLimits::default()
+            },
+            values_read: 0,
+            materialized_bytes: 0,
+            reference_types: &references,
+            reference_type_lookup: None,
+            validated_reference_types: None,
+            has_registry: false,
+        };
+        let lookup_error = lookup_parser
+            .reference_type_index(("Type7", "Game", "Game.dll"))
+            .unwrap_err();
+        assert!(
+            lookup_error
+                .to_string()
+                .contains("reference-type lookup storage")
+        );
+        assert!(lookup_parser.reference_type_lookup.is_none());
+
+        let mut validation_parser = TypeTreeValueReader {
+            nodes: &[],
+            reader: EndianReader::new(Cursor::new(0_i32.to_le_bytes()), Endian::Little),
+            absolute_start: 0,
+            limits: TypeTreeReadLimits {
+                maximum_materialized_bytes: references.len() - 1,
+                ..TypeTreeReadLimits::default()
+            },
+            values_read: 0,
+            materialized_bytes: 0,
+            reference_types: &references,
+            reference_type_lookup: None,
+            validated_reference_types: None,
+            has_registry: false,
+        };
+        let validation_error = validation_parser.read_reference_type(0, 0).unwrap_err();
+        assert!(
+            validation_error
+                .to_string()
+                .contains("reference-type validation cache")
+        );
+        assert!(validation_parser.validated_reference_types.is_none());
     }
 
     /// The registry Unity writes after an object body for a
