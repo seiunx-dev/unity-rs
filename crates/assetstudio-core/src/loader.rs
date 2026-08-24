@@ -963,12 +963,24 @@ impl AssetCollection {
     }
 
     pub(crate) fn object_index_by_path_id(&self, file_index: usize, path_id: i64) -> Option<usize> {
+        self.object_index_by_path_id_with_probe(file_index, path_id, || {})
+    }
+
+    pub(crate) fn object_index_by_path_id_with_probe(
+        &self,
+        file_index: usize,
+        path_id: i64,
+        mut probe: impl FnMut(),
+    ) -> Option<usize> {
         if let Some(entries) = self
             .reference_index
             .as_ref()
             .and_then(|index| index.objects_by_file.get(file_index))
         {
-            let start = entries.partition_point(|entry| entry.path_id < path_id);
+            let start = entries.partition_point(|entry| {
+                probe();
+                entry.path_id < path_id
+            });
             if let Some(entry) = entries.get(start).filter(|entry| entry.path_id == path_id)
                 && self
                     .serialized_files
@@ -984,7 +996,10 @@ impl AssetCollection {
             .file
             .objects
             .iter()
-            .position(|object| object.path_id == path_id)
+            .position(|object| {
+                probe();
+                object.path_id == path_id
+            })
     }
 
     pub(crate) fn resource_index_by_path(&self, requested_path: &str) -> Option<usize> {
