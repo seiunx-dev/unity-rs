@@ -468,24 +468,16 @@ impl AssetCollection {
             unity_cn_key,
             ..
         } = *settings;
-        let mut pending = VecDeque::from([PendingInput {
+        let mut pending = VecDeque::new();
+        charge_pending_inputs(&mut pending, 1, budget, limits)?;
+        pending.push_back(PendingInput {
             path,
             region,
             depth: 0,
             unity_version_hint: None,
-        }]);
+        });
 
         while let Some(input) = pending.pop_front() {
-            budget.discovered_files = budget
-                .discovered_files
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid_data("discovered file count overflowed"))?;
-            if budget.discovered_files > limits.maximum_discovered_files {
-                return Err(Error::invalid_data(format!(
-                    "asset traversal exceeds {} discovered files",
-                    limits.maximum_discovered_files
-                )));
-            }
             if input.depth > limits.maximum_nesting_depth {
                 return Err(Error::invalid_data(format!(
                     "asset traversal exceeds {} container layers",
@@ -496,6 +488,11 @@ impl AssetCollection {
             let detection = detect_region(&input.region)?;
             match detection.file_type {
                 FileType::AssetsFile => {
+                    self.serialized_files.try_reserve(1).map_err(|error| {
+                        Error::invalid_data(format!(
+                            "cannot grow loaded serialized-file table: {error}"
+                        ))
+                    })?;
                     let file = SerializedFile::open_with_options(
                         input.region,
                         SerializedOpenOptions {
@@ -547,6 +544,7 @@ impl AssetCollection {
                         let unity_version_hint =
                             (!bundle.header.common.unity_revision.is_stripped())
                                 .then(|| bundle.header.common.unity_revision.clone());
+                        charge_pending_inputs(&mut pending, bundle.entries.len(), budget, limits)?;
                         for index in 0..bundle.entries.len() {
                             let entry = &bundle.entries[index];
                             let region = Region::from_bytes(bundle.read_entry(index)?);
@@ -563,6 +561,7 @@ impl AssetCollection {
                         let unity_version_hint =
                             (!bundle.header.common.unity_revision.is_stripped())
                                 .then(|| bundle.header.common.unity_revision.clone());
+                        charge_pending_inputs(&mut pending, bundle.entries.len(), budget, limits)?;
                         for index in 0..bundle.entries.len() {
                             let entry = &bundle.entries[index];
                             let region = Region::from_bytes(bundle.read_entry(index)?);
@@ -591,6 +590,7 @@ impl AssetCollection {
                         ..web_defaults
                     };
                     let web = WebFile::open_with_limits(input.region, web_limits)?;
+                    charge_pending_inputs(&mut pending, web.entries.len(), budget, limits)?;
                     for index in 0..web.entries.len() {
                         let entry = &web.entries[index];
                         pending.push_back(PendingInput {
@@ -611,6 +611,7 @@ impl AssetCollection {
                 FileType::GzipFile => {
                     let region = decompress_gzip(&input.region, limits.compression)?;
                     charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
+                    charge_pending_inputs(&mut pending, 1, budget, limits)?;
                     pending.push_back(PendingInput {
                         path: input.path,
                         region,
@@ -621,6 +622,7 @@ impl AssetCollection {
                 FileType::BrotliFile => {
                     let region = decompress_brotli(&input.region, limits.compression)?;
                     charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
+                    charge_pending_inputs(&mut pending, 1, budget, limits)?;
                     pending.push_back(PendingInput {
                         path: input.path,
                         region,
@@ -636,6 +638,7 @@ impl AssetCollection {
                         ..limits.compression
                     };
                     let archive = ZipContainer::open(&input.region, compression)?;
+                    charge_pending_inputs(&mut pending, archive.entries.len(), budget, limits)?;
                     for index in 0..archive.entries.len() {
                         let entry = &archive.entries[index];
                         let region = archive.read_entry(index)?;
@@ -648,10 +651,15 @@ impl AssetCollection {
                         });
                     }
                 }
-                FileType::ResourceFile => self.resources.push(LoadedResource {
-                    path: input.path.into_string(),
-                    region: input.region,
-                }),
+                FileType::ResourceFile => {
+                    self.resources.try_reserve(1).map_err(|error| {
+                        Error::invalid_data(format!("cannot grow loaded resource table: {error}"))
+                    })?;
+                    self.resources.push(LoadedResource {
+                        path: input.path.into_string(),
+                        region: input.region,
+                    });
+                }
             }
         }
 
@@ -1590,6 +1598,29 @@ struct PendingInput {
     unity_version_hint: Option<crate::unity_version::UnityVersion>,
 }
 
+fn charge_pending_inputs(
+    pending: &mut VecDeque<PendingInput>,
+    additional: usize,
+    budget: &mut AssetLoadBudget,
+    limits: &AssetLoadLimits,
+) -> Result<()> {
+    let next = budget
+        .discovered_files
+        .checked_add(additional)
+        .ok_or_else(|| Error::invalid_data("discovered file count overflowed"))?;
+    budget.discovered_files = next;
+    if next > limits.maximum_discovered_files {
+        return Err(Error::invalid_data(format!(
+            "asset traversal exceeds {} discovered files",
+            limits.maximum_discovered_files
+        )));
+    }
+    pending.try_reserve(additional).map_err(|error| {
+        Error::invalid_data(format!("cannot grow pending asset input queue: {error}"))
+    })?;
+    Ok(())
+}
+
 fn filesystem_path_byte_length(path: &Path) -> usize {
     path.as_os_str().as_encoded_bytes().len()
 }
@@ -2161,6 +2192,7 @@ fn compare_ascii_case_insensitive(left: &str, right: &str) -> Ordering {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
     use std::io::Write;
     use std::path::Path;
@@ -2176,8 +2208,8 @@ mod tests {
     use super::{
         AssetCollection, AssetLoadBudget, AssetLoadLimits, AssetLoadOptions, LoadDiagnostic,
         LoadFailurePolicy, LoadPath, LoadedResource, LoadedSerializedFile, ObjectMetadataBuilder,
-        ObjectMetadataEntry, ObjectMetadataIndexBudget, ObjectMetadataKey, PendingObjectNames,
-        object_metadata_position_with_probe,
+        ObjectMetadataEntry, ObjectMetadataIndexBudget, ObjectMetadataKey, PendingInput,
+        PendingObjectNames, charge_pending_inputs, object_metadata_position_with_probe,
     };
 
     #[test]
@@ -2251,6 +2283,65 @@ mod tests {
         let error = AssetCollection::load_path_with_limits(&input, limits).unwrap_err();
         assert!(error.to_string().contains("exceeds 0 directories"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_input_batches_charge_before_queue_growth() {
+        let limits = AssetLoadLimits {
+            maximum_discovered_files: 3,
+            ..AssetLoadLimits::default()
+        };
+        let mut budget = AssetLoadBudget::default();
+        let mut pending = VecDeque::new();
+        charge_pending_inputs(&mut pending, 1, &mut budget, &limits).unwrap();
+        pending.push_back(PendingInput {
+            path: LoadPath("root".to_owned()),
+            region: Region::from_bytes(b"root".to_vec()),
+            depth: 0,
+            unity_version_hint: None,
+        });
+        charge_pending_inputs(&mut pending, 2, &mut budget, &limits).unwrap();
+        assert_eq!(budget.discovered_files, 3);
+        assert!(pending.capacity() >= pending.len() + 2);
+
+        let capacity = pending.capacity();
+        let error = charge_pending_inputs(&mut pending, 1, &mut budget, &limits).unwrap_err();
+        assert!(error.to_string().contains("exceeds 3 discovered files"));
+        assert_eq!(budget.discovered_files, 4);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.capacity(), capacity);
+    }
+
+    #[test]
+    fn loads_large_web_batch_at_the_exact_discovered_file_limit() {
+        const ENTRY_COUNT: usize = 16_384;
+        let paths: Vec<_> = (0..ENTRY_COUNT)
+            .map(|index| format!("entry-{index:05}"))
+            .collect();
+        let entries: Vec<_> = paths.iter().map(|path| (path.as_str(), &[][..])).collect();
+        let web = web_file(&entries);
+        let low_limits = AssetLoadLimits {
+            maximum_discovered_files: ENTRY_COUNT,
+            ..AssetLoadLimits::default()
+        };
+        let error =
+            AssetCollection::load_with_limits("root", Region::from_bytes(web.clone()), low_limits)
+                .unwrap_err();
+        assert!(error.to_string().contains("exceeds 16384 discovered files"));
+
+        let exact_limits = AssetLoadLimits {
+            maximum_discovered_files: ENTRY_COUNT + 1,
+            ..AssetLoadLimits::default()
+        };
+        let collection =
+            AssetCollection::load_with_limits("root", Region::from_bytes(web), exact_limits)
+                .unwrap();
+        assert_eq!(collection.resources.len(), ENTRY_COUNT);
+        assert_eq!(collection.resources[0].path, "root::entry-00000");
+        assert_eq!(
+            collection.resources[ENTRY_COUNT - 1].path,
+            "root::entry-16383"
+        );
     }
 
     #[test]
