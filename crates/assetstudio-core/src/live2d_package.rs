@@ -50,6 +50,8 @@ use crate::{Error, Result};
 pub struct Live2dPackageLimits {
     pub maximum_mono_behaviours: usize,
     pub maximum_scripts: usize,
+    /// Maximum bytes retained by the identity and loose-role lookup tables.
+    pub maximum_role_index_bytes: usize,
     pub maximum_models: usize,
     pub maximum_renderers: usize,
     pub maximum_textures: usize,
@@ -90,6 +92,7 @@ impl Default for Live2dPackageLimits {
         Self {
             maximum_mono_behaviours: 2_000_000,
             maximum_scripts: 1_000_000,
+            maximum_role_index_bytes: 256 * 1024 * 1024,
             maximum_models: 100_000,
             maximum_renderers: 2_000_000,
             maximum_textures: 1_000_000,
@@ -819,6 +822,7 @@ struct ScriptedComponent {
 
 struct ComponentIndexes {
     roles: Vec<((usize, usize), CubismRole)>,
+    loose_roles: LooseRoleIndex,
     models: Vec<ActiveModel>,
     expression_controllers: Vec<ScriptedComponent>,
     fade_controllers: Vec<ScriptedComponent>,
@@ -831,6 +835,69 @@ struct ComponentIndexes {
     parts_by_model: Vec<(SceneObjectKey, Vec<ScriptedComponent>)>,
     eye_blink_parameters_by_model: Vec<(SceneObjectKey, Vec<ScriptedComponent>)>,
     mouth_parameters_by_model: Vec<(SceneObjectKey, Vec<ScriptedComponent>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LooseRoleEntry {
+    file_index: usize,
+    object_index: usize,
+    role_key: u8,
+}
+
+impl LooseRoleEntry {
+    fn identity(&self) -> (usize, usize) {
+        (self.file_index, self.object_index)
+    }
+
+    fn group_key(&self) -> (usize, u8) {
+        (self.file_index, self.role_key)
+    }
+}
+
+struct LooseRoleIndex {
+    entries: Vec<LooseRoleEntry>,
+}
+
+impl LooseRoleIndex {
+    fn build(roles: &[((usize, usize), CubismRole)]) -> Result<Self> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(roles.len()).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate loose Live2D role index: {error}"))
+        })?;
+        for &((file_index, object_index), role) in roles {
+            entries.push(LooseRoleEntry {
+                file_index,
+                object_index,
+                role_key: cubism_role_key(role),
+            });
+        }
+        entries
+            .sort_unstable_by_key(|entry| (entry.file_index, entry.role_key, entry.object_index));
+        Ok(Self { entries })
+    }
+
+    fn entries(&self, file_index: usize, role: CubismRole) -> &[LooseRoleEntry] {
+        let range = self.bounds_with_probe(file_index, role, || {});
+        &self.entries[range]
+    }
+
+    fn bounds_with_probe(
+        &self,
+        file_index: usize,
+        role: CubismRole,
+        mut probe: impl FnMut(),
+    ) -> std::ops::Range<usize> {
+        let key = (file_index, cubism_role_key(role));
+        let start = self.entries.partition_point(|entry| {
+            probe();
+            entry.group_key() < key
+        });
+        let length = self.entries[start..].partition_point(|entry| {
+            probe();
+            entry.group_key() == key
+        });
+        start..start + length
+    }
 }
 
 #[derive(Default)]
@@ -855,7 +922,7 @@ impl ComponentPartitions {
         let mut partitions = Self::default();
         partitions
             .roles
-            .try_reserve(component_count)
+            .try_reserve_exact(component_count)
             .map_err(|error| {
                 Error::invalid_data(format!("cannot allocate Live2D role index: {error}"))
             })?;
@@ -1248,6 +1315,7 @@ impl<'a> PackageState<'a> {
     }
 
     fn index_components(&mut self) -> Result<ComponentIndexes> {
+        validate_role_index_budget(self.components.len(), self.limits.maximum_role_index_bytes)?;
         let mut partitions =
             ComponentPartitions::new(self.components.len(), self.models, self.renderers)?;
         for component in std::mem::take(&mut self.components) {
@@ -1269,6 +1337,7 @@ impl<'a> PackageState<'a> {
             mouth_parameters,
         } = partitions;
         roles.sort_unstable_by_key(|entry| entry.0);
+        let loose_roles = LooseRoleIndex::build(&roles)?;
         expression_controllers.sort_unstable_by_key(component_identity);
         fade_controllers.sort_unstable_by_key(component_identity);
 
@@ -1291,6 +1360,7 @@ impl<'a> PackageState<'a> {
             Self::assign_auxiliary_components(&nearest_models, mouth_parameters)?;
         Ok(ComponentIndexes {
             roles,
+            loose_roles,
             models,
             expression_controllers,
             fade_controllers,
@@ -1496,7 +1566,7 @@ impl<'a> PackageState<'a> {
             &indexes.roles,
         )?;
         if expressions.is_empty() {
-            return self.loose_expressions(&indexes.roles, file_index);
+            return self.loose_expressions(&indexes.loose_roles, file_index);
         }
         Ok(expressions)
     }
@@ -1521,7 +1591,7 @@ impl<'a> PackageState<'a> {
         if !motions.is_empty() {
             return Ok(motions);
         }
-        let motions = self.loose_motions(&indexes.roles, model.object.file_index, targets)?;
+        let motions = self.loose_motions(&indexes.loose_roles, model.object.file_index, targets)?;
         if !motions.is_empty() {
             return Ok(motions);
         }
@@ -1574,7 +1644,7 @@ impl<'a> PackageState<'a> {
         let motion_fps = motions.first().map_or(0.0, |motion| motion.motion.fps());
         let physics_controller = active_model.physics_controller.or_else(|| {
             Self::loose_component(
-                &indexes.roles,
+                &indexes.loose_roles,
                 CubismRole::PhysicsController,
                 model.object.file_index,
             )
@@ -2383,11 +2453,12 @@ impl<'a> PackageState<'a> {
     /// when both are present.
     fn loose_motions(
         &mut self,
-        roles: &[((usize, usize), CubismRole)],
+        roles: &LooseRoleIndex,
         file_index: usize,
         targets: &CubismMotionTargetNames,
     ) -> Result<Vec<Live2dPackageMotion>> {
-        let count = Self::loose_identities(roles, CubismRole::FadeMotionData, file_index).count();
+        let entries = roles.entries(file_index, CubismRole::FadeMotionData);
+        let count = entries.len();
         let _ = charge_usize(
             self.motions,
             count,
@@ -2404,27 +2475,12 @@ impl<'a> PackageState<'a> {
                 "cannot allocate loose Live2D motion names: {error}"
             ))
         })?;
-        for identity in Self::loose_identities(roles, CubismRole::FadeMotionData, file_index) {
-            if let Some(motion) = self.project_motion(identity, targets, &mut claimed)? {
+        for entry in entries {
+            if let Some(motion) = self.project_motion(entry.identity(), targets, &mut claimed)? {
                 motions.push(motion);
             }
         }
         Ok(motions)
-    }
-
-    /// Every loose component of `role` in `file_index`, in discovery order,
-    /// without retaining a second copy of the collection-wide role table.
-    fn loose_identities(
-        roles: &[((usize, usize), CubismRole)],
-        role: CubismRole,
-        file_index: usize,
-    ) -> impl Iterator<Item = (usize, usize)> + '_ {
-        roles
-            .iter()
-            .filter(move |((identity_file, _), candidate)| {
-                *candidate == role && *identity_file == file_index
-            })
-            .map(|(identity, _)| *identity)
     }
 
     /// The first loose component of `role` in `file_index`, if any.
@@ -2435,11 +2491,14 @@ impl<'a> PackageState<'a> {
     /// has to that group, and it keeps a loose object in one bundle from
     /// attaching to a model in another.
     fn loose_component(
-        roles: &[((usize, usize), CubismRole)],
+        roles: &LooseRoleIndex,
         role: CubismRole,
         file_index: usize,
     ) -> Option<(usize, usize)> {
-        Self::loose_identities(roles, role, file_index).next()
+        roles
+            .entries(file_index, role)
+            .first()
+            .map(LooseRoleEntry::identity)
     }
 
     /// Projects every loose `CubismExpressionData` in `file_index`.
@@ -2449,10 +2508,11 @@ impl<'a> PackageState<'a> {
     /// ordering, which the list defines and a scan cannot reproduce.
     fn loose_expressions(
         &mut self,
-        roles: &[((usize, usize), CubismRole)],
+        roles: &LooseRoleIndex,
         file_index: usize,
     ) -> Result<Vec<Live2dPackageExpression>> {
-        let count = Self::loose_identities(roles, CubismRole::ExpressionData, file_index).count();
+        let entries = roles.entries(file_index, CubismRole::ExpressionData);
+        let count = entries.len();
         let _ = charge_usize(
             self.expressions,
             count,
@@ -2469,9 +2529,8 @@ impl<'a> PackageState<'a> {
                 "cannot allocate loose Live2D expression names: {error}"
             ))
         })?;
-        for (file_index, object_index) in
-            Self::loose_identities(roles, CubismRole::ExpressionData, file_index)
-        {
+        for entry in entries {
+            let (file_index, object_index) = entry.identity();
             let loaded = self
                 .collection
                 .serialized_files
@@ -3146,6 +3205,47 @@ fn component_identity(component: &ScriptedComponent) -> (usize, usize) {
     (component.object.file_index, component.object_index)
 }
 
+fn validate_role_index_budget(component_count: usize, maximum_bytes: usize) -> Result<()> {
+    let identity_bytes = component_count
+        .checked_mul(std::mem::size_of::<((usize, usize), CubismRole)>())
+        .ok_or_else(|| Error::invalid_data("Live2D identity-role index size overflowed"))?;
+    let loose_bytes = component_count
+        .checked_mul(std::mem::size_of::<LooseRoleEntry>())
+        .ok_or_else(|| Error::invalid_data("loose Live2D role index size overflowed"))?;
+    let total = identity_bytes
+        .checked_add(loose_bytes)
+        .ok_or_else(|| Error::invalid_data("Live2D role index size overflowed"))?;
+    if total > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "Live2D role indexes require {total} bytes, limit is {maximum_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+fn cubism_role_key(role: CubismRole) -> u8 {
+    match role {
+        CubismRole::Moc => 0,
+        CubismRole::Model => 1,
+        CubismRole::Renderer => 2,
+        CubismRole::PhysicsController => 3,
+        CubismRole::FadeController => 4,
+        CubismRole::ExpressionController => 5,
+        CubismRole::DisplayInfoParameterName => 6,
+        CubismRole::DisplayInfoPartName => 7,
+        CubismRole::PosePart => 8,
+        CubismRole::ExpressionData => 9,
+        CubismRole::ExpressionList => 10,
+        CubismRole::FadeMotionData => 11,
+        CubismRole::FadeMotionList => 12,
+        CubismRole::EyeBlinkParameter => 13,
+        CubismRole::MouthParameter => 14,
+        CubismRole::Parameter => 15,
+        CubismRole::Part => 16,
+        CubismRole::Other => 17,
+    }
+}
+
 fn push_component(
     values: &mut Vec<ScriptedComponent>,
     component: ScriptedComponent,
@@ -3673,16 +3773,78 @@ mod tests {
 
     use super::{
         Live2dPackageDiagnosticKind, Live2dPackageLimits, Live2dPackageMaterializeLimits,
-        NearestParentModelIndex, PackageState, build_live2d_packages,
-        build_live2d_packages_with_schema_provider, claim_name, materialize_live2d_packages,
-        safe_file_stem,
+        LooseRoleEntry, LooseRoleIndex, NearestParentModelIndex, PackageState,
+        build_live2d_packages, build_live2d_packages_with_schema_provider, claim_name,
+        materialize_live2d_packages, safe_file_stem, validate_role_index_budget,
     };
+    use crate::live2d::CubismRole;
 
     const GAME_OBJECT: i32 = 1;
     const TRANSFORM: i32 = 4;
     const TEXTURE_2D: i32 = 28;
     const MONO_BEHAVIOUR: i32 = 114;
     const MONO_SCRIPT: i32 = 115;
+
+    #[test]
+    fn indexes_loose_roles_logarithmically_in_discovery_order() {
+        const ENTRY_COUNT: usize = 16_384;
+        let roles: Vec<_> = (0..ENTRY_COUNT)
+            .rev()
+            .map(|object_index| {
+                let role = if object_index % 2 == 0 {
+                    CubismRole::ExpressionData
+                } else {
+                    CubismRole::PhysicsController
+                };
+                ((7, object_index), role)
+            })
+            .collect();
+        let index = LooseRoleIndex::build(&roles).unwrap();
+
+        let expressions = index.entries(7, CubismRole::ExpressionData);
+        assert_eq!(expressions.len(), ENTRY_COUNT / 2);
+        assert_eq!(
+            expressions.first().map(LooseRoleEntry::identity),
+            Some((7, 0))
+        );
+        assert_eq!(
+            expressions.last().map(LooseRoleEntry::identity),
+            Some((7, ENTRY_COUNT - 2))
+        );
+        assert_eq!(
+            index
+                .entries(7, CubismRole::PhysicsController)
+                .first()
+                .map(LooseRoleEntry::identity),
+            Some((7, 1))
+        );
+        assert!(index.entries(8, CubismRole::ExpressionData).is_empty());
+
+        let mut comparisons = 0_usize;
+        for _ in 0..ENTRY_COUNT {
+            let range = index.bounds_with_probe(7, CubismRole::ExpressionData, || {
+                comparisons += 1;
+            });
+            assert_eq!(range.len(), ENTRY_COUNT / 2);
+        }
+        assert!(comparisons < ENTRY_COUNT * 32, "{comparisons}");
+    }
+
+    #[test]
+    fn rejects_role_indexes_one_byte_before_allocation_budget() {
+        const COMPONENT_COUNT: usize = 16_384;
+        let identity_bytes = COMPONENT_COUNT
+            .checked_mul(std::mem::size_of::<((usize, usize), CubismRole)>())
+            .unwrap();
+        let loose_bytes = COMPONENT_COUNT
+            .checked_mul(std::mem::size_of::<LooseRoleEntry>())
+            .unwrap();
+        let exact = identity_bytes.checked_add(loose_bytes).unwrap();
+
+        validate_role_index_budget(COMPONENT_COUNT, exact).unwrap();
+        let error = validate_role_index_budget(COMPONENT_COUNT, exact - 1).unwrap_err();
+        assert!(error.to_string().contains("Live2D role indexes require"));
+    }
 
     #[test]
     fn selects_animator_bound_clips_for_fade_motion_fallback() {
