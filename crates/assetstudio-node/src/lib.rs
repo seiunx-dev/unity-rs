@@ -16,7 +16,9 @@ use assetstudio_core::export::{
 use assetstudio_core::extraction::ExtractionOptions;
 use assetstudio_core::image_export::ImageFormat;
 use assetstudio_core::live2d_clip_motion::CubismClipMotionReadLimits;
-use assetstudio_core::live2d_motion::{CubismFadeMotionReadLimits, CubismMotionTargetNames};
+use assetstudio_core::live2d_motion::{
+    CubismFadeMotionReadLimits, CubismMotionTargetIndexLimits, CubismMotionTargetNames,
+};
 use assetstudio_core::live2d_package::{
     Live2dPackageBytesSet as CoreLive2dPackageBytesSet, Live2dPackageLimits,
     Live2dPackageMaterializeLimits,
@@ -3745,6 +3747,7 @@ fn live2d_package_limits(
         maximum_file_bytes,
         maximum_total_bytes,
         texture,
+        motion_target_index: CubismMotionTargetIndexLimits::default(),
     };
     Ok((planning, materialize))
 }

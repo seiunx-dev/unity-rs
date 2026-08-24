@@ -18,8 +18,8 @@ use crate::live2d_clip_motion::{
     CubismClipMotion, CubismClipMotionReadLimits, read_cubism_clip_motion_with_acl_decoder,
 };
 use crate::live2d_motion::{
-    CubismFadeMotion, CubismFadeMotionReadLimits, CubismMotionTargetNames,
-    project_cubism_fade_motion,
+    CubismFadeMotion, CubismFadeMotionReadLimits, CubismMotionTargetIndex,
+    CubismMotionTargetIndexLimits, CubismMotionTargetNames, project_cubism_fade_motion,
 };
 use crate::live2d_physics::{CubismPhysicsReadLimits, project_cubism_physics};
 use crate::live2d_schema::{
@@ -202,6 +202,26 @@ impl Live2dPackageMotionSource {
             Self::Fade(motion) => {
                 motion.write_motion3_json(targets, force_bezier, output, maximum_bytes)
             }
+            Self::AnimationClip(motion) => {
+                motion.write_motion3_json(force_bezier, output, maximum_bytes)
+            }
+        }
+    }
+
+    fn write_motion3_json_with_target_index(
+        &self,
+        target_index: &CubismMotionTargetIndex<'_>,
+        force_bezier: bool,
+        output: &mut impl Write,
+        maximum_bytes: u64,
+    ) -> Result<u64> {
+        match self {
+            Self::Fade(motion) => motion.write_motion3_json_with_target_index(
+                target_index,
+                force_bezier,
+                output,
+                maximum_bytes,
+            ),
             Self::AnimationClip(motion) => {
                 motion.write_motion3_json(force_bezier, output, maximum_bytes)
             }
@@ -403,6 +423,7 @@ pub struct Live2dPackageMaterializeLimits {
     pub maximum_file_bytes: u64,
     pub maximum_total_bytes: u64,
     pub texture: TextureReadLimits,
+    pub motion_target_index: CubismMotionTargetIndexLimits,
 }
 
 impl Default for Live2dPackageMaterializeLimits {
@@ -411,6 +432,7 @@ impl Default for Live2dPackageMaterializeLimits {
             maximum_file_bytes: 512 * 1024 * 1024,
             maximum_total_bytes: 4 * 1024 * 1024 * 1024,
             texture: TextureReadLimits::default(),
+            motion_target_index: CubismMotionTargetIndexLimits::default(),
         }
     }
 }
@@ -699,6 +721,7 @@ fn materialize_motions(
     targets: &CubismMotionTargetNames,
     force_bezier: bool,
 ) -> Result<Vec<Live2dPackageMotionBytes>> {
+    let target_index = CubismMotionTargetIndex::build(targets, limits.motion_target_index)?;
     let mut motions = Vec::new();
     motions.try_reserve(source.len()).map_err(|error| {
         Error::invalid_data(format!(
@@ -707,8 +730,8 @@ fn materialize_motions(
     })?;
     for motion in source {
         let json = materialize_package_file(total, limits, "Live2D motion JSON", |output| {
-            motion.motion.write_motion3_json(
-                targets,
+            motion.motion.write_motion3_json_with_target_index(
+                &target_index,
                 force_bezier,
                 output,
                 limits.maximum_file_bytes,
@@ -1578,6 +1601,7 @@ impl<'a> PackageState<'a> {
         active_model: &ActiveModel,
         indexes: &ComponentIndexes,
         targets: &CubismMotionTargetNames,
+        target_index: &CubismMotionTargetIndex<'_>,
     ) -> Result<Vec<Live2dPackageMotion>> {
         let model = &active_model.component;
         let direct = components_for_model(&indexes.fade_motions_by_model, model.object);
@@ -1586,12 +1610,13 @@ impl<'a> PackageState<'a> {
             &indexes.fade_controllers,
             direct,
             &indexes.roles,
-            targets,
+            target_index,
         )?;
         if !motions.is_empty() {
             return Ok(motions);
         }
-        let motions = self.loose_motions(&indexes.loose_roles, model.object.file_index, targets)?;
+        let motions =
+            self.loose_motions(&indexes.loose_roles, model.object.file_index, target_index)?;
         if !motions.is_empty() {
             return Ok(motions);
         }
@@ -1640,7 +1665,10 @@ impl<'a> PackageState<'a> {
         let expressions = self.model_expressions(active_model, model.object.file_index, indexes)?;
         let (motion_targets, eye_blink_parameters, lip_sync_parameters) =
             self.parameter_metadata_for_model(model.object, &moc, indexes)?;
-        let motions = self.model_motions(active_model, indexes, &motion_targets)?;
+        let motion_target_index =
+            CubismMotionTargetIndex::build(&motion_targets, self.limits.motion.target_index)?;
+        let motions =
+            self.model_motions(active_model, indexes, &motion_targets, &motion_target_index)?;
         let motion_fps = motions.first().map_or(0.0, |motion| motion.motion.fps());
         let physics_controller = active_model.physics_controller.or_else(|| {
             Self::loose_component(
@@ -2135,7 +2163,7 @@ impl<'a> PackageState<'a> {
         controllers: &[ScriptedComponent],
         direct: &[ScriptedComponent],
         roles: &[((usize, usize), CubismRole)],
-        targets: &CubismMotionTargetNames,
+        target_index: &CubismMotionTargetIndex<'_>,
     ) -> Result<Vec<Live2dPackageMotion>> {
         let identities = if let Some(identity) = controller_identity {
             self.motion_identities_from_controller(identity, controllers, roles)?
@@ -2156,7 +2184,7 @@ impl<'a> PackageState<'a> {
             Error::invalid_data(format!("cannot allocate Live2D motion names: {error}"))
         })?;
         for identity in identities {
-            if let Some(motion) = self.project_motion(identity, targets, &mut claimed)? {
+            if let Some(motion) = self.project_motion(identity, target_index, &mut claimed)? {
                 motions.push(motion);
             }
         }
@@ -2239,7 +2267,7 @@ impl<'a> PackageState<'a> {
     fn project_motion(
         &mut self,
         identity: (usize, usize),
-        targets: &CubismMotionTargetNames,
+        target_index: &CubismMotionTargetIndex<'_>,
         claimed: &mut HashSet<String>,
     ) -> Result<Option<Live2dPackageMotion>> {
         self.motions = charge_usize(
@@ -2291,8 +2319,8 @@ impl<'a> PackageState<'a> {
             .maximum_total_motion_bytes
             .checked_sub(self.motion_bytes)
             .ok_or_else(|| Error::invalid_data("Live2D motion byte accounting underflowed"))?;
-        let written = motion.write_motion3_json(
-            targets,
+        let written = motion.write_motion3_json_with_target_index(
+            target_index,
             self.limits.force_bezier_motions,
             &mut io::sink(),
             remaining.min(self.limits.motion.maximum_output_bytes),
@@ -2451,7 +2479,7 @@ impl<'a> PackageState<'a> {
         &mut self,
         roles: &LooseRoleIndex,
         file_index: usize,
-        targets: &CubismMotionTargetNames,
+        target_index: &CubismMotionTargetIndex<'_>,
     ) -> Result<Vec<Live2dPackageMotion>> {
         let entries = roles.entries(file_index, CubismRole::FadeMotionData);
         let count = entries.len();
@@ -2472,7 +2500,9 @@ impl<'a> PackageState<'a> {
             ))
         })?;
         for entry in entries {
-            if let Some(motion) = self.project_motion(entry.identity(), targets, &mut claimed)? {
+            if let Some(motion) =
+                self.project_motion(entry.identity(), target_index, &mut claimed)?
+            {
                 motions.push(motion);
             }
         }
@@ -4000,6 +4030,17 @@ mod tests {
         assert!(package.eye_blink_parameters.is_empty());
         assert!(package.lip_sync_parameters.is_empty());
 
+        let mut set = build_live2d_packages(&collection, Live2dPackageLimits::default()).unwrap();
+        set.packages[0]
+            .motion_targets
+            .parameters
+            .push("ParamAngleX".to_owned());
+        let mut target_limits = Live2dPackageMaterializeLimits::default();
+        target_limits.motion_target_index.maximum_names = 0;
+        let error = materialize_live2d_packages(set, target_limits)
+            .expect_err("materialization must enforce the motion target index budget");
+        assert!(error.to_string().contains("motion target names"), "{error}");
+
         // The two budgets fail differently on purpose: one says raise this
         // file's ceiling, the other says raise the whole set's, and a caller
         // cannot act on the difference unless the message carries it.
@@ -4238,6 +4279,12 @@ mod tests {
         let package = &set.packages[0];
         assert_eq!(package.motion_targets.parameters, ["ParamAngleX"]);
         assert_eq!(package.motion_targets.parts, ["PartArm", "PartHead"]);
+
+        let mut limits = Live2dPackageLimits::default();
+        limits.motion.target_index.maximum_names = 2;
+        let error = build_live2d_packages(&collection, limits)
+            .expect_err("planning must enforce the shared motion target index budget");
+        assert!(error.to_string().contains("motion target names"), "{error}");
 
         let mut manifest = Vec::new();
         package.write_model3_json(&mut manifest, u64::MAX).unwrap();

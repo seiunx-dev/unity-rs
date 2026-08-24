@@ -7,6 +7,27 @@ use crate::serialized::SerializedFile;
 use crate::type_tree::{TypeTreeReadLimits, TypeValue};
 use crate::{Error, Result};
 
+/// Budgets for classifying Cubism motion curve identifiers against a model's
+/// parameter and part tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CubismMotionTargetIndexLimits {
+    pub maximum_names: usize,
+    pub maximum_string_bytes: usize,
+    pub maximum_total_string_bytes: usize,
+    pub maximum_index_bytes: usize,
+}
+
+impl Default for CubismMotionTargetIndexLimits {
+    fn default() -> Self {
+        Self {
+            maximum_names: 2_000_000,
+            maximum_string_bytes: 16 * 1024 * 1024,
+            maximum_total_string_bytes: 128 * 1024 * 1024,
+            maximum_index_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CubismFadeMotionReadLimits {
     pub maximum_object_bytes: u64,
@@ -16,6 +37,7 @@ pub struct CubismFadeMotionReadLimits {
     pub maximum_total_string_bytes: usize,
     pub maximum_output_bytes: u64,
     pub type_tree: TypeTreeReadLimits,
+    pub target_index: CubismMotionTargetIndexLimits,
 }
 
 impl Default for CubismFadeMotionReadLimits {
@@ -28,6 +50,7 @@ impl Default for CubismFadeMotionReadLimits {
             maximum_total_string_bytes: 128 * 1024 * 1024,
             maximum_output_bytes: 512 * 1024 * 1024,
             type_tree: TypeTreeReadLimits::default(),
+            target_index: CubismMotionTargetIndexLimits::default(),
         }
     }
 }
@@ -65,6 +88,91 @@ pub struct CubismMotionTargetNames {
     pub parts: Vec<String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct CubismMotionTargetIndex<'a> {
+    parameters: Vec<&'a str>,
+    parts: Vec<&'a str>,
+}
+
+impl<'a> CubismMotionTargetIndex<'a> {
+    pub(crate) fn build(
+        targets: &'a CubismMotionTargetNames,
+        limits: CubismMotionTargetIndexLimits,
+    ) -> Result<Self> {
+        let name_count = targets
+            .parameters
+            .len()
+            .checked_add(targets.parts.len())
+            .ok_or_else(|| Error::invalid_data("Cubism motion target count overflowed"))?;
+        if name_count > limits.maximum_names {
+            return Err(limit_error(
+                "motion target names",
+                name_count,
+                limits.maximum_names,
+            ));
+        }
+        let index_bytes = name_count
+            .checked_mul(std::mem::size_of::<&str>())
+            .ok_or_else(|| Error::invalid_data("Cubism motion target index size overflowed"))?;
+        if index_bytes > limits.maximum_index_bytes {
+            return Err(Error::invalid_data(format!(
+                "Cubism motion target index needs {index_bytes} bytes, limit is {}",
+                limits.maximum_index_bytes
+            )));
+        }
+        let mut total_string_bytes = 0_usize;
+        for name in targets.parameters.iter().chain(&targets.parts) {
+            if name.len() > limits.maximum_string_bytes {
+                return Err(Error::invalid_data(format!(
+                    "Cubism motion target is {} bytes, exceeding limit {}",
+                    name.len(),
+                    limits.maximum_string_bytes
+                )));
+            }
+            total_string_bytes = total_string_bytes
+                .checked_add(name.len())
+                .ok_or_else(|| Error::invalid_data("Cubism motion target strings overflowed"))?;
+            if total_string_bytes > limits.maximum_total_string_bytes {
+                return Err(Error::invalid_data(format!(
+                    "Cubism motion target strings use {total_string_bytes} bytes, exceeding limit {}",
+                    limits.maximum_total_string_bytes
+                )));
+            }
+        }
+
+        let parameters = sorted_target_refs(&targets.parameters, "parameter")?;
+        let parts = sorted_target_refs(&targets.parts, "part")?;
+        Ok(Self { parameters, parts })
+    }
+
+    fn target_for(&self, id: &str) -> &'static str {
+        if matches!(id, "Opacity" | "EyeBlink" | "LipSync") {
+            "Model"
+        } else if self.parameters.binary_search(&id).is_ok() {
+            "Parameter"
+        } else if self.parts.binary_search(&id).is_ok()
+            || contains_ascii_case_insensitive(id.as_bytes(), b"part")
+        {
+            "PartOpacity"
+        } else {
+            "Parameter"
+        }
+    }
+}
+
+fn sorted_target_refs<'a>(values: &'a [String], kind: &'static str) -> Result<Vec<&'a str>> {
+    let mut index = Vec::new();
+    index.try_reserve_exact(values.len()).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate Cubism motion {kind} target index: {error}"
+        ))
+    })?;
+    index.extend(values.iter().map(String::as_str));
+    index.sort_unstable();
+    index.dedup();
+    Ok(index)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MotionCurveView<'a> {
     pub target: &'a str,
@@ -99,6 +207,39 @@ impl CubismFadeMotion {
         output: &mut W,
         maximum_bytes: u64,
     ) -> Result<u64> {
+        self.write_motion3_json_with_limits(
+            targets,
+            CubismMotionTargetIndexLimits::default(),
+            force_bezier,
+            output,
+            maximum_bytes,
+        )
+    }
+
+    pub fn write_motion3_json_with_limits<W: Write>(
+        &self,
+        targets: &CubismMotionTargetNames,
+        target_limits: CubismMotionTargetIndexLimits,
+        force_bezier: bool,
+        output: &mut W,
+        maximum_bytes: u64,
+    ) -> Result<u64> {
+        let target_index = CubismMotionTargetIndex::build(targets, target_limits)?;
+        self.write_motion3_json_with_target_index(
+            &target_index,
+            force_bezier,
+            output,
+            maximum_bytes,
+        )
+    }
+
+    pub(crate) fn write_motion3_json_with_target_index<W: Write>(
+        &self,
+        target_index: &CubismMotionTargetIndex<'_>,
+        force_bezier: bool,
+        output: &mut W,
+        maximum_bytes: u64,
+    ) -> Result<u64> {
         let mut curves = Vec::new();
         curves.try_reserve(self.curves.len()).map_err(|error| {
             Error::invalid_data(format!("cannot allocate Cubism motion curves: {error}"))
@@ -108,7 +249,7 @@ impl CubismFadeMotion {
                 continue;
             }
             curves.push(MotionCurveView {
-                target: target_for(&curve.parameter_id, targets),
+                target: target_index.target_for(&curve.parameter_id),
                 id: &curve.parameter_id,
                 fade_in_time: curve.fade_in_time,
                 fade_out_time: curve.fade_out_time,
@@ -288,8 +429,10 @@ pub fn project_cubism_fade_motion(
         motion_length,
         curves: projected,
     };
-    crate::error::output_validation(motion.write_motion3_json(
-        &CubismMotionTargetNames::default(),
+    let target_names = CubismMotionTargetNames::default();
+    let target_index = CubismMotionTargetIndex::build(&target_names, limits.target_index)?;
+    crate::error::output_validation(motion.write_motion3_json_with_target_index(
+        &target_index,
         false,
         &mut io::sink(),
         limits.maximum_output_bytes,
@@ -420,29 +563,11 @@ fn is_inverse_stepped(
         && next.value.to_bits() == current.value.to_bits()
 }
 
-fn target_for(id: &str, targets: &CubismMotionTargetNames) -> &'static str {
-    if matches!(id, "Opacity" | "EyeBlink" | "LipSync") {
-        "Model"
-    } else if contains_name(&targets.parameters, id) {
-        "Parameter"
-    } else if contains_name(&targets.parts, id)
-        || contains_ascii_case_insensitive(id.as_bytes(), b"part")
-    {
-        "PartOpacity"
-    } else {
-        "Parameter"
-    }
-}
-
 fn contains_ascii_case_insensitive(value: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && value
             .windows(needle.len())
             .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
-fn contains_name(values: &[String], target: &str) -> bool {
-    values.iter().any(|value| value == target)
 }
 
 #[derive(Clone, Copy)]
@@ -733,7 +858,9 @@ impl<W: Write> Write for BoundedWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CubismFadeMotionReadLimits, CubismMotionTargetNames, project_cubism_fade_motion, target_for,
+        CubismFadeMotion, CubismFadeMotionCurve, CubismFadeMotionReadLimits, CubismMotionKeyframe,
+        CubismMotionTargetIndex, CubismMotionTargetIndexLimits, CubismMotionTargetNames,
+        project_cubism_fade_motion,
     };
     use crate::type_tree::{TypeField, TypeValue};
 
@@ -833,13 +960,129 @@ mod tests {
             parameters: Vec::new(),
             parts: vec!["ArmOpacity".to_owned()],
         };
-        assert_eq!(target_for("ArmOpacity", &targets), "PartOpacity");
-        assert_eq!(target_for("DrawablePaRtOpacity", &targets), "PartOpacity");
-        assert_eq!(target_for("ParameterAngleX", &targets), "Parameter");
+        let index =
+            CubismMotionTargetIndex::build(&targets, CubismMotionTargetIndexLimits::default())
+                .unwrap();
+        assert_eq!(index.target_for("ArmOpacity"), "PartOpacity");
+        assert_eq!(index.target_for("DrawablePaRtOpacity"), "PartOpacity");
+        assert_eq!(index.target_for("ParameterAngleX"), "Parameter");
 
         let mut long = "x".repeat(4096);
         long.push_str("PART");
-        assert_eq!(target_for(&long, &targets), "PartOpacity");
+        assert_eq!(index.target_for(&long), "PartOpacity");
+    }
+
+    #[test]
+    fn indexes_large_reverse_target_tables_and_preserves_precedence() {
+        const TARGET_COUNT: usize = 16_384;
+        let mut parameters = Vec::new();
+        parameters.try_reserve(TARGET_COUNT + 1).unwrap();
+        for value in (0..TARGET_COUNT).rev() {
+            parameters.push(format!("Param{value:05}"));
+        }
+        parameters.push(parameters[123].clone());
+        let shared = parameters[0].clone();
+        let targets = CubismMotionTargetNames {
+            parameters,
+            parts: vec![shared.clone(), "PartArm".to_owned()],
+        };
+
+        let index =
+            CubismMotionTargetIndex::build(&targets, CubismMotionTargetIndexLimits::default())
+                .unwrap();
+
+        for value in 0..TARGET_COUNT {
+            assert_eq!(index.target_for(&format!("Param{value:05}")), "Parameter");
+        }
+        assert_eq!(index.target_for(&shared), "Parameter");
+        assert_eq!(index.target_for("PartArm"), "PartOpacity");
+        assert_eq!(index.target_for("Opacity"), "Model");
+
+        let mut curves = Vec::new();
+        curves.try_reserve(4_096).unwrap();
+        for _ in 0..4_096 {
+            curves.push(CubismFadeMotionCurve {
+                parameter_id: "Param00000".to_owned(),
+                fade_in_time: 0.0,
+                fade_out_time: 0.0,
+                keyframes: vec![CubismMotionKeyframe {
+                    time: 0.0,
+                    value: 0.0,
+                    in_slope: 0.0,
+                    out_slope: 0.0,
+                }],
+            });
+        }
+        let motion = CubismFadeMotion {
+            path_id: 1,
+            source_name: String::new(),
+            motion_name: String::new(),
+            fade_in_time: 0.0,
+            fade_out_time: 0.0,
+            motion_length: 0.0,
+            curves,
+        };
+        motion
+            .write_motion3_json(&targets, false, &mut std::io::sink(), 16 * 1024 * 1024)
+            .unwrap();
+    }
+
+    #[test]
+    fn enforces_motion_target_index_budgets() {
+        let targets = CubismMotionTargetNames {
+            parameters: vec!["ParamAngleX".to_owned()],
+            parts: vec!["PartArm".to_owned()],
+        };
+        let defaults = CubismMotionTargetIndexLimits::default();
+        let index_bytes = 2 * std::mem::size_of::<&str>();
+
+        let error = CubismMotionTargetIndex::build(
+            &targets,
+            CubismMotionTargetIndexLimits {
+                maximum_names: 1,
+                ..defaults
+            },
+        )
+        .expect_err("target-count budget must reject the index");
+        assert!(error.to_string().contains("motion target names"));
+        let error = CubismMotionTargetIndex::build(
+            &targets,
+            CubismMotionTargetIndexLimits {
+                maximum_string_bytes: "ParamAngleX".len() - 1,
+                ..defaults
+            },
+        )
+        .expect_err("per-string budget must reject the index");
+        assert!(error.to_string().contains("motion target is"));
+        let error = CubismMotionTargetIndex::build(
+            &targets,
+            CubismMotionTargetIndexLimits {
+                maximum_total_string_bytes: "ParamAngleX".len() + "PartArm".len() - 1,
+                ..defaults
+            },
+        )
+        .expect_err("total-string budget must reject the index");
+        assert!(error.to_string().contains("target strings use"));
+        let error = CubismMotionTargetIndex::build(
+            &targets,
+            CubismMotionTargetIndexLimits {
+                maximum_index_bytes: index_bytes - 1,
+                ..defaults
+            },
+        )
+        .expect_err("index-byte budget must reject the index");
+        assert!(error.to_string().contains("target index needs"));
+
+        CubismMotionTargetIndex::build(
+            &targets,
+            CubismMotionTargetIndexLimits {
+                maximum_names: 2,
+                maximum_string_bytes: "ParamAngleX".len(),
+                maximum_total_string_bytes: "ParamAngleX".len() + "PartArm".len(),
+                maximum_index_bytes: index_bytes,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
