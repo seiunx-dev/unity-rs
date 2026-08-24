@@ -139,6 +139,7 @@ def consume_public_api(
     model_texture_limits = ModelTextureLimits(
         maximum_texture_references=1_024,
         maximum_textures=128,
+        maximum_name_index_bytes=8 * 1024 * 1024,
         maximum_total_encoded_bytes=256 * 1024 * 1024,
         maximum_single_texture_bytes=64 * 1024 * 1024,
     )

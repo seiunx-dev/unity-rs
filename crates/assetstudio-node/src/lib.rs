@@ -893,6 +893,7 @@ pub struct SceneLimits {
 pub struct ModelTextureLimits {
     pub maximum_texture_references: Option<u32>,
     pub maximum_textures: Option<u32>,
+    pub maximum_name_index_bytes: Option<i64>,
     pub maximum_total_encoded_bytes: Option<i64>,
     pub maximum_single_texture_bytes: Option<i64>,
 }
@@ -1173,6 +1174,11 @@ fn model_texture_limits(options: Option<ModelTextureLimits>) -> Result<SceneText
             defaults.maximum_texture_references,
         ),
         maximum_textures: count_limit(options.maximum_textures, defaults.maximum_textures),
+        maximum_name_index_bytes: non_negative_limit(
+            options.maximum_name_index_bytes,
+            defaults.maximum_name_index_bytes,
+            "maximumNameIndexBytes",
+        )?,
         maximum_total_encoded_bytes: non_negative_limit(
             options.maximum_total_encoded_bytes,
             defaults.maximum_total_encoded_bytes,
@@ -5234,16 +5240,22 @@ mod tests {
     fn maps_the_model_texture_reference_budget() {
         let defaults = model_texture_limits(None).expect("default texture limits");
         assert_eq!(defaults.maximum_texture_references, 1_000_000);
+        assert_eq!(defaults.maximum_name_index_bytes, 64 * 1024 * 1024);
 
         let configured = model_texture_limits(Some(ModelTextureLimits {
             maximum_texture_references: Some(0),
             maximum_textures: None,
+            maximum_name_index_bytes: None,
             maximum_total_encoded_bytes: None,
             maximum_single_texture_bytes: None,
         }))
         .expect("configured texture limits");
         assert_eq!(configured.maximum_texture_references, 0);
         assert_eq!(configured.maximum_textures, defaults.maximum_textures);
+        assert_eq!(
+            configured.maximum_name_index_bytes,
+            defaults.maximum_name_index_bytes
+        );
     }
 
     fn assert_bounded_option_error(error: &napi::Error, field: &str, oversized: &str) {
