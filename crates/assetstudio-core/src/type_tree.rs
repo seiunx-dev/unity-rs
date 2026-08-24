@@ -1,4 +1,5 @@
 use std::io::{Read, Seek};
+use std::rc::Rc;
 
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::serialized::{SerializedFile, SerializedType, TypeTree, TypeTreeNode};
@@ -11,6 +12,98 @@ const ALIGN_BYTES_FLAG: i32 = 0x4000;
 const MANAGED_REFERENCES_REGISTRY: &str = "ManagedReferencesRegistry";
 const REFERENCED_MANAGED_TYPE: &str = "ReferencedManagedType";
 const REFERENCED_OBJECT_DATA: &str = "ReferencedObjectData";
+
+/// Precomputed exclusive end offsets for every node in one preorder tree.
+///
+/// Arrays and maps reuse the same element schema once per runtime value. A
+/// forward scan for each `subtree_end` therefore turns a bounded schema and a
+/// bounded element count into their product. Building this table once keeps
+/// every boundary lookup constant-time while preserving preorder semantics.
+#[derive(Debug, Clone)]
+pub(crate) struct TypeTreeLayout {
+    subtree_ends: Rc<Vec<usize>>,
+}
+
+impl TypeTreeLayout {
+    pub(crate) fn new(nodes: &[TypeTreeNode]) -> Result<Self> {
+        Self::new_with_probe(nodes, || {})
+    }
+
+    fn new_with_probe(nodes: &[TypeTreeNode], mut probe: impl FnMut()) -> Result<Self> {
+        validate_tree_shape(nodes)?;
+        let count = nodes.len();
+        let mut subtree_ends = Vec::new();
+        subtree_ends.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate {count} TypeTree subtree boundaries: {error}"
+            ))
+        })?;
+        subtree_ends.resize(count, count);
+
+        // The stack contains the still-open ancestor chain. Reserving the
+        // worst case up front makes the only auxiliary allocation fallible.
+        let mut open: Vec<usize> = Vec::new();
+        open.try_reserve_exact(count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate {count} TypeTree subtree stack entries: {error}"
+            ))
+        })?;
+        for (index, node) in nodes.iter().enumerate() {
+            probe();
+            while open
+                .last()
+                .is_some_and(|open_index| nodes[*open_index].level >= node.level)
+            {
+                probe();
+                let closed = open.pop().expect("the open-node stack was non-empty");
+                subtree_ends[closed] = index;
+            }
+            open.push(index);
+        }
+        Ok(Self {
+            subtree_ends: Rc::new(subtree_ends),
+        })
+    }
+
+    pub(crate) fn subtree_end(&self, index: usize) -> usize {
+        self.subtree_ends
+            .get(index)
+            .copied()
+            .unwrap_or(self.subtree_ends.len())
+    }
+
+    fn retained_bytes(node_count: usize) -> Result<usize> {
+        node_count
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| Error::invalid_data("TypeTree subtree index size overflowed"))
+    }
+
+    fn new_bounded(
+        nodes: &[TypeTreeNode],
+        retained_bytes: usize,
+        maximum_bytes: usize,
+        label: &str,
+    ) -> Result<(Self, usize)> {
+        let index_bytes = Self::retained_bytes(nodes.len())?;
+        let build_bytes = index_bytes
+            .checked_mul(2)
+            .and_then(|bytes| retained_bytes.checked_add(bytes))
+            .ok_or_else(|| Error::invalid_data("TypeTree subtree index budget overflowed"))?;
+        if build_bytes > maximum_bytes {
+            return Err(Error::invalid_data(format!(
+                "{label} would raise materialized type tree bytes to {build_bytes}, above limit {maximum_bytes}"
+            )));
+        }
+        Ok((Self::new(nodes)?, index_bytes))
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            subtree_ends: Rc::new(Vec::new()),
+        }
+    }
+}
 
 /// Borrows the class, namespace and assembly one registry entry names.
 ///
@@ -45,8 +138,9 @@ pub struct TypeTreeReadLimits {
     pub maximum_string_bytes: usize,
     pub maximum_typeless_bytes: usize,
     /// Conservative upper bound for heap work retained by the materialized
-    /// value tree. This includes value/vector slots, cloned field names,
-    /// decoded strings, and their fallible capacities.
+    /// value tree and its parser indexes. This includes value/vector slots,
+    /// cloned field names, decoded strings, subtree boundaries, and their
+    /// fallible capacities.
     pub maximum_materialized_bytes: usize,
 }
 
@@ -257,17 +351,23 @@ pub fn read_type_tree_from_reader_with_reference_types<R: Read + Seek>(
     limits: TypeTreeReadLimits,
     reference_types: &[SerializedType],
 ) -> Result<TypeValue> {
-    validate_tree_shape(&tree.nodes)?;
+    let (layout, layout_bytes) = TypeTreeLayout::new_bounded(
+        &tree.nodes,
+        0,
+        limits.maximum_materialized_bytes,
+        "TypeTree subtree index",
+    )?;
     let mut parser = TypeTreeValueReader {
         nodes: &tree.nodes,
+        layout,
         reader,
         absolute_start,
         limits,
         values_read: 0,
-        materialized_bytes: 0,
+        materialized_bytes: layout_bytes,
         reference_types,
         reference_type_lookup: None,
-        validated_reference_types: None,
+        reference_type_layouts: None,
         has_registry: false,
     };
     let (value, next) = parser.read_node(0, 0)?;
@@ -304,17 +404,23 @@ fn read_type_tree_root_field_from_reader_with_reference_types<R: Read + Seek>(
     reference_types: &[SerializedType],
     field_name: &str,
 ) -> Result<Option<TypeValue>> {
-    validate_tree_shape(&tree.nodes)?;
+    let (layout, layout_bytes) = TypeTreeLayout::new_bounded(
+        &tree.nodes,
+        0,
+        limits.maximum_materialized_bytes,
+        "TypeTree subtree index",
+    )?;
     let mut parser = TypeTreeValueReader {
         nodes: &tree.nodes,
+        layout,
         reader,
         absolute_start,
         limits,
         values_read: 0,
-        materialized_bytes: 0,
+        materialized_bytes: layout_bytes,
         reference_types,
         reference_type_lookup: None,
-        validated_reference_types: None,
+        reference_type_layouts: None,
         has_registry: false,
     };
     let (value, next) = parser.read_root_field(0, field_name)?;
@@ -351,6 +457,7 @@ impl ReferenceTypeLookupEntry<'_> {
 
 struct TypeTreeValueReader<'a, R> {
     nodes: &'a [TypeTreeNode],
+    layout: TypeTreeLayout,
     reader: EndianReader<R>,
     absolute_start: u64,
     limits: TypeTreeReadLimits,
@@ -364,10 +471,10 @@ struct TypeTreeValueReader<'a, R> {
     /// old first-declaration-wins behavior without scanning all reference types
     /// for every `rid`.
     reference_type_lookup: Option<Vec<ReferenceTypeLookupEntry<'a>>>,
-    /// One bit per reference type, built lazily. A sorted `Vec<usize>` still
-    /// makes files whose entries each name a distinct type quadratic when
-    /// checking whether that type's tree has already been validated.
-    validated_reference_types: Option<Vec<bool>>,
+    /// Built lazily for reference types that actually occur in the payload.
+    /// The cached layout is also the proof that the referenced tree shape was
+    /// validated, so repeated entries never rescan that schema.
+    reference_type_layouts: Option<Vec<Option<TypeTreeLayout>>>,
     /// Unity writes one registry per object, at the outermost level. A
     /// reference type's own tree can declare another, and reading that one
     /// would consume bytes that are not there.
@@ -383,7 +490,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         })?;
         let kind = ValueKind::from_type_name(&node.type_name);
         let mut align = node.meta_flags & ALIGN_BYTES_FLAG != 0;
-        let subtree_end = subtree_end(self.nodes, index);
+        let subtree_end = self.layout.subtree_end(index);
 
         let (value, next) = match kind {
             ValueKind::Signed8 => (
@@ -417,7 +524,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
             ValueKind::Float64 => (TypeValue::Float(self.reader.read_f64()?), index + 1),
             ValueKind::Boolean => (TypeValue::Boolean(self.reader.read_bool()?), index + 1),
             ValueKind::String if is_array_parent(self.nodes, index) => {
-                validate_array_shape(self.nodes, index)?;
+                validate_array_shape(self.nodes, &self.layout, index)?;
                 let value = self.read_aligned_string()?;
                 (TypeValue::String(value), subtree_end)
             }
@@ -438,7 +545,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 (value, subtree_end)
             }
             ValueKind::TypelessData => {
-                validate_typeless_shape(self.nodes, index)?;
+                validate_typeless_shape(self.nodes, &self.layout, index)?;
                 let length =
                     self.read_length(self.limits.maximum_typeless_bytes, "TypelessData byte")?;
                 let offset = self.reader.position()?;
@@ -508,7 +615,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
 
         let root_level = root.level;
         let align = root.meta_flags & ALIGN_BYTES_FLAG != 0;
-        let end = subtree_end(self.nodes, index);
+        let end = self.layout.subtree_end(index);
         let mut selected = None;
         let mut child = index + 1;
         while child < end {
@@ -522,7 +629,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
             }
             if node.type_name == MANAGED_REFERENCES_REGISTRY {
                 if self.has_registry {
-                    child = subtree_end(self.nodes, child);
+                    child = self.layout.subtree_end(child);
                     continue;
                 }
                 self.has_registry = true;
@@ -548,7 +655,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         })?;
         let kind = ValueKind::from_type_name(&node.type_name);
         let mut align = node.meta_flags & ALIGN_BYTES_FLAG != 0;
-        let end = subtree_end(self.nodes, index);
+        let end = self.layout.subtree_end(index);
         let next = match kind {
             ValueKind::Signed8 => {
                 self.reader.read_i8()?;
@@ -583,7 +690,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 index + 1
             }
             ValueKind::String if is_array_parent(self.nodes, index) => {
-                validate_array_shape(self.nodes, index)?;
+                validate_array_shape(self.nodes, &self.layout, index)?;
                 self.skip_aligned_string()?;
                 end
             }
@@ -596,7 +703,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 end
             }
             ValueKind::TypelessData => {
-                validate_typeless_shape(self.nodes, index)?;
+                validate_typeless_shape(self.nodes, &self.layout, index)?;
                 let length =
                     self.read_length(self.limits.maximum_typeless_bytes, "TypelessData byte")?;
                 self.skip_bytes(length, "TypelessData")?;
@@ -623,7 +730,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
 
     fn skip_class(&mut self, index: usize, depth: usize) -> Result<()> {
         let parent_level = self.nodes[index].level;
-        let end = subtree_end(self.nodes, index);
+        let end = self.layout.subtree_end(index);
         let mut child = index + 1;
         while child < end {
             let node = &self.nodes[child];
@@ -636,7 +743,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
             }
             if node.type_name == MANAGED_REFERENCES_REGISTRY {
                 if self.has_registry {
-                    child = subtree_end(self.nodes, child);
+                    child = self.layout.subtree_end(child);
                     continue;
                 }
                 self.has_registry = true;
@@ -648,7 +755,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
 
     fn skip_referenced_object(&mut self, index: usize, depth: usize) -> Result<()> {
         let parent_level = self.nodes[index].level;
-        let end = subtree_end(self.nodes, index);
+        let end = self.layout.subtree_end(index);
         let mut reference_type_index = None;
         let mut child = index + 1;
         while child < end {
@@ -667,7 +774,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 if let Some(tree_index) = reference_type_index {
                     self.skip_reference_type(tree_index, depth + 1)?;
                 }
-                child = subtree_end(self.nodes, child);
+                child = self.layout.subtree_end(child);
                 continue;
             }
             if node.type_name == REFERENCED_MANAGED_TYPE {
@@ -683,8 +790,11 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
     }
 
     fn skip_reference_type(&mut self, tree_index: usize, depth: usize) -> Result<()> {
-        self.ensure_reference_type_validation_cache()?;
-        let tree = self.reference_types[tree_index]
+        let layout = self.reference_type_layout(tree_index)?;
+        let tree = self
+            .reference_types
+            .get(tree_index)
+            .ok_or_else(|| Error::invalid_data("reference type index is out of range"))?
             .type_tree
             .as_ref()
             .ok_or_else(|| {
@@ -693,32 +803,25 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                      value has no stated layout"
                 ))
             })?;
-        let already_validated = self
-            .validated_reference_types
-            .as_ref()
-            .is_some_and(|validated| validated[tree_index]);
-        if !already_validated {
-            validate_tree_shape(&tree.nodes)?;
-            self.validated_reference_types
-                .as_mut()
-                .expect("reference-type validation cache was initialized")[tree_index] = true;
-        }
+        let tree_nodes: &'a [TypeTreeNode] = &tree.nodes;
         let outer = self.nodes;
-        self.nodes = &tree.nodes;
+        let outer_layout = std::mem::replace(&mut self.layout, layout);
+        self.nodes = tree_nodes;
         let result = self.skip_node(0, depth);
         self.nodes = outer;
+        self.layout = outer_layout;
         let next = result?;
-        if next != tree.nodes.len() {
+        if next != tree_nodes.len() {
             return Err(Error::invalid_data(format!(
                 "reference type root covers {next} of {} nodes",
-                tree.nodes.len()
+                tree_nodes.len()
             )));
         }
         Ok(())
     }
 
     fn skip_array(&mut self, index: usize, depth: usize) -> Result<bool> {
-        let shape = validate_array_shape(self.nodes, index)?;
+        let shape = validate_array_shape(self.nodes, &self.layout, index)?;
         let count = self.read_length(self.limits.maximum_array_elements, "array element")?;
         for _ in 0..count {
             self.skip_node(shape.data_index, depth + 1)?;
@@ -727,7 +830,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
     }
 
     fn skip_map(&mut self, index: usize, depth: usize) -> Result<bool> {
-        let shape = validate_map_shape(self.nodes, index)?;
+        let shape = validate_map_shape(self.nodes, &self.layout, index)?;
         let count = self.read_length(self.limits.maximum_array_elements, "map entry")?;
         for _ in 0..count {
             self.skip_node(shape.first_index, depth + 1)?;
@@ -762,7 +865,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
 
     fn read_class(&mut self, index: usize, depth: usize) -> Result<TypeValue> {
         let parent_level = self.nodes[index].level;
-        let end = subtree_end(self.nodes, index);
+        let end = self.layout.subtree_end(index);
         let mut child_count = 0_usize;
         let mut child = index + 1;
         while child < end {
@@ -777,7 +880,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
             child_count = child_count
                 .checked_add(1)
                 .ok_or_else(|| Error::invalid_data("type tree field count overflowed"))?;
-            child = subtree_end(self.nodes, child);
+            child = self.layout.subtree_end(child);
         }
         self.charge_capacity::<TypeField>(child_count, "type tree field storage")?;
         let mut fields = Vec::new();
@@ -795,7 +898,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                     // Unity wrote one registry, at the outermost level. This is
                     // a second declaration of the same thing, and reading it
                     // would consume bytes belonging to whatever follows.
-                    child = subtree_end(self.nodes, child);
+                    child = self.layout.subtree_end(child);
                     continue;
                 }
                 self.has_registry = true;
@@ -812,7 +915,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
     /// stored value laid out by that type's own tree.
     fn read_referenced_object(&mut self, index: usize, depth: usize) -> Result<TypeValue> {
         let parent_level = self.nodes[index].level;
-        let end = subtree_end(self.nodes, index);
+        let end = self.layout.subtree_end(index);
         let mut fields = Vec::new();
         // `Some(None)` is a declared null reference; outer `None` means the
         // entry has not named its type yet.
@@ -839,7 +942,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                     let value = self.read_reference_type(tree_index, depth + 1)?;
                     self.push_field(&mut fields, TypeField { name, value })?;
                 }
-                child = subtree_end(self.nodes, child);
+                child = self.layout.subtree_end(child);
                 continue;
             }
             let (value, next) = self.read_node(child, depth + 1)?;
@@ -940,26 +1043,68 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         Ok(())
     }
 
-    fn ensure_reference_type_validation_cache(&mut self) -> Result<()> {
-        if self.validated_reference_types.is_some() {
+    fn ensure_reference_type_layout_cache(&mut self) -> Result<()> {
+        if self.reference_type_layouts.is_some() {
             return Ok(());
         }
         let count = self.reference_types.len();
-        self.charge_capacity::<bool>(count, "reference-type validation cache")?;
-        let mut validated = Vec::new();
-        validated.try_reserve_exact(count).map_err(|error| {
+        self.charge_capacity::<Option<TypeTreeLayout>>(
+            count,
+            "reference-type subtree layout cache",
+        )?;
+        let mut layouts = Vec::new();
+        layouts.try_reserve_exact(count).map_err(|error| {
             Error::invalid_data(format!(
-                "cannot allocate {count} reference-type validation entries: {error}"
+                "cannot allocate {count} reference-type subtree layout entries: {error}"
             ))
         })?;
-        validated.resize(count, false);
-        self.validated_reference_types = Some(validated);
+        layouts.resize_with(count, || None);
+        self.reference_type_layouts = Some(layouts);
         Ok(())
     }
 
+    fn reference_type_layout(&mut self, tree_index: usize) -> Result<TypeTreeLayout> {
+        self.ensure_reference_type_layout_cache()?;
+        if let Some(layout) = self
+            .reference_type_layouts
+            .as_ref()
+            .and_then(|layouts| layouts.get(tree_index))
+            .and_then(Option::as_ref)
+        {
+            return Ok(layout.clone());
+        }
+        let nodes = &self
+            .reference_types
+            .get(tree_index)
+            .ok_or_else(|| Error::invalid_data("reference type index is out of range"))?
+            .type_tree
+            .as_ref()
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "reference type {tree_index} carries no type tree, so its stored value has no stated layout"
+                ))
+            })?
+            .nodes;
+        let (layout, index_bytes) = TypeTreeLayout::new_bounded(
+            nodes,
+            self.materialized_bytes,
+            self.limits.maximum_materialized_bytes,
+            "reference-type subtree index",
+        )?;
+        self.charge_materialized(index_bytes, "reference-type subtree index storage")?;
+        self.reference_type_layouts
+            .as_mut()
+            .expect("reference-type subtree layout cache was initialized")[tree_index] =
+            Some(layout.clone());
+        Ok(layout)
+    }
+
     fn read_reference_type(&mut self, tree_index: usize, depth: usize) -> Result<TypeValue> {
-        self.ensure_reference_type_validation_cache()?;
-        let tree = self.reference_types[tree_index]
+        let layout = self.reference_type_layout(tree_index)?;
+        let tree = self
+            .reference_types
+            .get(tree_index)
+            .ok_or_else(|| Error::invalid_data("reference type index is out of range"))?
             .type_tree
             .as_ref()
             .ok_or_else(|| {
@@ -968,34 +1113,28 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                      value has no stated layout"
                 ))
             })?;
-        let already_validated = self
-            .validated_reference_types
-            .as_ref()
-            .is_some_and(|validated| validated[tree_index]);
-        if !already_validated {
-            validate_tree_shape(&tree.nodes)?;
-            self.validated_reference_types
-                .as_mut()
-                .expect("reference-type validation cache was initialized")[tree_index] = true;
-        }
+        let tree_nodes: &'a [TypeTreeNode] = &tree.nodes;
         // The stored value is laid out by another tree entirely, so the node
-        // slice is swapped for the duration and put back however this ends.
+        // slice and its boundary index are swapped for the duration and put
+        // back however this ends.
         let outer = self.nodes;
-        self.nodes = &tree.nodes;
+        let outer_layout = std::mem::replace(&mut self.layout, layout);
+        self.nodes = tree_nodes;
         let result = self.read_node(0, depth);
         self.nodes = outer;
+        self.layout = outer_layout;
         let (value, next) = result?;
-        if next != tree.nodes.len() {
+        if next != tree_nodes.len() {
             return Err(Error::invalid_data(format!(
                 "reference type root covers {next} of {} nodes",
-                tree.nodes.len()
+                tree_nodes.len()
             )));
         }
         Ok(value)
     }
 
     fn read_array(&mut self, index: usize, depth: usize) -> Result<(TypeValue, bool)> {
-        let shape = validate_array_shape(self.nodes, index)?;
+        let shape = validate_array_shape(self.nodes, &self.layout, index)?;
         let count = self.read_length(self.limits.maximum_array_elements, "array element")?;
         self.charge_capacity::<TypeValue>(count, "type tree array storage")?;
         let mut values = Vec::new();
@@ -1009,7 +1148,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
     }
 
     fn read_map(&mut self, index: usize, depth: usize) -> Result<(TypeValue, bool)> {
-        let shape = validate_map_shape(self.nodes, index)?;
+        let shape = validate_map_shape(self.nodes, &self.layout, index)?;
         let count = self.read_length(self.limits.maximum_array_elements, "map entry")?;
         self.charge_capacity::<TypeMapEntry>(count, "type tree map storage")?;
         let mut entries = Vec::new();
@@ -1167,7 +1306,11 @@ pub(crate) fn is_array_parent(nodes: &[TypeTreeNode], index: usize) -> bool {
     })
 }
 
-fn validate_array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<ArrayShape> {
+fn validate_array_shape(
+    nodes: &[TypeTreeNode],
+    layout: &TypeTreeLayout,
+    index: usize,
+) -> Result<ArrayShape> {
     let parent = nodes
         .get(index)
         .ok_or_else(|| Error::invalid_data("array parent is outside the type tree"))?;
@@ -1205,7 +1348,7 @@ fn validate_array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<ArraySha
             "type tree node {index} has a malformed array schema"
         )));
     }
-    if subtree_end(nodes, data_index) != subtree_end(nodes, index) {
+    if layout.subtree_end(data_index) != layout.subtree_end(index) {
         return Err(Error::invalid_data(format!(
             "type tree node {index} has fields after its array data schema"
         )));
@@ -1216,8 +1359,12 @@ fn validate_array_shape(nodes: &[TypeTreeNode], index: usize) -> Result<ArraySha
     })
 }
 
-fn validate_map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<MapShape> {
-    let array = validate_array_shape(nodes, index)?;
+fn validate_map_shape(
+    nodes: &[TypeTreeNode],
+    layout: &TypeTreeLayout,
+    index: usize,
+) -> Result<MapShape> {
+    let array = validate_array_shape(nodes, layout, index)?;
     let pair_index = array.data_index;
     let pair = &nodes[pair_index];
     if pair.type_name != "pair" {
@@ -1237,12 +1384,12 @@ fn validate_map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<MapShape> 
             "type tree map first value has an invalid level",
         ));
     }
-    let second_index = subtree_end(nodes, first_index);
+    let second_index = layout.subtree_end(first_index);
     let second = nodes
         .get(second_index)
         .ok_or_else(|| Error::invalid_data("type tree map is missing its second value"))?;
     if second.level != pair.level.saturating_add(1)
-        || subtree_end(nodes, second_index) != subtree_end(nodes, pair_index)
+        || layout.subtree_end(second_index) != layout.subtree_end(pair_index)
     {
         return Err(Error::invalid_data(
             "type tree map second value has an invalid shape",
@@ -1255,7 +1402,11 @@ fn validate_map_shape(nodes: &[TypeTreeNode], index: usize) -> Result<MapShape> 
     })
 }
 
-fn validate_typeless_shape(nodes: &[TypeTreeNode], index: usize) -> Result<()> {
+fn validate_typeless_shape(
+    nodes: &[TypeTreeNode],
+    layout: &TypeTreeLayout,
+    index: usize,
+) -> Result<()> {
     let parent = nodes
         .get(index)
         .ok_or_else(|| Error::invalid_data("TypelessData parent is outside the type tree"))?;
@@ -1280,23 +1431,13 @@ fn validate_typeless_shape(nodes: &[TypeTreeNode], index: usize) -> Result<()> {
         || !matches!(size.type_name.as_str(), "int" | "SInt32")
         || data.level != child_level
         || !matches!(data.type_name.as_str(), "UInt8" | "SInt8" | "char")
-        || subtree_end(nodes, data_index) != subtree_end(nodes, index)
+        || layout.subtree_end(data_index) != layout.subtree_end(index)
     {
         return Err(Error::invalid_data(format!(
             "TypelessData node {index} has a malformed byte-array schema"
         )));
     }
     Ok(())
-}
-
-fn subtree_end(nodes: &[TypeTreeNode], index: usize) -> usize {
-    let Some(root) = nodes.get(index) else {
-        return nodes.len();
-    };
-    nodes[index + 1..]
-        .iter()
-        .position(|node| node.level <= root.level)
-        .map_or(nodes.len(), |relative| index + 1 + relative)
 }
 
 /// Checks that a node list describes one tree: a single level-0 root, and no
@@ -1337,10 +1478,44 @@ mod tests {
     use crate::serialized::{SerializedType, TypeTree, TypeTreeNode};
 
     use super::{
-        ReferenceTypeLookupEntry, TypeField, TypeTreeReadLimits, TypeTreeValueReader, TypeValue,
-        read_type_tree_from_reader, read_type_tree_from_reader_with_reference_types,
+        ReferenceTypeLookupEntry, TypeField, TypeTreeLayout, TypeTreeReadLimits,
+        TypeTreeValueReader, TypeValue, read_type_tree_from_reader,
+        read_type_tree_from_reader_with_reference_types,
         read_type_tree_root_field_from_reader_with_reference_types,
     };
+
+    #[test]
+    fn builds_and_queries_large_subtree_boundaries_in_linear_work() {
+        const COUNT: usize = 32_768;
+
+        // Querying every boundary in this chain was N + (N-1) + ... + 1
+        // forward comparisons. The precomputed table answers all of them
+        // directly after one pass.
+        let mut deep = Vec::new();
+        deep.try_reserve_exact(COUNT).unwrap();
+        for index in 0..COUNT {
+            deep.push(node("Node", "value", u32::try_from(index).unwrap(), false));
+        }
+        let mut deep_probes = 0_usize;
+        let deep_layout = TypeTreeLayout::new_with_probe(&deep, || deep_probes += 1).unwrap();
+        assert!(deep_probes <= COUNT * 2);
+        assert!((0..COUNT).all(|index| deep_layout.subtree_end(index) == COUNT));
+
+        // A wide tree exercises closing every previous sibling while keeping
+        // the build bound at one visit and one close per node.
+        let mut wide = Vec::new();
+        wide.try_reserve_exact(COUNT).unwrap();
+        wide.push(node("Root", "Base", 0, false));
+        for _ in 1..COUNT {
+            wide.push(node("int", "value", 1, false));
+        }
+        let mut wide_probes = 0_usize;
+        let wide_layout = TypeTreeLayout::new_with_probe(&wide, || wide_probes += 1).unwrap();
+        assert!(wide_probes <= COUNT * 2);
+        assert_eq!(wide_layout.subtree_end(0), COUNT);
+        assert!((1..COUNT - 1).all(|index| wide_layout.subtree_end(index) == index + 1));
+        assert_eq!(wide_layout.subtree_end(COUNT - 1), COUNT);
+    }
 
     #[test]
     fn reads_classes_strings_and_aligned_arrays() {
@@ -1718,6 +1893,7 @@ mod tests {
         let payload = vec![0_u8; REFERENCE_COUNT * std::mem::size_of::<i32>()];
         let mut parser = TypeTreeValueReader {
             nodes: &[],
+            layout: TypeTreeLayout::empty(),
             reader: EndianReader::new(Cursor::new(payload), Endian::Little),
             absolute_start: 0,
             limits: TypeTreeReadLimits::default(),
@@ -1725,7 +1901,7 @@ mod tests {
             materialized_bytes: 0,
             reference_types: &references,
             reference_type_lookup: None,
-            validated_reference_types: None,
+            reference_type_layouts: None,
             has_registry: false,
         };
 
@@ -1758,14 +1934,14 @@ mod tests {
         }
         assert!(
             parser
-                .validated_reference_types
+                .reference_type_layouts
                 .as_ref()
-                .is_some_and(|validated| validated.iter().all(|value| *value))
+                .is_some_and(|layouts| layouts.iter().all(Option::is_some))
         );
     }
 
     #[test]
-    fn bounds_reference_type_lookup_and_validation_storage_before_allocation() {
+    fn bounds_reference_type_lookup_and_layout_storage_before_allocation() {
         let references = (0..8)
             .map(|index| {
                 reference_type(
@@ -1777,6 +1953,7 @@ mod tests {
         let lookup_bytes = references.len() * std::mem::size_of::<ReferenceTypeLookupEntry<'_>>();
         let mut lookup_parser = TypeTreeValueReader {
             nodes: &[],
+            layout: TypeTreeLayout::empty(),
             reader: EndianReader::new(Cursor::new(Vec::new()), Endian::Little),
             absolute_start: 0,
             limits: TypeTreeReadLimits {
@@ -1787,7 +1964,7 @@ mod tests {
             materialized_bytes: 0,
             reference_types: &references,
             reference_type_lookup: None,
-            validated_reference_types: None,
+            reference_type_layouts: None,
             has_registry: false,
         };
         let lookup_error = lookup_parser
@@ -1800,8 +1977,9 @@ mod tests {
         );
         assert!(lookup_parser.reference_type_lookup.is_none());
 
-        let mut validation_parser = TypeTreeValueReader {
+        let mut layout_parser = TypeTreeValueReader {
             nodes: &[],
+            layout: TypeTreeLayout::empty(),
             reader: EndianReader::new(Cursor::new(0_i32.to_le_bytes()), Endian::Little),
             absolute_start: 0,
             limits: TypeTreeReadLimits {
@@ -1812,16 +1990,16 @@ mod tests {
             materialized_bytes: 0,
             reference_types: &references,
             reference_type_lookup: None,
-            validated_reference_types: None,
+            reference_type_layouts: None,
             has_registry: false,
         };
-        let validation_error = validation_parser.read_reference_type(0, 0).unwrap_err();
+        let layout_error = layout_parser.read_reference_type(0, 0).unwrap_err();
         assert!(
-            validation_error
+            layout_error
                 .to_string()
-                .contains("reference-type validation cache")
+                .contains("reference-type subtree layout cache")
         );
-        assert!(validation_parser.validated_reference_types.is_none());
+        assert!(layout_parser.reference_type_layouts.is_none());
     }
 
     /// The registry Unity writes after an object body for a
