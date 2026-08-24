@@ -83,7 +83,7 @@ resolved crate sources.
   copyright and complete permission notice ship beside the Core crate in
   `FSB_VORBIS_NOTICE.md`. The generated table is bounds checked before use.
   The `oggenc 1.4.3` tool with a system `libvorbis 1.3.7` encoder was used only
-  to create the non-silent stereo and six-channel differential fixtures
+  to create the non-silent stereo and 3-8-channel differential fixtures
   documented alongside them; vorbis-tools and libvorbis are not build or
   runtime dependencies and are not redistributed here.
   Ignored differential tests can invoke a separately installed
