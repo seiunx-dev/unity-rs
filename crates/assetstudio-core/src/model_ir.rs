@@ -980,6 +980,16 @@ fn require_key_target<'a>(
     expected_class_id: i32,
     field: &str,
 ) -> Result<(&'a crate::serialized::SerializedFile, usize)> {
+    require_key_target_with_probe(collection, key, expected_class_id, field, || {})
+}
+
+fn require_key_target_with_probe<'a>(
+    collection: &'a AssetCollection,
+    key: SceneObjectKey,
+    expected_class_id: i32,
+    field: &str,
+    probe: impl FnMut(),
+) -> Result<(&'a crate::serialized::SerializedFile, usize)> {
     let loaded = collection
         .serialized_files
         .get(key.file_index)
@@ -989,11 +999,8 @@ fn require_key_target<'a>(
                 key.file_index
             ))
         })?;
-    let object_index = loaded
-        .file
-        .objects
-        .iter()
-        .position(|object| object.path_id == key.path_id)
+    let object_index = collection
+        .object_index_by_path_id_with_probe(key.file_index, key.path_id, probe)
         .ok_or_else(|| {
             Error::invalid_data(format!(
                 "{field} path ID {} is absent from file {:?}",
@@ -1201,7 +1208,7 @@ mod tests {
     use crate::animation_component::ANIMATOR_OVERRIDE_CONTROLLER_CLASS_ID;
     use crate::animator_controller::ANIMATOR_CONTROLLER_CLASS_ID;
     use crate::avatar::AVATAR_CLASS_ID;
-    use crate::loader::{AssetCollection, LoadedSerializedFile};
+    use crate::loader::{AssetCollection, AssetLoadLimits, LoadedSerializedFile};
     use crate::material::MATERIAL_CLASS_ID;
     use crate::mesh::MESH_CLASS_ID;
     use crate::renderer::{MESH_RENDERER_CLASS_ID, SKINNED_MESH_RENDERER_CLASS_ID};
@@ -1215,7 +1222,7 @@ mod tests {
     use super::{
         ModelCoordinateConvention, ModelIrLimits, ModelNode, ModelRendererKind,
         build_model_indexes, build_model_ir, build_model_ir_for_game_object,
-        model_index_position_with_probe,
+        model_index_position_with_probe, require_key_target_with_probe,
     };
 
     const NULL: ObjectReference = ObjectReference {
@@ -1462,6 +1469,46 @@ mod tests {
                     comparisons += 1;
                 }),
                 Some(expected)
+            );
+        }
+        assert!(comparisons < ENTRY_COUNT * 20, "{comparisons}");
+    }
+
+    #[test]
+    fn model_asset_resolution_uses_the_collection_path_id_index() {
+        const ENTRY_COUNT: usize = 16_384;
+        let objects: Vec<_> = (1..=ENTRY_COUNT)
+            .rev()
+            .map(|path_id| (MESH_CLASS_ID, i64::try_from(path_id).unwrap(), Vec::new()))
+            .collect();
+        let file = SerializedFile::open(Region::from_bytes(synthetic_v22(&objects, &[]))).unwrap();
+        let mut collection = AssetCollection::from_loaded_parts(
+            vec![LoadedSerializedFile {
+                path: "indexed-model.assets".to_owned(),
+                file,
+            }],
+            Vec::new(),
+        );
+        collection
+            .rebuild_reference_index(AssetLoadLimits::default())
+            .unwrap();
+
+        let mut comparisons = 0_usize;
+        for path_id in 1..=i64::try_from(ENTRY_COUNT).unwrap() {
+            let (_, object_index) = require_key_target_with_probe(
+                &collection,
+                SceneObjectKey {
+                    file_index: 0,
+                    path_id,
+                },
+                MESH_CLASS_ID,
+                "Mesh",
+                || comparisons += 1,
+            )
+            .unwrap();
+            assert_eq!(
+                object_index,
+                ENTRY_COUNT - usize::try_from(path_id).unwrap()
             );
         }
         assert!(comparisons < ENTRY_COUNT * 20, "{comparisons}");
