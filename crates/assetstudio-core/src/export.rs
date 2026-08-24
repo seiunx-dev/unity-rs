@@ -21,8 +21,9 @@ use crate::serialized::SerializedFile;
 use crate::shader::{SHADER_CLASS_ID, ShaderReadLimits, ShaderTextAsset, read_shader};
 use crate::simple_assets::{
     AUDIO_CLIP_CLASS_ID, AudioClipAsset, DirectWavKind, FONT_CLASS_ID, MOVIE_TEXTURE_CLASS_ID,
-    SimpleAssetReadLimits, SimpleBinaryAsset, VIDEO_CLIP_CLASS_ID, read_audio_clip_asset,
-    read_font, read_movie_texture, read_video_clip, write_direct_wav,
+    SimpleAssetReadLimits, SimpleBinaryAsset, VIDEO_CLIP_CLASS_ID,
+    read_audio_clip_asset_by_file_index, read_font, read_movie_texture, read_video_clip,
+    write_direct_wav,
 };
 use crate::source::Region;
 use crate::sprite::{
@@ -699,7 +700,7 @@ fn select_auto_export_payload(
             )
         }
         AUDIO_CLIP_CLASS_ID => {
-            return select_audio_clip(collection, file, object_index, options);
+            return select_audio_clip(collection, file_index, object_index, options);
         }
         FONT_CLASS_ID | MOVIE_TEXTURE_CLASS_ID | VIDEO_CLIP_CLASS_ID => {
             let asset = read_simple_asset(
@@ -797,7 +798,7 @@ fn select_mono_behaviour_json(
 
 fn select_audio_clip(
     collection: &AssetCollection,
-    file: &SerializedFile,
+    file_index: usize,
     object_index: usize,
     options: ExportOptions,
 ) -> Result<ExportSelection> {
@@ -811,7 +812,7 @@ fn select_audio_clip(
         raw_extension,
         direct_wav,
         ..
-    } = read_audio_clip_asset(collection, file, object_index, limits)?;
+    } = read_audio_clip_asset_by_file_index(collection, file_index, object_index, limits)?;
     let wav_kind = match options.audio_format {
         AudioExportFormat::Auto => direct_wav,
         AudioExportFormat::Raw => None,
