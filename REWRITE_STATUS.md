@@ -989,9 +989,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `294f067`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `56cbd9f`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32684322130](https://github.com/Team-Haruki/unity-rs/actions/runs/32684322130) 16/16 全绿，
+[32685687815](https://github.com/Team-Haruki/unity-rs/actions/runs/32685687815) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
