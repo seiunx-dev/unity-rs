@@ -243,10 +243,22 @@ pub fn extract_region(
     Ok(extractor.report)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ClaimKind {
     File,
     Directory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CollisionCursorKind {
+    Leaf(ClaimKind),
+    Parent,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CollisionCursorKey {
+    path: PathBuf,
+    kind: CollisionCursorKind,
 }
 
 #[derive(Debug, Default)]
@@ -271,6 +283,15 @@ struct Extractor {
     /// output ordering, so randomized hashing cannot affect file names; growth
     /// is reserved fallibly before every insertion.
     claims: HashMap<PathBuf, ClaimKind>,
+    /// The suffix already reached for one portable desired path.
+    ///
+    /// Claims only grow during an extraction, so a rejected lower suffix never
+    /// becomes usable later through this process. Remembering the next leaf
+    /// suffix avoids restarting an O(n) scan for every duplicate entry. Parent
+    /// cursors remember the usable directory suffix itself so every child can
+    /// reuse it instead of rescanning the same file/directory conflicts.
+    /// Cursor keys are charged to the same cumulative path budget as claims.
+    collision_cursors: HashMap<CollisionCursorKey, u64>,
     temporary_sequence: u64,
     report: ExtractionReport,
 }
@@ -289,6 +310,7 @@ impl Extractor {
                 ..ExtractionBudget::default()
             },
             claims: HashMap::new(),
+            collision_cursors: HashMap::new(),
             temporary_sequence: 0,
             report: ExtractionReport::default(),
         }
@@ -795,8 +817,25 @@ impl Extractor {
     }
 
     fn allocate_path(&mut self, desired: &Path, kind: ClaimKind) -> Result<PathBuf> {
+        self.allocate_path_with_probe(desired, kind, || {})
+    }
+
+    fn allocate_path_with_probe(
+        &mut self,
+        desired: &Path,
+        kind: ClaimKind,
+        mut probe: impl FnMut(),
+    ) -> Result<PathBuf> {
         let resolved = self.resolve_parent_collisions(desired)?;
-        for collision_index in 0_u64.. {
+        let cursor_key = self.collision_cursor_key(&resolved, CollisionCursorKind::Leaf(kind))?;
+        let mut collision_index = self
+            .collision_cursors
+            .get(&cursor_key)
+            .copied()
+            .unwrap_or(0);
+        let mut needs_cursor = collision_index != 0;
+        loop {
+            probe();
             let candidate = if collision_index == 0 {
                 copy_path_fallibly(&resolved, "resolved extraction output path")?
             } else {
@@ -809,6 +848,10 @@ impl Extractor {
             let (key, claimed_path_total) =
                 portable_key(&candidate, self.options.limits, &self.budget.paths)?;
             if self.claims.contains_key(&key) {
+                needs_cursor = true;
+                collision_index = collision_index
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invalid_data("output collision counter overflowed"))?;
                 continue;
             }
             let absolute = join_relative_path_fallibly(
@@ -830,18 +873,33 @@ impl Extractor {
                 ExistingKind::Missing => true,
             };
             if usable {
-                self.claims.try_reserve(1).map_err(|error| {
-                    Error::invalid_data(format!("cannot grow extraction path claims: {error}"))
-                })?;
-                self.budget.paths.bytes = claimed_path_total;
-                self.claims.insert(key, kind);
+                let cursor = if needs_cursor {
+                    let next = collision_index.checked_add(1).ok_or_else(|| {
+                        Error::invalid_data("output collision counter overflowed")
+                    })?;
+                    Some((cursor_key, next))
+                } else {
+                    None
+                };
+                self.commit_path_claim(key, kind, claimed_path_total, cursor)?;
                 return Ok(candidate);
             }
+            needs_cursor = true;
+            collision_index = collision_index
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_data("output collision counter overflowed"))?;
         }
-        Err(Error::invalid_data("output collision counter overflowed"))
     }
 
-    fn resolve_parent_collisions(&self, desired: &Path) -> Result<PathBuf> {
+    fn resolve_parent_collisions(&mut self, desired: &Path) -> Result<PathBuf> {
+        self.resolve_parent_collisions_with_probe(desired, || {})
+    }
+
+    fn resolve_parent_collisions_with_probe(
+        &mut self,
+        desired: &Path,
+        mut probe: impl FnMut(),
+    ) -> Result<PathBuf> {
         let component_count = desired.components().count();
         let mut components = Vec::new();
         components
@@ -863,7 +921,20 @@ impl Extractor {
         }
         for index in 0..components.len().saturating_sub(1) {
             let original = copy_string_fallibly(&components[index], "original output component")?;
-            for collision_index in 0_u64.. {
+            let desired_parent = path_from_components(
+                &components[..=index],
+                self.options.limits.maximum_path_bytes,
+                "desired extraction output parent",
+            )?;
+            let cursor_key =
+                self.collision_cursor_key(&desired_parent, CollisionCursorKind::Parent)?;
+            let mut collision_index = self
+                .collision_cursors
+                .get(&cursor_key)
+                .copied()
+                .unwrap_or(0);
+            loop {
+                probe();
                 if collision_index != 0 {
                     components[index] = suffixed_component(&original, collision_index)?;
                 }
@@ -889,14 +960,25 @@ impl Extractor {
                     ExistingKind::Directory
                         if claim.is_none() || claim == Some(ClaimKind::Directory) =>
                     {
+                        if collision_index != 0 {
+                            self.retain_collision_cursor(cursor_key, collision_index)?;
+                        }
                         break;
                     }
-                    ExistingKind::Missing if claim != Some(ClaimKind::File) => break,
+                    ExistingKind::Missing if claim != Some(ClaimKind::File) => {
+                        if collision_index != 0 {
+                            self.retain_collision_cursor(cursor_key, collision_index)?;
+                        }
+                        break;
+                    }
                     ExistingKind::Regular
                     | ExistingKind::Other
                     | ExistingKind::Directory
                     | ExistingKind::Missing => {}
                 }
+                collision_index = collision_index.checked_add(1).ok_or_else(|| {
+                    Error::invalid_data("output parent collision counter overflowed")
+                })?;
             }
         }
         path_from_components(
@@ -904,6 +986,83 @@ impl Extractor {
             self.options.limits.maximum_path_bytes,
             "resolved extraction output path",
         )
+    }
+
+    fn collision_cursor_key(
+        &self,
+        path: &Path,
+        kind: CollisionCursorKind,
+    ) -> Result<CollisionCursorKey> {
+        let (path, _) = portable_key(path, self.options.limits, &self.budget.paths)?;
+        Ok(CollisionCursorKey { path, kind })
+    }
+
+    fn commit_path_claim(
+        &mut self,
+        path: PathBuf,
+        kind: ClaimKind,
+        claimed_path_total: usize,
+        cursor: Option<(CollisionCursorKey, u64)>,
+    ) -> Result<()> {
+        let cursor_is_new = cursor
+            .as_ref()
+            .is_some_and(|(key, _)| !self.collision_cursors.contains_key(key));
+        let retained_total = if cursor_is_new {
+            self.checked_cursor_total(
+                claimed_path_total,
+                cursor
+                    .as_ref()
+                    .expect("new cursor is present")
+                    .0
+                    .path
+                    .as_path(),
+            )?
+        } else {
+            claimed_path_total
+        };
+        self.claims.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow extraction path claims: {error}"))
+        })?;
+        if cursor_is_new {
+            self.collision_cursors.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow extraction collision cursors: {error}"))
+            })?;
+        }
+        self.budget.paths.bytes = retained_total;
+        let previous = self.claims.insert(path, kind);
+        debug_assert!(previous.is_none());
+        if let Some((key, value)) = cursor {
+            self.collision_cursors.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn retain_collision_cursor(&mut self, key: CollisionCursorKey, value: u64) -> Result<()> {
+        if let Some(cursor) = self.collision_cursors.get_mut(&key) {
+            *cursor = value;
+            return Ok(());
+        }
+        let retained_total = self.checked_cursor_total(self.budget.paths.bytes, &key.path)?;
+        self.collision_cursors.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow extraction collision cursors: {error}"))
+        })?;
+        self.budget.paths.bytes = retained_total;
+        self.collision_cursors.insert(key, value);
+        Ok(())
+    }
+
+    fn checked_cursor_total(&self, retained: usize, path: &Path) -> Result<usize> {
+        let bytes = filesystem_path_byte_length(path);
+        let total = retained
+            .checked_add(bytes)
+            .ok_or_else(|| Error::invalid_data("extraction path byte count overflowed"))?;
+        if total > self.options.limits.maximum_total_path_bytes {
+            return Err(Error::invalid_data(format!(
+                "extraction paths total {total} bytes, exceeding limit {}",
+                self.options.limits.maximum_total_path_bytes
+            )));
+        }
+        Ok(total)
     }
 
     fn claim_kind(&self, path: &Path) -> Result<Option<ClaimKind>> {
@@ -2263,6 +2422,127 @@ mod tests {
         assert_eq!(second, PathBuf::from("asset~1.bin"));
         assert_eq!(extractor.claims.len(), 2);
         assert!(extractor.budget.paths.bytes > 0);
+    }
+
+    #[test]
+    fn duplicate_leaf_names_resume_the_next_unchecked_suffix() {
+        const ENTRIES: usize = 16_384;
+
+        let root = TestDirectory::new("leaf-collision-cursor");
+        let mut extractor = Extractor::with_path_budget(
+            root.path().to_path_buf(),
+            ExtractionOptions::default(),
+            ExtractionPathBudget::default(),
+        );
+        let mut probes = 0_usize;
+        let mut last = PathBuf::new();
+        for _ in 0..ENTRIES {
+            last = extractor
+                .allocate_path_with_probe(Path::new("asset.bin"), ClaimKind::File, || {
+                    probes += 1;
+                })
+                .unwrap();
+        }
+
+        assert_eq!(last, PathBuf::from("asset~16383.bin"));
+        assert_eq!(extractor.claims.len(), ENTRIES);
+        assert_eq!(extractor.collision_cursors.len(), 1);
+        assert_eq!(
+            probes,
+            ENTRIES + 1,
+            "only the second claim should rediscover the unsuffixed path"
+        );
+    }
+
+    #[test]
+    fn collision_cursor_keys_are_retained_transactionally_under_the_path_budget() {
+        let root = TestDirectory::new("collision-cursor-budget");
+        let exact_limits = ExtractionLimits {
+            maximum_total_path_bytes: 5,
+            ..ExtractionLimits::default()
+        };
+        let mut exact = Extractor::with_path_budget(
+            root.path().to_path_buf(),
+            ExtractionOptions {
+                limits: exact_limits,
+                ..ExtractionOptions::default()
+            },
+            ExtractionPathBudget::default(),
+        );
+        assert_eq!(
+            exact
+                .allocate_path(Path::new("x"), ClaimKind::File)
+                .unwrap(),
+            PathBuf::from("x")
+        );
+        assert_eq!(
+            exact
+                .allocate_path(Path::new("x"), ClaimKind::File)
+                .unwrap(),
+            PathBuf::from("x~1")
+        );
+        assert_eq!(exact.budget.paths.bytes, 5);
+        assert_eq!(exact.collision_cursors.len(), 1);
+
+        let short_limits = ExtractionLimits {
+            maximum_total_path_bytes: 4,
+            ..ExtractionLimits::default()
+        };
+        let mut short = Extractor::with_path_budget(
+            root.path().to_path_buf(),
+            ExtractionOptions {
+                limits: short_limits,
+                ..ExtractionOptions::default()
+            },
+            ExtractionPathBudget::default(),
+        );
+        short
+            .allocate_path(Path::new("x"), ClaimKind::File)
+            .unwrap();
+        let error = short
+            .allocate_path(Path::new("x"), ClaimKind::File)
+            .unwrap_err();
+        assert!(error.to_string().contains("paths total 5 bytes"));
+        assert_eq!(short.budget.paths.bytes, 1);
+        assert_eq!(short.claims.len(), 1);
+        assert!(short.collision_cursors.is_empty());
+    }
+
+    #[test]
+    fn collided_parent_directories_reuse_the_resolved_suffix() {
+        const BLOCKED_SUFFIXES: usize = 4_096;
+        const CHILDREN: usize = 16_384;
+
+        let root = TestDirectory::new("parent-collision-cursor");
+        let mut extractor = Extractor::with_path_budget(
+            root.path().to_path_buf(),
+            ExtractionOptions::default(),
+            ExtractionPathBudget::default(),
+        );
+        for suffix in 0..BLOCKED_SUFFIXES {
+            let path = if suffix == 0 {
+                PathBuf::from("tree")
+            } else {
+                PathBuf::from(format!("tree~{suffix}"))
+            };
+            extractor.allocate_path(&path, ClaimKind::File).unwrap();
+        }
+
+        let mut probes = 0_usize;
+        for _ in 0..CHILDREN {
+            let resolved = extractor
+                .resolve_parent_collisions_with_probe(Path::new("tree/leaf.bin"), || {
+                    probes += 1;
+                })
+                .unwrap();
+            assert_eq!(resolved, PathBuf::from("tree~4096").join("leaf.bin"));
+        }
+        assert_eq!(extractor.collision_cursors.len(), 1);
+        assert_eq!(
+            probes,
+            BLOCKED_SUFFIXES + CHILDREN,
+            "the blocked prefix should be scanned once, then reused"
+        );
     }
 
     #[test]
