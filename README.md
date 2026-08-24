@@ -82,6 +82,9 @@ unique decoded textures, cumulative encoded bytes, and each texture's
 payload/output/decoder workspace. The reference limit also charges repeated
 references to one texture and references that become skipped diagnostics, so
 neither path can bypass the unique-texture limit in Rust, Python, or Node.
+Manual Rust construction is fallible as well: `SceneTextureSet::push_texture`
+returns `Result<usize>` and leaves the collection unchanged when capacity
+cannot be reserved, matching the existing fallible `bind` operation.
 
 ## Build and test
 
