@@ -366,7 +366,10 @@ formatter. Both possible atomic-publication outcomes are reserved before writing
 published file cannot become unreportable because a later vector growth fails. Portable
 case-insensitive output claims use a fallibly reserved hash index that is never iterated for naming;
 Unicode lowercase expansion is length-checked before key allocation and retained keys share the
-cumulative path budget. Asset-controlled relative output paths are assembled through checked,
+cumulative path budget. Repeated leaf collisions retain the next unchecked `~N` suffix, while a
+parent path blocked by files retains the directory suffix it already resolved; both cursor keys are
+reserved fallibly and charged to that same budget, so duplicate sanitized names and repeated children
+do not restart a quadratic suffix scan. Asset-controlled relative output paths are assembled through checked,
 fallible builders: container directories, parent-collision prefixes, wrapper-decoded names,
 `~N` collision suffixes, absolute output candidates, and temporary publication names all reserve
 before copying. The `_unpacked`, `.decoded`, and collision suffixes count toward the same 240-byte
