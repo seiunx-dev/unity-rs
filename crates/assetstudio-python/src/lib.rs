@@ -20,7 +20,9 @@ use assetstudio_core::export::{AudioExportFormat, ExportMode, ExportOptions};
 use assetstudio_core::extraction::{ExtractionLimits, ExtractionOptions, ExtractionReport};
 use assetstudio_core::image_export::ImageFormat;
 use assetstudio_core::live2d_clip_motion::CubismClipMotionReadLimits;
-use assetstudio_core::live2d_motion::{CubismFadeMotionReadLimits, CubismMotionTargetNames};
+use assetstudio_core::live2d_motion::{
+    CubismFadeMotionReadLimits, CubismMotionTargetIndexLimits, CubismMotionTargetNames,
+};
 use assetstudio_core::live2d_package::{
     Live2dPackageBytes, Live2dPackageBytesSet, Live2dPackageLimits, Live2dPackageMaterializeLimits,
 };
@@ -4487,6 +4489,7 @@ impl PyAssetStudio {
             maximum_file_bytes,
             maximum_total_bytes,
             texture: planning_limits.texture,
+            motion_target_index: CubismMotionTargetIndexLimits::default(),
         };
         let schema_provider = schemas.map(|schemas| Arc::clone(&schemas.provider));
         let set = py
