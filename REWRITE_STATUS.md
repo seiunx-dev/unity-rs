@@ -88,6 +88,9 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   不再为每个模型扫描集合级角色表；身份索引和散件索引共享显式字节预算；
 - 动画绑定图在构建时生成有预算的 `GameObject→Animator` 排序索引；Live2D 的 clip fallback
   通过二分保留源对象首项语义，不再为每个模型线扫全部 Animator binding；
+- 场景层级的 Transform-owner cache 与最终 `GameObject` lookup 共用显式索引字节预算；
+  cache 采用预留后写入的可失败哈希表，最终索引采用确定排序 Vec 二分，不再让百万级合法层级
+  通过不可失败的逐节点树分配把内存不足升级为进程 abort；
 - 有界递归解包，以及拒绝符号链接、同目录临时文件和原子发布的安全导出；文件系统
   名称中的非 UTF-8 数据按 Unix 字节或 Windows UTF-16 的现有 replacement 语义流式清洗，
   不再先物化完整 `to_string_lossy` 临时字符串。replacement 后的诊断标签长度先计入单项和
@@ -427,6 +430,23 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过。
   提交 `b8d0766` 的公开常规矩阵
   [32704054064](https://github.com/Team-Haruki/unity-rs/actions/runs/32704054064) 为 16/16 验证 job 全绿；
+- **SceneHierarchy 的不可失败索引分配已于 2026-08-24 收口**：场景读取本来已经对
+  GameObject、组件、Transform 子项、材质、骨骼和层级边执行集合级计数，并对输出 Vec 使用
+  `try_reserve`，但 Transform→GameObject owner cache 与最终 GameObject→node lookup 仍是逐项
+  分配的 `BTreeMap`；默认百万 GameObject/千万组件下，格式有效的输入可以绕过其他可失败分配，
+  在树节点分配失败时直接终止进程。现 owner cache 改为每个新 key 先计费、再
+  `HashMap::try_reserve(1)`、最后写入，重复 Transform key 只更新值而不重复收费；最终 lookup
+  在临时 cache 释放后一次精确预留 `(SceneObjectKey, node_index)` Vec，按 key 排序、拒绝重复身份，
+  查询通过二分完成。两者共同受 `SceneHierarchyLimits.maximum_index_bytes` 约束，默认 256 MiB；
+  Python `SceneLimits.maximum_index_bytes` 与 Node `maximumIndexBytes` 已同步公开并有运行时/类型声明
+  消费测试。规模回归用 16,384 个逆序、跨三个 file index 的 GameObject 做 16,384 次查询，锁定
+  每次少于 20 次比较；另覆盖重复身份、最终索引精确容量/低一字节拒绝，以及 owner cache 精确
+  单项容量、重复更新和第二项预算前拒绝。Core 常规测试 571 项通过、12 项独立可选音频 oracle
+  测试忽略，6 项畸形输入扫描及严格 workspace Clippy 通过；完整工作树执行
+  `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`，Rust/Python/Node 构建、
+  workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过。提交 `b77192a`
+  的公开常规矩阵
+  [32706872352](https://github.com/Team-Haruki/unity-rs/actions/runs/32706872352) 为 16/16 验证 job 全绿；
 - **`SerializeReference` 身份字符串已于 2026-08-22 纳入现有物化预算**：TypeTree reader
   已经把 `ReferencedManagedType` 的 class/namespace/assembly 三条字符串保留在输出树中，
   但原先为匹配 SerializedFile reference types 又逐条 `clone` 到临时
@@ -1063,9 +1083,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `b8d0766`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `b77192a`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32704054064](https://github.com/Team-Haruki/unity-rs/actions/runs/32704054064) 16/16 全绿，
+[32706872352](https://github.com/Team-Haruki/unity-rs/actions/runs/32706872352) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
@@ -1075,7 +1095,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | **已完成（2026-08-24）**：PR run 32659993206 的 16 个主 job 全绿；workflow_dispatch run 32660298990 为 28/28，全量包含六个 CLI artifact、六个 Node artifact 和六个 Python wheel。CLI staged 产物运行 `--help`，wheel 安装后通过公开 API/mypy，Node tarball 从临时消费者安装并核对 JS/TypeScript 运行时表面；法律文件随所有产物校验 |
 | 2 | **扩充代表性真实 corpus**：在现有 Unity 2022.3 与 6000.3 之外，优先加入 Tuanjie 2022.3.x、Nintendo Switch、旧 Unity 4/5/2017 和带完整托管快照的样本 | 私有 manifest 在 release 模式稳定通过；每类至少有对象顺序、PathID/class、名称/container、原始载荷 hash、主要解码结果或明确错误族的版本化快照；专有样本不提交到仓库 |
 | 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
-| 3A | **继续不依赖外部样本的 hostile-input 资源审计**：优先检查“只需一个字段却物化整棵对象”、跨对象重复遍历、累计输出/临时分配和目录工作量放大；本轮已完成 `CubismModel._moc` 的完整校验式根字段投影、`SerializeReference` registry 的类型查找/校验二次方放大治理、模型动画 path/suffix 的 `tracks × nodes`、Avatar fallback 的 `tracks × avatar_paths`、Live2D 散件回退的 `models × roles`，以及 clip fallback 的 `models × animators` 扫描治理 | 每个确认问题必须有能在旧实现触发预算失败或超线性工作的合成回归；修复后仍完整消费/校验输入，并通过零跳过的 Rust/Python/Node/oracle 本地门禁和公开常规矩阵。`45e1194` 的低物化预算、截断尾部及 registry/reference-type 投影回归是第一项完成证据；`3f24ff0` 的 16,384 类型规模、重复首声明和两类预分配预算回归是第二项；`df42c67` 的 8,192 同名叶子、任意中段后缀、旧线性 oracle 等价和精确索引预算是第三项；`dac020e` 的 16,384 次 Avatar hash 重复查询、重复首声明、只索引所选 Avatar 及共享 count/byte 预算是第四项；`ee6f668` 的 16,384 条松散角色逆序/重复查询、发现顺序/首项语义和统一字节预算低一字节拒绝是第五项；`b8d0766` 的 16,384 条逆序 Animator、重复首项、重复二分查询和精确索引预算是第六项完成证据 |
+| 3A | **继续不依赖外部样本的 hostile-input 资源审计**：优先检查“只需一个字段却物化整棵对象”、跨对象重复遍历、累计输出/临时分配、不可失败集合增长和目录工作量放大；本轮已完成 `CubismModel._moc` 的完整校验式根字段投影、`SerializeReference` registry 的类型查找/校验二次方放大治理、模型动画 path/suffix 的 `tracks × nodes`、Avatar fallback 的 `tracks × avatar_paths`、Live2D 散件回退的 `models × roles`、clip fallback 的 `models × animators`，以及 SceneHierarchy 两张百万级索引的不可失败树分配治理 | 每个确认问题必须有能在旧实现触发预算失败、超线性工作或不可恢复分配失败的合成回归；修复后仍完整消费/校验输入，并通过零跳过的 Rust/Python/Node/oracle 本地门禁和公开常规矩阵。`45e1194` 的低物化预算、截断尾部及 registry/reference-type 投影回归是第一项完成证据；`3f24ff0` 的 16,384 类型规模、重复首声明和两类预分配预算回归是第二项；`df42c67` 的 8,192 同名叶子、任意中段后缀、旧线性 oracle 等价和精确索引预算是第三项；`dac020e` 的 16,384 次 Avatar hash 重复查询、重复首声明、只索引所选 Avatar 及共享 count/byte 预算是第四项；`ee6f668` 的 16,384 条松散角色逆序/重复查询、发现顺序/首项语义和统一字节预算低一字节拒绝是第五项；`b8d0766` 的 16,384 条逆序 Animator、重复首项、重复二分查询和精确索引预算是第六项；`b77192a` 的 16,384 条逆序 GameObject 二分查询、重复身份拒绝、最终索引低一字节拒绝和 Transform-owner 预算前拒绝是第七项完成证据 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22）**：106 个高层 Core 方法均被机器检查为 102 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；65 个公开 Python 方法和 3 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
 | 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | 默认构建、测试、安装和用户工作流均不需要 .NET；没有 GUI 或旧 C ABI 发布物；七项完成条件均有当前证据，未满足项不得被标成完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
