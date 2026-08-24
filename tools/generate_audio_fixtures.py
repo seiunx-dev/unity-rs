@@ -20,8 +20,8 @@ internal codecs, and this crate's decoder (`ruopus`) handles them differently:
 One fixture of each keeps both facts under test, so the exact path stays exact
 and the divergent path cannot drift further without a failure.
 
-Usage, from the repository root, with `ffmpeg` (built with libopus) and `lame`
-on PATH:
+Usage, from the repository root, with `ffmpeg` (built with libopus), `lame`, and
+`oggenc` from vorbis-tools/libvorbis 1.3.7 on PATH:
 
     python3 tools/generate_audio_fixtures.py
 """
@@ -31,6 +31,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 FIXTURES = (
@@ -64,6 +65,11 @@ MPEG_MULTISTREAM_PAIRS = ((330, 440), (550, 660), (770, 880))
 OPUS_MULTISTREAM_FSB_NAME = "fsb5-opus-celt-6ch.fsb"
 OPUS_MULTISTREAM_OGG_NAME = "opus-celt-6ch.ogg"
 OPUS_MULTISTREAM_FREQUENCIES = (330, 440, 550, 660, 770, 880)
+VORBIS_MULTISTREAM_FSB_NAME = "fsb5-vorbis-6ch.fsb"
+VORBIS_MULTISTREAM_OGG_NAME = "vorbis-6ch.ogg"
+VORBIS_MULTISTREAM_FREQUENCIES = OPUS_MULTISTREAM_FREQUENCIES
+VORBIS_MULTISTREAM_SAMPLE_RATE = 32_000
+VORBIS_MULTISTREAM_SETUP_CRC = 0x6AAD13BC
 
 
 def run(command: list[str]) -> None:
@@ -264,7 +270,8 @@ def generate_multistream_opus(work: Path) -> None:
             "-map", "[a]", "-ac", "6", "-channel_layout", "5.1",
             "-c:a", "libopus", "-mapping_family", "1",
             "-application", "audio", "-b:a", "384k", "-vbr", "off",
-            "-frame_duration", "20", str(ogg),
+            "-frame_duration", "20", "-fflags", "+bitexact",
+            "-map_metadata", "-1", str(ogg),
         ]
     )
     run(command)
@@ -308,8 +315,86 @@ def generate_multistream_opus(work: Path) -> None:
     )
 
 
+def generate_multistream_vorbis(work: Path) -> None:
+    """Builds a six-channel FSB5 from a standard libvorbis stream."""
+    wave = work / "vorbis-6ch.wav"
+    ogg = work / VORBIS_MULTISTREAM_OGG_NAME
+    command = ["ffmpeg", "-v", "error", "-y"]
+    for frequency in VORBIS_MULTISTREAM_FREQUENCIES:
+        command.extend(
+            [
+                "-f", "lavfi", "-i",
+                (
+                    f"sine=frequency={frequency}:"
+                    f"sample_rate={VORBIS_MULTISTREAM_SAMPLE_RATE}:duration=0.12"
+                ),
+            ]
+        )
+    inputs = "".join(f"[{index}:a]" for index in range(6))
+    command.extend(
+        [
+            "-filter_complex", f"{inputs}amerge=inputs=6[a]",
+            "-map", "[a]", "-ac", "6", "-channel_layout", "5.1",
+            "-c:a", "pcm_s16le", str(wave),
+        ]
+    )
+    run(command)
+    run(
+        [
+            "oggenc", "--quiet", "--serial", "1", "--discard-comments",
+            "--quality", "4",
+            "--output", str(ogg), str(wave),
+        ]
+    )
+    packets = ogg_packets(ogg)
+    identification, setup, audio = packets[0], packets[2], packets[3:]
+    if (
+        not identification.startswith(b"\x01vorbis")
+        or len(identification) != 30
+        or identification[11] != 6
+        or int.from_bytes(identification[12:16], "little")
+        != VORBIS_MULTISTREAM_SAMPLE_RATE
+    ):
+        raise ValueError("unexpected six-channel Vorbis identification header")
+    setup_crc = zlib.crc32(setup) & 0xFFFF_FFFF
+    if setup_crc != VORBIS_MULTISTREAM_SETUP_CRC:
+        raise ValueError(
+            f"six-channel Vorbis setup CRC is {setup_crc:08x}, "
+            f"expected {VORBIS_MULTISTREAM_SETUP_CRC:08x}"
+        )
+    frame_count = ogg_last_granule(ogg)
+    if frame_count <= 0:
+        raise ValueError("six-channel Vorbis stream has no sample frames")
+    data = b"".join(len(packet).to_bytes(2, "little") + packet for packet in audio)
+    data += b"\0\0"
+    sample_mode = (frame_count << 34) | (2 << 5) | (7 << 1) | 1
+    metadata_header = (11 << 25) | (8 << 1)
+    sample_headers = (
+        sample_mode.to_bytes(8, "little")
+        + metadata_header.to_bytes(4, "little")
+        + setup_crc.to_bytes(4, "little")
+        + b"\0\0\0\0"
+    )
+    header = bytearray(0x3C)
+    header[:4] = b"FSB5"
+    header[4:8] = (1).to_bytes(4, "little")
+    header[8:12] = (1).to_bytes(4, "little")
+    header[12:16] = len(sample_headers).to_bytes(4, "little")
+    header[20:24] = len(data).to_bytes(4, "little")
+    header[24:28] = (15).to_bytes(4, "little")
+    (FIXTURES / VORBIS_MULTISTREAM_FSB_NAME).write_bytes(
+        header + sample_headers + data
+    )
+    (FIXTURES / VORBIS_MULTISTREAM_OGG_NAME).write_bytes(ogg.read_bytes())
+    print(
+        f"wrote {VORBIS_MULTISTREAM_FSB_NAME} and "
+        f"{VORBIS_MULTISTREAM_OGG_NAME}: {len(audio)} packets, "
+        f"{frame_count} frames"
+    )
+
+
 def main() -> None:
-    for tool in ("ffmpeg", "lame"):
+    for tool in ("ffmpeg", "lame", "oggenc"):
         if subprocess.run(["which", tool], capture_output=True).returncode != 0:
             sys.exit(f"{tool} is required to regenerate the audio fixtures")
     with tempfile.TemporaryDirectory() as directory:
@@ -319,6 +404,7 @@ def main() -> None:
         generate_mpeg(work)
         generate_multistream_mpeg(work)
         generate_multistream_opus(work)
+        generate_multistream_vorbis(work)
 
 
 if __name__ == "__main__":

@@ -3355,6 +3355,29 @@ fn vorbis_headers(
     .map_err(|_| Error::invalid_data("FSB5 Vorbis header decoder panicked"))?
 }
 
+fn vorbis_wave_channel_order(channels: u16) -> Result<&'static [u8]> {
+    // Vorbis I specifies its own surround speaker order. WAVE uses the native
+    // order represented by its channel mask, so a multichannel decode must be
+    // permuted before interleaving. These are FFmpeg's
+    // `ff_vorbis_channel_layout_offsets`, also used by vgmstream.
+    let order: &'static [u8] = match channels {
+        1 => &[0],
+        2 => &[0, 1],
+        3 => &[0, 2, 1],
+        4 => &[0, 1, 2, 3],
+        5 => &[0, 2, 1, 3, 4],
+        6 => &[0, 2, 1, 5, 3, 4],
+        7 => &[0, 2, 1, 6, 5, 3, 4],
+        8 => &[0, 2, 1, 7, 5, 6, 3, 4],
+        _ => {
+            return Err(Error::unsupported(format!(
+                "FSB5 Vorbis channel count {channels} is outside the verified 1..={MAX_VORBIS_CHANNELS} range"
+            )));
+        }
+    };
+    Ok(order)
+}
+
 fn scan_vorbis_packets(
     payload: &Region,
     data_offset: u64,
@@ -3494,6 +3517,7 @@ fn decode_fsb5_vorbis(
 ) -> Result<()> {
     let (identification, setup) =
         vorbis_headers(stream.channels, stream.sample_rate, stream.setup_crc)?;
+    let channel_order = vorbis_wave_channel_order(stream.channels)?;
     let mut previous_window = PreviousWindowRight::new();
     let mut packet_bytes = vorbis_packet_buffer()?;
     let mut pcm_bytes = Vec::new();
@@ -3547,8 +3571,9 @@ fn decode_fsb5_vorbis(
                 })?;
         }
         for frame in 0..write_frames {
-            for channel in &channels {
-                pcm_bytes.extend_from_slice(&channel[frame].to_le_bytes());
+            for &channel_index in channel_order {
+                pcm_bytes
+                    .extend_from_slice(&channels[usize::from(channel_index)][frame].to_le_bytes());
             }
         }
         output.write_all(&pcm_bytes)?;
@@ -3879,6 +3904,9 @@ mod tests {
 
     const FSB5_VORBIS_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/audio/fsb5-vorbis-stereo.fsb");
+    const FSB5_VORBIS_MULTISTREAM_FIXTURE: &[u8] =
+        include_bytes!("../tests/fixtures/audio/fsb5-vorbis-6ch.fsb");
+    const VORBIS_MULTISTREAM_OGG: &[u8] = include_bytes!("../tests/fixtures/audio/vorbis-6ch.ogg");
     const FSB5_MPEG_MULTISTREAM_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/audio/fsb5-mpeg-layer3-6ch.fsb");
 
@@ -5068,6 +5096,47 @@ mod tests {
     }
 
     #[test]
+    fn decodes_six_channel_fsb5_vorbis() {
+        let fsb = Region::from_bytes(FSB5_VORBIS_MULTISTREAM_FIXTURE.to_vec());
+        let stream = parse_fsb5_vorbis(&fsb).unwrap().unwrap();
+        assert_eq!(
+            (
+                stream.channels,
+                stream.sample_rate,
+                stream.frame_count,
+                stream.setup_crc,
+            ),
+            (6, 32_000, 3_840, 0x6aad_13bc)
+        );
+        let output_size = 44 + stream.frame_count * u64::from(stream.channels) * 2;
+        let mut wav = Vec::new();
+        write_direct_wav(
+            &fsb,
+            DirectWavKind::Fsb5Vorbis(stream),
+            output_size,
+            &mut wav,
+        )
+        .unwrap();
+        assert_eq!(wav.len(), usize::try_from(output_size).unwrap());
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 6);
+        let pcm = wave_data(&wav);
+        let mut hashes = [0xcbf2_9ce4_8422_2325_u64; 6];
+        for frame in pcm.chunks_exact(12) {
+            for channel in 0..6 {
+                for byte in &frame[channel * 2..channel * 2 + 2] {
+                    hashes[channel] ^= u64::from(*byte);
+                    hashes[channel] = hashes[channel].wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        for left in 0..hashes.len() {
+            for right in left + 1..hashes.len() {
+                assert_ne!(hashes[left], hashes[right], "channels {left} and {right}");
+            }
+        }
+    }
+
+    #[test]
     fn rejects_unknown_malformed_forged_and_over_budget_fsb5_vorbis() {
         let fsb = Region::from_bytes(FSB5_VORBIS_FIXTURE);
         let stream = parse_fsb5_vorbis(&fsb).unwrap().unwrap();
@@ -5143,6 +5212,60 @@ mod tests {
         assert!(maximum_delta <= 1);
         std::fs::remove_file(input).unwrap();
         std::fs::remove_file(output).unwrap();
+    }
+
+    /// The original Ogg header is the independent authority for the six
+    /// channel speaker order. FSB keeps the same audio packets but replaces
+    /// that header with only a setup CRC and a channel count.
+    #[test]
+    #[ignore = "requires the optional vgmstream-cli decoder oracle"]
+    fn fsb5_multistream_vorbis_matches_vgmstream_ogg_oracle() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let fsb = Region::from_bytes(FSB5_VORBIS_MULTISTREAM_FIXTURE.to_vec());
+        let kind = detect_direct_wav(&fsb, Some(16)).unwrap().unwrap();
+        let mut actual = Vec::new();
+        write_direct_wav(&fsb, kind, 1024 * 1024, &mut actual).unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let input = std::env::temp_dir().join(format!(
+            "assetstudio-fsb5-vorbis-multistream-{}-{unique}.ogg",
+            std::process::id()
+        ));
+        let output = input.with_extension("wav");
+        std::fs::write(&input, VORBIS_MULTISTREAM_OGG).unwrap();
+        let status = Command::new("vgmstream-cli")
+            .arg("-o")
+            .arg(&output)
+            .arg(&input)
+            .status()
+            .expect("vgmstream-cli must be installed to run this ignored oracle test");
+        assert!(status.success());
+        let expected = std::fs::read(&output).unwrap();
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_file(output).unwrap();
+
+        let rust = wave_data(&actual);
+        let oracle = wave_data(&expected);
+        assert_eq!(rust.len(), oracle.len());
+        let maximum_delta = rust
+            .chunks_exact(2)
+            .zip(oracle.chunks_exact(2))
+            .map(|(rust, oracle)| {
+                let rust = i16::from_le_bytes(rust.try_into().unwrap());
+                let oracle = i16::from_le_bytes(oracle.try_into().unwrap());
+                i32::from(rust).abs_diff(i32::from(oracle))
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            maximum_delta <= 1,
+            "multistream Vorbis maximum PCM16 delta is {maximum_delta}"
+        );
     }
 
     fn fsb5(version: u32, codec: u32, flags: u32, samples: &[SampleSpec], data: &[u8]) -> Vec<u8> {
