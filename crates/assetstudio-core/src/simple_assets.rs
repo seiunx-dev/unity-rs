@@ -190,6 +190,25 @@ pub fn read_audio_clip(
     Ok(read_audio_clip_asset(collection, file, object_index, limits)?.into_raw())
 }
 
+/// Reads an `AudioClip` by its stable collection file index.
+///
+/// This is the preferred collection-wide entry point. Legacy streamed clips
+/// derive their `.resS` name from the owning serialized-file path, so using the
+/// index avoids rediscovering that file with a linear pointer scan for every
+/// clip. [`read_audio_clip`] remains available for low-level callers which only
+/// have a borrowed [`SerializedFile`].
+pub fn read_audio_clip_by_file_index(
+    collection: &AssetCollection,
+    file_index: usize,
+    object_index: usize,
+    limits: SimpleAssetReadLimits,
+) -> Result<SimpleBinaryAsset> {
+    Ok(
+        read_audio_clip_asset_by_file_index(collection, file_index, object_index, limits)?
+            .into_raw(),
+    )
+}
+
 /// Reads an `AudioClip` and retains metadata for pure-Rust WAV export.
 pub fn read_audio_clip_asset(
     collection: &AssetCollection,
@@ -197,11 +216,43 @@ pub fn read_audio_clip_asset(
     object_index: usize,
     limits: SimpleAssetReadLimits,
 ) -> Result<AudioClipAsset> {
+    read_audio_clip_asset_impl(collection, file, None, object_index, limits)
+}
+
+/// Reads an `AudioClip` by its stable collection file index and retains
+/// metadata for pure-Rust WAV export.
+pub fn read_audio_clip_asset_by_file_index(
+    collection: &AssetCollection,
+    file_index: usize,
+    object_index: usize,
+    limits: SimpleAssetReadLimits,
+) -> Result<AudioClipAsset> {
+    let file = collection.serialized_files.get(file_index).ok_or_else(|| {
+        Error::invalid_data(format!(
+            "serialized file index {file_index} is out of range"
+        ))
+    })?;
+    read_audio_clip_asset_impl(
+        collection,
+        &file.file,
+        Some(file_index),
+        object_index,
+        limits,
+    )
+}
+
+fn read_audio_clip_asset_impl(
+    collection: &AssetCollection,
+    file: &SerializedFile,
+    file_index: Option<usize>,
+    object_index: usize,
+    limits: SimpleAssetReadLimits,
+) -> Result<AudioClipAsset> {
     require_known_unity_version(file, "AudioClip")?;
     let mut reader = ObjectPayloadReader::new(file, object_index, AUDIO_CLIP_CLASS_ID, limits)?;
     let name = reader.read_named_object()?;
     if file.unity_version.major < 5 {
-        return read_legacy_audio_clip(collection, file, reader, name, limits);
+        return read_legacy_audio_clip(collection, file, file_index, reader, name, limits);
     }
     reader.skip(12, "AudioClip load, channel, and frequency settings")?;
     let decoded_bits = reader.reader.read_i32()?;
@@ -229,6 +280,7 @@ pub fn read_audio_clip_asset(
 fn read_legacy_audio_clip(
     collection: &AssetCollection,
     file: &SerializedFile,
+    file_index: Option<usize>,
     mut reader: ObjectPayloadReader,
     name: String,
     limits: SimpleAssetReadLimits,
@@ -258,7 +310,12 @@ fn read_legacy_audio_clip(
         } else {
             let offset = u64::from(reader.reader.read_u32()?);
             StreamedResource {
-                source: legacy_audio_resource_name(collection, file, limits.maximum_string_bytes)?,
+                source: legacy_audio_resource_name(
+                    collection,
+                    file,
+                    file_index,
+                    limits.maximum_string_bytes,
+                )?,
                 offset,
                 size,
                 inline_region: reader.region.clone(),
@@ -344,24 +401,44 @@ fn inline_streamed_resource(
 fn legacy_audio_resource_name(
     collection: &AssetCollection,
     file: &SerializedFile,
+    file_index: Option<usize>,
     maximum_string_bytes: usize,
 ) -> Result<String> {
-    let path = collection
-        .serialized_files
-        .iter()
-        .find(|loaded| std::ptr::eq(std::ptr::from_ref(&loaded.file), std::ptr::from_ref(file)))
-        .map(|loaded| loaded.path.as_str())
-        .ok_or_else(|| {
-            Error::invalid_data(
-                "legacy streamed AudioClip source file is not part of the asset collection",
-            )
-        })?;
+    let path = match file_index {
+        Some(file_index) => collection
+            .serialized_files
+            .get(file_index)
+            .map(|loaded| loaded.path.as_str()),
+        None => collection.serialized_files.iter().find_map(|loaded| {
+            probe_legacy_audio_file_scan();
+            std::ptr::eq(std::ptr::from_ref(&loaded.file), std::ptr::from_ref(file))
+                .then_some(loaded.path.as_str())
+        }),
+    }
+    .ok_or_else(|| {
+        Error::invalid_data(
+            "legacy streamed AudioClip source file is not part of the asset collection",
+        )
+    })?;
     append_simple_suffix(
         path,
         ".resS",
         maximum_string_bytes,
         "legacy AudioClip resource name",
     )
+}
+
+#[cfg(not(test))]
+fn probe_legacy_audio_file_scan() {}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_AUDIO_FILE_SCAN_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn probe_legacy_audio_file_scan() {
+    LEGACY_AUDIO_FILE_SCAN_PROBES.set(LEGACY_AUDIO_FILE_SCAN_PROBES.get() + 1);
 }
 
 /// Reads a `VideoClip`, resolving its `StreamedResource` when needed.
@@ -703,7 +780,8 @@ mod tests {
     use super::{
         AUDIO_CLIP_CLASS_ID, DirectWavKind, FONT_CLASS_ID, MOVIE_TEXTURE_CLASS_ID,
         SimpleAssetReadLimits, VIDEO_CLIP_CLASS_ID, read_audio_clip, read_audio_clip_asset,
-        read_font, read_movie_texture, read_video_clip, write_direct_wav,
+        read_audio_clip_asset_by_file_index, read_font, read_movie_texture, read_video_clip,
+        write_direct_wav,
     };
 
     const FSB5_VORBIS_FIXTURE: &[u8] =
@@ -845,6 +923,76 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("legacy AudioClip resource name"));
+    }
+
+    #[test]
+    fn indexed_legacy_audio_avoids_collection_file_scan() {
+        const FILE_COUNT: usize = 16_384;
+
+        let mut external = named_object("legacy-stream");
+        external.extend_from_slice(&0_i32.to_le_bytes());
+        external.extend_from_slice(&13_i32.to_le_bytes());
+        external.extend_from_slice(&[0, 0]);
+        align(&mut external, 4);
+        external.extend_from_slice(&1_i32.to_le_bytes());
+        external.extend_from_slice(&5_i32.to_le_bytes());
+        external.extend_from_slice(&2_u32.to_le_bytes());
+        let file = parse_asset(AUDIO_CLIP_CLASS_ID, "4.7.2f1", &external);
+        let mut files = Vec::new();
+        files.try_reserve_exact(FILE_COUNT).unwrap();
+        for index in 0..FILE_COUNT {
+            files.push(LoadedSerializedFile {
+                path: if index + 1 == FILE_COUNT {
+                    "target.assets".to_owned()
+                } else {
+                    format!("decoy-{index}.assets")
+                },
+                file: file.clone(),
+            });
+        }
+        let collection = AssetCollection::from_loaded_parts(
+            files,
+            vec![LoadedResource {
+                path: "target.assets.resS".to_owned(),
+                region: Region::from_bytes(b"xxmp3!!zz".to_vec()),
+            }],
+        );
+
+        super::LEGACY_AUDIO_FILE_SCAN_PROBES.with(|probes| probes.set(0));
+        let indexed = read_audio_clip_asset_by_file_index(
+            &collection,
+            FILE_COUNT - 1,
+            0,
+            SimpleAssetReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(indexed.payload.read_to_vec(16).unwrap(), b"mp3!!");
+        assert_eq!(
+            super::LEGACY_AUDIO_FILE_SCAN_PROBES.with(std::cell::Cell::get),
+            0
+        );
+
+        let low_level = read_audio_clip_asset(
+            &collection,
+            &collection.serialized_files[FILE_COUNT - 1].file,
+            0,
+            SimpleAssetReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(low_level.payload.read_to_vec(16).unwrap(), b"mp3!!");
+        assert_eq!(
+            super::LEGACY_AUDIO_FILE_SCAN_PROBES.with(std::cell::Cell::get),
+            FILE_COUNT
+        );
+
+        let error = read_audio_clip_asset_by_file_index(
+            &collection,
+            FILE_COUNT,
+            0,
+            SimpleAssetReadLimits::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("file index"));
     }
 
     #[test]

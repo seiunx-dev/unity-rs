@@ -63,8 +63,8 @@ use crate::serialized::{
 };
 use crate::shader::{ShaderReadLimits, read_shader};
 use crate::simple_assets::{
-    AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, read_audio_clip_asset, read_font,
-    read_movie_texture, read_video_clip,
+    AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, read_audio_clip_asset_by_file_index,
+    read_font, read_movie_texture, read_video_clip,
 };
 use crate::source::Region;
 use crate::sprite::{Sprite, SpriteReadLimits, decode_sprite_rgba8_by_file_index, read_sprite};
@@ -1012,9 +1012,9 @@ impl StudioObject<'_> {
 
     /// Reads source-bound `AudioClip` bytes plus verified direct-WAV metadata.
     pub fn read_audio_clip(&self, limits: SimpleAssetReadLimits) -> Result<AudioClipAsset> {
-        read_audio_clip_asset(
+        read_audio_clip_asset_by_file_index(
             &self.studio.collection,
-            &self.loaded().file,
+            self.file_index,
             self.object_index,
             limits,
         )
