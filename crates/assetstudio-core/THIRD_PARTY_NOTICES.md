@@ -82,9 +82,10 @@ resolved crate sources.
   under MIT OR Apache-2.0. The workspace selects its MIT option; the upstream
   copyright and complete permission notice ship beside the Core crate in
   `FSB_VORBIS_NOTICE.md`. The generated table is bounds checked before use.
-  A system `libvorbis 1.3.7` encoder was used only to create the non-silent
-  differential fixture documented alongside it; libvorbis is not a build or
-  runtime dependency and is not redistributed here.
+  The `oggenc 1.4.3` tool with a system `libvorbis 1.3.7` encoder was used only
+  to create the non-silent stereo and six-channel differential fixtures
+  documented alongside them; vorbis-tools and libvorbis are not build or
+  runtime dependencies and are not redistributed here.
   Ignored differential tests can invoke a separately installed
   `vgmstream-cli` as an output oracle; vgmstream code or binaries are not
   linked, vendored, or redistributed by the workspace.

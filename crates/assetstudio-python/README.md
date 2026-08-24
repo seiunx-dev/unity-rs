@@ -56,9 +56,9 @@ The initial API supports:
   channels with FMOD frame padding, and
   sample-verified standard 48 kHz FSB Opus from mono through 7.1 with its
   family-1 multistream mapping and 312-frame encoder delay, plus pure-Rust FSB
-  Vorbis backed by the checked 161-entry FMOD setup-header table; remaining
-  platform codecs are preserved raw until a verified pure-Rust decoder is
-  available;
+  Vorbis from mono through 7.1 with the standard Vorbis-to-WAVE speaker
+  permutation and checked 161-entry FMOD setup-header table; remaining platform
+  codecs are preserved raw until a verified pure-Rust decoder is available;
 - direct embedded `Font`, legacy `MovieTexture`, and inline or externally
   streamed `VideoClip` payload reads, distinct from serialized wrapper bytes; and
 - structured, order-preserving `Material` shader references, keywords, tags,
