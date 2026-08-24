@@ -4,7 +4,8 @@
 //! null, missing, external-file, and wrongly typed targets are ignored. Once a
 //! correctly typed target resolves, its bounded parser remains strict.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 
 use crate::animation_clip::ANIMATION_CLIP_CLASS_ID;
 use crate::animation_component::{
@@ -29,6 +30,9 @@ pub struct AnimationGraphLimits {
     pub maximum_animator_bindings: usize,
     /// Maximum bytes retained by the sorted `GameObject` to Animator index.
     pub maximum_animator_index_bytes: usize,
+    /// Maximum logical bytes used by pending/build-time controller and clip
+    /// indexes, then reused by the final sorted lookup tables.
+    pub maximum_lookup_index_bytes: usize,
     pub maximum_legacy_animations: usize,
     pub maximum_controllers: usize,
     pub maximum_clips: usize,
@@ -44,6 +48,7 @@ impl Default for AnimationGraphLimits {
         Self {
             maximum_animator_bindings: 1_000_000,
             maximum_animator_index_bytes: 64 * 1024 * 1024,
+            maximum_lookup_index_bytes: 128 * 1024 * 1024,
             maximum_legacy_animations: 1_000_000,
             maximum_controllers: 1_000_000,
             maximum_clips: 2_000_000,
@@ -106,15 +111,17 @@ pub struct AnimationClipNode {
     pub name: String,
 }
 
+type SceneObjectIndex = Vec<(SceneObjectKey, usize)>;
+
 #[derive(Debug, Clone)]
 pub struct AnimationGraph {
     pub animators: Vec<AnimatorAnimationBinding>,
     pub legacy_animations: Vec<LegacyAnimationBinding>,
     pub controllers: Vec<AnimationControllerNode>,
     pub clips: Vec<AnimationClipNode>,
-    animator_index: Vec<(SceneObjectKey, usize)>,
-    controller_index: BTreeMap<SceneObjectKey, usize>,
-    clip_index: BTreeMap<SceneObjectKey, usize>,
+    animator_index: SceneObjectIndex,
+    controller_index: SceneObjectIndex,
+    clip_index: SceneObjectIndex,
 }
 
 impl AnimationGraph {
@@ -126,16 +133,13 @@ impl AnimationGraph {
 
     #[must_use]
     pub fn controller(&self, key: SceneObjectKey) -> Option<&AnimationControllerNode> {
-        self.controller_index
-            .get(&key)
-            .and_then(|index| self.controllers.get(*index))
+        key_index_position(&self.controller_index, key)
+            .and_then(|index| self.controllers.get(index))
     }
 
     #[must_use]
     pub fn clip(&self, key: SceneObjectKey) -> Option<&AnimationClipNode> {
-        self.clip_index
-            .get(&key)
-            .and_then(|index| self.clips.get(*index))
+        key_index_position(&self.clip_index, key).and_then(|index| self.clips.get(index))
     }
 
     #[cfg(test)]
@@ -151,8 +155,8 @@ impl AnimationGraph {
             controllers: Vec::new(),
             clips: Vec::new(),
             animator_index,
-            controller_index: BTreeMap::new(),
-            clip_index: BTreeMap::new(),
+            controller_index: Vec::new(),
+            clip_index: Vec::new(),
         }
     }
 }
@@ -185,13 +189,14 @@ struct GraphBuildState<'a> {
     legacy_animations: Vec<LegacyAnimationBinding>,
     controllers: Vec<AnimationControllerNode>,
     clips: Vec<AnimationClipNode>,
-    controller_index: BTreeMap<SceneObjectKey, usize>,
-    clip_index: BTreeMap<SceneObjectKey, usize>,
-    queued_controllers: BTreeSet<SceneObjectKey>,
+    controller_index: HashMap<SceneObjectKey, usize>,
+    clip_index: HashMap<SceneObjectKey, usize>,
+    queued_controllers: HashSet<SceneObjectKey>,
     pending_controllers: Vec<PendingController>,
     pending_index: usize,
     edges: usize,
     name_bytes: usize,
+    lookup_index_bytes: usize,
 }
 
 impl<'a> GraphBuildState<'a> {
@@ -203,13 +208,14 @@ impl<'a> GraphBuildState<'a> {
             legacy_animations: Vec::new(),
             controllers: Vec::new(),
             clips: Vec::new(),
-            controller_index: BTreeMap::new(),
-            clip_index: BTreeMap::new(),
-            queued_controllers: BTreeSet::new(),
+            controller_index: HashMap::new(),
+            clip_index: HashMap::new(),
+            queued_controllers: HashSet::new(),
             pending_controllers: Vec::new(),
             pending_index: 0,
             edges: 0,
             name_bytes: 0,
+            lookup_index_bytes: 0,
         }
     }
 
@@ -378,15 +384,27 @@ impl<'a> GraphBuildState<'a> {
                 )));
             }
             let index = self.controllers.len();
-            if self.controller_index.insert(node.object, index).is_some() {
+            if self.controller_index.contains_key(&node.object) {
                 return Err(Error::invalid_data(format!(
                     "animation controller {:?} was parsed more than once",
                     node.object
                 )));
             }
+            self.lookup_index_bytes = charge_index_bytes(
+                self.lookup_index_bytes,
+                size_of::<(SceneObjectKey, usize)>(),
+                self.limits.maximum_lookup_index_bytes,
+                "animation controller build index",
+            )?;
+            self.controller_index.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot grow animation controller build index: {error}"
+                ))
+            })?;
             self.controllers.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!("cannot grow animation controllers: {error}"))
             })?;
+            self.controller_index.insert(node.object, index);
             self.controllers.push(node);
         }
         Ok(())
@@ -435,16 +453,28 @@ impl<'a> GraphBuildState<'a> {
             file_index: target.file_index,
             path_id: target.path_id,
         };
-        if self.queued_controllers.insert(key) {
-            if self.queued_controllers.len() > self.limits.maximum_controllers {
+        if !self.queued_controllers.contains(&key) {
+            if self.queued_controllers.len() >= self.limits.maximum_controllers {
                 return Err(Error::invalid_data(format!(
                     "animation graph exceeds {} controllers",
                     self.limits.maximum_controllers
                 )));
             }
+            self.lookup_index_bytes = charge_index_bytes(
+                self.lookup_index_bytes,
+                size_of::<SceneObjectKey>(),
+                self.limits.maximum_lookup_index_bytes,
+                "pending animation controller index",
+            )?;
+            self.queued_controllers.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot grow pending animation controller index: {error}"
+                ))
+            })?;
             self.pending_controllers.try_reserve(1).map_err(|error| {
                 Error::invalid_data(format!("cannot grow pending controllers: {error}"))
             })?;
+            self.queued_controllers.insert(key);
             self.pending_controllers.push(PendingController {
                 key,
                 object_index: target.object_index,
@@ -496,10 +526,19 @@ impl<'a> GraphBuildState<'a> {
         };
         self.charge_name(name.len(), "AnimationClip name")?;
         let index = self.clips.len();
-        self.clip_index.insert(key, index);
+        self.lookup_index_bytes = charge_index_bytes(
+            self.lookup_index_bytes,
+            size_of::<(SceneObjectKey, usize)>(),
+            self.limits.maximum_lookup_index_bytes,
+            "AnimationClip build index",
+        )?;
+        self.clip_index.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow AnimationClip build index: {error}"))
+        })?;
         self.clips.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!("cannot grow AnimationClip nodes: {error}"))
         })?;
+        self.clip_index.insert(key, index);
         self.clips.push(AnimationClipNode { object: key, name });
         Ok(Some(key))
     }
@@ -548,18 +587,121 @@ impl<'a> GraphBuildState<'a> {
     }
 
     fn finish(self) -> Result<AnimationGraph> {
-        let animator_index =
-            build_animator_index(&self.animators, self.limits.maximum_animator_index_bytes)?;
+        let Self {
+            limits,
+            animators,
+            legacy_animations,
+            controllers,
+            clips,
+            controller_index,
+            clip_index,
+            queued_controllers,
+            pending_controllers,
+            ..
+        } = self;
+        drop((
+            controller_index,
+            clip_index,
+            queued_controllers,
+            pending_controllers,
+        ));
+        let animator_index = build_animator_index(&animators, limits.maximum_animator_index_bytes)?;
+        let (controller_index, clip_index) =
+            build_graph_lookup_indexes(&controllers, &clips, limits.maximum_lookup_index_bytes)?;
         Ok(AnimationGraph {
-            animators: self.animators,
-            legacy_animations: self.legacy_animations,
-            controllers: self.controllers,
-            clips: self.clips,
+            animators,
+            legacy_animations,
+            controllers,
+            clips,
             animator_index,
-            controller_index: self.controller_index,
-            clip_index: self.clip_index,
+            controller_index,
+            clip_index,
         })
     }
+}
+
+fn build_graph_lookup_indexes(
+    controllers: &[AnimationControllerNode],
+    clips: &[AnimationClipNode],
+    maximum_bytes: usize,
+) -> Result<(SceneObjectIndex, SceneObjectIndex)> {
+    let entry_count = controllers
+        .len()
+        .checked_add(clips.len())
+        .ok_or_else(|| Error::invalid_data("animation graph lookup entry count overflowed"))?;
+    let required = entry_count
+        .checked_mul(size_of::<(SceneObjectKey, usize)>())
+        .ok_or_else(|| Error::invalid_data("animation graph lookup index size overflowed"))?;
+    if required > maximum_bytes {
+        return Err(Error::invalid_data(format!(
+            "animation graph lookup indexes require {required} bytes, limit is {maximum_bytes}"
+        )));
+    }
+    let controller_index = build_key_index(
+        controllers.iter().map(|controller| controller.object),
+        controllers.len(),
+        "animation controller lookup entries",
+    )?;
+    let clip_index = build_key_index(
+        clips.iter().map(|clip| clip.object),
+        clips.len(),
+        "AnimationClip lookup entries",
+    )?;
+    Ok((controller_index, clip_index))
+}
+
+fn build_key_index(
+    keys: impl Iterator<Item = SceneObjectKey>,
+    length: usize,
+    field: &str,
+) -> Result<Vec<(SceneObjectKey, usize)>> {
+    let mut index = reserve_vec(length, field)?;
+    index.extend(
+        keys.enumerate()
+            .map(|(source_index, key)| (key, source_index)),
+    );
+    index.sort_unstable();
+    if let Some(window) = index.windows(2).find(|window| window[0].0 == window[1].0) {
+        return Err(Error::invalid_data(format!(
+            "{field} repeat object key {:?}",
+            window[0].0
+        )));
+    }
+    Ok(index)
+}
+
+fn key_index_position(index: &[(SceneObjectKey, usize)], key: SceneObjectKey) -> Option<usize> {
+    key_index_position_with_probe(index, key, || {})
+}
+
+fn key_index_position_with_probe(
+    index: &[(SceneObjectKey, usize)],
+    key: SceneObjectKey,
+    mut probe: impl FnMut(),
+) -> Option<usize> {
+    let position = index.partition_point(|(candidate, _)| {
+        probe();
+        *candidate < key
+    });
+    let &(candidate, source_index) = index.get(position)?;
+    (candidate == key).then_some(source_index)
+}
+
+fn charge_index_bytes(
+    current: usize,
+    additional: usize,
+    maximum: usize,
+    field: &str,
+) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| Error::invalid_data("animation graph lookup index bytes overflowed"))?;
+    if total > maximum {
+        return Err(Error::invalid_data(format!(
+            "{field} raises lookup indexes to {total} bytes, exceeding limit {maximum}"
+        )));
+    }
+    Ok(total)
 }
 
 fn build_animator_index(
@@ -648,9 +790,10 @@ mod tests {
 
     use super::{
         ANIMATION_CLASS_ID, ANIMATION_CLIP_CLASS_ID, ANIMATOR_CONTROLLER_CLASS_ID,
-        ANIMATOR_OVERRIDE_CONTROLLER_CLASS_ID, AnimationControllerKind, AnimationGraphLimits,
-        AnimatorAnimationBinding, animator_index_position, animator_index_position_with_probe,
-        build_animation_graph, build_animator_index,
+        ANIMATOR_OVERRIDE_CONTROLLER_CLASS_ID, AnimationClipNode, AnimationControllerKind,
+        AnimationControllerNode, AnimationGraphLimits, AnimatorAnimationBinding,
+        animator_index_position, animator_index_position_with_probe, build_animation_graph,
+        build_animator_index, build_graph_lookup_indexes, key_index_position_with_probe,
     };
 
     #[test]
@@ -781,6 +924,91 @@ mod tests {
         assert!(error.to_string().contains("Animator lookup index requires"));
     }
 
+    #[test]
+    fn controller_and_clip_indexes_scale_and_preserve_source_positions() {
+        const ENTRY_COUNT: usize = 16_384;
+        let controllers: Vec<_> = (0..ENTRY_COUNT)
+            .map(|source_index| test_controller_node(reverse_path_id(source_index, ENTRY_COUNT)))
+            .collect();
+        let clips: Vec<_> = (0..ENTRY_COUNT)
+            .map(|source_index| test_clip_node(reverse_path_id(source_index, ENTRY_COUNT)))
+            .collect();
+        let exact = lookup_index_bytes(controllers.len(), clips.len());
+        let (controller_index, clip_index) =
+            build_graph_lookup_indexes(&controllers, &clips, exact).unwrap();
+
+        let mut comparisons = 0_usize;
+        for path_id in 1..=i64::try_from(ENTRY_COUNT).unwrap() {
+            let expected = ENTRY_COUNT - usize::try_from(path_id).unwrap();
+            assert_eq!(
+                key_index_position_with_probe(&controller_index, graph_key(0, path_id), || {
+                    comparisons += 1;
+                }),
+                Some(expected)
+            );
+            assert_eq!(
+                key_index_position_with_probe(&clip_index, graph_key(1, path_id), || {
+                    comparisons += 1;
+                }),
+                Some(expected)
+            );
+        }
+        assert!(comparisons < ENTRY_COUNT * 40, "{comparisons}");
+    }
+
+    #[test]
+    fn graph_lookup_index_budget_is_exact_and_duplicates_are_rejected() {
+        let controllers = [test_controller_node(2), test_controller_node(1)];
+        let clips = [test_clip_node(2), test_clip_node(1)];
+        let exact = lookup_index_bytes(controllers.len(), clips.len());
+
+        build_graph_lookup_indexes(&controllers, &clips, exact).unwrap();
+        let error = build_graph_lookup_indexes(&controllers, &clips, exact - 1).unwrap_err();
+        assert!(error.to_string().contains("lookup indexes require"));
+
+        let duplicate_controllers = [test_controller_node(1), test_controller_node(1)];
+        let error = build_graph_lookup_indexes(&duplicate_controllers, &[], exact).unwrap_err();
+        assert!(error.to_string().contains("repeat object key"));
+
+        let duplicate_clips = [test_clip_node(1), test_clip_node(1)];
+        let error = build_graph_lookup_indexes(&[], &duplicate_clips, exact).unwrap_err();
+        assert!(error.to_string().contains("repeat object key"));
+    }
+
+    fn reverse_path_id(source_index: usize, length: usize) -> i64 {
+        i64::try_from(length - source_index).unwrap()
+    }
+
+    fn graph_key(file_index: usize, path_id: i64) -> SceneObjectKey {
+        SceneObjectKey {
+            file_index,
+            path_id,
+        }
+    }
+
+    fn test_controller_node(path_id: i64) -> AnimationControllerNode {
+        AnimationControllerNode {
+            object: graph_key(0, path_id),
+            name: String::new(),
+            kind: AnimationControllerKind::AnimatorController { clips: Vec::new() },
+        }
+    }
+
+    fn test_clip_node(path_id: i64) -> AnimationClipNode {
+        AnimationClipNode {
+            object: graph_key(1, path_id),
+            name: String::new(),
+        }
+    }
+
+    fn lookup_index_bytes(controller_count: usize, clip_count: usize) -> usize {
+        controller_count
+            .checked_add(clip_count)
+            .unwrap()
+            .checked_mul(std::mem::size_of::<(SceneObjectKey, usize)>())
+            .unwrap()
+    }
+
     fn test_animator_binding(path_id: i64) -> AnimatorAnimationBinding {
         let game_object = SceneObjectKey {
             file_index: 0,
@@ -810,6 +1038,10 @@ mod tests {
         for limits in [
             AnimationGraphLimits {
                 maximum_animator_index_bytes: 0,
+                ..AnimationGraphLimits::default()
+            },
+            AnimationGraphLimits {
+                maximum_lookup_index_bytes: 0,
                 ..AnimationGraphLimits::default()
             },
             AnimationGraphLimits {
