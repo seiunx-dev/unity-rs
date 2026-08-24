@@ -178,6 +178,57 @@ impl SerializedFile {
             &self.reference_types,
         )
     }
+
+    /// Reads one immediate field from an object's root record while still
+    /// walking and validating the complete `TypeTree` payload.
+    ///
+    /// This is intentionally crate-private: it is a bounded projection used by
+    /// readers that need one stable field, not a second public dynamic-object
+    /// API. Fields that are not selected are consumed without retaining their
+    /// value tree, so a small pointer field does not require materializing an
+    /// unrelated multi-million-element array.
+    pub(crate) fn read_type_tree_root_field_with_limits(
+        &self,
+        object_index: usize,
+        field_name: &str,
+        limits: TypeTreeReadLimits,
+    ) -> Result<Option<TypeValue>> {
+        let object = self.objects.get(object_index).ok_or_else(|| {
+            Error::invalid_data(format!(
+                "serialized object index {object_index} is out of range"
+            ))
+        })?;
+        let type_index = object.serialized_type_index.ok_or_else(|| {
+            Error::unsupported(format!(
+                "serialized object {} has no matching type metadata",
+                object.path_id
+            ))
+        })?;
+        let tree = self
+            .types
+            .get(type_index)
+            .and_then(|kind| kind.type_tree.as_ref())
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "serialized object {} has no type tree",
+                    object.path_id
+                ))
+            })?;
+        let payload = self.object_region(object_index)?;
+        let endian = if self.header.endianness == 0 {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+        read_type_tree_root_field_from_reader_with_reference_types(
+            tree,
+            EndianReader::new(payload.cursor(), endian),
+            object.byte_start,
+            limits,
+            &self.reference_types,
+            field_name,
+        )
+    }
 }
 
 pub fn read_type_tree_from_reader<R: Read + Seek>(
@@ -244,6 +295,44 @@ pub fn read_type_tree_from_reader_with_reference_types<R: Read + Seek>(
     Ok(value)
 }
 
+fn read_type_tree_root_field_from_reader_with_reference_types<R: Read + Seek>(
+    tree: &TypeTree,
+    reader: EndianReader<R>,
+    absolute_start: u64,
+    limits: TypeTreeReadLimits,
+    reference_types: &[SerializedType],
+    field_name: &str,
+) -> Result<Option<TypeValue>> {
+    validate_tree_shape(&tree.nodes)?;
+    let mut parser = TypeTreeValueReader {
+        nodes: &tree.nodes,
+        reader,
+        absolute_start,
+        limits,
+        values_read: 0,
+        materialized_bytes: 0,
+        reference_types,
+        validated_reference_types: Vec::new(),
+        has_registry: false,
+    };
+    let (value, next) = parser.read_root_field(0, field_name)?;
+    if next != tree.nodes.len() {
+        return Err(Error::invalid_data(format!(
+            "type tree root covers {next} of {} nodes",
+            tree.nodes.len()
+        )));
+    }
+    let consumed = parser.reader.position()?;
+    let length = parser.reader.len()?;
+    if consumed != length {
+        return Err(Error::unsupported(format!(
+            "type tree describes {consumed} of {length} object bytes; the tree does \
+             not match this object"
+        )));
+    }
+    Ok(value)
+}
+
 struct TypeTreeValueReader<'a, R> {
     nodes: &'a [TypeTreeNode],
     reader: EndianReader<R>,
@@ -266,23 +355,7 @@ struct TypeTreeValueReader<'a, R> {
 
 impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
     fn read_node(&mut self, index: usize, depth: usize) -> Result<(TypeValue, usize)> {
-        if depth > self.limits.maximum_depth {
-            return Err(Error::invalid_data(format!(
-                "object type tree exceeds depth limit {}",
-                self.limits.maximum_depth
-            )));
-        }
-        self.values_read = self
-            .values_read
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_data("type tree value count overflowed"))?;
-        if self.values_read > self.limits.maximum_values {
-            return Err(Error::invalid_data(format!(
-                "object type tree exceeds value limit {}",
-                self.limits.maximum_values
-            )));
-        }
-        self.charge_materialized(std::mem::size_of::<TypeValue>(), "type tree value storage")?;
+        self.visit_node(depth, true)?;
 
         let node = self.nodes.get(index).ok_or_else(|| {
             Error::invalid_data(format!("type tree node index {index} is out of range"))
@@ -348,16 +421,8 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
                 let length =
                     self.read_length(self.limits.maximum_typeless_bytes, "TypelessData byte")?;
                 let offset = self.reader.position()?;
+                self.skip_bytes(length, "TypelessData")?;
                 let size = u64::try_from(length).expect("TypelessData length fits in u64");
-                let end = offset
-                    .checked_add(size)
-                    .ok_or_else(|| Error::invalid_data("TypelessData range overflowed"))?;
-                if end > self.reader.len()? {
-                    return Err(Error::invalid_data(
-                        "TypelessData extends past the object payload",
-                    ));
-                }
-                self.reader.set_position(end)?;
                 (TypeValue::TypelessData { offset, size }, subtree_end)
             }
             ValueKind::ReferencedObject => {
@@ -375,6 +440,301 @@ impl<R: Read + Seek> TypeTreeValueReader<'_, R> {
             self.align(4)?;
         }
         Ok((value, next))
+    }
+
+    fn visit_node(&mut self, depth: usize, materialize: bool) -> Result<()> {
+        if depth > self.limits.maximum_depth {
+            return Err(Error::invalid_data(format!(
+                "object type tree exceeds depth limit {}",
+                self.limits.maximum_depth
+            )));
+        }
+        self.values_read = self
+            .values_read
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("type tree value count overflowed"))?;
+        if self.values_read > self.limits.maximum_values {
+            return Err(Error::invalid_data(format!(
+                "object type tree exceeds value limit {}",
+                self.limits.maximum_values
+            )));
+        }
+        if materialize {
+            self.charge_materialized(std::mem::size_of::<TypeValue>(), "type tree value storage")?;
+        }
+        Ok(())
+    }
+
+    fn read_root_field(
+        &mut self,
+        index: usize,
+        field_name: &str,
+    ) -> Result<(Option<TypeValue>, usize)> {
+        self.visit_node(0, false)?;
+        let root = self.nodes.get(index).ok_or_else(|| {
+            Error::invalid_data(format!("type tree node index {index} is out of range"))
+        })?;
+        let is_class = matches!(ValueKind::from_type_name(&root.type_name), ValueKind::Other)
+            || matches!(
+                ValueKind::from_type_name(&root.type_name),
+                ValueKind::String
+            ) && !is_array_parent(self.nodes, index);
+        if !is_class {
+            return Err(Error::invalid_data(
+                "type tree root-field projection requires a record root",
+            ));
+        }
+
+        let root_level = root.level;
+        let align = root.meta_flags & ALIGN_BYTES_FLAG != 0;
+        let end = subtree_end(self.nodes, index);
+        let mut selected = None;
+        let mut child = index + 1;
+        while child < end {
+            let node = &self.nodes[child];
+            if node.level != root_level + 1 {
+                return Err(Error::invalid_data(format!(
+                    "type tree class child at index {child} has level {}, expected {}",
+                    node.level,
+                    root_level + 1
+                )));
+            }
+            if node.type_name == MANAGED_REFERENCES_REGISTRY {
+                if self.has_registry {
+                    child = subtree_end(self.nodes, child);
+                    continue;
+                }
+                self.has_registry = true;
+            }
+            if selected.is_none() && node.field_name == field_name {
+                let (value, next) = self.read_node(child, 1)?;
+                selected = Some(value);
+                child = next;
+            } else {
+                child = self.skip_node(child, 1)?;
+            }
+        }
+        if align {
+            self.align(4)?;
+        }
+        Ok((selected, end))
+    }
+
+    fn skip_node(&mut self, index: usize, depth: usize) -> Result<usize> {
+        self.visit_node(depth, false)?;
+        let node = self.nodes.get(index).ok_or_else(|| {
+            Error::invalid_data(format!("type tree node index {index} is out of range"))
+        })?;
+        let kind = ValueKind::from_type_name(&node.type_name);
+        let mut align = node.meta_flags & ALIGN_BYTES_FLAG != 0;
+        let end = subtree_end(self.nodes, index);
+        let next = match kind {
+            ValueKind::Signed8 => {
+                self.reader.read_i8()?;
+                index + 1
+            }
+            ValueKind::Unsigned8 | ValueKind::Boolean => {
+                self.reader.read_u8()?;
+                index + 1
+            }
+            ValueKind::Character | ValueKind::Unsigned16 => {
+                self.reader.read_u16()?;
+                index + 1
+            }
+            ValueKind::Signed16 => {
+                self.reader.read_i16()?;
+                index + 1
+            }
+            ValueKind::Signed32 => {
+                self.reader.read_i32()?;
+                index + 1
+            }
+            ValueKind::Unsigned32 | ValueKind::Float32 => {
+                self.reader.read_u32()?;
+                index + 1
+            }
+            ValueKind::Signed64 => {
+                self.reader.read_i64()?;
+                index + 1
+            }
+            ValueKind::Unsigned64 | ValueKind::Float64 => {
+                self.reader.read_u64()?;
+                index + 1
+            }
+            ValueKind::String if is_array_parent(self.nodes, index) => {
+                validate_array_shape(self.nodes, index)?;
+                self.skip_aligned_string()?;
+                end
+            }
+            ValueKind::String => {
+                self.skip_class(index, depth)?;
+                end
+            }
+            ValueKind::Map => {
+                align |= self.skip_map(index, depth)?;
+                end
+            }
+            ValueKind::TypelessData => {
+                validate_typeless_shape(self.nodes, index)?;
+                let length =
+                    self.read_length(self.limits.maximum_typeless_bytes, "TypelessData byte")?;
+                self.skip_bytes(length, "TypelessData")?;
+                end
+            }
+            ValueKind::ReferencedObject => {
+                self.skip_referenced_object(index, depth)?;
+                end
+            }
+            ValueKind::Other if is_array_parent(self.nodes, index) => {
+                align |= self.skip_array(index, depth)?;
+                end
+            }
+            ValueKind::Other => {
+                self.skip_class(index, depth)?;
+                end
+            }
+        };
+        if align {
+            self.align(4)?;
+        }
+        Ok(next)
+    }
+
+    fn skip_class(&mut self, index: usize, depth: usize) -> Result<()> {
+        let parent_level = self.nodes[index].level;
+        let end = subtree_end(self.nodes, index);
+        let mut child = index + 1;
+        while child < end {
+            let node = &self.nodes[child];
+            if node.level != parent_level + 1 {
+                return Err(Error::invalid_data(format!(
+                    "type tree class child at index {child} has level {}, expected {}",
+                    node.level,
+                    parent_level + 1
+                )));
+            }
+            if node.type_name == MANAGED_REFERENCES_REGISTRY {
+                if self.has_registry {
+                    child = subtree_end(self.nodes, child);
+                    continue;
+                }
+                self.has_registry = true;
+            }
+            child = self.skip_node(child, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn skip_referenced_object(&mut self, index: usize, depth: usize) -> Result<()> {
+        let parent_level = self.nodes[index].level;
+        let end = subtree_end(self.nodes, index);
+        let mut reference_type_index = None;
+        let mut child = index + 1;
+        while child < end {
+            let node = &self.nodes[child];
+            if node.level != parent_level + 1 {
+                return Err(Error::invalid_data(format!(
+                    "managed reference child at index {child} has level {}, expected {}",
+                    node.level,
+                    parent_level + 1
+                )));
+            }
+            if node.type_name == REFERENCED_OBJECT_DATA {
+                let reference_type_index = reference_type_index.ok_or_else(|| {
+                    Error::invalid_data("managed reference stores its data before naming its type")
+                })?;
+                if let Some(tree_index) = reference_type_index {
+                    self.skip_reference_type(tree_index, depth + 1)?;
+                }
+                child = subtree_end(self.nodes, child);
+                continue;
+            }
+            if node.type_name == REFERENCED_MANAGED_TYPE {
+                let (value, next) = self.read_node(child, depth + 1)?;
+                reference_type_index =
+                    Some(self.reference_type_index(managed_type_identity(&value)?)?);
+                child = next;
+            } else {
+                child = self.skip_node(child, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_reference_type(&mut self, tree_index: usize, depth: usize) -> Result<()> {
+        let tree = self.reference_types[tree_index]
+            .type_tree
+            .as_ref()
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "reference type {tree_index} carries no type tree, so its stored \
+                     value has no stated layout"
+                ))
+            })?;
+        if !self.validated_reference_types.contains(&tree_index) {
+            validate_tree_shape(&tree.nodes)?;
+            self.validated_reference_types
+                .try_reserve(1)
+                .map_err(|error| {
+                    Error::invalid_data(format!("cannot record a checked reference type: {error}"))
+                })?;
+            self.validated_reference_types.push(tree_index);
+        }
+        let outer = self.nodes;
+        self.nodes = &tree.nodes;
+        let result = self.skip_node(0, depth);
+        self.nodes = outer;
+        let next = result?;
+        if next != tree.nodes.len() {
+            return Err(Error::invalid_data(format!(
+                "reference type root covers {next} of {} nodes",
+                tree.nodes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn skip_array(&mut self, index: usize, depth: usize) -> Result<bool> {
+        let shape = validate_array_shape(self.nodes, index)?;
+        let count = self.read_length(self.limits.maximum_array_elements, "array element")?;
+        for _ in 0..count {
+            self.skip_node(shape.data_index, depth + 1)?;
+        }
+        Ok(shape.align)
+    }
+
+    fn skip_map(&mut self, index: usize, depth: usize) -> Result<bool> {
+        let shape = validate_map_shape(self.nodes, index)?;
+        let count = self.read_length(self.limits.maximum_array_elements, "map entry")?;
+        for _ in 0..count {
+            self.skip_node(shape.first_index, depth + 1)?;
+            self.skip_node(shape.second_index, depth + 1)?;
+        }
+        Ok(shape.align)
+    }
+
+    fn skip_aligned_string(&mut self) -> Result<()> {
+        let length = self.read_length(self.limits.maximum_string_bytes, "type tree string byte")?;
+        self.skip_bytes(length, "type tree string")?;
+        if length != 0 {
+            self.align(4)?;
+        }
+        Ok(())
+    }
+
+    fn skip_bytes(&mut self, length: usize, field: &str) -> Result<()> {
+        let start = self.reader.position()?;
+        let length = u64::try_from(length)
+            .map_err(|_| Error::invalid_data(format!("{field} length does not fit in u64")))?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| Error::invalid_data(format!("{field} range overflowed")))?;
+        if end > self.reader.len()? {
+            return Err(Error::invalid_data(format!(
+                "{field} extends past the object payload"
+            )));
+        }
+        self.reader.set_position(end)
     }
 
     fn read_class(&mut self, index: usize, depth: usize) -> Result<TypeValue> {
@@ -888,6 +1248,7 @@ mod tests {
     use super::{
         TypeField, TypeTreeReadLimits, TypeValue, read_type_tree_from_reader,
         read_type_tree_from_reader_with_reference_types,
+        read_type_tree_root_field_from_reader_with_reference_types,
     };
 
     #[test]
@@ -1161,6 +1522,88 @@ mod tests {
         assert!(error.to_string().contains("materialized type tree bytes"));
     }
 
+    #[test]
+    fn projects_one_root_field_without_materializing_unrelated_values() {
+        let long_field_name = "unrelated_".repeat(512);
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0, false),
+                node("vector", "m_Unrelated", 1, false),
+                node("Array", "Array", 2, false),
+                node("int", "size", 3, false),
+                node("Item", "data", 3, false),
+                node("int", &long_field_name, 4, false),
+                node("PPtr<MonoBehaviour>", "_moc", 1, false),
+                node("int", "m_FileID", 2, false),
+                node("SInt64", "m_PathID", 2, false),
+                node("int", "m_Trailing", 1, false),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&128_i32.to_le_bytes());
+        for value in 0_i32..128 {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload.extend_from_slice(&2_i32.to_le_bytes());
+        payload.extend_from_slice(&77_i64.to_le_bytes());
+        payload.extend_from_slice(&9_i32.to_le_bytes());
+        let limits = TypeTreeReadLimits {
+            maximum_materialized_bytes: 1_024,
+            ..TypeTreeReadLimits::default()
+        };
+
+        let full_error = read_type_tree_from_reader(
+            &tree,
+            EndianReader::new(Cursor::new(payload.clone()), Endian::Little),
+            0,
+            limits,
+        )
+        .unwrap_err();
+        assert!(
+            full_error
+                .to_string()
+                .contains("materialized type tree bytes")
+        );
+
+        let projected = read_type_tree_root_field_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(payload.clone()), Endian::Little),
+            0,
+            limits,
+            &[],
+            "_moc",
+        )
+        .unwrap();
+        assert_eq!(
+            projected,
+            Some(TypeValue::Object(vec![
+                TypeField {
+                    name: "m_FileID".to_owned(),
+                    value: TypeValue::Signed(2),
+                },
+                TypeField {
+                    name: "m_PathID".to_owned(),
+                    value: TypeValue::Signed(77),
+                },
+            ]))
+        );
+
+        payload.truncate(payload.len() - std::mem::size_of::<i32>());
+        assert!(
+            read_type_tree_root_field_from_reader_with_reference_types(
+                &tree,
+                EndianReader::new(Cursor::new(payload), Endian::Little),
+                0,
+                limits,
+                &[],
+                "_moc",
+            )
+            .is_err(),
+            "projection must validate the skipped tail after the selected field"
+        );
+    }
+
     /// The registry Unity writes after an object body for a
     /// `SerializeReference` field, spelled exactly as a shipping Unity 6000.3
     /// bundle spells it.
@@ -1292,7 +1735,7 @@ mod tests {
 
         let value = read_type_tree_from_reader_with_reference_types(
             &tree,
-            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            EndianReader::new(Cursor::new(bytes.clone()), Endian::Little),
             0,
             TypeTreeReadLimits::default(),
             &references,
@@ -1324,6 +1767,17 @@ mod tests {
                 value: TypeValue::Signed(0x0102_0304),
             }])
         );
+
+        let projected = read_type_tree_root_field_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            &references,
+            "m_Value",
+        )
+        .unwrap();
+        assert_eq!(projected, Some(TypeValue::Signed(7)));
     }
 
     #[test]
