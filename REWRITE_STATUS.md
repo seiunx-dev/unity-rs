@@ -70,6 +70,10 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `CubismModel._moc` 已切到这条路径，不再为了一个 PPtr 物化模型中与它无关的百万级数组。
   合成回归在 1 KiB 物化预算下证明完整动态树会稳定拒绝、`_moc` 投影仍能解析，并锁定
   目标字段之后的截断尾部与 reference-type 数据仍必须失败或完整消费，不能用提前返回绕过校验；
+- `SerializeReference` registry 的类型身份解析会为每个对象惰性建立借用字符串的排序索引，
+  随后的 registry entry 通过二分查找；reference-type 树形校验结果使用按类型编号的布尔缓存。
+  两个辅助表都在分配前纳入 `maximum_materialized_bytes`，重复声明仍保持源文件首项优先，
+  不再让大量 entry × 大量近似 reference type 或大量不同 type 形成二次方 CPU 放大；
 - MonoScript、内嵌 TypeTree MonoBehaviour，以及可信外部完整 schema；
 - GameObject/Transform/Renderer/Animator 场景层级、跨文件引用和稳定对象元数据；
 - AnimationClip、AnimatorController、Avatar、动画绑定图；
@@ -405,6 +409,17 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `tools/local_ci.py --fail-on-skip outputs quality rust python node typing security cross`，
   Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型、RustSec、许可证、
   无头交付范围、六类输出格式以及 Linux/Windows 交叉编译全部通过，零组跳过；
+- **`SerializeReference` reference-type 查找与校验已于 2026-08-24 去除二次方放大**：
+  旧 reader 对每个 registry entry 都线扫最多 1,000,000 个 reference type，之后又用
+  `Vec::contains` 判断该 type tree 是否已经校验；大量近似身份会形成 `entry × type`，
+  大量不同类型则形成累计 `O(type²)`。现每次对象读取只惰性建立一次借用
+  class/namespace/assembly 的排序索引，键相同时再按原始序号排序，二分命中因此仍返回首个声明；
+  树形校验缓存改为按 reference-type index 的布尔表，首次校验后为 O(1) 查询。两个表均在
+  `try_reserve_exact` 前按精确容量计入 `maximum_materialized_bytes`，低预算失败不会留下半个缓存。
+  16,384 个近似类型、16,384 次重复命中、16,384 个不同 type tree 的规模回归锁定索引只建一次、
+  首声明语义和全部校验位；另有低一字节的 lookup/cache 预算测试证明分配前稳定拒绝。
+  完整工作树执行 `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`，
+  Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过；
 - **整场景 OBJ/MTL 临时分组已于 2026-08-22 去除输入规模复制**：OBJ writer 原先为每个
   renderable Renderer 创建 `ObjGroup` 时完整 `clone` 其材质槽 `Vec`，随后 MTL writer
   又为每个 submesh 用 `MaterialName::to_string()` 物化名称，并把所有已写名称保存在第二个
@@ -995,9 +1010,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
-整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `45e1194`。收口改动及公开 runner 修复已进入
+整理出的主体提交已经推送；2026-08-24 最近一次绿色矩阵验证代码 head 为 `3f24ff0`。收口改动及公开 runner 修复已进入
 [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32690903900](https://github.com/Team-Haruki/unity-rs/actions/runs/32690903900) 16/16 全绿，
+[32692750163](https://github.com/Team-Haruki/unity-rs/actions/runs/32692750163) 16/16 全绿，
 包含六平台 CLI/Node 制品的手工发布矩阵
 [32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
@@ -1007,7 +1022,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | **已完成（2026-08-24）**：PR run 32659993206 的 16 个主 job 全绿；workflow_dispatch run 32660298990 为 28/28，全量包含六个 CLI artifact、六个 Node artifact 和六个 Python wheel。CLI staged 产物运行 `--help`，wheel 安装后通过公开 API/mypy，Node tarball 从临时消费者安装并核对 JS/TypeScript 运行时表面；法律文件随所有产物校验 |
 | 2 | **扩充代表性真实 corpus**：在现有 Unity 2022.3 与 6000.3 之外，优先加入 Tuanjie 2022.3.x、Nintendo Switch、旧 Unity 4/5/2017 和带完整托管快照的样本 | 私有 manifest 在 release 模式稳定通过；每类至少有对象顺序、PathID/class、名称/container、原始载荷 hash、主要解码结果或明确错误族的版本化快照；专有样本不提交到仓库 |
 | 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
-| 3A | **继续不依赖外部样本的 hostile-input 资源审计**：优先检查“只需一个字段却物化整棵对象”、跨对象重复遍历、累计输出/临时分配和目录工作量放大；本轮已完成 `CubismModel._moc` 的完整校验式根字段投影 | 每个确认问题必须有能在旧实现触发预算失败或超线性工作的合成回归；修复后仍完整消费/校验输入，并通过零跳过的 Rust/Python/Node/oracle 本地门禁和公开常规矩阵。`45e1194` 的低物化预算、截断尾部及 `SerializeReference` 三类回归是第一项完成证据 |
+| 3A | **继续不依赖外部样本的 hostile-input 资源审计**：优先检查“只需一个字段却物化整棵对象”、跨对象重复遍历、累计输出/临时分配和目录工作量放大；本轮已完成 `CubismModel._moc` 的完整校验式根字段投影，以及 `SerializeReference` registry 的类型查找/校验二次方放大治理 | 每个确认问题必须有能在旧实现触发预算失败或超线性工作的合成回归；修复后仍完整消费/校验输入，并通过零跳过的 Rust/Python/Node/oracle 本地门禁和公开常规矩阵。`45e1194` 的低物化预算、截断尾部及 registry/reference-type 投影回归是第一项完成证据；`3f24ff0` 的 16,384 类型规模、重复首声明和两类预分配预算回归是第二项完成证据 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22）**：106 个高层 Core 方法均被机器检查为 102 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；65 个公开 Python 方法和 3 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
 | 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | 默认构建、测试、安装和用户工作流均不需要 .NET；没有 GUI 或旧 C ABI 发布物；七项完成条件均有当前证据，未满足项不得被标成完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
