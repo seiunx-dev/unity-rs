@@ -77,6 +77,12 @@ and their automated audits are recorded in
 | Remaining asset formats | Planned from sample-backed corpus hits |
 | WinForms GUI | Intentionally out of scope |
 
+`ModelTextureLimits` independently bounds non-null material texture references,
+unique decoded textures, cumulative encoded bytes, and each texture's
+payload/output/decoder workspace. The reference limit also charges repeated
+references to one texture and references that become skipped diagnostics, so
+neither path can bypass the unique-texture limit in Rust, Python, or Node.
+
 ## Build and test
 
 Everything the CI workflow runs is also runnable here, on any platform:
