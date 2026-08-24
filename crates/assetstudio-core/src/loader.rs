@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,6 +51,11 @@ pub struct AssetLoadLimits {
     pub maximum_container_assignments: usize,
     pub maximum_object_name_assignments: usize,
     pub maximum_total_object_name_bytes: usize,
+    /// Maximum unique objects retaining a name or container assignment.
+    pub maximum_object_metadata_entries: usize,
+    /// Maximum logical bytes simultaneously retained by object-metadata
+    /// values and their temporary build indexes.
+    pub maximum_object_metadata_index_bytes: usize,
     /// Maximum combined serialized-file and object entries in the collection-wide `PPtr`
     /// lookup index.
     pub maximum_reference_index_entries: usize,
@@ -75,6 +81,8 @@ impl Default for AssetLoadLimits {
             maximum_container_assignments: 10_000_000,
             maximum_object_name_assignments: 1_000_000,
             maximum_total_object_name_bytes: 256 * 1024 * 1024,
+            maximum_object_metadata_entries: 10_000_000,
+            maximum_object_metadata_index_bytes: 1024 * 1024 * 1024,
             maximum_reference_index_entries: 10_000_000,
             maximum_resource_index_entries: 2_000_000,
             container_metadata: ContainerMetadataReadLimits::default(),
@@ -196,7 +204,7 @@ pub struct AssetCollection {
     /// Inputs skipped under [`LoadFailurePolicy::SkipInput`], in discovery
     /// order. Always empty under [`LoadFailurePolicy::Abort`].
     pub diagnostics: Vec<LoadDiagnostic>,
-    pub(crate) object_metadata: BTreeMap<(usize, i64), LoadedObjectMetadata>,
+    pub(crate) object_metadata: Vec<ObjectMetadataEntry>,
     reference_index: Option<AssetReferenceIndex>,
     resource_index: Option<AssetResourceIndex>,
 }
@@ -275,7 +283,7 @@ impl AssetCollection {
             serialized_files,
             resources,
             diagnostics,
-            object_metadata: BTreeMap::new(),
+            object_metadata: Vec::new(),
             reference_index: None,
             resource_index: None,
         }
@@ -662,7 +670,9 @@ impl AssetCollection {
         file_index: usize,
         path_id: i64,
     ) -> Option<&LoadedObjectMetadata> {
-        self.object_metadata.get(&(file_index, path_id))
+        object_metadata_position(&self.object_metadata, (file_index, path_id))
+            .and_then(|index| self.object_metadata.get(index))
+            .map(|entry| &entry.1)
     }
 
     /// Resolves container/name metadata after constructing a collection from pre-parsed parts.
@@ -759,10 +769,11 @@ impl AssetCollection {
     fn rebuild_object_metadata(&mut self, limits: &AssetLoadLimits) -> Result<()> {
         self.rebuild_reference_index(*limits)?;
         self.rebuild_resource_index(*limits)?;
-        let mut metadata = BTreeMap::new();
+        let mut metadata = ObjectMetadataBuilder::default();
         let mut pending_names = PendingObjectNames::default();
         let mut assignment_count = 0_usize;
         let mut name_budget = ObjectNameBudget::default();
+        let mut index_budget = ObjectMetadataIndexBudget::default();
         for file_index in 0..self.serialized_files.len() {
             let loaded = &self.serialized_files[file_index];
             let mut preload_table = Vec::new();
@@ -775,21 +786,32 @@ impl AssetCollection {
                     object.path_id,
                     object.class_id,
                     &mut name_budget,
+                    &mut index_budget,
                     limits,
                 )?;
+                let mut container_state = ContainerObjectMetadataBuildState {
+                    metadata: &mut metadata,
+                    assignment_count: &mut assignment_count,
+                    index_budget: &mut index_budget,
+                };
                 self.collect_container_object_metadata(
                     file_index,
                     object_index,
                     &mut preload_table,
-                    &mut metadata,
-                    &mut assignment_count,
+                    &mut container_state,
                     limits,
                 )?;
             }
         }
 
-        pending_names.resolve(self, &mut metadata, &mut name_budget, limits)?;
-        self.object_metadata = metadata;
+        pending_names.resolve(
+            self,
+            &mut metadata,
+            &mut name_budget,
+            &mut index_budget,
+            limits,
+        )?;
+        self.object_metadata = metadata.finish();
         Ok(())
     }
 
@@ -798,8 +820,7 @@ impl AssetCollection {
         file_index: usize,
         object_index: usize,
         preload_table: &mut Vec<ObjectReference>,
-        metadata: &mut BTreeMap<ObjectMetadataKey, LoadedObjectMetadata>,
-        assignment_count: &mut usize,
+        state: &mut ContainerObjectMetadataBuildState<'_>,
         limits: &AssetLoadLimits,
     ) -> Result<()> {
         let loaded = &self.serialized_files[file_index];
@@ -816,9 +837,9 @@ impl AssetCollection {
                     .file
                     .read_asset_bundle_metadata(object_index, limits.container_metadata)?;
                 if !bundle.name.is_empty() {
-                    metadata
-                        .entry((file_index, object.path_id))
-                        .or_default()
+                    state
+                        .metadata
+                        .entry_mut((file_index, object.path_id), state.index_budget, limits)?
                         .name = Some(bundle.name);
                 }
                 if !bundle.is_streamed_scene_asset_bundle {
@@ -852,10 +873,13 @@ impl AssetCollection {
                         })?;
                     let key: Arc<str> = Arc::from(entry.key);
                     for reference in references {
-                        charge_container_assignment(assignment_count, limits)?;
+                        charge_container_assignment(state.assignment_count, limits)?;
                         if let Some(target) = self.resolve_object_reference(file_index, *reference)
                         {
-                            metadata.entry(target).or_default().container = Some(Arc::clone(&key));
+                            state
+                                .metadata
+                                .entry_mut(target, state.index_budget, limits)?
+                                .container = Some(Arc::clone(&key));
                         }
                     }
                 }
@@ -865,9 +889,12 @@ impl AssetCollection {
                     .file
                     .read_resource_manager_metadata(object_index, limits.container_metadata)?;
                 for entry in manager.container {
-                    charge_container_assignment(assignment_count, limits)?;
+                    charge_container_assignment(state.assignment_count, limits)?;
                     if let Some(target) = self.resolve_object_reference(file_index, entry.asset) {
-                        metadata.entry(target).or_default().container = Some(Arc::from(entry.key));
+                        state
+                            .metadata
+                            .entry_mut(target, state.index_budget, limits)?
+                            .container = Some(Arc::from(entry.key));
                     }
                 }
             }
@@ -1130,12 +1157,124 @@ fn first_resource_index(
 }
 
 type ObjectMetadataKey = (usize, i64);
+type ObjectMetadataEntry = (ObjectMetadataKey, LoadedObjectMetadata);
+
+#[derive(Default)]
+struct ObjectMetadataBuilder {
+    entries: Vec<ObjectMetadataEntry>,
+    index: HashMap<ObjectMetadataKey, usize>,
+}
+
+#[derive(Default)]
+struct ObjectMetadataIndexBudget {
+    logical_bytes: usize,
+}
+
+struct ContainerObjectMetadataBuildState<'a> {
+    metadata: &'a mut ObjectMetadataBuilder,
+    assignment_count: &'a mut usize,
+    index_budget: &'a mut ObjectMetadataIndexBudget,
+}
+
+impl ObjectMetadataBuilder {
+    fn get(&self, key: &ObjectMetadataKey) -> Option<&LoadedObjectMetadata> {
+        self.index
+            .get(key)
+            .and_then(|index| self.entries.get(*index))
+            .map(|entry| &entry.1)
+    }
+
+    fn entry_mut(
+        &mut self,
+        key: ObjectMetadataKey,
+        budget: &mut ObjectMetadataIndexBudget,
+        limits: &AssetLoadLimits,
+    ) -> Result<&mut LoadedObjectMetadata> {
+        if let Some(index) = self.index.get(&key).copied() {
+            return self
+                .entries
+                .get_mut(index)
+                .map(|entry| &mut entry.1)
+                .ok_or_else(|| Error::invalid_data("object metadata build index is inconsistent"));
+        }
+        if self.entries.len() >= limits.maximum_object_metadata_entries {
+            return Err(Error::invalid_data(format!(
+                "object metadata exceeds {} unique entries",
+                limits.maximum_object_metadata_entries
+            )));
+        }
+        let additional = size_of::<ObjectMetadataEntry>()
+            .checked_add(size_of::<(ObjectMetadataKey, usize)>())
+            .ok_or_else(|| Error::invalid_data("object metadata entry size overflowed"))?;
+        let next = checked_object_metadata_index_bytes(
+            budget.logical_bytes,
+            additional,
+            limits.maximum_object_metadata_index_bytes,
+            "object metadata build entry",
+        )?;
+        self.entries.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow object metadata entries: {error}"))
+        })?;
+        self.index.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow object metadata build index: {error}"))
+        })?;
+        let index = self.entries.len();
+        self.entries.push((key, LoadedObjectMetadata::default()));
+        self.index.insert(key, index);
+        budget.logical_bytes = next;
+        Ok(&mut self.entries[index].1)
+    }
+
+    fn finish(self) -> Vec<ObjectMetadataEntry> {
+        let Self { mut entries, index } = self;
+        drop(index);
+        entries.sort_unstable_by_key(|entry| entry.0);
+        entries
+    }
+}
+
+fn object_metadata_position(
+    entries: &[ObjectMetadataEntry],
+    key: ObjectMetadataKey,
+) -> Option<usize> {
+    object_metadata_position_with_probe(entries, key, || {})
+}
+
+fn object_metadata_position_with_probe(
+    entries: &[ObjectMetadataEntry],
+    key: ObjectMetadataKey,
+    mut probe: impl FnMut(),
+) -> Option<usize> {
+    let position = entries.partition_point(|entry| {
+        probe();
+        entry.0 < key
+    });
+    entries.get(position).filter(|entry| entry.0 == key)?;
+    Some(position)
+}
+
+fn checked_object_metadata_index_bytes(
+    current: usize,
+    additional: usize,
+    maximum: usize,
+    field: &str,
+) -> Result<usize> {
+    let next = current
+        .checked_add(additional)
+        .ok_or_else(|| Error::invalid_data("object metadata index bytes overflowed"))?;
+    if next > maximum {
+        return Err(Error::invalid_data(format!(
+            "{field} raises metadata indexes to {next} bytes, exceeding limit {maximum}"
+        )));
+    }
+    Ok(next)
+}
 
 #[derive(Default)]
 struct PendingObjectNames {
     animator_game_objects: Vec<(ObjectMetadataKey, ObjectReference)>,
     mono_behaviour_scripts: Vec<(ObjectMetadataKey, ObjectReference)>,
-    mono_script_classes: BTreeMap<ObjectMetadataKey, String>,
+    mono_script_classes: HashMap<ObjectMetadataKey, String>,
 }
 
 #[derive(Default)]
@@ -1174,13 +1313,14 @@ impl PendingObjectNames {
     #[allow(clippy::too_many_arguments)]
     fn collect(
         &mut self,
-        metadata: &mut BTreeMap<ObjectMetadataKey, LoadedObjectMetadata>,
+        metadata: &mut ObjectMetadataBuilder,
         file_index: usize,
         file: &SerializedFile,
         object_index: usize,
         path_id: i64,
         class_id: i32,
         budget: &mut ObjectNameBudget,
+        index_budget: &mut ObjectMetadataIndexBudget,
         limits: &AssetLoadLimits,
     ) -> Result<()> {
         if let Some(name_metadata) =
@@ -1188,7 +1328,9 @@ impl PendingObjectNames {
         {
             if let Some(name) = name_metadata.name {
                 budget.charge(name.len(), limits)?;
-                metadata.entry((file_index, path_id)).or_default().name = Some(name);
+                metadata
+                    .entry_mut((file_index, path_id), index_budget, limits)?
+                    .name = Some(name);
             }
             if class_id == ANIMATOR_CLASS_ID {
                 if let Some(game_object) = name_metadata.game_object {
@@ -1224,17 +1366,45 @@ impl PendingObjectNames {
             };
             let script = read_mono_script(file, object_index, mono_limits)?;
             budget.charge(script.class_name.len(), limits)?;
-            self.mono_script_classes
-                .insert((file_index, path_id), script.class_name);
+            self.insert_mono_script_class(
+                (file_index, path_id),
+                script.class_name,
+                index_budget,
+                limits,
+            )?;
         }
+        Ok(())
+    }
+
+    fn insert_mono_script_class(
+        &mut self,
+        key: ObjectMetadataKey,
+        class_name: String,
+        index_budget: &mut ObjectMetadataIndexBudget,
+        limits: &AssetLoadLimits,
+    ) -> Result<()> {
+        if !self.mono_script_classes.contains_key(&key) {
+            let next = checked_object_metadata_index_bytes(
+                index_budget.logical_bytes,
+                size_of::<(ObjectMetadataKey, String)>(),
+                limits.maximum_object_metadata_index_bytes,
+                "MonoScript class build entry",
+            )?;
+            self.mono_script_classes.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!("cannot grow MonoScript class build index: {error}"))
+            })?;
+            index_budget.logical_bytes = next;
+        }
+        self.mono_script_classes.insert(key, class_name);
         Ok(())
     }
 
     fn resolve(
         self,
         collection: &AssetCollection,
-        metadata: &mut BTreeMap<ObjectMetadataKey, LoadedObjectMetadata>,
+        metadata: &mut ObjectMetadataBuilder,
         budget: &mut ObjectNameBudget,
+        index_budget: &mut ObjectMetadataIndexBudget,
         limits: &AssetLoadLimits,
     ) -> Result<()> {
         for (animator, game_object) in self.animator_game_objects {
@@ -1248,7 +1418,7 @@ impl PendingObjectNames {
                 continue;
             };
             budget.charge(name.len(), limits)?;
-            metadata.entry(animator).or_default().name = Some(name);
+            metadata.entry_mut(animator, index_budget, limits)?.name = Some(name);
         }
         for (behaviour, script) in self.mono_behaviour_scripts {
             if metadata
@@ -1265,7 +1435,7 @@ impl PendingObjectNames {
                 continue;
             };
             budget.charge(class_name.len(), limits)?;
-            metadata.entry(behaviour).or_default().name = Some(class_name.clone());
+            metadata.entry_mut(behaviour, index_budget, limits)?.name = Some(class_name.clone());
         }
         Ok(())
     }
@@ -2005,7 +2175,9 @@ mod tests {
 
     use super::{
         AssetCollection, AssetLoadBudget, AssetLoadLimits, AssetLoadOptions, LoadDiagnostic,
-        LoadFailurePolicy, LoadPath, LoadedResource, LoadedSerializedFile,
+        LoadFailurePolicy, LoadPath, LoadedResource, LoadedSerializedFile, ObjectMetadataBuilder,
+        ObjectMetadataEntry, ObjectMetadataIndexBudget, ObjectMetadataKey, PendingObjectNames,
+        object_metadata_position_with_probe,
     };
 
     #[test]
@@ -2408,6 +2580,130 @@ mod tests {
         assert!(collection.reference_index.is_none());
         // A failed explicit rebuild keeps lookups correct through the linear fallback.
         assert_eq!(collection.object_index_by_path_id(0, 9), Some(0));
+    }
+
+    #[test]
+    fn object_metadata_index_scales_and_preserves_last_assignment() {
+        const COUNT: usize = 16_384;
+        let entry_bytes = object_metadata_entry_bytes();
+        let limits = AssetLoadLimits {
+            maximum_object_metadata_entries: COUNT,
+            maximum_object_metadata_index_bytes: COUNT.checked_mul(entry_bytes).unwrap(),
+            ..AssetLoadLimits::default()
+        };
+        let mut metadata = ObjectMetadataBuilder::default();
+        let mut budget = ObjectMetadataIndexBudget::default();
+        for path_id in (0..COUNT).rev() {
+            metadata
+                .entry_mut((0, i64::try_from(path_id).unwrap()), &mut budget, &limits)
+                .unwrap();
+        }
+        let charged = budget.logical_bytes;
+        metadata
+            .entry_mut((0, 7), &mut budget, &limits)
+            .unwrap()
+            .name = Some("last".to_owned());
+        assert_eq!(budget.logical_bytes, charged);
+
+        let entries = metadata.finish();
+        let mut comparisons = 0_usize;
+        for path_id in 0..COUNT {
+            let key = (0, i64::try_from(path_id).unwrap());
+            let position = object_metadata_position_with_probe(&entries, key, || {
+                comparisons += 1;
+            })
+            .unwrap();
+            assert_eq!(entries[position].0, key);
+        }
+        assert!(comparisons < COUNT * 20, "used {comparisons} comparisons");
+        let seventh = object_metadata_position_with_probe(&entries, (0, 7), || {}).unwrap();
+        assert_eq!(entries[seventh].1.name.as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn object_metadata_budget_rejects_before_growth() {
+        let entry_bytes = object_metadata_entry_bytes();
+        let limits = AssetLoadLimits {
+            maximum_object_metadata_entries: 1,
+            maximum_object_metadata_index_bytes: entry_bytes,
+            ..AssetLoadLimits::default()
+        };
+        let mut metadata = ObjectMetadataBuilder::default();
+        let mut budget = ObjectMetadataIndexBudget::default();
+        metadata.entry_mut((0, 1), &mut budget, &limits).unwrap();
+        metadata.entry_mut((0, 1), &mut budget, &limits).unwrap();
+        let error = metadata
+            .entry_mut((0, 2), &mut budget, &limits)
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 1 unique entries"));
+        assert_eq!(metadata.entries.len(), 1);
+        assert_eq!(metadata.index.len(), 1);
+        assert_eq!(budget.logical_bytes, entry_bytes);
+
+        let low_limits = AssetLoadLimits {
+            maximum_object_metadata_index_bytes: entry_bytes - 1,
+            ..AssetLoadLimits::default()
+        };
+        let mut metadata = ObjectMetadataBuilder::default();
+        let mut budget = ObjectMetadataIndexBudget::default();
+        let error = metadata
+            .entry_mut((0, 1), &mut budget, &low_limits)
+            .unwrap_err();
+        assert!(error.to_string().contains("metadata indexes"));
+        assert!(metadata.entries.is_empty() && metadata.index.is_empty());
+        assert_eq!(budget.logical_bytes, 0);
+    }
+
+    #[test]
+    fn mono_script_class_index_shares_budget_and_preserves_last_value() {
+        let entry_bytes = object_metadata_entry_bytes();
+        let script_bytes = std::mem::size_of::<(ObjectMetadataKey, String)>();
+        let limits = AssetLoadLimits {
+            maximum_object_metadata_index_bytes: entry_bytes + script_bytes,
+            ..AssetLoadLimits::default()
+        };
+        let mut metadata = ObjectMetadataBuilder::default();
+        let mut pending = PendingObjectNames::default();
+        let mut budget = ObjectMetadataIndexBudget::default();
+        metadata.entry_mut((0, 1), &mut budget, &limits).unwrap();
+        pending
+            .insert_mono_script_class((0, 2), "First".to_owned(), &mut budget, &limits)
+            .unwrap();
+        let charged = budget.logical_bytes;
+        pending
+            .insert_mono_script_class((0, 2), "Second".to_owned(), &mut budget, &limits)
+            .unwrap();
+        assert_eq!(budget.logical_bytes, charged);
+        assert_eq!(pending.mono_script_classes.get(&(0, 2)).unwrap(), "Second");
+        let error = pending
+            .insert_mono_script_class((0, 3), "Third".to_owned(), &mut budget, &limits)
+            .unwrap_err();
+        assert!(error.to_string().contains("metadata indexes"));
+        assert_eq!(pending.mono_script_classes.len(), 1);
+    }
+
+    #[test]
+    fn public_object_metadata_limits_reject_named_assets() {
+        let entry_bytes = object_metadata_entry_bytes();
+        let limits = [
+            AssetLoadLimits {
+                maximum_object_metadata_entries: 0,
+                ..AssetLoadLimits::default()
+            },
+            AssetLoadLimits {
+                maximum_object_metadata_index_bytes: entry_bytes - 1,
+                ..AssetLoadLimits::default()
+            },
+        ];
+        for limits in limits {
+            let mut collection = named_material_collection();
+            let error = collection.resolve_object_metadata(limits).unwrap_err();
+            assert!(
+                error.to_string().contains("object metadata"),
+                "unexpected error: {error}"
+            );
+            assert!(collection.object_metadata.is_empty());
+        }
     }
 
     #[test]
@@ -3277,6 +3573,30 @@ mod tests {
         while !output.len().is_multiple_of(4) {
             output.push(0);
         }
+    }
+
+    fn object_metadata_entry_bytes() -> usize {
+        std::mem::size_of::<ObjectMetadataEntry>()
+            .checked_add(std::mem::size_of::<(ObjectMetadataKey, usize)>())
+            .unwrap()
+    }
+
+    fn named_material_collection() -> AssetCollection {
+        let mut material = Vec::new();
+        push_aligned_string(&mut material, "named material");
+        let file = SerializedFile::open(Region::from_bytes(synthetic_v22_file(
+            "2022.3.62f1",
+            &[(21, 1, material)],
+            &[],
+        )))
+        .unwrap();
+        AssetCollection::from_loaded_parts(
+            vec![LoadedSerializedFile {
+                path: "named.assets".to_owned(),
+                file,
+            }],
+            Vec::new(),
+        )
     }
 
     fn aligned_string_size(value: &str) -> usize {
