@@ -2198,7 +2198,7 @@ impl AssetStudio {
     ) -> Result<CubismClipMotion> {
         let maximum = byte_limit(maximum_bytes)?;
         let limits = cubism_clip_motion_limits(maximum)?;
-        let target_names = cubism_motion_targets(targets, limits)?;
+        let target_names = cubism_motion_targets(targets, &limits)?;
         let motion = self
             .object(file_index, bigint_i64(path_id, "pathId")?)?
             .read_cubism_clip_motion(&target_names, limits)
@@ -2229,7 +2229,7 @@ impl AssetStudio {
             studio: Arc::clone(&self.studio),
             file_index: usize::try_from(file_index).expect("u32 fits usize"),
             path_id: bigint_i64(path_id, "pathId")?,
-            targets: cubism_motion_targets(targets, limits)?,
+            targets: cubism_motion_targets(targets, &limits)?,
             force_bezier: force_bezier.unwrap_or(false),
             maximum,
             decoder: Arc::new(JsAclDecoder {
@@ -4003,7 +4003,7 @@ fn cubism_auxiliary_limits(maximum: u64) -> Result<CubismAuxiliaryReadLimits> {
 
 fn cubism_motion_targets(
     targets: Option<Object<'_>>,
-    limits: CubismClipMotionReadLimits,
+    limits: &CubismClipMotionReadLimits,
 ) -> Result<CubismMotionTargetNames> {
     let Some(targets) = targets else {
         return Ok(CubismMotionTargetNames::default());
@@ -4046,7 +4046,7 @@ fn copy_js_string_array(
     env: napi::sys::napi_env,
     values: Option<Array<'_>>,
     total_string_bytes: &mut usize,
-    limits: CubismClipMotionReadLimits,
+    limits: &CubismClipMotionReadLimits,
     field: &'static str,
 ) -> Result<Vec<String>> {
     let Some(values) = values else {
