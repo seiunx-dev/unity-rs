@@ -138,7 +138,13 @@ pub fn build_model_animations_with_acl_decoder(
             .ok_or_else(|| Error::invalid_data("animation string byte budget is exhausted"))?,
     )?;
     let selections = select_clips(graph, model, limits.maximum_clips)?;
-    let mut state = AnimationBuildState::new(limits, paths, blend_shapes.total_string_bytes)?;
+    let avatar_path_indexes = AvatarPathIndexes::build(model, &selections, &limits, &paths)?;
+    let mut state = AnimationBuildState::new(
+        limits,
+        paths,
+        avatar_path_indexes,
+        blend_shapes.total_string_bytes,
+    )?;
     for selection in selections {
         let file = collection
             .serialized_files
@@ -255,6 +261,7 @@ fn push_selection(
 struct AnimationBuildState {
     limits: ModelAnimationLimits,
     paths: ModelPathIndex,
+    avatar_path_indexes: AvatarPathIndexes,
     clips: Vec<ModelAnimationClip>,
     used_names: HashSet<String>,
     total_tracks: usize,
@@ -268,6 +275,7 @@ impl AnimationBuildState {
     fn new(
         limits: ModelAnimationLimits,
         paths: ModelPathIndex,
+        avatar_path_indexes: AvatarPathIndexes,
         blend_shape_string_bytes: usize,
     ) -> Result<Self> {
         let total_string_bytes = paths
@@ -277,6 +285,7 @@ impl AnimationBuildState {
         Ok(Self {
             limits,
             paths,
+            avatar_path_indexes,
             clips: Vec::new(),
             used_names: HashSet::new(),
             total_tracks: 0,
@@ -450,13 +459,20 @@ impl AnimationBuildState {
             .transpose()?;
         let layout = BindingLayout::build(&clip.binding_constant.generic_bindings)?;
         let avatar = avatar_key.and_then(|key| model.avatar(key));
+        let avatar_paths = avatar_key
+            .and_then(|key| self.avatar_path_indexes.get(key))
+            .zip(avatar)
+            .map(|(index, avatar)| AvatarPathResolver {
+                paths: &avatar.avatar.paths,
+                index,
+            });
         let mut tracks = Vec::new();
         let mut by_node = HashMap::new();
         let mut blend_shape_tracks = Vec::new();
         let mut by_blend_shape = HashMap::new();
         let mut context = MuscleBuildContext {
             paths: &self.paths,
-            avatar_paths: avatar.map(|entry| entry.avatar.paths.as_slice()),
+            avatar_paths,
             layout: &layout,
             tracks: &mut tracks,
             by_node: &mut by_node,
@@ -695,7 +711,7 @@ const fn binding_width(binding: GenericBinding) -> usize {
 
 struct MuscleBuildContext<'a, 'b> {
     paths: &'a ModelPathIndex,
-    avatar_paths: Option<&'a [crate::avatar::AvatarPath]>,
+    avatar_paths: Option<AvatarPathResolver<'a>>,
     layout: &'a BindingLayout,
     tracks: &'b mut Vec<ModelAnimationTrack>,
     by_node: &'b mut HashMap<SceneObjectKey, usize>,
@@ -1751,6 +1767,8 @@ struct ModelPathIndex {
     entries_by_key: Vec<(SceneObjectKey, usize)>,
     suffixes: PathSuffixIndex,
     hash_nodes: HashMap<u32, SceneObjectKey>,
+    path_hash_count: usize,
+    path_index_bytes: usize,
     total_string_bytes: usize,
 }
 
@@ -1783,6 +1801,8 @@ impl ModelPathIndex {
             entries_by_key,
             suffixes,
             hash_nodes,
+            path_hash_count,
+            path_index_bytes,
             total_string_bytes: builder.total_bytes,
         })
     }
@@ -1816,15 +1836,226 @@ impl ModelPathIndex {
     fn resolve_hash(
         &self,
         hash: u32,
-        avatar_paths: Option<&[crate::avatar::AvatarPath]>,
+        avatar_paths: Option<AvatarPathResolver<'_>>,
     ) -> Option<SceneObjectKey> {
         self.hash_nodes.get(&hash).copied().or_else(|| {
             avatar_paths
-                .and_then(|paths| paths.iter().find(|entry| entry.hash == hash))
-                .map(|entry| entry.path.as_str())
+                .and_then(|resolver| resolver.resolve(hash))
                 .and_then(|path| self.resolve_suffix(path))
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AvatarPathLookup {
+    hash: u32,
+    source_index: usize,
+}
+
+#[derive(Debug, Default)]
+struct AvatarPathIndex {
+    entries: Vec<AvatarPathLookup>,
+}
+
+impl AvatarPathIndex {
+    fn build(paths: &[crate::avatar::AvatarPath]) -> Result<Self> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(paths.len()).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate Avatar path hash index: {error}"))
+        })?;
+        entries.extend(
+            paths
+                .iter()
+                .enumerate()
+                .map(|(source_index, path)| AvatarPathLookup {
+                    hash: path.hash,
+                    source_index,
+                }),
+        );
+        entries.sort_unstable_by(|left, right| {
+            left.hash
+                .cmp(&right.hash)
+                .then(left.source_index.cmp(&right.source_index))
+        });
+        Ok(Self { entries })
+    }
+
+    fn source_index(&self, hash: u32) -> Option<usize> {
+        self.source_index_counted(hash, &mut 0)
+    }
+
+    fn source_index_counted(&self, hash: u32, comparisons: &mut usize) -> Option<usize> {
+        let mut left = 0_usize;
+        let mut right = self.entries.len();
+        while left < right {
+            *comparisons = comparisons.saturating_add(1);
+            let middle = left + (right - left) / 2;
+            if self.entries[middle].hash < hash {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        self.entries
+            .get(left)
+            .filter(|entry| entry.hash == hash)
+            .map(|entry| entry.source_index)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AvatarPathResolver<'a> {
+    paths: &'a [crate::avatar::AvatarPath],
+    index: &'a AvatarPathIndex,
+}
+
+impl<'a> AvatarPathResolver<'a> {
+    fn resolve(self, hash: u32) -> Option<&'a str> {
+        self.index
+            .source_index(hash)
+            .and_then(|source_index| self.paths.get(source_index))
+            .map(|entry| entry.path.as_str())
+    }
+}
+
+#[derive(Debug)]
+struct SelectedAvatarPathIndex {
+    key: SceneObjectKey,
+    index: AvatarPathIndex,
+}
+
+#[derive(Debug, Default)]
+struct AvatarPathIndexes {
+    entries: Vec<SelectedAvatarPathIndex>,
+}
+
+impl AvatarPathIndexes {
+    fn build(
+        model: &ModelIr,
+        selections: &[ClipSelection],
+        limits: &ModelAnimationLimits,
+        model_paths: &ModelPathIndex,
+    ) -> Result<Self> {
+        Self::build_with_resolver(selections, limits, model_paths, |key| {
+            model
+                .avatar(key)
+                .map(|avatar| avatar.avatar.paths.as_slice())
+        })
+    }
+
+    fn build_with_resolver<'a>(
+        selections: &[ClipSelection],
+        limits: &ModelAnimationLimits,
+        model_paths: &ModelPathIndex,
+        mut resolve_paths: impl FnMut(SceneObjectKey) -> Option<&'a [crate::avatar::AvatarPath]>,
+    ) -> Result<Self> {
+        let selected_count = selections
+            .iter()
+            .filter(|selection| selection.avatar.is_some())
+            .count();
+        let key_bytes =
+            checked_index_bytes::<SceneObjectKey>(selected_count, "selected Avatar path keys")?;
+        check_path_index_budget(
+            model_paths.path_index_bytes,
+            key_bytes,
+            limits.maximum_path_index_bytes,
+        )?;
+
+        let mut selected_keys = Vec::new();
+        selected_keys
+            .try_reserve_exact(selected_count)
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate selected Avatar path keys: {error}"
+                ))
+            })?;
+        selected_keys.extend(selections.iter().filter_map(|selection| selection.avatar));
+        selected_keys.sort_unstable();
+        selected_keys.dedup();
+
+        let mut indexed_avatar_count = 0_usize;
+        let mut avatar_path_count = 0_usize;
+        for key in &selected_keys {
+            let Some(paths) = resolve_paths(*key) else {
+                continue;
+            };
+            indexed_avatar_count = indexed_avatar_count
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_data("selected Avatar count overflowed"))?;
+            avatar_path_count = avatar_path_count
+                .checked_add(paths.len())
+                .ok_or_else(|| Error::invalid_data("Avatar path hash count overflowed"))?;
+        }
+        let total_hash_count = model_paths
+            .path_hash_count
+            .checked_add(avatar_path_count)
+            .ok_or_else(|| Error::invalid_data("animation path-hash count overflowed"))?;
+        if total_hash_count > limits.maximum_path_hashes {
+            return Err(Error::invalid_data(format!(
+                "animation path hashes exceed limit {}",
+                limits.maximum_path_hashes
+            )));
+        }
+
+        let selected_index_bytes = checked_index_bytes::<SelectedAvatarPathIndex>(
+            indexed_avatar_count,
+            "selected Avatar path indexes",
+        )?;
+        let lookup_bytes =
+            checked_index_bytes::<AvatarPathLookup>(avatar_path_count, "Avatar path hash index")?;
+        let additional_bytes = key_bytes
+            .checked_add(selected_index_bytes)
+            .and_then(|bytes| bytes.checked_add(lookup_bytes))
+            .ok_or_else(|| Error::invalid_data("Avatar path-index byte budget overflowed"))?;
+        check_path_index_budget(
+            model_paths.path_index_bytes,
+            additional_bytes,
+            limits.maximum_path_index_bytes,
+        )?;
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(indexed_avatar_count)
+            .map_err(|error| {
+                Error::invalid_data(format!("cannot allocate selected Avatar indexes: {error}"))
+            })?;
+        for key in selected_keys {
+            let Some(paths) = resolve_paths(key) else {
+                continue;
+            };
+            entries.push(SelectedAvatarPathIndex {
+                key,
+                index: AvatarPathIndex::build(paths)?,
+            });
+        }
+        Ok(Self { entries })
+    }
+
+    fn get(&self, key: SceneObjectKey) -> Option<&AvatarPathIndex> {
+        let position = self.entries.partition_point(|entry| entry.key < key);
+        self.entries
+            .get(position)
+            .filter(|entry| entry.key == key)
+            .map(|entry| &entry.index)
+    }
+}
+
+fn checked_index_bytes<T>(count: usize, name: &str) -> Result<usize> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| Error::invalid_data(format!("{name} byte size overflowed")))
+}
+
+fn check_path_index_budget(existing: usize, additional: usize, maximum: usize) -> Result<()> {
+    let total = existing
+        .checked_add(additional)
+        .ok_or_else(|| Error::invalid_data("animation path-index byte budget overflowed"))?;
+    if total > maximum {
+        return Err(Error::invalid_data(format!(
+            "animation path indexes need {total} bytes, exceeding limit {maximum}"
+        )));
+    }
+    Ok(())
 }
 
 impl PathSuffixIndex {
@@ -2291,9 +2522,10 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        AnimationBuildState, BindingLayout, BlendShapeIndex, CurveBuildContext,
+        AnimationBuildState, AvatarPathIndex, AvatarPathIndexes, AvatarPathLookup,
+        AvatarPathResolver, BindingLayout, BlendShapeIndex, ClipSelection, CurveBuildContext,
         ExplicitCurveSlices, ModelAnimationLimits, ModelPathEntry, ModelPathIndex,
-        MuscleBuildContext, PathSuffixIndex, append_bound_sample,
+        MuscleBuildContext, PathSuffixIndex, SelectedAvatarPathIndex, append_bound_sample,
         append_compressed_quaternion_keys, blend_shape_crc32, convert_explicit_blend_shapes,
         convert_explicit_curve_slices, convert_muscle_clip, convert_muscle_clip_with_acl,
         join_legacy_path, path_index_allocation_bytes, select_clips, unity_crc32,
@@ -2310,9 +2542,16 @@ mod tests {
                 range_minimums: Vec::new(),
             },
             hash_nodes: HashMap::new(),
+            path_hash_count: 0,
+            path_index_bytes: 0,
             total_string_bytes: usize::MAX,
         };
-        let result = AnimationBuildState::new(ModelAnimationLimits::default(), paths, 1);
+        let result = AnimationBuildState::new(
+            ModelAnimationLimits::default(),
+            paths,
+            AvatarPathIndexes::default(),
+            1,
+        );
         assert!(matches!(
             result,
             Err(crate::Error::InvalidData(message))
@@ -2383,8 +2622,15 @@ mod tests {
             hash: 0x1234_5678,
             path: "Root/Arm".to_owned(),
         }];
+        let avatar_index = AvatarPathIndex::build(&avatar_paths).unwrap();
         assert_eq!(
-            paths.resolve_hash(0x1234_5678, Some(&avatar_paths)),
+            paths.resolve_hash(
+                0x1234_5678,
+                Some(AvatarPathResolver {
+                    paths: &avatar_paths,
+                    index: &avatar_index,
+                }),
+            ),
             Some(key(2))
         );
         let curves = curve_fixture();
@@ -2477,6 +2723,169 @@ mod tests {
                 "suffix {suffix:?}"
             );
         }
+    }
+
+    #[test]
+    fn avatar_path_hash_index_preserves_first_duplicate_with_logarithmic_queries() {
+        const DISTINCT: usize = 16_384;
+        const TARGET: u32 = 0xfedc_ba98;
+        let mut avatar_paths = Vec::new();
+        avatar_paths.try_reserve_exact(DISTINCT + 2).unwrap();
+        for entry in 0..DISTINCT {
+            avatar_paths.push(AvatarPath {
+                hash: u32::try_from(entry).unwrap(),
+                path: format!("Missing/Bone{entry}"),
+            });
+        }
+        let first_target = avatar_paths.len();
+        avatar_paths.push(AvatarPath {
+            hash: TARGET,
+            path: "Root/Arm".to_owned(),
+        });
+        avatar_paths.push(AvatarPath {
+            hash: TARGET,
+            path: "Other/Arm".to_owned(),
+        });
+
+        let index = AvatarPathIndex::build(&avatar_paths).unwrap();
+        assert_eq!(index.source_index(TARGET), Some(first_target));
+        assert_eq!(
+            AvatarPathResolver {
+                paths: &avatar_paths,
+                index: &index,
+            }
+            .resolve(TARGET),
+            Some("Root/Arm")
+        );
+
+        let mut comparisons = 0_usize;
+        for _ in 0..DISTINCT {
+            assert_eq!(
+                index.source_index_counted(TARGET, &mut comparisons),
+                Some(first_target)
+            );
+        }
+        assert!(
+            comparisons < DISTINCT * 32,
+            "{comparisons} indexed comparisons"
+        );
+    }
+
+    #[test]
+    fn selected_avatar_indexes_only_materialize_selected_keys_and_deduplicate() {
+        use std::cell::Cell;
+
+        let (model_paths, selections, avatar_paths) = selected_avatar_index_fixture();
+        let calls = Cell::new(0_usize);
+        let indexes = AvatarPathIndexes::build_with_resolver(
+            &selections,
+            &ModelAnimationLimits::default(),
+            &model_paths,
+            |candidate| {
+                assert_eq!(candidate, key(900), "unselected Avatar was materialized");
+                calls.set(calls.get() + 1);
+                Some(avatar_paths.as_slice())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            2,
+            "one selected Avatar is resolved in two passes"
+        );
+        assert_eq!(indexes.entries.len(), 1);
+        assert_eq!(indexes.get(key(900)).unwrap().source_index(7), Some(0));
+    }
+
+    #[test]
+    fn selected_avatar_indexes_share_path_count_and_storage_budgets() {
+        let (model_paths, selections, avatar_paths) = selected_avatar_index_fixture();
+
+        let count_limit = model_paths.path_hash_count + avatar_paths.len() - 1;
+        let count_error = AvatarPathIndexes::build_with_resolver(
+            &selections,
+            &ModelAnimationLimits {
+                maximum_path_hashes: count_limit,
+                ..ModelAnimationLimits::default()
+            },
+            &model_paths,
+            |_| Some(avatar_paths.as_slice()),
+        )
+        .unwrap_err();
+        assert!(
+            count_error
+                .to_string()
+                .contains("animation path hashes exceed limit"),
+            "{count_error}"
+        );
+
+        let required = model_paths.path_index_bytes
+            + selections
+                .iter()
+                .filter(|selection| selection.avatar.is_some())
+                .count()
+                * std::mem::size_of::<SceneObjectKey>()
+            + std::mem::size_of::<SelectedAvatarPathIndex>()
+            + avatar_paths.len() * std::mem::size_of::<AvatarPathLookup>();
+        let byte_error = AvatarPathIndexes::build_with_resolver(
+            &selections,
+            &ModelAnimationLimits {
+                maximum_path_index_bytes: required - 1,
+                ..ModelAnimationLimits::default()
+            },
+            &model_paths,
+            |_| Some(avatar_paths.as_slice()),
+        )
+        .unwrap_err();
+        assert!(
+            byte_error
+                .to_string()
+                .contains("animation path indexes need"),
+            "{byte_error}"
+        );
+        AvatarPathIndexes::build_with_resolver(
+            &selections,
+            &ModelAnimationLimits {
+                maximum_path_index_bytes: required,
+                ..ModelAnimationLimits::default()
+            },
+            &model_paths,
+            |_| Some(avatar_paths.as_slice()),
+        )
+        .unwrap();
+    }
+
+    fn selected_avatar_index_fixture() -> (ModelPathIndex, [ClipSelection; 3], [AvatarPath; 2]) {
+        let model_paths =
+            ModelPathIndex::build(&model_fixture(), &ModelAnimationLimits::default()).unwrap();
+        let selections = [
+            ClipSelection {
+                clip: key(901),
+                legacy_base: None,
+                avatar: Some(key(900)),
+            },
+            ClipSelection {
+                clip: key(902),
+                legacy_base: None,
+                avatar: Some(key(900)),
+            },
+            ClipSelection {
+                clip: key(903),
+                legacy_base: Some(key(1)),
+                avatar: None,
+            },
+        ];
+        let avatar_paths = [
+            AvatarPath {
+                hash: 7,
+                path: "Root/Arm".to_owned(),
+            },
+            AvatarPath {
+                hash: 7,
+                path: "Other/Arm".to_owned(),
+            },
+        ];
+        (model_paths, selections, avatar_paths)
     }
 
     #[test]
