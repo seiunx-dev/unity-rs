@@ -2018,7 +2018,17 @@ def assert_schema_construction_releases_gil() -> None:
     try:
         start.set()
         assert not ran.is_set(), "GIL probe ran before entering the Rust constructor"
-        schema = MonoBehaviourSchema("Probe.dll", "Probe", nodes)
+        # Releasing the GIL makes the worker runnable, but it does not force the
+        # operating system to schedule that thread before a very fast Rust
+        # call returns. Give it several bounded constructor windows. With the
+        # switch interval above, a binding which actually holds the GIL cannot
+        # pass by switching between these Python loop iterations.
+        schema = None
+        for _ in range(8):
+            schema = MonoBehaviourSchema("Probe.dll", "Probe", nodes)
+            if ran.is_set():
+                break
+        assert schema is not None
         assert schema.node_count == 100_000
         assert ran.is_set(), "MonoBehaviourSchema construction held the GIL"
     finally:
