@@ -394,7 +394,10 @@ filesystem-string converter: names that are not valid UTF-8 no longer materializ
 UTF-16 surrogates are streamed with the platform's replacement semantics; the Loader and extractor
 charge the expanded label bytes before one exact allocation, while extraction's portable 240-byte
 component ceiling is enforced character by character. Extraction success, skip and failure reports
-also reserve fallibly. Python export/extraction report paths and Node export report paths use the
+also reserve fallibly and share a separate 256 MiB `maximum_metadata_bytes` default. That
+cumulative budget counts retained source labels, encoded output paths and failure messages; Rust
+and Python callers can tighten it, while Node's compact `extract` entry point inherits the Core
+default. Python export/extraction report paths and Node export report paths use the
 same private two-pass filesystem-string algorithm: they count replacement-expanded UTF-8 first,
 reserve with the binding's own fallible allocator, and then copy once, rather than allocating a complete
 `to_string_lossy` temporary before the binding can report allocation failure. CLI argument and
