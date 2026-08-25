@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STUB = ROOT / "crates/assetstudio-python/python/assetstudio/__init__.pyi"
 CONSUMER = ROOT / "crates/assetstudio-python/tests/typecheck_api.py"
 CORE_STUDIO = ROOT / "crates/assetstudio-core/src/studio.rs"
+PYTHON_BINDING = ROOT / "crates/assetstudio-python/src/lib.rs"
 
 # Every public high-level Rust method must either name the Python symbol that
 # represents it or be listed in INTENTIONAL_RUST_ONLY with a concrete ownership
@@ -154,6 +155,48 @@ CORE_IMPL_RANGES = (
 
 class AuditError(ValueError):
     """The stub is not completely exercised by the strict consumer."""
+
+
+def rust_braced_block(source: str, marker: str) -> str:
+    """Return one Rust block starting at the first brace after ``marker``."""
+    marker_offset = source.find(marker)
+    if marker_offset < 0:
+        raise AuditError(f"Python binding does not contain {marker!r}")
+    opening = source.find("{", marker_offset + len(marker))
+    if opening < 0:
+        raise AuditError(f"Python binding has no body after {marker!r}")
+    depth = 0
+    for offset in range(opening, len(source)):
+        character = source[offset]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1 : offset]
+    raise AuditError(f"Python binding has an unterminated body after {marker!r}")
+
+
+def validate_texture_gil_boundary(source: str) -> None:
+    """Keep texture row conversion inside the GIL-detached Rust closure."""
+    expectations = (
+        ("fn read_texture(", "DisplayRowPyImage::from_decoded(image)"),
+        ("fn read_texture_array(", "DisplayRowPyImages::from_decoded(images)"),
+    )
+    for method_marker, conversion in expectations:
+        method = rust_braced_block(source, method_marker)
+        detach_offset = method.find("py.detach")
+        if detach_offset < 0:
+            raise AuditError(f"{method_marker[:-1]} does not release the GIL")
+        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        if conversion not in detached:
+            raise AuditError(
+                f"{method_marker[:-1]} performs display-row conversion outside py.detach"
+            )
+        if "flip_rgba_rows" in method:
+            raise AuditError(
+                f"{method_marker[:-1]} directly flips rows while the GIL may be held"
+            )
 
 
 def has_decorator(function: ast.FunctionDef, name: str) -> bool:
@@ -331,12 +374,14 @@ def main() -> None:
             CORE_STUDIO.read_text(encoding="utf-8"),
             STUB.read_text(encoding="utf-8"),
         )
+        validate_texture_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
     except AuditError as error:
         raise SystemExit(str(error)) from error
     print(
         "Python API surface audit passed "
         f"({methods} methods, {properties} properties; "
-        f"{core_methods} Core methods classified, {rust_only} Rust-only)"
+        f"{core_methods} Core methods classified, {rust_only} Rust-only; "
+        "texture row conversion detached)"
     )
 
 
