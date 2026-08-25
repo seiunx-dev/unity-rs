@@ -70,6 +70,10 @@ methods:
   constructor, and requires it to run while `MonoBehaviourSchema` builds a
   valid 100,000-node registry. Per-node UTF-8 is charged before the fallible
   Rust copy, so rejection never first materializes an unbounded `Vec<String>`.
+  The same installed-wheel test builds a 100,000-entry
+  `MonoBehaviourSchemas` collection and requires the helper thread to run while
+  its shared Core lookup index is constructed; Python object extraction remains
+  under the GIL, but the pure-Rust hash/index work does not.
 - Public list-shaped inputs no longer rely on PyO3's eager `Vec` extraction.
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;

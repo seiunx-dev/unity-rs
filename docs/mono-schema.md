@@ -71,9 +71,12 @@ Rust callers that keep schemas as independently reusable registries can build a
 indexes only `(registry, entry)` positions, so neither TypeTrees nor identity
 strings are cloned. Python's `MonoBehaviourSchemas` uses this set: collection
 construction rejects more than 100,000 schemas before converting the first
-Python element, then exact-version and fallback lookup stay indexed while
+Python element. Once those Python objects have been validated and their
+registries retained, construction of the shared random-keyed Core index runs
+outside the GIL. Exact-version and fallback lookup stay indexed while
 preserving the supplied first-match order. This closes the otherwise quadratic
-case where every stripped object scanned every Python-visible schema.
+case where every stripped object scanned every Python-visible schema without
+making a 100,000-entry index build monopolize the interpreter.
 
 ## The document
 
