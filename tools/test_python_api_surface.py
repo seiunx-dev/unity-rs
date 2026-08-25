@@ -43,6 +43,9 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
         check_python_api_surface.validate_texture_gil_boundary(
             check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
         )
+        check_python_api_surface.validate_payload_gil_boundary(
+            check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        )
 
     def test_texture_row_conversion_must_stay_detached(self) -> None:
         binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
@@ -71,6 +74,33 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
             r"read_texture_array.*outside py\.detach",
         ):
             check_python_api_surface.validate_texture_gil_boundary(altered)
+
+    def test_binary_payload_materialization_must_stay_detached(self) -> None:
+        binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        for method_marker, materialization in (
+            *check_python_api_surface.PAYLOAD_GIL_EXPECTATIONS,
+        ):
+            variable = "audio" if method_marker == "fn read_audio_clip(" else "asset"
+            needle = f"            {materialization}\n        }})?;"
+            method_offset = binding.find(method_marker)
+            self.assertGreaterEqual(method_offset, 0)
+            call_offset = binding.find(needle, method_offset)
+            self.assertGreaterEqual(call_offset, 0)
+            replacement = (
+                f"            Ok({variable})\n        }})?;\n"
+                f"        let {variable} = {materialization}?;"
+            )
+            altered = (
+                binding[:call_offset]
+                + replacement
+                + binding[call_offset + len(needle) :]
+            )
+            method_name = method_marker.removeprefix("fn ").removesuffix("(")
+            with self.assertRaisesRegex(
+                check_python_api_surface.AuditError,
+                rf"{method_name}.*outside py\.detach",
+            ):
+                check_python_api_surface.validate_payload_gil_boundary(altered)
 
     def test_instance_method_omission_is_rejected(self) -> None:
         consumer = COMPLETE_CONSUMER.replace("    studio.read_text(0)\n", "")

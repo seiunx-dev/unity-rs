@@ -199,6 +199,28 @@ def validate_texture_gil_boundary(source: str) -> None:
             )
 
 
+PAYLOAD_GIL_EXPECTATIONS = (
+    ("fn read_audio_clip(", "materialize_audio_clip(audio, format, maximum_bytes)"),
+    ("fn read_font(", "materialize_binary_asset(asset, maximum_bytes)"),
+    ("fn read_movie_texture(", "materialize_binary_asset(asset, maximum_bytes)"),
+    ("fn read_video_clip(", "materialize_binary_asset(asset, maximum_bytes)"),
+)
+
+
+def validate_payload_gil_boundary(source: str) -> None:
+    """Keep source-bound byte materialization inside the detached closure."""
+    for method_marker, materialization in PAYLOAD_GIL_EXPECTATIONS:
+        method = rust_braced_block(source, method_marker)
+        detach_offset = method.find("py.detach")
+        if detach_offset < 0:
+            raise AuditError(f"{method_marker[:-1]} does not release the GIL")
+        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        if materialization not in detached:
+            raise AuditError(
+                f"{method_marker[:-1]} materializes its payload outside py.detach"
+            )
+
+
 def has_decorator(function: ast.FunctionDef, name: str) -> bool:
     return any(
         isinstance(decorator, ast.Name) and decorator.id == name
@@ -375,13 +397,14 @@ def main() -> None:
             STUB.read_text(encoding="utf-8"),
         )
         validate_texture_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
+        validate_payload_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
     except AuditError as error:
         raise SystemExit(str(error)) from error
     print(
         "Python API surface audit passed "
         f"({methods} methods, {properties} properties; "
         f"{core_methods} Core methods classified, {rust_only} Rust-only; "
-        "texture row conversion detached)"
+        "texture row conversion and binary payload materialization detached)"
     )
 
 

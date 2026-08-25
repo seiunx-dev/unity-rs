@@ -3978,11 +3978,13 @@ impl PyAssetStudio {
             ..SimpleAssetReadLimits::default()
         };
         let audio = py.detach(|| {
-            self.object(file_index, path_id)?
+            let audio = self
+                .object(file_index, path_id)?
                 .read_audio_clip(limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            materialize_audio_clip(audio, format, maximum_bytes)
         })?;
-        materialize_audio_clip(audio, format, maximum_bytes)
+        Ok(audio)
     }
 
     /// Reads the embedded font program rather than the serialized `Font` wrapper.
@@ -3996,11 +3998,13 @@ impl PyAssetStudio {
     ) -> PyResult<PyBinaryAsset> {
         let limits = simple_asset_limits(maximum_bytes);
         let asset = py.detach(|| {
-            self.object(file_index, path_id)?
+            let asset = self
+                .object(file_index, path_id)?
                 .read_font(limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            materialize_binary_asset(asset, maximum_bytes)
         })?;
-        materialize_binary_asset(asset, maximum_bytes)
+        Ok(asset)
     }
 
     /// Reads the resident Ogg payload from a legacy `MovieTexture`.
@@ -4014,11 +4018,13 @@ impl PyAssetStudio {
     ) -> PyResult<PyBinaryAsset> {
         let limits = simple_asset_limits(maximum_bytes);
         let asset = py.detach(|| {
-            self.object(file_index, path_id)?
+            let asset = self
+                .object(file_index, path_id)?
                 .read_movie_texture(limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            materialize_binary_asset(asset, maximum_bytes)
         })?;
-        materialize_binary_asset(asset, maximum_bytes)
+        Ok(asset)
     }
 
     /// Reads one inline or externally streamed `VideoClip` payload.
@@ -4032,11 +4038,13 @@ impl PyAssetStudio {
     ) -> PyResult<PyBinaryAsset> {
         let limits = simple_asset_limits(maximum_bytes);
         let asset = py.detach(|| {
-            self.object(file_index, path_id)?
+            let asset = self
+                .object(file_index, path_id)?
                 .read_video_clip(limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            materialize_binary_asset(asset, maximum_bytes)
         })?;
-        materialize_binary_asset(asset, maximum_bytes)
+        Ok(asset)
     }
 
     /// Reads one `Material` while preserving property order and duplicate names.
