@@ -190,6 +190,49 @@ def block_between(source: str, start_marker: str, end_marker: str) -> str:
     return source[start:end]
 
 
+def braced_block(source: str, marker: str) -> str:
+    """Return one source block beginning at ``marker`` through its closing brace."""
+    start = source.find(marker)
+    if start < 0:
+        raise AuditError(f"source does not contain {marker!r}")
+    opening = source.find("{", start + len(marker))
+    if opening < 0:
+        raise AuditError(f"source does not open a block after {marker!r}")
+    depth = 0
+    for index in range(opening, len(source)):
+        character = source[index]
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AuditError(f"source does not close the block after {marker!r}")
+
+
+def validate_live2d_worker_projection(rust_source: str) -> None:
+    """Keep unbounded package-table projection off the Node event loop."""
+    task = braced_block(rust_source, "impl Task for Live2dPackagesWithAclTask")
+    output = re.search(r"\btype Output\s*=\s*([^;]+);", task)
+    if output is None or output.group(1).strip() != "Live2dPackageSet":
+        raise AuditError(
+            "Live2dPackagesWithAclTask must return the projected Live2dPackageSet "
+            "from its worker"
+        )
+    compute = braced_block(task, "fn compute")
+    resolve = braced_block(task, "fn resolve")
+    if "convert_live2d_package_set(set)" not in compute:
+        raise AuditError(
+            "Live2dPackagesWithAclTask must project package files and diagnostics "
+            "inside compute"
+        )
+    if "convert_live2d_package_set" in resolve:
+        raise AuditError(
+            "Live2dPackagesWithAclTask must not project package files or diagnostics "
+            "inside resolve"
+        )
+
+
 def rust_node_symbols(source: str) -> set[str]:
     """Extract exported class members and mapped object fields from Rust."""
     implementation = block_between(
@@ -349,6 +392,7 @@ def main() -> None:
     rust_source = NODE_RUST.read_text(encoding="utf-8")
     declaration_source = DECLARATIONS.read_text(encoding="utf-8")
     try:
+        validate_live2d_worker_projection(rust_source)
         methods, properties = validate_node_declarations(rust_source, declaration_source)
         core_methods, rust_only = validate_core_mapping(
             core_source,

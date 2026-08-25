@@ -3497,7 +3497,7 @@ pub struct Live2dPackagesWithAclTask {
 }
 
 impl Task for Live2dPackagesWithAclTask {
-    type Output = CoreLive2dPackageBytesSet;
+    type Output = Live2dPackageSet;
     type JsValue = Live2dPackageSet;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -3509,18 +3509,20 @@ impl Task for Live2dPackagesWithAclTask {
         let provider = schemas
             .as_ref()
             .map(|value| value as &dyn MonoBehaviourSchemaProvider);
-        self.studio
+        let set = self
+            .studio
             .read_live2d_packages_with_adapters(
                 self.planning_limits,
                 self.materialize_limits,
                 provider,
                 Some(self.decoder.as_ref()),
             )
-            .map_err(core_error)
+            .map_err(core_error)?;
+        convert_live2d_package_set(set)
     }
 
     fn resolve(&mut self, _env: Env, set: Self::Output) -> Result<Self::JsValue> {
-        convert_live2d_package_set(set)
+        Ok(set)
     }
 }
 
