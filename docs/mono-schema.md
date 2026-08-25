@@ -48,6 +48,15 @@ object read through a schema is reported as `typetree_json_schema` rather than
 `typetree_json`, because it is a weaker claim: it is only as good as the schema
 it came from.
 
+Schema JSON is parsed directly into the final registry under the document,
+entry, per-entry/total node, per-string, and retained-string-total limits. The
+reader does not first construct a second `serde_json::Value` tree. Entry and
+node limits are checked before descending into the next element; a lexical
+pass measures escaped strings as decoded UTF-8 before `serde_json` allocates
+its one-string unescape scratch. Unknown document fields are consumed without
+materializing their value. The CLI additionally streams each repeatable file
+under one cumulative set of the same budgets.
+
 ## The document
 
 ```json
