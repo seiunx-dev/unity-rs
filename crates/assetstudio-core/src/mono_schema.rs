@@ -3,7 +3,10 @@
 //! Providers return a complete Unity `TypeTree` for the serialized object.
 //! The Core never opens or executes the named managed assembly.
 
+use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::str::FromStr;
 
@@ -89,17 +92,49 @@ impl Default for MonoBehaviourSchemaDocumentLimits {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct MonoBehaviourSchemaRegistry {
     entries: Vec<MonoBehaviourSchemaEntry>,
+    // Asset-controlled identities are hashed with a per-registry random key.
+    // Buckets retain indices so no assembly/class/version String is copied;
+    // every candidate is compared again, making hash collisions harmless.
+    identity_hash_builder: RandomState,
+    identity_buckets: HashMap<u64, Vec<usize>>,
     overrides_embedded_tree: bool,
+}
+
+impl fmt::Debug for MonoBehaviourSchemaRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MonoBehaviourSchemaRegistry")
+            .field("entries", &self.entries)
+            .field("overrides_embedded_tree", &self.overrides_embedded_tree)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for MonoBehaviourSchemaRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+            && self.overrides_embedded_tree == other.overrides_embedded_tree
+    }
+}
+
+impl Eq for MonoBehaviourSchemaRegistry {}
+
+impl Default for MonoBehaviourSchemaRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MonoBehaviourSchemaRegistry {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            identity_hash_builder: RandomState::new(),
+            identity_buckets: HashMap::new(),
             overrides_embedded_tree: false,
         }
     }
@@ -110,12 +145,57 @@ impl MonoBehaviourSchemaRegistry {
     }
 
     pub fn push(&mut self, entry: MonoBehaviourSchemaEntry) -> Result<()> {
+        let identity_hash = schema_lookup_hash(
+            &self.identity_hash_builder,
+            &entry.assembly_name,
+            &entry.namespace,
+            &entry.class_name,
+            entry.unity_version.as_deref(),
+        );
         self.entries.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!(
                 "cannot grow MonoBehaviour schema registry: {error}"
             ))
         })?;
-        self.entries.push(entry);
+        let entry_index = self.entries.len();
+        if let Some(bucket) = self.identity_buckets.get_mut(&identity_hash) {
+            if bucket.iter().any(|&entry_index| {
+                self.entries.get(entry_index).is_some_and(|existing| {
+                    schema_lookup_key_matches(
+                        existing,
+                        &entry.assembly_name,
+                        &entry.namespace,
+                        &entry.class_name,
+                        entry.unity_version.as_deref(),
+                    )
+                })
+            }) {
+                self.entries.push(entry);
+                return Ok(());
+            }
+            bucket.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot grow MonoBehaviour schema lookup bucket: {error}"
+                ))
+            })?;
+            self.entries.push(entry);
+            bucket.push(entry_index);
+        } else {
+            self.identity_buckets.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot grow MonoBehaviour schema lookup index: {error}"
+                ))
+            })?;
+            let mut bucket = Vec::new();
+            bucket.try_reserve_exact(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate MonoBehaviour schema lookup bucket: {error}"
+                ))
+            })?;
+            bucket.push(entry_index);
+            self.entries.push(entry);
+            self.identity_buckets.insert(identity_hash, bucket);
+        }
         Ok(())
     }
 
@@ -124,6 +204,16 @@ impl MonoBehaviourSchemaRegistry {
     /// Order decides ties, so schemas loaded first keep priority over later
     /// ones for the same class.
     pub fn extend(&mut self, other: Self) -> Result<()> {
+        if other.entries.is_empty() {
+            return Ok(());
+        }
+        let (identity_hash_builder, identity_buckets) = build_schema_identity_index(
+            self.entries.iter().chain(other.entries.iter()),
+            self.entries
+                .len()
+                .checked_add(other.entries.len())
+                .ok_or_else(|| Error::invalid_data("MonoBehaviour schema count overflowed"))?,
+        )?;
         self.entries
             .try_reserve(other.entries.len())
             .map_err(|error| {
@@ -132,6 +222,8 @@ impl MonoBehaviourSchemaRegistry {
                 ))
             })?;
         self.entries.extend(other.entries);
+        self.identity_hash_builder = identity_hash_builder;
+        self.identity_buckets = identity_buckets;
         Ok(())
     }
 
@@ -1301,25 +1393,49 @@ impl<'de> Visitor<'de> for SchemaStringVisitor<'_> {
 
 impl MonoBehaviourSchemaProvider for MonoBehaviourSchemaRegistry {
     fn schema(&self, identity: MonoBehaviourSchemaIdentity<'_>) -> Result<Option<&TypeTree>> {
-        let mut fallback = None;
-        for entry in &self.entries {
-            if !assembly_names_equal(&entry.assembly_name, identity.assembly_name)
-                || entry.namespace != identity.namespace
-                || entry.class_name != identity.class_name
-            {
-                continue;
-            }
-            match entry.unity_version.as_deref() {
-                Some(version) if version == identity.unity_version => return Ok(Some(&entry.tree)),
-                None if fallback.is_none() => fallback = Some(&entry.tree),
-                _ => {}
-            }
+        if let Some(tree) = self.lookup_tree(identity, Some(identity.unity_version))? {
+            return Ok(Some(tree));
         }
-        Ok(fallback)
+        self.lookup_tree(identity, None)
     }
 
     fn overrides_embedded_tree(&self) -> bool {
         self.overrides_embedded_tree
+    }
+}
+
+impl MonoBehaviourSchemaRegistry {
+    fn lookup_tree(
+        &self,
+        identity: MonoBehaviourSchemaIdentity<'_>,
+        unity_version: Option<&str>,
+    ) -> Result<Option<&TypeTree>> {
+        let lookup_hash = schema_lookup_hash(
+            &self.identity_hash_builder,
+            identity.assembly_name,
+            identity.namespace,
+            identity.class_name,
+            unity_version,
+        );
+        let Some(candidate_indices) = self.identity_buckets.get(&lookup_hash) else {
+            return Ok(None);
+        };
+        for &entry_index in candidate_indices {
+            record_schema_lookup_probe();
+            let entry = self.entries.get(entry_index).ok_or_else(|| {
+                Error::invalid_data("MonoBehaviour schema lookup index is inconsistent")
+            })?;
+            if schema_lookup_key_matches(
+                entry,
+                identity.assembly_name,
+                identity.namespace,
+                identity.class_name,
+                unity_version,
+            ) {
+                return Ok(Some(&entry.tree));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1499,8 +1615,106 @@ pub fn read_mono_behaviour_json_with_provider(
 /// before comparing; without this every schema misses and the whole document
 /// silently does nothing.
 fn assembly_names_equal(left: &str, right: &str) -> bool {
-    trim_assembly_extension(portable_file_name(left))
-        .eq_ignore_ascii_case(trim_assembly_extension(portable_file_name(right)))
+    assembly_lookup_name(left).eq_ignore_ascii_case(assembly_lookup_name(right))
+}
+
+fn assembly_lookup_name(value: &str) -> &str {
+    trim_assembly_extension(portable_file_name(value))
+}
+
+fn schema_lookup_hash(
+    hash_builder: &RandomState,
+    assembly_name: &str,
+    namespace: &str,
+    class_name: &str,
+    unity_version: Option<&str>,
+) -> u64 {
+    let normalized_assembly = assembly_lookup_name(assembly_name);
+    let mut hasher = hash_builder.build_hasher();
+    normalized_assembly.len().hash(&mut hasher);
+    for byte in normalized_assembly.bytes() {
+        hasher.write_u8(byte.to_ascii_lowercase());
+    }
+    namespace.hash(&mut hasher);
+    class_name.hash(&mut hasher);
+    unity_version.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn schema_lookup_key_matches(
+    entry: &MonoBehaviourSchemaEntry,
+    assembly_name: &str,
+    namespace: &str,
+    class_name: &str,
+    unity_version: Option<&str>,
+) -> bool {
+    assembly_names_equal(&entry.assembly_name, assembly_name)
+        && entry.namespace == namespace
+        && entry.class_name == class_name
+        && entry.unity_version.as_deref() == unity_version
+}
+
+fn build_schema_identity_index<'a>(
+    entries: impl Iterator<Item = &'a MonoBehaviourSchemaEntry>,
+    entry_count: usize,
+) -> Result<(RandomState, HashMap<u64, Vec<usize>>)> {
+    let hash_builder = RandomState::new();
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    buckets.try_reserve(entry_count).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate MonoBehaviour schema lookup index: {error}"
+        ))
+    })?;
+    for (entry_index, entry) in entries.enumerate() {
+        let identity_hash = schema_lookup_hash(
+            &hash_builder,
+            &entry.assembly_name,
+            &entry.namespace,
+            &entry.class_name,
+            entry.unity_version.as_deref(),
+        );
+        if let Some(bucket) = buckets.get_mut(&identity_hash) {
+            bucket.try_reserve(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot grow MonoBehaviour schema lookup bucket: {error}"
+                ))
+            })?;
+            bucket.push(entry_index);
+        } else {
+            let mut bucket = Vec::new();
+            bucket.try_reserve_exact(1).map_err(|error| {
+                Error::invalid_data(format!(
+                    "cannot allocate MonoBehaviour schema lookup bucket: {error}"
+                ))
+            })?;
+            bucket.push(entry_index);
+            buckets.insert(identity_hash, bucket);
+        }
+    }
+    Ok((hash_builder, buckets))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SCHEMA_LOOKUP_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_schema_lookup_probe() {
+    SCHEMA_LOOKUP_PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+const fn record_schema_lookup_probe() {}
+
+#[cfg(test)]
+fn reset_schema_lookup_probes() {
+    SCHEMA_LOOKUP_PROBES.with(|probes| probes.set(0));
+}
+
+#[cfg(test)]
+fn schema_lookup_probes() -> usize {
+    SCHEMA_LOOKUP_PROBES.with(std::cell::Cell::get)
 }
 
 fn trim_assembly_extension(value: &str) -> &str {
@@ -1564,9 +1778,10 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        MonoBehaviourSchemaDocumentLimits, MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry,
-        MonoBehaviourSchemaSource, read_mono_behaviour_json_with_provider,
-        read_mono_behaviour_value_with_provider,
+        MonoBehaviourSchemaDocumentLimits, MonoBehaviourSchemaEntry, MonoBehaviourSchemaIdentity,
+        MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry, MonoBehaviourSchemaSource,
+        read_mono_behaviour_json_with_provider, read_mono_behaviour_value_with_provider,
+        reset_schema_lookup_probes, schema_lookup_probes,
     };
     use crate::monobehaviour::{
         MONO_BEHAVIOUR_CLASS_ID, MONO_SCRIPT_CLASS_ID, MonoBehaviourReadLimits,
@@ -1708,6 +1923,91 @@ mod tests {
                 MonoBehaviourReadLimits::default(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_lookup_is_indexed_by_version_and_keeps_first_priority() {
+        const ENTRY_COUNT: usize = 20_000;
+        const TAGGED_VERSION: usize = 12_345;
+
+        let mut registry = MonoBehaviourSchemaRegistry::new();
+        registry
+            .push(MonoBehaviourSchemaEntry {
+                assembly_name: "folder/Assembly-CSharp.DLL".to_owned(),
+                namespace: "Game".to_owned(),
+                class_name: "Stats".to_owned(),
+                unity_version: None,
+                tree: tagged_tree("fallback-first"),
+            })
+            .unwrap();
+        for version_index in 0..ENTRY_COUNT {
+            registry
+                .push(MonoBehaviourSchemaEntry {
+                    assembly_name: "Assembly-CSharp".to_owned(),
+                    namespace: "Game".to_owned(),
+                    class_name: "Stats".to_owned(),
+                    unity_version: Some(format!("version-{version_index}")),
+                    tree: if version_index == TAGGED_VERSION {
+                        tagged_tree("exact-first")
+                    } else {
+                        TypeTree {
+                            nodes: Vec::new(),
+                            string_buffer: Vec::new(),
+                        }
+                    },
+                })
+                .unwrap();
+        }
+        // Later duplicates remain visible through entries(), but neither an
+        // exact nor fallback lookup may let them outrank the first document.
+        for (unity_version, tag) in [
+            (None, "fallback-second"),
+            (Some(format!("version-{TAGGED_VERSION}")), "exact-second"),
+        ] {
+            registry
+                .push(MonoBehaviourSchemaEntry {
+                    assembly_name: "ASSEMBLY-CSHARP.dll".to_owned(),
+                    namespace: "Game".to_owned(),
+                    class_name: "Stats".to_owned(),
+                    unity_version,
+                    tree: tagged_tree(tag),
+                })
+                .unwrap();
+        }
+        assert_eq!(registry.entries().len(), ENTRY_COUNT + 3);
+
+        reset_schema_lookup_probes();
+        for version_index in (0..ENTRY_COUNT).rev() {
+            let unity_version = format!("version-{version_index}");
+            let tree = registry
+                .schema(MonoBehaviourSchemaIdentity {
+                    unity_version: &unity_version,
+                    assembly_name: "assembly-csharp",
+                    namespace: "Game",
+                    class_name: "Stats",
+                })
+                .unwrap()
+                .unwrap();
+            if version_index == TAGGED_VERSION {
+                assert_eq!(tree.nodes[0].field_name, "exact-first");
+            }
+        }
+        let fallback = registry
+            .schema(MonoBehaviourSchemaIdentity {
+                unity_version: "missing-version",
+                assembly_name: "archive:/folder/assembly-csharp.dll",
+                namespace: "Game",
+                class_name: "Stats",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.nodes[0].field_name, "fallback-first");
+
+        let probes = schema_lookup_probes();
+        assert!(
+            probes <= ENTRY_COUNT.saturating_mul(2),
+            "indexed lookup inspected {probes} candidates for {ENTRY_COUNT} exact versions"
         );
     }
 
@@ -2001,7 +2301,9 @@ mod tests {
     #[test]
     fn registries_join_and_the_first_document_keeps_priority() {
         let mut first = MonoBehaviourSchemaRegistry::from_json(SCHEMA_DOCUMENT.as_bytes()).unwrap();
-        let second = MonoBehaviourSchemaRegistry::from_json(SCHEMA_DOCUMENT.as_bytes()).unwrap();
+        let mut second =
+            MonoBehaviourSchemaRegistry::from_json(SCHEMA_DOCUMENT.as_bytes()).unwrap();
+        second.entries[0].tree = tagged_tree("second-document");
         first.extend(second).unwrap();
         assert_eq!(first.entries().len(), 2);
         let collection = fixture();
@@ -2104,6 +2406,13 @@ mod tests {
                 node("char", "data", 3, 0),
                 node("SInt32", "score", 1, 0),
             ],
+            string_buffer: Vec::new(),
+        }
+    }
+
+    fn tagged_tree(tag: &str) -> TypeTree {
+        TypeTree {
+            nodes: vec![node("Tagged", tag, 0, 0)],
             string_buffer: Vec::new(),
         }
     }
