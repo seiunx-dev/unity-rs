@@ -73,6 +73,12 @@ methods:
   immediately from the synchronous call, while both the MonoBehaviour JSON and
   Live2D/ACL asynchronous calls return normally and reject their Promises before
   parsing or invoking the decoder callback.
+- `readTextureAsync` and `readTextureArrayAsync` decode and convert bottom-up
+  Unity pixels to the top-down JavaScript row order entirely in `Task::compute`.
+  Their public task-output types encode that invariant, leaving `resolve` only
+  to wrap already-final bytes. Rust tests cover one image and multiple layers;
+  installed-addon tests compare synchronous and Promise output for real
+  Texture2D and Texture2DArray fixtures pixel by pixel.
 - `tests/installed_package.cjs` loads the packed tarball from a temporary
   consumer, parses the installed `index.d.ts`, and compares its static methods,
   instance methods, and getters bidirectionally with the installed native
