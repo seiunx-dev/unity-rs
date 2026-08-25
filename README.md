@@ -100,6 +100,11 @@ The CLI's `split-objects` and `animator` batches retain one case-folded output
 name index across every candidate. `--maximum-name-index-bytes` bounds the
 exact UTF-8 bytes stored by that hidden index (64 MiB by default, configurable
 through 512 MiB); a rejected claim does not advance its collision suffix.
+The standalone `live2d` MOC exporter applies the same default and command-line
+limit to its own case-folded output-name index. A name-budget rejection happens
+before the output directory is created and leaves the retained-name state
+unchanged; the complete `live2d-package` planner continues to use Core's broader
+package-name and diagnostic budgets.
 
 ## Build and test
 
