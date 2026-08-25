@@ -74,7 +74,10 @@ methods:
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;
   `MonoBehaviourSchemas` and `CubismMotionTargets` reserve fallibly and convert
-  one entry at a time. `unity_cn_key` accepts only the documented `bytes | str`
+  one entry at a time. A schema collection rejects more than 100,000 entries
+  before converting any element, retains each reusable Core registry through
+  `Arc`, and builds one shared random-keyed index instead of scanning the whole
+  Python list for every stripped object. `unity_cn_key` accepts only the documented `bytes | str`
   and copies directly into the exact 16-byte array rather than accepting an
   arbitrary integer sequence. Injected ACL output carries the same
   `AclDecodeLimits` as Core and checks list lengths plus the frame×curve value
