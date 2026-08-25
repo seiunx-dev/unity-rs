@@ -18,11 +18,16 @@
 - WinForms 或其他 GUI；
 - 旧版自定义 C ABI 的兼容、发布或语义复刻。
 
+暂时拿不到真实样本或独立 oracle 的 Unity/Tuanjie 版本与平台格式保留在
+`corpus/` 验收工程和兼容矩阵中，继续稳定返回 `Unsupported`，不猜布局。它们仍是未来
+兼容性 1.0 的证据缺口，但按本次迁移约定不阻塞无头 Rust/Python 运行时重写的完成。
+
 托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `ASSETSTUDIO_REPO` 或同级目录定位它。旧 `assetstudio-ffi`/context handle 源码已从仓库删除，不再只是排除在 Cargo workspace 之外。
 
 ## 当前阶段
 
-项目当前处于 **Rust/Python Beta** 阶段：主流程已经可用，但还不能宣称覆盖全部 Unity/Tuanjie 版本长尾，也尚未达到可以删除托管 oracle 的证据强度。
+无头 Rust/Python 运行时重写已经完成；项目仍处于 **Rust/Python Beta** 阶段，因为还不能
+宣称覆盖全部 Unity/Tuanjie 版本长尾，也尚未达到可以删除托管 oracle 的证据强度。
 
 | 交付面 | 当前状态 | 说明 |
 | --- | --- | --- |
@@ -30,7 +35,7 @@
 | Python | Beta，主要目标接口 | 直接绑定 Core，覆盖加载、枚举、资源读取、主要资产读取、FBX、Live2D、导出和解包 |
 | CLI | Beta | inspect/info/list/scene、export/extract、FBX、Animator/SplitObjects、Live2D 已接入 |
 | Node.js | 可选 Beta | 同步与 Promise worker API 已覆盖加载、枚举及主要读取路径；保留 `scene(maximumGameObjects?)`，并通过 `sceneWithLimits` 暴露与 Core/Python 相同的六类场景预算；路径与单/多内存输入都可组合传入加载选项（Unity 版本、UnityCN 密钥、失败容忍策略、输入上限），Live2D 包连同 diagnostics 一起返回，外部 schema 可恢复 stripped 包，Promise worker 可在同一次调用中再注入 Tuanjie ACL decoder；模型导出（场景 OBJ 与带贴图的 FBX）与 Python 等价；Core→Node 映射、Rust addon、生成声明和严格 TypeScript 消费均有机器审计 |
-| .NET 运行时退役 | 尚未完成 | 公开 Rust/Python/Node 不依赖 .NET；C# 仍用于差分 oracle 和格式核验 |
+| .NET 运行时退役 | 已完成 | 默认构建、安装和用户工作流完全不需要 .NET；C# 只用于显式差分 oracle 和格式核验 |
 
 这些状态是风险分级，不是按代码行数计算的完成百分比。
 Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classifier；安装后门禁同时
@@ -42,9 +47,10 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 无 GUI 的 Rust/Python 主流程、CLI 和可选 Node 绑定已经闭合；当前离 1.0 的主要差距是
 **证据收口**，而不是恢复旧 C ABI 或继续扩张公开接口：
 
-1. **可自主完成的发布收口**：继续审计已声明支持路径的 hostile input、累计内存/输出和
-   worker/GIL 边界，直到支持矩阵中没有未处置的已确认 P1/P2；随后逐条执行本文“完成判定”，
-   固定 1.0 能力矩阵、版本和发布说明，并再次通过零跳过本地门禁与公开多平台矩阵。
+1. **可自主完成的发布收口已完成（2026-08-25）**：已声明支持路径的 hostile input、
+   累计内存/输出和 worker/GIL 边界完成第四十九项治理；零跳过本地门禁与最终 HEAD 的
+   公开多平台矩阵再次全绿。正式发布版本号、合并和 registry 发布仍由维护者决定，不是
+   解析或绑定实现缺口。
 2. **需要真实样本的验收**：补 Tuanjie 2022.3.x、Nintendo Switch、Unity 4/5/2017 和
    带完整托管快照的代表性 corpus。只对样本实际命中的长尾补实现；UnityArchive、虚拟几何
    cluster、Switch stripped/低 mip 及平台 codec 在没有可验证布局或独立 oracle 时继续稳定
@@ -1448,7 +1454,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 3A-48 | **已完成 Node 异步 Texture2DArray 最终层表的 event-loop 治理**：此前 O(pixel bytes) 行翻转已在 worker，但最多 4,096 层、累计 1 GiB 像素的最终 Vec 仍在 `resolve` 才可失败预留，并逐层把 Core image 转为 napi-facing `RgbaImage`/`Buffer`。`DisplayRowImages` 现在直接持有 worker 构造完成的最终层表；`compute` 完成行翻转、表预留和每层投影，`resolve` 的 `into_nodes` 只移动一个现成 Vec，同步 API 和 JavaScript 像素/字段顺序不变 | `bb2eb98`：源码门禁要求 async task 继续输出 `DisplayRowImages`、worker helper 必须预留最终表并调用 `convert_image`，同时禁止 `into_nodes` 出现分配、循环或 image projection；两条负向变体分别改回未投影输出和把转换塞回 event-loop helper 后均稳定失败。Rust worker 单测确认两层 Buffer 已按 top-down 行序完成；Node debug/release addon、运行时 API、严格 TypeScript、包内容、安装后临时消费者与 npm tarball 全部通过。完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32859413104](https://github.com/Team-Haruki/unity-rs/actions/runs/32859413104) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十八项完成证据 |
 | 3A-49 | **已完成 Python `SpriteAtlas` 大型元数据表的 GIL 治理**：对象解析原本在 `Python::detach` 内完成，但随后重新持有 GIL 才遍历最多 1,000,000 条 packed-sprite/render-data/secondary-texture 记录，转换 PPtr、展开 rect/vector/settings tuple 并移动名称表。现在 `prepare_sprite_atlas` 在同一 detach 闭包内完成全部纯 Rust 可失败表投影；attached 路径只为最终 key/render-data/secondary-texture 调用必须由 PyO3 执行的 `Py::new`，公开字段、顺序和预算语义不变 | `e8c9365`：源码门禁要求 preparation 位于 `py.detach` 且 Python wrapping 位于闭包外，负向变体把 preparation 移走后稳定失败。Python crate check/严格 Clippy、真实 wheel 与 sdist 重建和安装后 SpriteAtlas 行为测试、公开面检查、严格 Python 3.9 mypy，以及完整 `quality rust python node typing oracle` 本地门禁均全部通过、零组跳过；公开常规矩阵 [32862849606](https://github.com/Team-Haruki/unity-rs/actions/runs/32862849606) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十九项完成证据 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22；2026-08-25 随诊断分页扩展）**：107 个高层 Core 方法均被机器检查为 103 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；66 个公开 Python 方法和 4 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
-| 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | 默认构建、测试、安装和用户工作流均不需要 .NET；没有 GUI 或旧 C ABI 发布物；七项完成条件均有当前证据，未满足项不得被标成完成 |
+| 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | **无头运行时退役完成（2026-08-25）**：`check_delivery_scope.py` 与 8 项反向自测确认 workspace 只有 Core/CLI/Python/可选 Node，三个前端均直接依赖 Core，源码、公开 API 和发布物均无 GUI、旧 C ABI 或 context handle；`cargo metadata` 独立复核一致。最终 HEAD `0c23ac1` 的公开矩阵 [32863442940](https://github.com/Team-Haruki/unity-rs/actions/runs/32863442940) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。兼容性 1.0 仍等待本文明确列出的外部 corpus，不把未验证格式冒充完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
 
 贯穿所有步骤的范围约束不变：**不做 GUI，不恢复或扩展旧自定义 C ABI，
