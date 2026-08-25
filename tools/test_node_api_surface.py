@@ -17,6 +17,7 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
         cls.consumer = check_node_api_surface.CONSUMER.read_text(encoding="utf-8")
 
     def test_current_core_rust_declarations_and_consumer_are_complete(self) -> None:
+        check_node_api_surface.validate_live2d_worker_projection(self.rust)
         self.assertEqual(
             check_node_api_surface.validate_node_declarations(
                 self.rust,
@@ -39,6 +40,38 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
             ),
             (85, 4),
         )
+
+    def test_live2d_worker_must_return_the_projected_table(self) -> None:
+        altered = self.rust.replace(
+            "    type Output = Live2dPackageSet;\n",
+            "    type Output = CoreLive2dPackageBytesSet;\n",
+            1,
+        )
+        self.assertNotEqual(altered, self.rust)
+        with self.assertRaisesRegex(
+            check_node_api_surface.AuditError,
+            r"must return the projected Live2dPackageSet",
+        ):
+            check_node_api_surface.validate_live2d_worker_projection(altered)
+
+    def test_live2d_projection_cannot_move_back_to_resolve(self) -> None:
+        altered = self.rust.replace(
+            "        convert_live2d_package_set(set)\n"
+            "    }\n\n"
+            "    fn resolve(&mut self, _env: Env, set: Self::Output) -> Result<Self::JsValue> {\n"
+            "        Ok(set)\n",
+            "        Ok(set)\n"
+            "    }\n\n"
+            "    fn resolve(&mut self, _env: Env, set: Self::Output) -> Result<Self::JsValue> {\n"
+            "        convert_live2d_package_set(set)\n",
+            1,
+        )
+        self.assertNotEqual(altered, self.rust)
+        with self.assertRaisesRegex(
+            check_node_api_surface.AuditError,
+            r"inside compute",
+        ):
+            check_node_api_surface.validate_live2d_worker_projection(altered)
 
     def test_new_core_method_must_be_classified(self) -> None:
         altered = self.core.replace(
