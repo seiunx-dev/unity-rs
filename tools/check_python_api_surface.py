@@ -221,6 +221,29 @@ def validate_payload_gil_boundary(source: str) -> None:
             )
 
 
+CUBISM_JSON_GIL_EXPECTATIONS = (
+    ("fn read_cubism_expression(", "prepare_cubism_expression("),
+    ("fn read_cubism_physics(", "python_cubism_physics("),
+    ("fn read_cubism_fade_motion(", "python_cubism_fade_motion("),
+    ("fn read_cubism_clip_motion(", "python_cubism_clip_motion("),
+    ("fn read_cubism_acl_clip_motion(", "python_cubism_clip_motion("),
+)
+
+
+def validate_cubism_json_gil_boundary(source: str) -> None:
+    """Keep bounded Cubism JSON production inside the detached closure."""
+    for method_marker, preparation in CUBISM_JSON_GIL_EXPECTATIONS:
+        method = rust_braced_block(source, method_marker)
+        detach_offset = method.find("py.detach")
+        if detach_offset < 0:
+            raise AuditError(f"{method_marker[:-1]} does not release the GIL")
+        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        if preparation not in detached:
+            raise AuditError(
+                f"{method_marker[:-1]} materializes Cubism JSON outside py.detach"
+            )
+
+
 def has_decorator(function: ast.FunctionDef, name: str) -> bool:
     return any(
         isinstance(decorator, ast.Name) and decorator.id == name
@@ -398,13 +421,14 @@ def main() -> None:
         )
         validate_texture_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
         validate_payload_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
+        validate_cubism_json_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
     except AuditError as error:
         raise SystemExit(str(error)) from error
     print(
         "Python API surface audit passed "
         f"({methods} methods, {properties} properties; "
         f"{core_methods} Core methods classified, {rust_only} Rust-only; "
-        "texture row conversion and binary payload materialization detached)"
+        "texture rows, binary payloads and Cubism JSON detached)"
     )
 
 
