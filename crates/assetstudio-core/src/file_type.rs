@@ -40,7 +40,7 @@ pub struct FileDetection {
     pub data_offset: u64,
 }
 
-/// Classifies an `AssetStudio` input from its leading bytes and total file size.
+/// Classifies a Unity asset input from its leading bytes and total file size.
 ///
 /// `header` should contain up to [`HEADER_SCAN_LENGTH`] bytes from offset zero.
 #[must_use]

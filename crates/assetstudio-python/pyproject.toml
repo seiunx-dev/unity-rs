@@ -5,11 +5,11 @@ build-backend = "maturin"
 [project]
 name = "assetstudio-rs"
 dynamic = ["version"]
-description = "Native Python bindings for the AssetStudio Rust core"
+description = "Native Python bindings for unity-rs"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
-keywords = ["unity", "assets", "assetbundle", "assetstudio"]
+keywords = ["unity", "unity-rs", "assets", "assetbundle"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",

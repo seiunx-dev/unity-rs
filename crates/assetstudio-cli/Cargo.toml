@@ -1,6 +1,6 @@
 [package]
 name = "assetstudio-cli"
-description = "Native Rust command-line frontend for AssetStudio"
+description = "Native command-line frontend for unity-rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

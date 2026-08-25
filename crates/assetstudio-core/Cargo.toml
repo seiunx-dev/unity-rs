@@ -1,6 +1,6 @@
 [package]
 name = "assetstudio-core"
-description = "Native Rust implementation of AssetStudio's Unity asset parsing core"
+description = "Headless Unity asset parsing and export core for unity-rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

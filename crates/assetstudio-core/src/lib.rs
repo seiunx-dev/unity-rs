@@ -1,8 +1,7 @@
-//! Native Rust implementation of `AssetStudio`'s format parsing core.
+//! The headless Unity asset parsing and export core for `unity-rs`.
 //!
-//! The rewrite is intentionally being built from the bottom up. This crate does
-//! not call the existing .NET `NativeAOT` adapter; every exported module here is a
-//! native Rust implementation.
+//! This crate is a native Rust implementation. It does not load the historical
+//! .NET runtime or call the retired `NativeAOT` adapter.
 
 pub mod acl;
 pub mod animation_clip;

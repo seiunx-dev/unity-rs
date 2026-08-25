@@ -273,9 +273,10 @@ fn header_extension() -> FbxNode {
         .child(FbxNode::new("FBXHeaderVersion").with(FbxProperty::I32(1003)))
         .child(FbxNode::new("FBXVersion").with(FbxProperty::I32(7400)))
         .child(FbxNode::new("EncryptionType").with(FbxProperty::I32(0)))
-        .child(FbxNode::new("Creator").with(FbxProperty::String(
-            "AssetStudio Rust binary FBX writer".to_owned(),
-        )))
+        .child(
+            FbxNode::new("Creator")
+                .with(FbxProperty::String("unity-rs binary FBX writer".to_owned())),
+        )
 }
 
 /// The axis system, which decides how an importer orients the scene.
