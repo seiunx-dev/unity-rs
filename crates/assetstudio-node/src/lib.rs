@@ -3736,7 +3736,7 @@ impl Task for ReadTextureArrayTask {
     }
 
     fn resolve(&mut self, _env: Env, images: Self::Output) -> Result<Self::JsValue> {
-        images.into_nodes()
+        Ok(images.into_nodes())
     }
 }
 
@@ -4586,22 +4586,20 @@ impl DisplayRowImage {
 
 /// The same worker-completed row-order invariant for a `Texture2DArray`.
 #[doc(hidden)]
-pub struct DisplayRowImages(Vec<assetstudio_core::texture::RgbaImage>);
+pub struct DisplayRowImages(Vec<RgbaImage>);
 
 impl DisplayRowImages {
-    fn from_decoded(mut images: Vec<assetstudio_core::texture::RgbaImage>) -> Result<Self> {
-        for image in &mut images {
-            assetstudio_core::image_export::flip_rgba_rows(image).map_err(core_error)?;
-        }
-        Ok(Self(images))
-    }
-
-    fn into_nodes(self) -> Result<Vec<RgbaImage>> {
-        let mut output = reserve(self.0.len(), "Texture2DArray images")?;
-        for image in self.0 {
+    fn from_decoded(images: Vec<assetstudio_core::texture::RgbaImage>) -> Result<Self> {
+        let mut output = reserve(images.len(), "Texture2DArray images")?;
+        for mut image in images {
+            assetstudio_core::image_export::flip_rgba_rows(&mut image).map_err(core_error)?;
             output.push(convert_image(image));
         }
-        Ok(output)
+        Ok(Self(output))
+    }
+
+    fn into_nodes(self) -> Vec<RgbaImage> {
+        self.0
     }
 }
 
@@ -4614,7 +4612,7 @@ fn convert_decoded_image(image: assetstudio_core::texture::RgbaImage) -> Result<
 fn convert_decoded_images(
     images: Vec<assetstudio_core::texture::RgbaImage>,
 ) -> Result<Vec<RgbaImage>> {
-    DisplayRowImages::from_decoded(images)?.into_nodes()
+    DisplayRowImages::from_decoded(images).map(DisplayRowImages::into_nodes)
 }
 
 fn convert_animation_clip_info(
@@ -5371,8 +5369,8 @@ mod tests {
             decoded_test_image(5, 6),
         ])
         .expect("decoded texture array");
-        assert_eq!(images[0].pixels, [4, 0, 0, 255, 3, 0, 0, 255]);
-        assert_eq!(images[1].pixels, [6, 0, 0, 255, 5, 0, 0, 255]);
+        assert_eq!(&images[0].pixels[..], &[4, 0, 0, 255, 3, 0, 0, 255]);
+        assert_eq!(&images[1].pixels[..], &[6, 0, 0, 255, 5, 0, 0, 255]);
     }
 
     #[test]
