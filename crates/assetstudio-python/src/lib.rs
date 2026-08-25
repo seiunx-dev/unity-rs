@@ -11,9 +11,12 @@ use assetstudio_core::acl::{
     AclDecoderInputLimits,
 };
 use assetstudio_core::animation_clip::AnimationClipReadLimits;
-use assetstudio_core::animation_component::{AnimationClipOverride, AnimationComponentReadLimits};
-use assetstudio_core::animator_controller::AnimatorControllerReadLimits;
-use assetstudio_core::avatar::AvatarReadLimits;
+use assetstudio_core::animation_component::{
+    AnimationClipOverride, AnimationComponentReadLimits, AnimatorOverrideController,
+    LegacyAnimationComponent,
+};
+use assetstudio_core::animator_controller::{AnimatorController, AnimatorControllerReadLimits};
+use assetstudio_core::avatar::{Avatar, AvatarReadLimits};
 use assetstudio_core::bundle::OodleDecoder;
 use assetstudio_core::compression::CompressionLimits;
 use assetstudio_core::export::{AudioExportFormat, ExportMode, ExportOptions};
@@ -45,7 +48,10 @@ use assetstudio_core::monobehaviour::{MonoBehaviourReadLimits, MonoScript};
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
 use assetstudio_core::scene_hierarchy::{SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey};
 use assetstudio_core::scene_textures::{SceneTexture, SceneTextureLimits, SceneTextureSkip};
-use assetstudio_core::serialized::{ContainerMetadataReadLimits, TypeTree, TypeTreeNode};
+use assetstudio_core::serialized::{
+    AssetBundleMetadata, ContainerMetadataReadLimits, PreloadDataMetadata, ResourceManagerMetadata,
+    TypeTree, TypeTreeNode,
+};
 use assetstudio_core::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
     write_direct_wav,
@@ -3141,25 +3147,12 @@ impl PyAssetStudio {
         maximum_bytes: u64,
     ) -> PyResult<PyLegacyAnimation> {
         let limits = animation_component_limits(maximum_bytes)?;
-        let animation = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let animation = self
+                .object(file_index, path_id)?
                 .read_legacy_animation(limits)
-                .map_err(core_error)
-        })?;
-        let mut clips = reserve_metadata(
-            animation.clips.len(),
-            "Python legacy Animation clip references",
-        )?;
-        for reference in animation.clips {
-            clips.push(object_reference_tuple(reference));
-        }
-        Ok(PyLegacyAnimation {
-            path_id: animation.path_id,
-            game_object: object_reference_tuple(animation.behaviour.component.game_object),
-            enabled: animation.behaviour.enabled,
-            default_clip: object_reference_tuple(animation.default_clip),
-            clips,
-            trailing_bytes: animation.trailing_bytes,
+                .map_err(core_error)?;
+            prepare_legacy_animation(animation)
         })
     }
 
@@ -3174,27 +3167,12 @@ impl PyAssetStudio {
         maximum_bytes: u64,
     ) -> PyResult<PyAnimatorOverrideController> {
         let limits = animation_component_limits(maximum_bytes)?;
-        let controller = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let controller = self
+                .object(file_index, path_id)?
                 .read_animator_override_controller(limits)
-                .map_err(core_error)
-        })?;
-        let mut clip_overrides = reserve_metadata(
-            controller.clips.len(),
-            "Python AnimatorOverrideController clip overrides",
-        )?;
-        for pair in controller.clips {
-            clip_overrides.push((
-                object_reference_tuple(pair.original_clip),
-                object_reference_tuple(pair.override_clip),
-            ));
-        }
-        Ok(PyAnimatorOverrideController {
-            path_id: controller.path_id,
-            name: controller.name,
-            controller: object_reference_tuple(controller.controller),
-            clip_overrides,
-            trailing_bytes: controller.trailing_bytes,
+                .map_err(core_error)?;
+            prepare_animator_override_controller(controller)
         })
     }
 
@@ -3221,42 +3199,11 @@ impl PyAssetStudio {
             maximum_string_bytes,
             maximum_total_string_bytes,
         );
-        let (path_id, bundle) = py.detach(|| {
+        py.detach(|| {
             let object = self.object(file_index, path_id)?;
             let path_id = object.path_id();
-            object
-                .read_asset_bundle(limits)
-                .map(|bundle| (path_id, bundle))
-                .map_err(core_error)
-        })?;
-        let mut preload_table = reserve_metadata(
-            bundle.preload_table.len(),
-            "Python AssetBundle preload references",
-        )?;
-        for reference in bundle.preload_table {
-            preload_table.push(object_reference_tuple(reference));
-        }
-        let mut container = reserve_metadata(
-            bundle.container.len(),
-            "Python AssetBundle container entries",
-        )?;
-        for entry in bundle.container {
-            container.push((
-                entry.key,
-                entry.preload_index,
-                entry.preload_size,
-                object_reference_tuple(entry.asset),
-            ));
-        }
-        Ok(PyAssetBundle {
-            path_id,
-            name: bundle.name,
-            object_name: bundle.object_name,
-            asset_bundle_name: bundle.asset_bundle_name,
-            preload_table,
-            container,
-            dependencies: bundle.dependencies,
-            is_streamed_scene_asset_bundle: bundle.is_streamed_scene_asset_bundle,
+            let bundle = object.read_asset_bundle(limits).map_err(core_error)?;
+            prepare_asset_bundle(path_id, bundle)
         })
     }
 
@@ -3283,22 +3230,12 @@ impl PyAssetStudio {
             maximum_string_bytes,
             maximum_total_string_bytes,
         );
-        let (path_id, manager) = py.detach(|| {
+        py.detach(|| {
             let object = self.object(file_index, path_id)?;
             let path_id = object.path_id();
-            object
-                .read_resource_manager(limits)
-                .map(|manager| (path_id, manager))
-                .map_err(core_error)
-        })?;
-        let mut container = reserve_metadata(
-            manager.container.len(),
-            "Python ResourceManager container entries",
-        )?;
-        for entry in manager.container {
-            container.push((entry.key, object_reference_tuple(entry.asset)));
-        }
-        Ok(PyResourceManager { path_id, container })
+            let manager = object.read_resource_manager(limits).map_err(core_error)?;
+            prepare_resource_manager(path_id, manager)
+        })
     }
 
     /// Parses one bounded Unity `PreloadData` object-reference table.
@@ -3315,23 +3252,11 @@ impl PyAssetStudio {
             ContainerMetadataReadLimits::default().maximum_string_bytes,
             ContainerMetadataReadLimits::default().maximum_total_string_bytes,
         );
-        let (path_id, preload) = py.detach(|| {
+        py.detach(|| {
             let object = self.object(file_index, path_id)?;
             let path_id = object.path_id();
-            object
-                .read_preload_data(limits)
-                .map(|preload| (path_id, preload))
-                .map_err(core_error)
-        })?;
-        let mut assets =
-            reserve_metadata(preload.assets.len(), "Python PreloadData asset references")?;
-        for reference in preload.assets {
-            assets.push(object_reference_tuple(reference));
-        }
-        Ok(PyPreloadData {
-            path_id,
-            name: preload.name,
-            assets,
+            let preload = object.read_preload_data(limits).map_err(core_error)?;
+            prepare_preload_data(path_id, preload)
         })
     }
 
@@ -3547,37 +3472,12 @@ impl PyAssetStudio {
             maximum_total_allocation_bytes: maximum_bytes,
             ..AnimatorControllerReadLimits::default()
         };
-        let controller = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let controller = self
+                .object(file_index, path_id)?
                 .read_animator_controller(limits)
-                .map_err(core_error)
-        })?;
-        let mut tos = reserve_metadata(controller.tos.len(), "Python AnimatorController TOS")?;
-        for entry in controller.tos {
-            tos.push((entry.key, entry.value));
-        }
-        let mut animation_clips = reserve_metadata(
-            controller.animation_clips.len(),
-            "Python AnimatorController clip references",
-        )?;
-        for reference in controller.animation_clips {
-            animation_clips.push((reference.file_id, reference.path_id));
-        }
-        Ok(PyAnimatorController {
-            path_id: controller.path_id,
-            name: controller.name,
-            controller_size: controller.controller_size,
-            layer_count: controller.controller.layers.len(),
-            state_machine_count: controller.controller.state_machines.len(),
-            value_count: controller.controller.values.values.len(),
-            entity_id_count: controller
-                .controller
-                .default_values
-                .entity_ids
-                .as_ref()
-                .map(|values| values.count),
-            tos,
-            animation_clips,
+                .map_err(core_error)?;
+            prepare_animator_controller(controller)
         })
     }
 
@@ -3601,39 +3501,12 @@ impl PyAssetStudio {
             maximum_reference_bytes: maximum_bytes,
             ..AvatarReadLimits::default()
         };
-        let avatar = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let avatar = self
+                .object(file_index, path_id)?
                 .read_avatar(limits)
-                .map_err(core_error)
-        })?;
-        let (has_human_description, human_bone_count, skeleton_bone_count, root_motion_bone_name) =
-            avatar
-                .human_description
-                .map_or((false, 0, 0, None), |description| {
-                    (
-                        true,
-                        description.human_bones.len(),
-                        description.skeleton_bones.len(),
-                        Some(description.root_motion_bone_name),
-                    )
-                });
-        let path_count = avatar.paths.len();
-        let mut paths = reserve_metadata(path_count, "Python Avatar paths")?;
-        for entry in avatar.paths {
-            paths.push((entry.hash, entry.path));
-        }
-        Ok(PyAvatar {
-            path_id: avatar.path_id,
-            name: avatar.name,
-            declared_avatar_size: avatar.declared_avatar_size,
-            skeleton_node_count: avatar.constant.avatar_skeleton.nodes.len(),
-            human_skeleton_node_count: avatar.constant.human.skeleton.nodes.len(),
-            path_count,
-            paths,
-            has_human_description,
-            human_bone_count,
-            skeleton_bone_count,
-            root_motion_bone_name,
+                .map_err(core_error)?;
+            prepare_avatar(avatar)
         })
     }
 
@@ -4592,6 +4465,172 @@ impl PyAssetStudio {
             ))
         })
     }
+}
+
+fn prepare_legacy_animation(animation: LegacyAnimationComponent) -> PyResult<PyLegacyAnimation> {
+    let mut clips = reserve_metadata(
+        animation.clips.len(),
+        "Python legacy Animation clip references",
+    )?;
+    for reference in animation.clips {
+        clips.push(object_reference_tuple(reference));
+    }
+    Ok(PyLegacyAnimation {
+        path_id: animation.path_id,
+        game_object: object_reference_tuple(animation.behaviour.component.game_object),
+        enabled: animation.behaviour.enabled,
+        default_clip: object_reference_tuple(animation.default_clip),
+        clips,
+        trailing_bytes: animation.trailing_bytes,
+    })
+}
+
+fn prepare_animator_override_controller(
+    controller: AnimatorOverrideController,
+) -> PyResult<PyAnimatorOverrideController> {
+    let mut clip_overrides = reserve_metadata(
+        controller.clips.len(),
+        "Python AnimatorOverrideController clip overrides",
+    )?;
+    for pair in controller.clips {
+        clip_overrides.push((
+            object_reference_tuple(pair.original_clip),
+            object_reference_tuple(pair.override_clip),
+        ));
+    }
+    Ok(PyAnimatorOverrideController {
+        path_id: controller.path_id,
+        name: controller.name,
+        controller: object_reference_tuple(controller.controller),
+        clip_overrides,
+        trailing_bytes: controller.trailing_bytes,
+    })
+}
+
+fn prepare_asset_bundle(path_id: i64, bundle: AssetBundleMetadata) -> PyResult<PyAssetBundle> {
+    let mut preload_table = reserve_metadata(
+        bundle.preload_table.len(),
+        "Python AssetBundle preload references",
+    )?;
+    for reference in bundle.preload_table {
+        preload_table.push(object_reference_tuple(reference));
+    }
+    let mut container = reserve_metadata(
+        bundle.container.len(),
+        "Python AssetBundle container entries",
+    )?;
+    for entry in bundle.container {
+        container.push((
+            entry.key,
+            entry.preload_index,
+            entry.preload_size,
+            object_reference_tuple(entry.asset),
+        ));
+    }
+    Ok(PyAssetBundle {
+        path_id,
+        name: bundle.name,
+        object_name: bundle.object_name,
+        asset_bundle_name: bundle.asset_bundle_name,
+        preload_table,
+        container,
+        dependencies: bundle.dependencies,
+        is_streamed_scene_asset_bundle: bundle.is_streamed_scene_asset_bundle,
+    })
+}
+
+fn prepare_resource_manager(
+    path_id: i64,
+    manager: ResourceManagerMetadata,
+) -> PyResult<PyResourceManager> {
+    let mut container = reserve_metadata(
+        manager.container.len(),
+        "Python ResourceManager container entries",
+    )?;
+    for entry in manager.container {
+        container.push((entry.key, object_reference_tuple(entry.asset)));
+    }
+    Ok(PyResourceManager { path_id, container })
+}
+
+fn prepare_preload_data(path_id: i64, preload: PreloadDataMetadata) -> PyResult<PyPreloadData> {
+    let mut assets = reserve_metadata(preload.assets.len(), "Python PreloadData asset references")?;
+    for reference in preload.assets {
+        assets.push(object_reference_tuple(reference));
+    }
+    Ok(PyPreloadData {
+        path_id,
+        name: preload.name,
+        assets,
+    })
+}
+
+fn prepare_animator_controller(controller: AnimatorController) -> PyResult<PyAnimatorController> {
+    let layer_count = controller.controller.layers.len();
+    let state_machine_count = controller.controller.state_machines.len();
+    let value_count = controller.controller.values.values.len();
+    let entity_id_count = controller
+        .controller
+        .default_values
+        .entity_ids
+        .as_ref()
+        .map(|values| values.count);
+    let mut tos = reserve_metadata(controller.tos.len(), "Python AnimatorController TOS")?;
+    for entry in controller.tos {
+        tos.push((entry.key, entry.value));
+    }
+    let mut animation_clips = reserve_metadata(
+        controller.animation_clips.len(),
+        "Python AnimatorController clip references",
+    )?;
+    for reference in controller.animation_clips {
+        animation_clips.push((reference.file_id, reference.path_id));
+    }
+    Ok(PyAnimatorController {
+        path_id: controller.path_id,
+        name: controller.name,
+        controller_size: controller.controller_size,
+        layer_count,
+        state_machine_count,
+        value_count,
+        entity_id_count,
+        tos,
+        animation_clips,
+    })
+}
+
+fn prepare_avatar(avatar: Avatar) -> PyResult<PyAvatar> {
+    let skeleton_node_count = avatar.constant.avatar_skeleton.nodes.len();
+    let human_skeleton_node_count = avatar.constant.human.skeleton.nodes.len();
+    let (has_human_description, human_bone_count, skeleton_bone_count, root_motion_bone_name) =
+        avatar
+            .human_description
+            .map_or((false, 0, 0, None), |description| {
+                (
+                    true,
+                    description.human_bones.len(),
+                    description.skeleton_bones.len(),
+                    Some(description.root_motion_bone_name),
+                )
+            });
+    let path_count = avatar.paths.len();
+    let mut paths = reserve_metadata(path_count, "Python Avatar paths")?;
+    for entry in avatar.paths {
+        paths.push((entry.hash, entry.path));
+    }
+    Ok(PyAvatar {
+        path_id: avatar.path_id,
+        name: avatar.name,
+        declared_avatar_size: avatar.declared_avatar_size,
+        skeleton_node_count,
+        human_skeleton_node_count,
+        path_count,
+        paths,
+        has_human_description,
+        human_bone_count,
+        skeleton_bone_count,
+        root_motion_bone_name,
+    })
 }
 
 struct PreparedCubismExpression {
