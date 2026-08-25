@@ -112,6 +112,16 @@ methods:
   requires all seven preparation helpers to remain inside their corresponding
   closure and has one negative mutation per method. Installed wheel and sdist
   behavior tests continue to validate every returned field and reference table.
+- Collection file/object/resource convenience lists and bounded pages, tolerant
+  load diagnostics, scene nodes, SplitObjects/Animator FBX candidates, Material
+  property tables, model-texture skip descriptions and export/extraction reports
+  now follow the same rule. The Core call and all fallible pure-Rust result-table
+  projection run in one detached closure; only unique model texture files still
+  require attached `Py::new` calls. A call-aware lexical parser accepts both
+  block and single-expression closures and proves each of the 15 preparation
+  calls remains inside `py.detach`; one negative mutation per path prevents the
+  audit from passing vacuously. Wheel/sdist behavior and strict typing continue
+  to cover their unchanged external signatures and result fields.
 - Public list-shaped inputs no longer rely on PyO3's eager `Vec` extraction.
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;
