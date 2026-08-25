@@ -205,12 +205,12 @@ def export_and_validate() -> int:
         for column in range(width)
         for value in (17 * column + 1, 40 * row + 2, 90 + column, 255 - 30 * row)
     )
-    with tempfile.TemporaryDirectory(prefix="assetstudio-png-") as directory:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-png-") as directory:
         work = Path(directory)
         assets = work / "texture.assets"
         assets.write_bytes(texture_assets(width, height, source))
         result = subprocess.run(
-            ["cargo", "run", "--quiet", "-p", "assetstudio-cli", "--locked", "--",
+            ["cargo", "run", "--quiet", "-p", "unity-rs-cli", "--locked", "--",
              "export", str(assets), str(work / "out")],
             cwd=ROOT, capture_output=True, text=True,
         )

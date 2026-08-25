@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/assetstudio-cli",
-    "crates/assetstudio-core",
-    "crates/assetstudio-node",
-    "crates/assetstudio-python",
+    "crates/unity-rs-cli",
+    "crates/unity-rs-core",
+    "crates/unity-rs-node",
+    "crates/unity-rs-python",
 ]
 resolver = "3"
 

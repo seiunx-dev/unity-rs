@@ -34,13 +34,13 @@ def run(command: list[str], *, cwd: Path = ROOT) -> None:
 
 
 def managed_repo() -> Path:
-    configured = os.environ.get("ASSETSTUDIO_REPO")
+    configured = os.environ.get("UNITY_RS_ORACLE_REPO")
     repository = Path(configured) if configured else ROOT.parent / "AssetStudio"
     required = repository / "AssetStudio" / "AssetStudio.csproj"
     if not required.is_file():
         raise RuntimeError(
             "the schema generator needs the managed AssetStudio oracle; "
-            f"looked for {required}. Set ASSETSTUDIO_REPO to its checkout"
+            f"looked for {required}. Set UNITY_RS_ORACLE_REPO to its checkout"
         )
     return repository.resolve()
 
@@ -130,7 +130,7 @@ def main() -> int:
             f"-p:AssetStudioRepo={oracle}",
         ]
     )
-    with tempfile.TemporaryDirectory(prefix="assetstudio-monoschema-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-monoschema-") as temporary:
         root = Path(temporary)
         assembly_directory = write_fixture(root / "fixture")
 

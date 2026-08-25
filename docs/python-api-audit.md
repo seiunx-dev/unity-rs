@@ -2,7 +2,7 @@
 
 Last verified: 2026-08-25.
 
-`assetstudio-rs` is a direct PyO3 binding over `assetstudio-core`.  It does not
+`unity-rs` is a direct PyO3 binding over `unity-rs-core`.  It does not
 load the removed custom C ABI or a .NET assembly.  This document records how
 the stable high-level Rust surface is represented in Python and which apparent
 one-to-one differences are intentional wrappers rather than missing features.
@@ -11,13 +11,13 @@ one-to-one differences are intentional wrappers rather than missing features.
 
 | Rust `Studio` capability | Python surface |
 | --- | --- |
-| Path, one-region and named multi-region loading with options | `AssetStudio(...)`, `from_bytes`, `from_memory_files` |
+| Path, one-region and named multi-region loading with options | `UnityRs(...)`, `from_bytes`, `from_memory_files` |
 | File, object and resource counts and stable iteration | properties, convenience lists, iterators and bounded pages |
 | Source-bound resources and object payloads | bounded `read_resource*`, `read_raw`, `read_text` and specialized readers |
 | Scene hierarchy and model planning | `scene`, SplitObjects/Animator candidates and selected-GameObject FBX |
 | Textures, sprites, audio/video/font, mesh, shader, material and project settings | corresponding bounded `read_*` methods |
 | Animation, controller, avatar, ACL adapter and Live2D | corresponding metadata/document/package readers and caller decoder hooks |
-| Atomic collection export and safe recursive extraction | `AssetStudio.export` and module-level `extract` |
+| Atomic collection export and safe recursive extraction | `UnityRs.export` and module-level `extract` |
 
 The following Rust methods intentionally do not have identically shaped Python
 methods:
@@ -44,7 +44,7 @@ methods:
   the Python 3.9-compatible stub. All 107 public methods across `Studio`,
   `StudioFile`, `StudioResource` and `StudioObject` must map to a real Python
   symbol or one of the four Rust-only ownership/borrow entries above. It also
-  requires every public `AssetStudio` method and property to be used by the
+  requires every public `UnityRs` method and property to be used by the
   strict mypy consumer. A newly published but unclassified Core method, a
   missing Python target, or a published but unconsumed Python method fails
   `quality`. `tools/test_python_api_surface.py` runs the current

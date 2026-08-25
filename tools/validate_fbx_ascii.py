@@ -129,12 +129,12 @@ def export_and_validate() -> int:
     from validate_fbx_binary import synthetic_model  # noqa: PLC0415
 
     root = Path(__file__).resolve().parent.parent
-    with tempfile.TemporaryDirectory(prefix="assetstudio-fbx-ascii-") as directory:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-fbx-ascii-") as directory:
         assets = Path(directory) / "model.assets"
         assets.write_bytes(synthetic_model())
         output = Path(directory) / "model.fbx"
         result = subprocess.run(
-            ["cargo", "run", "--quiet", "-p", "assetstudio-cli", "--locked", "--",
+            ["cargo", "run", "--quiet", "-p", "unity-rs-cli", "--locked", "--",
              "fbx", str(assets), str(output)],
             cwd=root, capture_output=True, text=True,
         )

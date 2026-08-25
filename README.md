@@ -28,15 +28,14 @@ gates speculatively.
 
 | Surface | Current identifier | Status |
 | --- | --- | --- |
-| Rust library | `assetstudio-core` | Primary, implemented |
-| Native CLI | `assetstudio` / Cargo package `assetstudio-cli` | Implemented |
-| Python distribution | `assetstudio-rs`, import `assetstudio` | Primary, implemented (`cp39-abi3`) |
-| Node.js package | `assetstudio-rs-node` | Optional Beta |
+| Rust library | `unity-rs-core` | Primary, implemented |
+| Native CLI | `unity-rs` / Cargo package `unity-rs-cli` | Implemented |
+| Python distribution | `unity-rs`, import `unity_rs` | Primary, implemented (`cp39-abi3`) |
+| Node.js package | `unity-rs-node` | Optional Beta |
 
-The project name is `unity-rs`. The identifiers above are retained for source
-and package compatibility; they are code/API names, not the project brand.
-Changing them would be a separate breaking release rather than a documentation
-rename.
+The project and all first-party public identifiers now use the `unity-rs`
+family. In language syntax that cannot contain a hyphen, the corresponding
+identifiers are `unity_rs_core`, `unity_rs`, and `UnityRs`.
 
 For the maintained compatibility matrix, evidence, and deferred sample-backed
 work, see [REWRITE_STATUS.md](REWRITE_STATUS.md). Binding coverage is tracked in
@@ -47,18 +46,18 @@ work, see [REWRITE_STATUS.md](REWRITE_STATUS.md). Binding coverage is tracked in
 
 ### Rust
 
-From a Cargo project, the existing crate can be imported under the `unity_rs`
+From a Cargo project, import the core crate under the `unity_rs_core`
 name:
 
 ```toml
 [dependencies]
-unity_rs = { package = "assetstudio-core", git = "https://github.com/Team-Haruki/unity-rs" }
+unity_rs_core = { package = "unity-rs-core", git = "https://github.com/Team-Haruki/unity-rs" }
 ```
 
 ```rust,no_run
-use unity_rs::studio::Studio;
+use unity_rs_core::studio::Studio;
 
-fn main() -> Result<(), unity_rs::Error> {
+fn main() -> Result<(), unity_rs_core::Error> {
     let studio = Studio::open("game_Data")?;
 
     for object in studio.objects() {
@@ -85,10 +84,10 @@ fn main() -> Result<(), unity_rs::Error> {
 Run directly from the checkout:
 
 ```shell
-cargo run -p assetstudio-cli -- info game_Data
-cargo run -p assetstudio-cli -- list bundle.ab
-cargo run -p assetstudio-cli -- export bundle.ab exported
-cargo run -p assetstudio-cli -- extract bundle.ab unpacked
+cargo run -p unity-rs-cli -- info game_Data
+cargo run -p unity-rs-cli -- list bundle.ab
+cargo run -p unity-rs-cli -- export bundle.ab exported
+cargo run -p unity-rs-cli -- extract bundle.ab unpacked
 ```
 
 Common commands:
@@ -107,8 +106,8 @@ Common commands:
 | `live2d` | Export verified `.moc3` payloads |
 | `live2d-package` | Materialize verified Live2D packages |
 
-Use `cargo run -p assetstudio-cli -- --help` or
-`cargo run -p assetstudio-cli -- <command> --help` for complete options and
+Use `cargo run -p unity-rs-cli -- --help` or
+`cargo run -p unity-rs-cli -- <command> --help` for complete options and
 budgets.
 
 ### Python
@@ -116,14 +115,14 @@ budgets.
 Build the abi3 extension from the checkout:
 
 ```shell
-cd crates/assetstudio-python
+cd crates/unity-rs-python
 maturin develop --locked --offline
 ```
 
 ```python
-from assetstudio import AssetStudio, ExportLimits, SceneLimits
+from unity_rs import UnityRs, ExportLimits, SceneLimits
 
-studio = AssetStudio("game_Data")
+studio = UnityRs("game_Data")
 
 for obj in studio.iter_objects():
     print(obj.file_index, obj.path_id, obj.class_id, obj.name)
@@ -149,15 +148,15 @@ type-checked in CI.
 Build the optional addon from the checkout:
 
 ```shell
-cd crates/assetstudio-node
+cd crates/unity-rs-node
 npm install
 npm run build:debug
 ```
 
 ```javascript
-const { AssetStudio } = require("assetstudio-rs-node")
+const { UnityRs } = require("unity-rs-node")
 
-const studio = new AssetStudio("game_Data")
+const studio = new UnityRs("game_Data")
 console.log(studio.fileCount, studio.objectCount, studio.resourceCount)
 
 const firstPage = studio.objectPage(0, 0, 256)
@@ -257,10 +256,10 @@ formats are reported separately from corrupted data and failed I/O.
 ## Workspace layout
 
 ```text
-crates/assetstudio-core    Rust parsing/export core
-crates/assetstudio-cli     Native command-line frontend
-crates/assetstudio-python  PyO3 abi3 package
-crates/assetstudio-node    Optional napi-rs package
+crates/unity-rs-core    Rust parsing/export core
+crates/unity-rs-cli     Native command-line frontend
+crates/unity-rs-python  PyO3 abi3 package
+crates/unity-rs-node    Optional napi-rs package
 corpus/                    Private real-asset acceptance harness
 oracle/                    Checked managed differential harness
 tools/                     Quality, packaging, corpus, and API audits
@@ -307,12 +306,12 @@ CI verifies:
   vgmstream where those comparisons are independent.
 
 The managed oracle is optional and is never loaded by the runtime. To run it
-from a checkout, set the legacy-compatible `ASSETSTUDIO_REPO` variable to the
-managed repository path or keep that checkout beside this repository:
+from a checkout, set `UNITY_RS_ORACLE_REPO` to the managed repository path or
+keep that checkout beside this repository:
 
 ```shell
-ASSETSTUDIO_REPO=/path/to/managed/oracle \
-  cargo test -p assetstudio-core --test dotnet_oracle --locked -- --ignored
+UNITY_RS_ORACLE_REPO=/path/to/managed/oracle \
+  cargo test -p unity-rs-core --test dotnet_oracle --locked -- --ignored
 ```
 
 ## Credits

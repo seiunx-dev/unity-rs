@@ -35,10 +35,10 @@ class DeliveryScopeTests(unittest.TestCase):
             with self.subTest(relative=relative):
                 path = self.root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("[package]\nname = 'assetstudio-ffi'\n", encoding="utf-8")
+                path.write_text("[package]\nname = 'unity-rs-ffi'\n", encoding="utf-8")
                 with self.assertRaises(AssertionError):
                     check_delivery_scope.check_retired_surfaces(self.root)
-                shutil.rmtree(self.root / "crates/assetstudio-ffi")
+                shutil.rmtree(self.root / "crates/unity-rs-ffi")
 
     def test_retired_ffi_directory_fails_without_source_files(self) -> None:
         retired = self.root / check_delivery_scope.FORBIDDEN_REPOSITORY_PATHS[0]
@@ -73,19 +73,19 @@ class DeliveryScopeTests(unittest.TestCase):
             with self.subTest(relative=relative):
                 path = self.root / relative
                 original = path.read_text(encoding="utf-8")
-                path.write_text(f"{original}assetstudio-ffi\n", encoding="utf-8")
+                path.write_text(f"{original}unity-rs-ffi\n", encoding="utf-8")
                 with self.assertRaises(AssertionError):
                     check_delivery_scope.check_retired_surfaces(self.root)
                 path.write_text(original, encoding="utf-8")
 
     def test_public_context_in_non_root_rust_module_fails(self) -> None:
-        source = self.root / "crates/assetstudio-core/src/parser_state.rs"
+        source = self.root / "crates/unity-rs-core/src/parser_state.rs"
         source.write_text("pub struct ParserContext;\n", encoding="utf-8")
         with self.assertRaises(AssertionError):
             check_delivery_scope.check_retired_surfaces(self.root)
 
     def test_custom_exported_c_abi_fails(self) -> None:
-        source = self.root / "crates/assetstudio-core/src/legacy_abi.rs"
+        source = self.root / "crates/unity-rs-core/src/legacy_abi.rs"
         for declaration in (
             '#[unsafe(no_mangle)]\npub extern "C" fn context_open() {}\n',
             'pub unsafe extern "C" fn context_close() {}\n',
@@ -98,7 +98,7 @@ class DeliveryScopeTests(unittest.TestCase):
         source.unlink()
 
     def test_extra_production_target_fails(self) -> None:
-        expected = check_delivery_scope.EXPECTED_PRIMARY_TARGET["assetstudio-core"]
+        expected = check_delivery_scope.EXPECTED_PRIMARY_TARGET["unity-rs-core"]
         package = {
             "targets": [
                 {
@@ -108,16 +108,16 @@ class DeliveryScopeTests(unittest.TestCase):
                 }
             ]
         }
-        check_delivery_scope.check_package_targets("assetstudio-core", package)
+        check_delivery_scope.check_package_targets("unity-rs-core", package)
         package["targets"].append(
             {
-                "name": "assetstudio-gui",
+                "name": "unity-rs-gui",
                 "kind": ["bin"],
                 "crate_types": ["bin"],
             }
         )
         with self.assertRaises(AssertionError):
-            check_delivery_scope.check_package_targets("assetstudio-core", package)
+            check_delivery_scope.check_package_targets("unity-rs-core", package)
 
 
 if __name__ == "__main__":

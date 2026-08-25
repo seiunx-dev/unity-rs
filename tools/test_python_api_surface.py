@@ -9,9 +9,9 @@ import check_python_api_surface
 
 
 MINIMAL_STUB = """
-class AssetStudio:
+class UnityRs:
     @classmethod
-    def open(cls, path: str) -> AssetStudio: ...
+    def open(cls, path: str) -> UnityRs: ...
 
     @property
     def object_count(self) -> int: ...
@@ -20,9 +20,9 @@ class AssetStudio:
 """
 
 COMPLETE_CONSUMER = """
-def consume_public_api(studio: AssetStudio) -> None:
-    alias: AssetStudio = studio
-    AssetStudio.open("fixture.assets")
+def consume_public_api(studio: UnityRs) -> None:
+    alias: UnityRs = studio
+    UnityRs.open("fixture.assets")
     studio.read_text(0)
     count = alias.object_count
 """
@@ -212,7 +212,7 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
     def test_missing_named_classes_are_diagnostic(self) -> None:
         with self.assertRaisesRegex(
             check_python_api_surface.AuditError,
-            r"stub does not define AssetStudio",
+            r"stub does not define UnityRs",
         ):
             check_python_api_surface.validate_surface("class Other: pass", COMPLETE_CONSUMER)
         with self.assertRaisesRegex(
@@ -243,7 +243,7 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
         self.assertNotEqual(altered, stub)
         with self.assertRaisesRegex(
             check_python_api_surface.AuditError,
-            r"StudioObject.read_shader_text -> AssetStudio.read_shader",
+            r"StudioObject.read_shader_text -> UnityRs.read_shader",
         ):
             check_python_api_surface.validate_core_mapping(
                 check_python_api_surface.CORE_STUDIO.read_text(encoding="utf-8"),

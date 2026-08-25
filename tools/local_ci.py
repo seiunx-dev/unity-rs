@@ -69,8 +69,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-NODE = ROOT / "crates" / "assetstudio-node"
-PYTHON = ROOT / "crates" / "assetstudio-python"
+NODE = ROOT / "crates" / "unity-rs-node"
+PYTHON = ROOT / "crates" / "unity-rs-python"
 # The wheel is installed here rather than into whatever interpreter happens to
 # be on PATH. A Homebrew or distribution Python refuses `pip install` outright
 # under PEP 668, and one that does not would be left carrying a build of this
@@ -80,7 +80,7 @@ VENV = PYTHON / ".ci-venv"
 VENV_314 = PYTHON / ".ci-venv-314"
 MYPY_VERSION = "1.18.2"
 CLI_BINARY = ROOT / "target" / "release" / (
-    "assetstudio.exe" if os.name == "nt" else "assetstudio"
+    "unity-rs.exe" if os.name == "nt" else "unity-rs"
 )
 
 # Several steps below verify with `assert` -- the inline `-c` snippets here and
@@ -188,7 +188,7 @@ def groups(interpreter: str) -> list[Group]:
                     "package the core crate",
                     [
                         "cargo", "package", "--allow-dirty", "--locked",
-                        "-p", "assetstudio-core",
+                        "-p", "unity-rs-core",
                     ],
                 ),
                 Step(
@@ -241,7 +241,7 @@ def groups(interpreter: str) -> list[Group]:
                     "build release CLI",
                     [
                         "cargo", "build", "--release", "--locked",
-                        "-p", "assetstudio-cli",
+                        "-p", "unity-rs-cli",
                     ],
                 ),
                 Step("smoke exact release CLI", [str(CLI_BINARY), "--help"]),
@@ -257,7 +257,7 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "managed differential",
                     [
-                        "cargo", "test", "-p", "assetstudio-core", "--test",
+                        "cargo", "test", "-p", "unity-rs-core", "--test",
                         "dotnet_oracle", "--locked", "--", "--ignored",
                     ],
                 ),
@@ -275,7 +275,7 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "audio differential",
                     [
-                        "cargo", "test", "-p", "assetstudio-core", "--lib",
+                        "cargo", "test", "-p", "unity-rs-core", "--lib",
                         "--locked", "--", "--ignored",
                     ],
                 )
@@ -331,8 +331,8 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "compile Core/CLI/Python for Windows x86-64",
                     [
-                        "cargo", "check", "-p", "assetstudio-core",
-                        "-p", "assetstudio-cli", "-p", "assetstudio-python",
+                        "cargo", "check", "-p", "unity-rs-core",
+                        "-p", "unity-rs-cli", "-p", "unity-rs-python",
                         "--all-targets", "--locked", "--target",
                         "x86_64-pc-windows-gnu",
                     ],
@@ -376,7 +376,7 @@ def groups(interpreter: str) -> list[Group]:
                         [
                             "docker", "run", "--rm",
                             "--platform", f"linux/{architecture}",
-                            "-v", f"{ROOT}:/src", "-w", "/src/crates/assetstudio-python",
+                            "-v", f"{ROOT}:/src", "-w", "/src/crates/unity-rs-python",
                             "-e", f"CARGO_TARGET_DIR=/tmp/target-python-{architecture}",
                             LINUX_IMAGE,
                             "sh", "-c", LINUX_WHEEL,
@@ -535,7 +535,7 @@ def groups(interpreter: str) -> list[Group]:
                     cwd=PYTHON,
                 )
             ],
-            probe=[venv_interpreter(), "-c", "import assetstudio, UnityPy"],
+            probe=[venv_interpreter(), "-c", "import unity_rs, UnityPy"],
             reason="needs the built wheel and UnityPy in the same interpreter",
         ),
     ]
@@ -551,13 +551,13 @@ LINUX_SETUP = "apt-get update -qq >/dev/null && apt-get install -y -qq gcc >/dev
 # does not carry.
 LINUX_TESTS = (
     f"{LINUX_SETUP} && apt-get install -y -qq python3 >/dev/null"
-    " && cargo test -p assetstudio-core -p assetstudio-cli --locked"
-    " && cargo build --release --locked -p assetstudio-cli"
-    ' && "$CARGO_TARGET_DIR/release/assetstudio" --help >/dev/null'
+    " && cargo test -p unity-rs-core -p unity-rs-cli --locked"
+    " && cargo build --release --locked -p unity-rs-cli"
+    ' && "$CARGO_TARGET_DIR/release/unity-rs" --help >/dev/null'
     " && python3 tools/stage_cli_artifact.py"
-    ' "$CARGO_TARGET_DIR/release/assetstudio" /tmp/cli-artifact'
+    ' "$CARGO_TARGET_DIR/release/unity-rs" /tmp/cli-artifact'
     ' && test "$(find /tmp/cli-artifact -maxdepth 1 -type f | wc -l)" -eq 4'
-    " && /tmp/cli-artifact/assetstudio --help >/dev/null"
+    " && /tmp/cli-artifact/unity-rs --help >/dev/null"
 )
 
 LINUX_WHEEL = (
@@ -589,9 +589,9 @@ def linux_node_command(node_architecture: str, addon_architecture: str) -> str:
         " && mkdir /tmp/repository"
         " && tar --exclude=.git --exclude=target --exclude=node_modules"
         " --exclude='*.node' -C /src -cf - . | tar -C /tmp/repository -xf -"
-        " && cd /tmp/repository/crates/assetstudio-node"
+        " && cd /tmp/repository/crates/unity-rs-node"
         " && npm ci --silent && npm run build"
-        f" && test -f assetstudio-node.linux-{addon_architecture}-gnu.node"
+        f" && test -f unity-rs-node.linux-{addon_architecture}-gnu.node"
         " && npm test && npm run test:package"
         " && mkdir /tmp/node-pack"
         " && npm pack --silent --pack-destination /tmp/node-pack >/dev/null"

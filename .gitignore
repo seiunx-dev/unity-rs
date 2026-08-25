@@ -2,15 +2,15 @@
 /target/
 
 # Python extension module and locally built distributions
-crates/assetstudio-python/python/assetstudio/_native.*
-crates/assetstudio-python/.ci-venv/
-crates/assetstudio-python/dist/
-crates/assetstudio-python/sdist-dist/
+crates/unity-rs-python/python/unity_rs/_native.*
+crates/unity-rs-python/.ci-venv/
+crates/unity-rs-python/dist/
+crates/unity-rs-python/sdist-dist/
 __pycache__/
 *.pyc
 
 # Node addon and dependencies
-crates/assetstudio-node/*.node
+crates/unity-rs-node/*.node
 node_modules/
 
 # Managed differential oracle build output

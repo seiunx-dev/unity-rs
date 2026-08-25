@@ -9,7 +9,7 @@ both directions without loading a platform-specific native addon:
 * every stable high-level Core method is mapped to a real Node symbol or has a
   concrete Rust-only ownership reason;
 * the ``#[napi]`` Rust class/object fields and ``index.d.ts`` agree; and
-* every public ``AssetStudio`` member is used by the strict TypeScript consumer.
+* every public ``UnityRs`` member is used by the strict TypeScript consumer.
 """
 
 from __future__ import annotations
@@ -21,76 +21,76 @@ import check_python_api_surface
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE_STUDIO = ROOT / "crates/assetstudio-core/src/studio.rs"
-NODE_RUST = ROOT / "crates/assetstudio-node/src/lib.rs"
-DECLARATIONS = ROOT / "crates/assetstudio-node/index.d.ts"
-CONSUMER = ROOT / "crates/assetstudio-node/tests/types.ts"
+CORE_STUDIO = ROOT / "crates/unity-rs-core/src/studio.rs"
+NODE_RUST = ROOT / "crates/unity-rs-node/src/lib.rs"
+DECLARATIONS = ROOT / "crates/unity-rs-node/index.d.ts"
+CONSUMER = ROOT / "crates/unity-rs-node/tests/types.ts"
 
 # This table is intentionally independent of the Python mapping. Updating one
 # binding cannot silently classify another. Multiple streaming/materializing
 # Core methods may map to one bounded Node byte-returning method.
 CORE_TO_NODE = {
-    "Studio.open": "AssetStudio.constructor",
-    "Studio.open_with_options": "AssetStudio.openWith",
-    "Studio.open_region": "AssetStudio.fromBuffer",
-    "Studio.open_region_with_options": "AssetStudio.fromBuffer",
-    "Studio.open_regions": "AssetStudio.fromBuffers",
-    "Studio.open_regions_with_options": "AssetStudio.fromBuffers",
-    "Studio.file_count": "AssetStudio.fileCount",
-    "Studio.object_count": "AssetStudio.objectCount",
-    "Studio.resource_count": "AssetStudio.resourceCount",
-    "Studio.load_diagnostics": "AssetStudio.loadDiagnosticPage",
-    "Studio.files": "AssetStudio.filePage",
-    "Studio.file": "AssetStudio.filePage",
-    "Studio.resources": "AssetStudio.resourcePage",
-    "Studio.resource": "AssetStudio.readResource",
-    "Studio.resource_by_path": "AssetStudio.resourceIndexByPath",
-    "Studio.objects": "AssetStudio.objectPage",
-    "Studio.object": "AssetStudio.readRaw",
-    "Studio.scene_hierarchy": "AssetStudio.sceneWithLimits",
-    "Studio.export": "AssetStudio.exportWithOptions",
-    "Studio.extract": "AssetStudio.extract",
-    "Studio.write_static_fbx": "AssetStudio.readStaticFbx",
-    "Studio.read_static_fbx": "AssetStudio.readStaticFbx",
-    "Studio.write_fbx": "AssetStudio.readFbx",
-    "Studio.write_fbx_with_acl_decoder": "AssetStudio.readFbxWithAclDecoder",
-    "Studio.write_static_fbx_binary": "AssetStudio.readStaticFbxBinary",
-    "Studio.read_static_fbx_binary": "AssetStudio.readStaticFbxBinary",
-    "Studio.write_fbx_binary": "AssetStudio.readFbxBinary",
+    "Studio.open": "UnityRs.constructor",
+    "Studio.open_with_options": "UnityRs.openWith",
+    "Studio.open_region": "UnityRs.fromBuffer",
+    "Studio.open_region_with_options": "UnityRs.fromBuffer",
+    "Studio.open_regions": "UnityRs.fromBuffers",
+    "Studio.open_regions_with_options": "UnityRs.fromBuffers",
+    "Studio.file_count": "UnityRs.fileCount",
+    "Studio.object_count": "UnityRs.objectCount",
+    "Studio.resource_count": "UnityRs.resourceCount",
+    "Studio.load_diagnostics": "UnityRs.loadDiagnosticPage",
+    "Studio.files": "UnityRs.filePage",
+    "Studio.file": "UnityRs.filePage",
+    "Studio.resources": "UnityRs.resourcePage",
+    "Studio.resource": "UnityRs.readResource",
+    "Studio.resource_by_path": "UnityRs.resourceIndexByPath",
+    "Studio.objects": "UnityRs.objectPage",
+    "Studio.object": "UnityRs.readRaw",
+    "Studio.scene_hierarchy": "UnityRs.sceneWithLimits",
+    "Studio.export": "UnityRs.exportWithOptions",
+    "Studio.extract": "UnityRs.extract",
+    "Studio.write_static_fbx": "UnityRs.readStaticFbx",
+    "Studio.read_static_fbx": "UnityRs.readStaticFbx",
+    "Studio.write_fbx": "UnityRs.readFbx",
+    "Studio.write_fbx_with_acl_decoder": "UnityRs.readFbxWithAclDecoder",
+    "Studio.write_static_fbx_binary": "UnityRs.readStaticFbxBinary",
+    "Studio.read_static_fbx_binary": "UnityRs.readStaticFbxBinary",
+    "Studio.write_fbx_binary": "UnityRs.readFbxBinary",
     "Studio.write_fbx_binary_with_acl_decoder": (
-        "AssetStudio.readFbxBinaryWithAclDecoder"
+        "UnityRs.readFbxBinaryWithAclDecoder"
     ),
-    "Studio.read_fbx_binary": "AssetStudio.readFbxBinary",
+    "Studio.read_fbx_binary": "UnityRs.readFbxBinary",
     "Studio.read_fbx_binary_with_acl_decoder": (
-        "AssetStudio.readFbxBinaryWithAclDecoder"
+        "UnityRs.readFbxBinaryWithAclDecoder"
     ),
-    "Studio.write_fbx_with_textures": "AssetStudio.readFbxWithTextures",
-    "Studio.read_model_obj": "AssetStudio.readModelObj",
-    "Studio.read_fbx": "AssetStudio.readFbx",
-    "Studio.read_fbx_with_acl_decoder": "AssetStudio.readFbxWithAclDecoder",
-    "Studio.split_object_fbx_candidates": "AssetStudio.splitObjectFbxCandidates",
-    "Studio.animator_fbx_candidates": "AssetStudio.animatorFbxCandidates",
-    "Studio.write_game_object_fbx": "AssetStudio.readGameObjectFbx",
+    "Studio.write_fbx_with_textures": "UnityRs.readFbxWithTextures",
+    "Studio.read_model_obj": "UnityRs.readModelObj",
+    "Studio.read_fbx": "UnityRs.readFbx",
+    "Studio.read_fbx_with_acl_decoder": "UnityRs.readFbxWithAclDecoder",
+    "Studio.split_object_fbx_candidates": "UnityRs.splitObjectFbxCandidates",
+    "Studio.animator_fbx_candidates": "UnityRs.animatorFbxCandidates",
+    "Studio.write_game_object_fbx": "UnityRs.readGameObjectFbx",
     "Studio.write_game_object_fbx_with_acl_decoder": (
-        "AssetStudio.readGameObjectFbxWithAclDecoder"
+        "UnityRs.readGameObjectFbxWithAclDecoder"
     ),
-    "Studio.read_game_object_fbx": "AssetStudio.readGameObjectFbx",
+    "Studio.read_game_object_fbx": "UnityRs.readGameObjectFbx",
     "Studio.read_game_object_fbx_with_acl_decoder": (
-        "AssetStudio.readGameObjectFbxWithAclDecoder"
+        "UnityRs.readGameObjectFbxWithAclDecoder"
     ),
-    "Studio.live2d_packages": "AssetStudio.live2DPackages",
+    "Studio.live2d_packages": "UnityRs.live2DPackages",
     "Studio.live2d_packages_with_schema_provider": (
-        "AssetStudio.readLive2DPackagesWithSchemas"
+        "UnityRs.readLive2DPackagesWithSchemas"
     ),
     "Studio.live2d_packages_with_adapters": (
-        "AssetStudio.readLive2DPackagesWithAclDecoder"
+        "UnityRs.readLive2DPackagesWithAclDecoder"
     ),
-    "Studio.read_live2d_packages": "AssetStudio.readLive2DPackages",
+    "Studio.read_live2d_packages": "UnityRs.readLive2DPackages",
     "Studio.read_live2d_packages_with_schema_provider": (
-        "AssetStudio.readLive2DPackagesWithSchemas"
+        "UnityRs.readLive2DPackagesWithSchemas"
     ),
     "Studio.read_live2d_packages_with_adapters": (
-        "AssetStudio.readLive2DPackagesWithAclDecoder"
+        "UnityRs.readLive2DPackagesWithAclDecoder"
     ),
     "StudioFile.index": "FileInfo.index",
     "StudioFile.path": "FileInfo.path",
@@ -99,10 +99,10 @@ CORE_TO_NODE = {
     "StudioResource.index": "ResourceInfo.index",
     "StudioResource.path": "ResourceInfo.path",
     "StudioResource.byte_size": "ResourceInfo.byteSize",
-    "StudioResource.write": "AssetStudio.readResource",
-    "StudioResource.write_range": "AssetStudio.readResourceRange",
-    "StudioResource.read": "AssetStudio.readResource",
-    "StudioResource.read_range": "AssetStudio.readResourceRange",
+    "StudioResource.write": "UnityRs.readResource",
+    "StudioResource.write_range": "UnityRs.readResourceRange",
+    "StudioResource.read": "UnityRs.readResource",
+    "StudioResource.read_range": "UnityRs.readResourceRange",
     "StudioObject.file_index": "ObjectInfo.fileIndex",
     "StudioObject.object_index": "ObjectInfo.objectIndex",
     "StudioObject.source_path": "ObjectInfo.sourcePath",
@@ -111,47 +111,47 @@ CORE_TO_NODE = {
     "StudioObject.byte_size": "ObjectInfo.byteSize",
     "StudioObject.name": "ObjectInfo.name",
     "StudioObject.container": "ObjectInfo.container",
-    "StudioObject.write_raw": "AssetStudio.readRaw",
-    "StudioObject.read_raw": "AssetStudio.readRaw",
-    "StudioObject.read_text_bytes": "AssetStudio.readText",
-    "StudioObject.read_shader_text": "AssetStudio.readShader",
-    "StudioObject.write_mesh_obj": "AssetStudio.readMeshObj",
-    "StudioObject.read_mesh_obj": "AssetStudio.readMeshObj",
-    "StudioObject.read_animation_clip": "AssetStudio.readAnimationClipInfo",
-    "StudioObject.read_legacy_animation": "AssetStudio.readLegacyAnimation",
+    "StudioObject.write_raw": "UnityRs.readRaw",
+    "StudioObject.read_raw": "UnityRs.readRaw",
+    "StudioObject.read_text_bytes": "UnityRs.readText",
+    "StudioObject.read_shader_text": "UnityRs.readShader",
+    "StudioObject.write_mesh_obj": "UnityRs.readMeshObj",
+    "StudioObject.read_mesh_obj": "UnityRs.readMeshObj",
+    "StudioObject.read_animation_clip": "UnityRs.readAnimationClipInfo",
+    "StudioObject.read_legacy_animation": "UnityRs.readLegacyAnimation",
     "StudioObject.read_animator_override_controller": (
-        "AssetStudio.readAnimatorOverrideController"
+        "UnityRs.readAnimatorOverrideController"
     ),
-    "StudioObject.read_asset_bundle": "AssetStudio.readAssetBundle",
-    "StudioObject.read_resource_manager": "AssetStudio.readResourceManager",
-    "StudioObject.read_preload_data": "AssetStudio.readPreloadData",
-    "StudioObject.read_animator_controller": "AssetStudio.readAnimatorController",
-    "StudioObject.read_avatar": "AssetStudio.readAvatar",
-    "StudioObject.read_audio_clip": "AssetStudio.readAudioClip",
-    "StudioObject.read_font": "AssetStudio.readFont",
-    "StudioObject.read_movie_texture": "AssetStudio.readMovieTexture",
-    "StudioObject.read_video_clip": "AssetStudio.readVideoClip",
-    "StudioObject.read_material": "AssetStudio.readMaterial",
-    "StudioObject.read_mono_script": "AssetStudio.readMonoScript",
-    "StudioObject.read_type_tree_json": "AssetStudio.readTypeTreeJson",
-    "StudioObject.write_type_tree_dump": "AssetStudio.readTypeTreeDump",
-    "StudioObject.read_type_tree_dump": "AssetStudio.readTypeTreeDump",
-    "StudioObject.read_mono_behaviour_json": "AssetStudio.readMonoBehaviourJson",
-    "StudioObject.decode_texture_mip": "AssetStudio.readTexture",
-    "StudioObject.decode_texture_array_mip0": "AssetStudio.readTextureArray",
-    "StudioObject.read_sprite_atlas": "AssetStudio.readSpriteAtlas",
-    "StudioObject.read_sprite": "AssetStudio.readSpriteMetadata",
-    "StudioObject.decode_sprite": "AssetStudio.readSprite",
-    "StudioObject.read_build_settings": "AssetStudio.readBuildSettings",
-    "StudioObject.read_player_settings": "AssetStudio.readPlayerSettings",
-    "StudioObject.read_cubism_expression": "AssetStudio.readCubismExpression",
-    "StudioObject.read_cubism_pose_part": "AssetStudio.readCubismPosePart",
-    "StudioObject.read_cubism_display_info": "AssetStudio.readCubismDisplayInfo",
-    "StudioObject.read_cubism_physics": "AssetStudio.readCubismPhysics",
-    "StudioObject.read_cubism_fade_motion": "AssetStudio.readCubismFadeMotion",
-    "StudioObject.read_cubism_clip_motion": "AssetStudio.readCubismClipMotion",
+    "StudioObject.read_asset_bundle": "UnityRs.readAssetBundle",
+    "StudioObject.read_resource_manager": "UnityRs.readResourceManager",
+    "StudioObject.read_preload_data": "UnityRs.readPreloadData",
+    "StudioObject.read_animator_controller": "UnityRs.readAnimatorController",
+    "StudioObject.read_avatar": "UnityRs.readAvatar",
+    "StudioObject.read_audio_clip": "UnityRs.readAudioClip",
+    "StudioObject.read_font": "UnityRs.readFont",
+    "StudioObject.read_movie_texture": "UnityRs.readMovieTexture",
+    "StudioObject.read_video_clip": "UnityRs.readVideoClip",
+    "StudioObject.read_material": "UnityRs.readMaterial",
+    "StudioObject.read_mono_script": "UnityRs.readMonoScript",
+    "StudioObject.read_type_tree_json": "UnityRs.readTypeTreeJson",
+    "StudioObject.write_type_tree_dump": "UnityRs.readTypeTreeDump",
+    "StudioObject.read_type_tree_dump": "UnityRs.readTypeTreeDump",
+    "StudioObject.read_mono_behaviour_json": "UnityRs.readMonoBehaviourJson",
+    "StudioObject.decode_texture_mip": "UnityRs.readTexture",
+    "StudioObject.decode_texture_array_mip0": "UnityRs.readTextureArray",
+    "StudioObject.read_sprite_atlas": "UnityRs.readSpriteAtlas",
+    "StudioObject.read_sprite": "UnityRs.readSpriteMetadata",
+    "StudioObject.decode_sprite": "UnityRs.readSprite",
+    "StudioObject.read_build_settings": "UnityRs.readBuildSettings",
+    "StudioObject.read_player_settings": "UnityRs.readPlayerSettings",
+    "StudioObject.read_cubism_expression": "UnityRs.readCubismExpression",
+    "StudioObject.read_cubism_pose_part": "UnityRs.readCubismPosePart",
+    "StudioObject.read_cubism_display_info": "UnityRs.readCubismDisplayInfo",
+    "StudioObject.read_cubism_physics": "UnityRs.readCubismPhysics",
+    "StudioObject.read_cubism_fade_motion": "UnityRs.readCubismFadeMotion",
+    "StudioObject.read_cubism_clip_motion": "UnityRs.readCubismClipMotion",
     "StudioObject.read_cubism_clip_motion_with_acl_decoder": (
-        "AssetStudio.readCubismClipMotionWithAclDecoder"
+        "UnityRs.readCubismClipMotionWithAclDecoder"
     ),
 }
 
@@ -268,13 +268,13 @@ def rust_node_symbols(source: str) -> set[str]:
     """Extract exported class members and mapped object fields from Rust."""
     implementation = block_between(
         source,
-        "#[napi]\nimpl AssetStudio {",
-        "\n}\n\nimpl AssetStudio {",
+        "#[napi]\nimpl UnityRs {",
+        "\n}\n\nimpl UnityRs {",
     )
     symbols: set[str] = set()
     for name in re.findall(r"^\s*pub fn ([A-Za-z_][A-Za-z0-9_]*)", implementation, re.M):
         javascript = "constructor" if name == "new" else snake_to_javascript(name)
-        symbol = f"AssetStudio.{javascript}"
+        symbol = f"UnityRs.{javascript}"
         if symbol in symbols:
             raise AuditError(f"Rust Node symbol is declared twice: {symbol}")
         symbols.add(symbol)
@@ -291,8 +291,8 @@ def rust_node_symbols(source: str) -> set[str]:
 
 
 def declaration_symbols(source: str) -> tuple[set[str], set[str], set[str]]:
-    """Return all mapped symbols plus AssetStudio methods and properties."""
-    class_block = block_between(source, "export declare class AssetStudio {", "\n}")
+    """Return all mapped symbols plus UnityRs methods and properties."""
+    class_block = block_between(source, "export declare class UnityRs {", "\n}")
     methods: set[str] = set()
     properties: set[str] = set()
     for line in class_block.splitlines():
@@ -308,7 +308,7 @@ def declaration_symbols(source: str) -> tuple[set[str], set[str], set[str]]:
         else:
             methods.add(name)
 
-    symbols = {f"AssetStudio.{name}" for name in methods | properties}
+    symbols = {f"UnityRs.{name}" for name in methods | properties}
     for object_name in MAPPED_OBJECTS:
         block = block_between(source, f"export interface {object_name} {{", "\n}")
         for field in re.findall(r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\??:", block, re.M):
@@ -317,12 +317,12 @@ def declaration_symbols(source: str) -> tuple[set[str], set[str], set[str]]:
 
 
 def validate_node_declarations(rust_source: str, declaration_source: str) -> tuple[int, int]:
-    """Require Rust's public AssetStudio class and generated declarations to agree."""
+    """Require Rust's public UnityRs class and generated declarations to agree."""
     rust = rust_node_symbols(rust_source)
     declarations, methods, properties = declaration_symbols(declaration_source)
-    rust_class = {symbol for symbol in rust if symbol.startswith("AssetStudio.")}
+    rust_class = {symbol for symbol in rust if symbol.startswith("UnityRs.")}
     declaration_class = {
-        symbol for symbol in declarations if symbol.startswith("AssetStudio.")
+        symbol for symbol in declarations if symbol.startswith("UnityRs.")
     }
     missing_declarations = sorted(rust_class - declaration_class)
     stale_declarations = sorted(declaration_class - rust_class)
@@ -387,11 +387,11 @@ def consumed_members(source: str) -> tuple[set[str], set[str]]:
     source = without_comments(source)
     calls = set(
         re.findall(
-            r"(?:\bstudio|\bAssetStudio)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
+            r"(?:\bstudio|\bUnityRs)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
             source,
         )
     )
-    if re.search(r"\bnew\s+AssetStudio\s*\(", source):
+    if re.search(r"\bnew\s+UnityRs\s*\(", source):
         calls.add("constructor")
     attributes = set(
         re.findall(r"\bstudio\.([A-Za-z_$][A-Za-z0-9_$]*)", source)
@@ -411,7 +411,7 @@ def validate_surface(declaration_source: str, consumer_source: str) -> tuple[int
         if missing_properties:
             details.append("properties: " + ", ".join(missing_properties))
         raise AuditError(
-            "strict TypeScript consumer does not cover every public AssetStudio member ("
+            "strict TypeScript consumer does not cover every public UnityRs member ("
             + "; ".join(details)
             + ")"
         )

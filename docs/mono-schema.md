@@ -37,7 +37,7 @@ every version that will consume it.
 Then hand the document to any command that opens a collection:
 
 ```
-assetstudio --mono-schema schema.json export <input> <output>
+unity-rs --mono-schema schema.json export <input> <output>
 ```
 
 `--class 114` narrows an export to `MonoBehaviour` alone, which is usually what
