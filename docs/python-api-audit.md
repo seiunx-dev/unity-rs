@@ -74,6 +74,9 @@ methods:
   `MonoBehaviourSchemas` collection and requires the helper thread to run while
   its shared Core lookup index is constructed; Python object extraction remains
   under the GIL, but the pure-Rust hash/index work does not.
+  Programmatic schema construction also uses the JSON document's version
+  invariant: an invalid Unity version becomes `ValueError` and cannot leave a
+  never-matching entry in the registry.
 - Public list-shaped inputs no longer rely on PyO3's eager `Vec` extraction.
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;
