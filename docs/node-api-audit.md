@@ -75,10 +75,14 @@ methods:
   parsing or invoking the decoder callback.
 - `readTextureAsync` and `readTextureArrayAsync` decode and convert bottom-up
   Unity pixels to the top-down JavaScript row order entirely in `Task::compute`.
-  Their public task-output types encode that invariant, leaving `resolve` only
-  to wrap already-final bytes. Rust tests cover one image and multiple layers;
-  installed-addon tests compare synchronous and Promise output for real
-  Texture2D and Texture2DArray fixtures pixel by pixel.
+  Their public task-output types encode that invariant. The array task also
+  fallibly reserves the final layer table and converts every layer into its
+  Node-facing `RgbaImage`/`Buffer` on the worker, so `resolve` only moves the
+  already-final Vec. A positive/negative source audit rejects changing the
+  task output or adding allocation, loops, or image projection back to
+  `into_nodes`. Rust tests cover one image and multiple layers; installed-addon
+  tests compare synchronous and Promise output for real Texture2D and
+  Texture2DArray fixtures pixel by pixel.
 - `readLive2DPackagesWithAclDecoder` materializes its packages on a worker and
   now also flattens every MOC, manifest, texture, JSON document and diagnostic
   into the final fallibly allocated `Live2DPackageSet` there. Its `resolve`
