@@ -43,6 +43,9 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
         check_python_api_surface.validate_texture_gil_boundary(
             check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
         )
+        check_python_api_surface.validate_sprite_atlas_gil_boundary(
+            check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        )
         check_python_api_surface.validate_payload_gil_boundary(
             check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
         )
@@ -110,6 +113,20 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
                 rf"{method_name}.*outside py\.detach",
             ):
                 check_python_api_surface.validate_payload_gil_boundary(altered)
+
+    def test_sprite_atlas_projection_must_stay_detached(self) -> None:
+        binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        altered = binding.replace(
+            "            prepare_sprite_atlas(atlas)\n",
+            "            moved_outside(atlas)\n",
+            1,
+        )
+        self.assertNotEqual(altered, binding)
+        with self.assertRaisesRegex(
+            check_python_api_surface.AuditError,
+            r"read_sprite_atlas.*outside py\.detach",
+        ):
+            check_python_api_surface.validate_sprite_atlas_gil_boundary(altered)
 
     def test_cubism_json_materialization_must_stay_detached(self) -> None:
         binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
