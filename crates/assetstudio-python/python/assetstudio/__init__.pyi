@@ -793,11 +793,14 @@ class ExportLimits:
         *,
         maximum_objects: int = 1_000_000,
         maximum_total_output_bytes: int = 17_179_869_184,
+        maximum_metadata_bytes: int = 268_435_456,
     ) -> ExportLimits: ...
     @property
     def maximum_objects(self) -> int: ...
     @property
     def maximum_total_output_bytes(self) -> int: ...
+    @property
+    def maximum_metadata_bytes(self) -> int: ...
 
 class ExtractionLimits:
     def __new__(

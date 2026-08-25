@@ -82,6 +82,9 @@ pub struct ExportOptions {
     pub pretty_json: bool,
     pub maximum_objects: usize,
     pub maximum_total_output_bytes: u64,
+    /// Cumulative encoded bytes retained by the returned report and the
+    /// collision indexes used while constructing it.
+    pub maximum_metadata_bytes: u64,
     pub maximum_raw_object_bytes: u64,
     pub maximum_type_tree_json_bytes: u64,
     pub maximum_type_tree_dump_bytes: u64,
@@ -111,6 +114,7 @@ impl Default for ExportOptions {
             pretty_json: true,
             maximum_objects: 1_000_000,
             maximum_total_output_bytes: 16 * 1024 * 1024 * 1024,
+            maximum_metadata_bytes: 256 * 1024 * 1024,
             maximum_raw_object_bytes: 512 * 1024 * 1024,
             maximum_type_tree_json_bytes: 256 * 1024 * 1024,
             maximum_type_tree_dump_bytes: 256 * 1024 * 1024,
@@ -169,6 +173,49 @@ struct ObjectExportContext<'a> {
     source: &'a str,
     output_directory: &'a Path,
     options: ExportOptions,
+}
+
+#[derive(Debug)]
+struct ExportMetadataBudget {
+    used: u64,
+    maximum: u64,
+    exhausted: bool,
+}
+
+impl ExportMetadataBudget {
+    const fn new(maximum: u64) -> Self {
+        Self {
+            used: 0,
+            maximum,
+            exhausted: false,
+        }
+    }
+
+    fn preview(&mut self, additional: usize) -> Result<u64> {
+        let additional = u64::try_from(additional).map_err(|_| {
+            self.exhausted = true;
+            export_metadata_budget_error(self.maximum)
+        })?;
+        let next = self.used.checked_add(additional).ok_or_else(|| {
+            self.exhausted = true;
+            export_metadata_budget_error(self.maximum)
+        })?;
+        if next > self.maximum {
+            self.exhausted = true;
+            return Err(export_metadata_budget_error(self.maximum));
+        }
+        Ok(next)
+    }
+
+    const fn commit(&mut self, next: u64) {
+        self.used = next;
+    }
+}
+
+fn export_metadata_budget_error(maximum: u64) -> Error {
+    Error::invalid_data(format!(
+        "export metadata exceeds the {maximum} byte cumulative limit"
+    ))
 }
 
 pub fn export_collection(
@@ -239,6 +286,7 @@ pub fn export_collection_with_plan(
     let output_root = prepare_output_root(output_root)?;
     let mut report = ExportReport::default();
     let mut total_output_bytes = 0_u64;
+    let mut metadata_budget = ExportMetadataBudget::new(options.maximum_metadata_bytes);
 
     for (file_index, loaded) in collection.serialized_files.iter().enumerate() {
         let group_prefix = format!("{file_index:04}_");
@@ -283,6 +331,7 @@ pub fn export_collection_with_plan(
                 object_index,
                 remaining_output_bytes,
                 &mut claimed_paths,
+                &mut metadata_budget,
             );
             match outcome {
                 Ok((record, written)) => {
@@ -293,23 +342,17 @@ pub fn export_collection_with_plan(
                     report.exported.push(record);
                 }
                 Err(error) => {
-                    let declined = matches!(error, Error::Unsupported(_));
-                    let bucket = if declined {
-                        &mut report.unsupported
-                    } else {
-                        &mut report.failures
-                    };
-                    bucket.try_reserve(1).map_err(|reserve_error| {
-                        Error::invalid_data(format!(
-                            "cannot grow export records while recording {error}: {reserve_error}"
-                        ))
-                    })?;
-                    bucket.push(ExportFailure {
-                        source: copy_export_string(&loaded.path, "export failure source")?,
-                        path_id: object.path_id,
-                        class_id: object.class_id,
-                        error: format_export_error(&error)?,
-                    });
+                    if metadata_budget.exhausted {
+                        return Err(error);
+                    }
+                    append_export_failure(
+                        &mut report,
+                        &loaded.path,
+                        object.path_id,
+                        object.class_id,
+                        &error,
+                        &mut metadata_budget,
+                    )?;
                 }
             }
         }
@@ -318,17 +361,49 @@ pub fn export_collection_with_plan(
     Ok(report)
 }
 
+fn append_export_failure(
+    report: &mut ExportReport,
+    source: &str,
+    path_id: i64,
+    class_id: i32,
+    error: &Error,
+    metadata_budget: &mut ExportMetadataBudget,
+) -> Result<()> {
+    let bucket = if matches!(error, Error::Unsupported(_)) {
+        &mut report.unsupported
+    } else {
+        &mut report.failures
+    };
+    bucket.try_reserve(1).map_err(|reserve_error| {
+        Error::invalid_data(format!(
+            "cannot grow export records while recording {error}: {reserve_error}"
+        ))
+    })?;
+    let (source, error) = bounded_export_failure_metadata(source, error, metadata_budget)?;
+    bucket.push(ExportFailure {
+        source,
+        path_id,
+        class_id,
+        error,
+    });
+    Ok(())
+}
+
 fn export_object(
     context: &ObjectExportContext<'_>,
     object_index: usize,
     remaining_output_bytes: u64,
     claimed_paths: &mut HashSet<String>,
+    metadata_budget: &mut ExportMetadataBudget,
 ) -> Result<(ExportRecord, u64)> {
     let object = context.file.objects.get(object_index).ok_or_else(|| {
         Error::invalid_data(format!(
             "serialized object index {object_index} is out of range"
         ))
     })?;
+    // A source copy is retained whether this object succeeds or is recorded
+    // as a failure. Refuse an impossible budget before decoding its payload.
+    metadata_budget.preview(context.source.len())?;
 
     let (base_name, extension, payload_kind, payload) = select_export_payload(
         context.collection,
@@ -383,7 +458,14 @@ fn export_object(
         &extension,
         object.path_id,
         claimed_paths,
+        metadata_budget,
     )?;
+    let record_metadata_bytes = context
+        .source
+        .len()
+        .checked_add(output_path.as_os_str().as_encoded_bytes().len())
+        .ok_or_else(|| Error::invalid_data("export record metadata length overflowed"))?;
+    let next_metadata_bytes = metadata_budget.preview(record_metadata_bytes)?;
     let record = ExportRecord {
         source: copy_export_string(context.source, "export record source")?,
         path_id: object.path_id,
@@ -391,6 +473,27 @@ fn export_object(
         output_path,
         payload_kind,
     };
+    let written = publish_export_payload(
+        &record,
+        payload,
+        context,
+        object_index,
+        object.byte_size,
+        remaining_output_bytes,
+    )?;
+    metadata_budget.commit(next_metadata_bytes);
+
+    Ok((record, written))
+}
+
+fn publish_export_payload(
+    record: &ExportRecord,
+    payload: ExportPayload,
+    context: &ObjectExportContext<'_>,
+    object_index: usize,
+    object_size: u64,
+    remaining_output_bytes: u64,
+) -> Result<u64> {
     ensure_secure_export_directory(context.output_directory)?;
     let mut output = AtomicExportFile::create(&record.output_path)?;
     let written;
@@ -398,13 +501,7 @@ fn export_object(
         let mut writer =
             OutputLimitWriter::new(BufWriter::new(output.file_mut()), remaining_output_bytes);
         let write_result = (|| -> Result<()> {
-            write_export_payload(
-                payload,
-                context,
-                object_index,
-                object.byte_size,
-                &mut writer,
-            )?;
+            write_export_payload(payload, context, object_index, object_size, &mut writer)?;
             writer.flush()?;
             Ok(())
         })();
@@ -417,8 +514,7 @@ fn export_object(
         written = writer.written;
     }
     output.persist(&record.output_path, context.options.overwrite_existing)?;
-
-    Ok((record, written))
+    Ok(written)
 }
 
 fn write_export_payload(
@@ -1007,10 +1103,8 @@ fn unique_output_path(
     extension: &str,
     path_id: i64,
     claimed_paths: &mut HashSet<String>,
+    metadata_budget: &mut ExportMetadataBudget,
 ) -> Result<PathBuf> {
-    claimed_paths
-        .try_reserve(2)
-        .map_err(|error| Error::invalid_data(format!("cannot grow export path set: {error}")))?;
     let collision_suffix = format!(" @{path_id}");
     for suffix in ["", collision_suffix.as_str()] {
         let component = joined_component(
@@ -1021,7 +1115,15 @@ fn unique_output_path(
         let identity = portable_export_key(&component)?;
         let candidate =
             join_export_path_fallibly(directory, Path::new(&component), "export output path")?;
+        if claimed_paths.contains(identity.as_str()) {
+            continue;
+        }
+        let next_metadata_bytes = metadata_budget.preview(identity.len())?;
+        claimed_paths.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow export path set: {error}"))
+        })?;
         if claimed_paths.insert(identity) {
+            metadata_budget.commit(next_metadata_bytes);
             return Ok(candidate);
         }
     }
@@ -1102,11 +1204,93 @@ impl fmt::Write for FallibleExportFormatString {
     }
 }
 
-fn format_export_error(error: &Error) -> Result<String> {
-    let mut output = FallibleExportFormatString::default();
-    fmt::write(&mut output, format_args!("{error}"))
-        .map_err(|_| Error::invalid_data("cannot allocate export failure message"))?;
+struct BoundedExportFormatString {
+    value: String,
+    maximum: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedExportFormatString {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            value: String::new(),
+            maximum,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl fmt::Write for BoundedExportFormatString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let next = self.value.len().checked_add(value.len()).ok_or_else(|| {
+            self.limit_exceeded = true;
+            fmt::Error
+        })?;
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(fmt::Error);
+        }
+        self.value
+            .try_reserve(value.len())
+            .map_err(|_| fmt::Error)?;
+        self.value.push_str(value);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportErrorFormatFailure {
+    Limit,
+    Allocation,
+}
+
+fn format_export_error(
+    error: &Error,
+    maximum_bytes: usize,
+) -> std::result::Result<String, ExportErrorFormatFailure> {
+    let mut output = BoundedExportFormatString::new(maximum_bytes);
+    if fmt::write(&mut output, format_args!("{error}")).is_err() {
+        return if output.limit_exceeded {
+            Err(ExportErrorFormatFailure::Limit)
+        } else {
+            Err(ExportErrorFormatFailure::Allocation)
+        };
+    }
     Ok(output.value)
+}
+
+fn bounded_export_failure_metadata(
+    source: &str,
+    error: &Error,
+    budget: &mut ExportMetadataBudget,
+) -> Result<(String, String)> {
+    let source_total = budget.preview(source.len())?;
+    let remaining = budget
+        .maximum
+        .checked_sub(source_total)
+        .ok_or_else(|| export_metadata_budget_error(budget.maximum))?;
+    let maximum_error_bytes = usize::try_from(remaining).unwrap_or(usize::MAX);
+    let error = match format_export_error(error, maximum_error_bytes) {
+        Ok(error) => error,
+        Err(ExportErrorFormatFailure::Limit) => {
+            budget.exhausted = true;
+            return Err(export_metadata_budget_error(budget.maximum));
+        }
+        Err(ExportErrorFormatFailure::Allocation) => {
+            return Err(Error::invalid_data(
+                "cannot allocate export failure message",
+            ));
+        }
+    };
+    let next = budget.preview(
+        source
+            .len()
+            .checked_add(error.len())
+            .ok_or_else(|| Error::invalid_data("export failure metadata length overflowed"))?,
+    )?;
+    let source = copy_export_string(source, "export failure source")?;
+    budget.commit(next);
+    Ok((source, error))
 }
 
 fn prepare_output_root(path: &Path) -> Result<PathBuf> {
@@ -1485,10 +1669,11 @@ mod tests {
     use crate::source::Region;
 
     use super::{
-        ExportMode, ExportOptions, FilenameFormat, MAX_PORTABLE_EXPORT_COMPONENT_BYTES,
-        export_collection, format_export_error, format_file_name, has_extension,
-        join_export_path_fallibly, lexical_absolute, portable_export_key, prepare_output_root,
-        replace_backup_path, sanitize_file_name, type_value_name, unique_output_path,
+        ExportMetadataBudget, ExportMode, ExportOptions, FilenameFormat,
+        MAX_PORTABLE_EXPORT_COMPONENT_BYTES, export_collection, format_export_error,
+        format_file_name, has_extension, join_export_path_fallibly, lexical_absolute,
+        portable_export_key, prepare_output_root, replace_backup_path, sanitize_file_name,
+        type_value_name, unique_output_path,
     };
     use crate::type_tree::{TypeField, TypeValue};
 
@@ -1532,8 +1717,16 @@ mod tests {
         let name = "a".repeat(MAX_PORTABLE_EXPORT_COMPONENT_BYTES - " @7.txt".len());
         let first = format!("{name}.txt");
         let mut claimed = HashSet::from([portable_export_key(&first).unwrap()]);
-        let collision =
-            unique_output_path(&directory, &name, ".txt", path_id, &mut claimed).unwrap();
+        let mut metadata = ExportMetadataBudget::new(u64::MAX);
+        let collision = unique_output_path(
+            &directory,
+            &name,
+            ".txt",
+            path_id,
+            &mut claimed,
+            &mut metadata,
+        )
+        .unwrap();
         let component = collision.file_name().unwrap().to_string_lossy();
         assert_eq!(component.len(), MAX_PORTABLE_EXPORT_COMPONENT_BYTES);
         assert!(component.ends_with(" @7.txt"));
@@ -1542,7 +1735,15 @@ mod tests {
         let mut claimed =
             HashSet::from([portable_export_key(&format!("{overlong_name}.txt")).unwrap()]);
         assert!(
-            unique_output_path(&directory, &overlong_name, ".txt", path_id, &mut claimed,).is_err()
+            unique_output_path(
+                &directory,
+                &overlong_name,
+                ".txt",
+                path_id,
+                &mut claimed,
+                &mut metadata,
+            )
+            .is_err()
         );
 
         assert_eq!(portable_export_key("İ.BIN").unwrap(), "i\u{307}.bin");
@@ -1550,15 +1751,32 @@ mod tests {
     }
 
     #[test]
+    fn lowercase_export_claims_obey_exact_metadata_boundaries() {
+        let directory = PathBuf::from("group");
+        let mut claimed = HashSet::new();
+        let mut rejected = ExportMetadataBudget::new(2);
+        assert!(unique_output_path(&directory, "İ", "", 7, &mut claimed, &mut rejected,).is_err());
+        assert!(claimed.is_empty());
+        assert_eq!(rejected.used, 0);
+
+        let mut accepted = ExportMetadataBudget::new(3);
+        let path = unique_output_path(&directory, "İ", "", 7, &mut claimed, &mut accepted).unwrap();
+        assert_eq!(path, directory.join("İ"));
+        assert_eq!(claimed, HashSet::from(["i\u{307}".to_owned()]));
+        assert_eq!(accepted.used, 3);
+    }
+
+    #[test]
     fn export_failure_messages_preserve_error_families_through_fallible_formatting() {
         assert_eq!(
-            format_export_error(&Error::invalid_data("invalid payload")).unwrap(),
+            format_export_error(&Error::invalid_data("invalid payload"), usize::MAX).unwrap(),
             "invalid payload"
         );
         assert_eq!(
-            format_export_error(&Error::unsupported("future layout")).unwrap(),
+            format_export_error(&Error::unsupported("future layout"), usize::MAX).unwrap(),
             "unsupported: future layout"
         );
+        assert!(format_export_error(&Error::invalid_data("invalid payload"), 14).is_err());
     }
 
     #[test]
@@ -1640,6 +1858,98 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".assetstudio-export-")
         }));
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn successful_export_metadata_has_an_exact_cumulative_limit() {
+        let collection = AssetCollection::load(
+            "fixture.assets",
+            Region::from_bytes(synthetic_v22_text_asset()),
+        )
+        .unwrap();
+        let output = unique_temp_directory("assetstudio-export-metadata-success");
+        let baseline = export_collection(&collection, &output, ExportOptions::default()).unwrap();
+        let record = baseline.exported.first().unwrap();
+        let file_name = record.output_path.file_name().unwrap().to_str().unwrap();
+        let required = record
+            .source
+            .len()
+            .checked_add(record.output_path.as_os_str().as_encoded_bytes().len())
+            .and_then(|length| length.checked_add(portable_export_key(file_name).unwrap().len()))
+            .and_then(|length| u64::try_from(length).ok())
+            .unwrap();
+        fs::remove_dir_all(&output).unwrap();
+
+        let error = export_collection(
+            &collection,
+            &output,
+            ExportOptions {
+                maximum_metadata_bytes: required - 1,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("export metadata exceeds"));
+        assert!(!output.join("0000_fixture.assets/demo.lua").exists());
+        fs::remove_dir_all(&output).unwrap();
+
+        let report = export_collection(
+            &collection,
+            &output,
+            ExportOptions {
+                maximum_metadata_bytes: required,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.exported.len(), 1);
+        assert!(report.failures.is_empty());
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn failure_report_metadata_has_an_exact_cumulative_limit() {
+        let collection = AssetCollection::load(
+            "stripped.assets",
+            Region::from_bytes(synthetic_v22_mono_behaviour(false)),
+        )
+        .unwrap();
+        let output = unique_temp_directory("assetstudio-export-metadata-failure");
+        let baseline = export_collection(&collection, &output, ExportOptions::default()).unwrap();
+        let failure = baseline.unsupported.first().unwrap();
+        let required = u64::try_from(failure.source.len() + failure.error.len()).unwrap();
+        fs::remove_dir_all(&output).unwrap();
+
+        let error = export_collection(
+            &collection,
+            &output,
+            ExportOptions {
+                maximum_metadata_bytes: required - 1,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("export metadata exceeds"));
+        assert_eq!(
+            fs::read_dir(output.join("0000_stripped.assets"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::remove_dir_all(&output).unwrap();
+
+        let report = export_collection(
+            &collection,
+            &output,
+            ExportOptions {
+                maximum_metadata_bytes: required,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(report.failures.is_empty());
         fs::remove_dir_all(output).unwrap();
     }
 

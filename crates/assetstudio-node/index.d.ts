@@ -659,6 +659,7 @@ export interface ExportConfiguration {
   prettyJson?: boolean
   maximumObjects?: number
   maximumTotalOutputBytes?: number
+  maximumMetadataBytes?: number
   maximumRawObjectBytes?: number
   maximumTypeTreeJsonBytes?: number
   maximumTypeTreeDumpBytes?: number

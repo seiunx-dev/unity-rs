@@ -160,6 +160,7 @@ const exportOptions: ExportConfiguration = {
   prettyJson: false,
   maximumObjects: 100,
   maximumTotalOutputBytes: 1024,
+  maximumMetadataBytes: 1024,
   maximumRawObjectBytes: 1024,
   maximumTypeTreeJsonBytes: 1024,
   maximumTypeTreeDumpBytes: 1024,

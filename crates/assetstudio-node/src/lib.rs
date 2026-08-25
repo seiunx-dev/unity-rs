@@ -860,6 +860,7 @@ pub struct ExportConfiguration {
     pub pretty_json: Option<bool>,
     pub maximum_objects: Option<u32>,
     pub maximum_total_output_bytes: Option<i64>,
+    pub maximum_metadata_bytes: Option<i64>,
     pub maximum_raw_object_bytes: Option<i64>,
     pub maximum_type_tree_json_bytes: Option<i64>,
     pub maximum_type_tree_dump_bytes: Option<i64>,
@@ -1014,6 +1015,11 @@ fn apply_export_limits(
         options.maximum_total_output_bytes,
         configured.maximum_total_output_bytes,
         "maximumTotalOutputBytes",
+    )?;
+    configured.maximum_metadata_bytes = non_negative_limit(
+        options.maximum_metadata_bytes,
+        configured.maximum_metadata_bytes,
+        "maximumMetadataBytes",
     )?;
     configured.maximum_raw_object_bytes = non_negative_limit(
         options.maximum_raw_object_bytes,

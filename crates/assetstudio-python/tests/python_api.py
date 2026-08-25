@@ -2581,6 +2581,17 @@ def main() -> None:
         assert len(limited_report.failures) == 1
         assert not any(path.is_file() for path in byte_limited.rglob("*"))
 
+        metadata_limits = ExportLimits(maximum_metadata_bytes=0)
+        assert metadata_limits.maximum_metadata_bytes == 0
+        metadata_limited = Path(directory) / "metadata-limited"
+        try:
+            studio.export(metadata_limited, limits=metadata_limits)
+        except ValueError as error:
+            assert "export metadata exceeds" in str(error)
+        else:
+            raise AssertionError("export metadata budget should raise ValueError")
+        assert not any(path.is_file() for path in metadata_limited.rglob("*"))
+
         try:
             studio.read_raw(0, 8)
         except KeyError:

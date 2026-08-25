@@ -2191,6 +2191,7 @@ console.log('node api: multi-buffer, resource range and scene ok')
       prettyJson: false,
       maximumObjects: 1,
       maximumTotalOutputBytes: 1024,
+      maximumMetadataBytes: 1024,
       maximumRawObjectBytes: 1024,
       maximumTypeTreeJsonBytes: 1024,
       maximumTypeTreeDumpBytes: 1024,
@@ -2211,8 +2212,19 @@ console.log('node api: multi-buffer, resource range and scene ok')
     assert.equal(configured.exported[0].payloadKind, 'raw')
     assert.equal(path.basename(configured.exported[0].outputPath), '7.dat')
 
+    const metadataLimitedRoot = path.join(outputDirectory, 'metadata-limited')
+    assert.throws(
+      () => exportStudio.exportWithOptions(metadataLimitedRoot, {
+        maximumMetadataBytes: 0,
+      }),
+      /export metadata exceeds/i,
+    )
+    const relativeExportPath = path.relative(outputDirectory, report.exported[0].outputPath)
+    assert.equal(fs.existsSync(path.join(metadataLimitedRoot, relativeExportPath)), false)
+
     for (const field of [
       'maximumTotalOutputBytes',
+      'maximumMetadataBytes',
       'maximumRawObjectBytes',
       'maximumTypeTreeJsonBytes',
       'maximumTypeTreeDumpBytes',

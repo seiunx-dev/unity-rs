@@ -965,6 +965,8 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          --image-format <jpg|jpeg|png|bmp|tga|webp|raw-rgba>\n  \
          --jpeg-quality <1-100>\n  --no-restore-text-extension\n  \
          --audio-format <auto|raw|wav>\n  \
+         --maximum-metadata-bytes <N>  Cumulative report and output-name index bytes;\n  \
+         the default is 268435456\n  \
          --class <ID>                  Export only this class, repeatable. IDs are the\n  \
          numbers list and export print, for example 114 for MonoBehaviour.\n  \
          --compact-json\n\n\
@@ -1367,6 +1369,18 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
                 .get(index)
                 .ok_or_else(|| Error::invalid_data("--audio-format requires a value"))?;
             options.audio_format = parse_audio_format(value)?;
+        } else if parse_options && argument == "--maximum-metadata-bytes" {
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| Error::invalid_data("--maximum-metadata-bytes requires a value"))?;
+            options.maximum_metadata_bytes = value
+                .to_str()
+                .ok_or_else(|| Error::invalid_data("metadata limit must be valid UTF-8 digits"))?
+                .parse::<u64>()
+                .map_err(|_| {
+                    Error::invalid_data("metadata limit must be a non-negative integer")
+                })?;
         } else if parse_options && argument == "--class" {
             index += 1;
             let value = arguments
@@ -4937,6 +4951,7 @@ mod tests {
         assert_eq!(command.options.image_format, ImageFormat::Png);
         assert_eq!(command.options.jpeg_quality, 75);
         assert_eq!(command.options.audio_format, AudioExportFormat::Auto);
+        assert_eq!(command.options.maximum_metadata_bytes, 256 * 1024 * 1024);
         assert!(!command.options.overwrite_existing);
         assert!(command.options.restore_text_asset_extension);
         assert!(command.options.pretty_json);
@@ -4956,6 +4971,8 @@ mod tests {
             "91",
             "--audio-format",
             "wav",
+            "--maximum-metadata-bytes",
+            "123",
             "--overwrite",
             "--no-restore-text-extension",
             "--compact-json",
@@ -4968,6 +4985,7 @@ mod tests {
         assert_eq!(command.options.image_format, ImageFormat::Tga);
         assert_eq!(command.options.jpeg_quality, 91);
         assert_eq!(command.options.audio_format, AudioExportFormat::Wav);
+        assert_eq!(command.options.maximum_metadata_bytes, 123);
         assert!(command.options.overwrite_existing);
         assert!(!command.options.restore_text_asset_extension);
         assert!(!command.options.pretty_json);
@@ -5033,6 +5051,36 @@ mod tests {
         assert!(
             parse_export_arguments(&arguments(&["--audio-format", "flac", "input", "output",]))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn export_arguments_validate_the_metadata_budget() {
+        let command = parse_export_arguments(&arguments(&[
+            "--maximum-metadata-bytes",
+            "0",
+            "input",
+            "output",
+        ]))
+        .unwrap();
+        assert_eq!(command.options.maximum_metadata_bytes, 0);
+        assert!(
+            parse_export_arguments(&arguments(&[
+                "--maximum-metadata-bytes",
+                "-1",
+                "input",
+                "output",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_export_arguments(&arguments(&[
+                "--maximum-metadata-bytes",
+                "not-a-number",
+                "input",
+                "output",
+            ]))
+            .is_err()
         );
     }
 
