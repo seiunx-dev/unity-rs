@@ -85,6 +85,15 @@ methods:
   both methods lexically and its negative tests move each conversion outside
   `py.detach` to prove the gate fails. Installed wheel and sdist tests continue
   to compare the resulting single-image and per-layer pixels exactly.
+- AudioClip and the three source-bound simple binary readers use the same
+  boundary. `read_audio_clip` parses metadata and produces its final bounded
+  WAV/raw bytes inside one detach closure; `read_font`, `read_movie_texture`
+  and `read_video_clip` also copy their `Region` payloads there. The attached
+  path receives final Rust-backed `PyAudioClip`/`PyBinaryAsset` values and only
+  transfers ownership. The source audit requires each materializer call to
+  remain lexically inside its method's `py.detach`, with one negative mutation
+  per call site. Installed wheel/sdist behavior covers raw audio plus the
+  verified FSB5 WAV codecs and all three simple assets, including output limits.
 - Public list-shaped inputs no longer rely on PyO3's eager `Vec` extraction.
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;
