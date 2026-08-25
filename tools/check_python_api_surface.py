@@ -177,6 +177,38 @@ def rust_braced_block(source: str, marker: str) -> str:
     raise AuditError(f"Python binding has an unterminated body after {marker!r}")
 
 
+def rust_parenthesized_call(source: str, marker: str) -> str:
+    """Return one Rust call body, ignoring parentheses inside strings."""
+    marker_offset = source.find(marker)
+    if marker_offset < 0:
+        raise AuditError(f"Python binding does not contain {marker!r}")
+    opening = source.find("(", marker_offset + len(marker))
+    if opening < 0:
+        raise AuditError(f"Python binding has no call after {marker!r}")
+    depth = 0
+    in_string = False
+    escaped = False
+    for offset in range(opening, len(source)):
+        character = source[offset]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1 : offset]
+    raise AuditError(f"Python binding has an unterminated call after {marker!r}")
+
+
 def validate_texture_gil_boundary(source: str) -> None:
     """Keep texture row conversion inside the GIL-detached Rust closure."""
     expectations = (
@@ -269,6 +301,39 @@ def validate_metadata_projection_gil_boundary(source: str) -> None:
         if preparation not in detached:
             raise AuditError(
                 f"{method_marker[:-1]} projects metadata outside py.detach"
+            )
+
+
+TABLE_PROJECTION_GIL_EXPECTATIONS = (
+    ("fn load_diagnostic_page(", "prepare_load_diagnostic_page("),
+    ("fn files(", "prepare_files("),
+    ("fn objects(", "prepare_objects("),
+    ("fn resources(", "prepare_resources("),
+    ("fn file_page(", "prepare_file_page("),
+    ("fn object_page(", "prepare_object_page("),
+    ("fn resource_page(", "prepare_resource_page("),
+    ("fn scene(", "prepare_scene_nodes("),
+    ("fn split_object_fbx_candidates(", "python_fbx_candidates("),
+    ("fn animator_fbx_candidates(", "python_fbx_candidates("),
+    ("fn read_model_obj(", "skipped_textures("),
+    ("fn read_fbx_with_textures(", "skipped_textures("),
+    ("fn read_material(", "convert_material("),
+    ("fn export(", "prepare_export_report("),
+    ("fn extract(", "convert_extraction_report("),
+)
+
+
+def validate_table_projection_gil_boundary(source: str) -> None:
+    """Keep collection/report table projection outside the GIL."""
+    for method_marker, preparation in TABLE_PROJECTION_GIL_EXPECTATIONS:
+        method = rust_braced_block(source, method_marker)
+        detach_offset = method.find("py.detach")
+        if detach_offset < 0:
+            raise AuditError(f"{method_marker[:-1]} does not release the GIL")
+        detached = rust_parenthesized_call(method[detach_offset:], "py.detach")
+        if preparation not in detached:
+            raise AuditError(
+                f"{method_marker[:-1]} projects its result table outside py.detach"
             )
 
 
@@ -453,13 +518,16 @@ def main() -> None:
         validate_metadata_projection_gil_boundary(
             PYTHON_BINDING.read_text(encoding="utf-8")
         )
+        validate_table_projection_gil_boundary(
+            PYTHON_BINDING.read_text(encoding="utf-8")
+        )
     except AuditError as error:
         raise SystemExit(str(error)) from error
     print(
         "Python API surface audit passed "
         f"({methods} methods, {properties} properties; "
         f"{core_methods} Core methods classified, {rust_only} Rust-only; "
-        "texture rows, binary payloads, Cubism JSON and metadata projection detached)"
+        "texture rows, binary payloads, Cubism JSON and result tables detached)"
     )
 
 

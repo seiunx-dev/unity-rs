@@ -19,7 +19,7 @@ use assetstudio_core::animator_controller::{AnimatorController, AnimatorControll
 use assetstudio_core::avatar::{Avatar, AvatarReadLimits};
 use assetstudio_core::bundle::OodleDecoder;
 use assetstudio_core::compression::CompressionLimits;
-use assetstudio_core::export::{AudioExportFormat, ExportMode, ExportOptions};
+use assetstudio_core::export::{AudioExportFormat, ExportMode, ExportOptions, ExportReport};
 use assetstudio_core::extraction::{ExtractionLimits, ExtractionOptions, ExtractionReport};
 use assetstudio_core::image_export::ImageFormat;
 use assetstudio_core::live2d_clip_motion::CubismClipMotionReadLimits;
@@ -2546,52 +2546,31 @@ impl PyAssetStudio {
 
     /// Returns a bounded page of inputs skipped by the tolerant load policy.
     #[pyo3(signature = (*, offset=0, limit=4_096))]
-    fn load_diagnostic_page(&self, offset: usize, limit: usize) -> PyResult<Vec<PyLoadDiagnostic>> {
-        check_metadata_page_limit(limit)?;
-        let diagnostics = self.studio.load_diagnostics();
-        let available = diagnostics.len().saturating_sub(offset);
-        let count = available.min(limit);
-        let mut output = reserve_metadata(count, "Python load diagnostic page")?;
-        for diagnostic in diagnostics.iter().skip(offset).take(count) {
-            output.push(python_load_diagnostic(diagnostic)?);
-        }
-        Ok(output)
+    fn load_diagnostic_page(
+        &self,
+        py: Python<'_>,
+        offset: usize,
+        limit: usize,
+    ) -> PyResult<Vec<PyLoadDiagnostic>> {
+        py.detach(|| prepare_load_diagnostic_page(&self.studio, offset, limit))
     }
 
     /// Returns all file metadata for convenience. Use `iter_files()` or
     /// `file_page()` for collections near the one-million-item safety limit.
-    fn files(&self) -> PyResult<Vec<PyFileInfo>> {
-        checked_convenience_list(self.studio.file_count(), "files", "iter_files")?;
-        let mut output = reserve_metadata(self.studio.file_count(), "Python file metadata")?;
-        for file in self.studio.files() {
-            output.push(python_file_info(file)?);
-        }
-        Ok(output)
+    fn files(&self, py: Python<'_>) -> PyResult<Vec<PyFileInfo>> {
+        py.detach(|| prepare_files(&self.studio))
     }
 
     /// Returns all object metadata for convenience. Use `iter_objects()` or
     /// `object_page()` for large collections.
-    fn objects(&self) -> PyResult<Vec<PyObjectInfo>> {
-        checked_convenience_list(self.studio.object_count(), "objects", "iter_objects")?;
-        let mut output = reserve_metadata(self.studio.object_count(), "Python object metadata")?;
-        for object in self.studio.objects() {
-            output.push(python_object_info(object)?);
-        }
-        Ok(output)
+    fn objects(&self, py: Python<'_>) -> PyResult<Vec<PyObjectInfo>> {
+        py.detach(|| prepare_objects(&self.studio))
     }
 
     /// Returns all external resource metadata for convenience. Use
     /// `iter_resources()` or `resource_page()` for very large collections.
-    fn resources(&self) -> PyResult<Vec<PyResourceInfo>> {
-        checked_convenience_list(self.studio.resource_count(), "resources", "iter_resources")?;
-        let mut output = reserve_metadata(
-            self.studio.resource_count(),
-            "Python external resource metadata",
-        )?;
-        for resource in self.studio.resources() {
-            output.push(python_resource_info(resource)?);
-        }
-        Ok(output)
+    fn resources(&self, py: Python<'_>) -> PyResult<Vec<PyResourceInfo>> {
+        py.detach(|| prepare_resources(&self.studio))
     }
 
     /// Iterates file metadata without first materializing a Python list.
@@ -2621,56 +2600,31 @@ impl PyAssetStudio {
 
     /// Returns a bounded page of collection file metadata.
     #[pyo3(signature = (*, offset=0, limit=4_096))]
-    fn file_page(&self, offset: usize, limit: usize) -> PyResult<Vec<PyFileInfo>> {
-        check_metadata_page_limit(limit)?;
-        let available = self.studio.file_count().saturating_sub(offset);
-        let count = available.min(limit);
-        let mut output = reserve_metadata(count, "Python file metadata page")?;
-        for file in self.studio.files().skip(offset).take(count) {
-            output.push(python_file_info(file)?);
-        }
-        Ok(output)
+    fn file_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<PyFileInfo>> {
+        py.detach(|| prepare_file_page(&self.studio, offset, limit))
     }
 
     /// Returns a bounded page within one serialized file's object table.
     #[pyo3(signature = (file_index, *, offset=0, limit=4_096))]
     fn object_page(
         &self,
+        py: Python<'_>,
         file_index: usize,
         offset: usize,
         limit: usize,
     ) -> PyResult<Vec<PyObjectInfo>> {
-        check_metadata_page_limit(limit)?;
-        let file = self
-            .studio
-            .file(file_index)
-            .ok_or_else(|| PyKeyError::new_err(format!("file index {file_index} was not found")))?;
-        let available = file.object_count().saturating_sub(offset);
-        let count = available.min(limit);
-        let mut output = reserve_metadata(count, "Python object metadata page")?;
-        for object_index in offset..offset + count {
-            let object = self
-                .studio
-                .object_by_index(file_index, object_index)
-                .ok_or_else(|| {
-                    PyValueError::new_err("object page could not resolve a validated object index")
-                })?;
-            output.push(python_object_info(object)?);
-        }
-        Ok(output)
+        py.detach(|| prepare_object_page(&self.studio, file_index, offset, limit))
     }
 
     /// Returns a bounded page of external resource metadata.
     #[pyo3(signature = (*, offset=0, limit=4_096))]
-    fn resource_page(&self, offset: usize, limit: usize) -> PyResult<Vec<PyResourceInfo>> {
-        check_metadata_page_limit(limit)?;
-        let available = self.studio.resource_count().saturating_sub(offset);
-        let count = available.min(limit);
-        let mut output = reserve_metadata(count, "Python external resource metadata page")?;
-        for resource in self.studio.resources().skip(offset).take(count) {
-            output.push(python_resource_info(resource)?);
-        }
-        Ok(output)
+    fn resource_page(
+        &self,
+        py: Python<'_>,
+        offset: usize,
+        limit: usize,
+    ) -> PyResult<Vec<PyResourceInfo>> {
+        py.detach(|| prepare_resource_page(&self.studio, offset, limit))
     }
 
     /// Reads one external resource by stable collection index.
@@ -2736,14 +2690,10 @@ impl PyAssetStudio {
         let limits = limits.map_or_else(SceneHierarchyLimits::default, |limits| {
             SceneHierarchyLimits::from(*limits)
         });
-        let hierarchy = py
-            .detach(|| self.studio.scene_hierarchy(limits))
-            .map_err(core_error)?;
-        let mut nodes = reserve_metadata(hierarchy.nodes.len(), "Python scene nodes")?;
-        for node in hierarchy.nodes {
-            nodes.push(python_scene_node(node)?);
-        }
-        Ok(nodes)
+        py.detach(|| {
+            let hierarchy = self.studio.scene_hierarchy(limits).map_err(core_error)?;
+            prepare_scene_nodes(hierarchy.nodes)
+        })
     }
 
     /// Builds general static ASCII FBX 7.4, including direct-bone skin clusters.
@@ -2836,24 +2786,24 @@ impl PyAssetStudio {
 
     /// Enumerates managed-compatible `SplitObjects` FBX roots.
     fn split_object_fbx_candidates(&self, py: Python<'_>) -> PyResult<Vec<PyFbxCandidate>> {
-        let candidates = py
-            .detach(|| {
-                self.studio
-                    .split_object_fbx_candidates(ModelExportPlanLimits::default())
-            })
-            .map_err(core_error)?;
-        python_fbx_candidates(candidates, "SplitObjects FBX candidates")
+        py.detach(|| {
+            let candidates = self
+                .studio
+                .split_object_fbx_candidates(ModelExportPlanLimits::default())
+                .map_err(core_error)?;
+            python_fbx_candidates(candidates, "SplitObjects FBX candidates")
+        })
     }
 
     /// Enumerates Animator-owned FBX roots.
     fn animator_fbx_candidates(&self, py: Python<'_>) -> PyResult<Vec<PyFbxCandidate>> {
-        let candidates = py
-            .detach(|| {
-                self.studio
-                    .animator_fbx_candidates(ModelExportPlanLimits::default())
-            })
-            .map_err(core_error)?;
-        python_fbx_candidates(candidates, "Animator FBX candidates")
+        py.detach(|| {
+            let candidates = self
+                .studio
+                .animator_fbx_candidates(ModelExportPlanLimits::default())
+                .map_err(core_error)?;
+            python_fbx_candidates(candidates, "Animator FBX candidates")
+        })
     }
 
     /// Materializes one selected `GameObject` FBX branch.
@@ -2979,18 +2929,20 @@ impl PyAssetStudio {
         let texture_limits = texture_limits.map_or_else(SceneTextureLimits::default, |limits| {
             SceneTextureLimits::from(*limits)
         });
-        let model = py
-            .detach(|| {
-                self.studio.read_model_obj(
+        let (model, skipped) = py.detach(|| {
+            let mut model = self
+                .studio
+                .read_model_obj(
                     material_library_name,
                     maximum_bytes,
                     texture_format,
                     texture_limits,
                 )
-            })
-            .map_err(core_error)?;
+                .map_err(core_error)?;
+            let skipped = skipped_textures(std::mem::take(&mut model.textures.skipped))?;
+            Ok::<_, PyErr>((model, skipped))
+        })?;
         let textures = model_files(py, model.textures.textures)?;
-        let skipped = skipped_textures(model.textures.skipped)?;
         Ok(PyModelObj {
             obj: model.obj,
             material_library_name: model.material_library_name,
@@ -3025,18 +2977,20 @@ impl PyAssetStudio {
         let texture_limits = texture_limits.map_or_else(SceneTextureLimits::default, |limits| {
             SceneTextureLimits::from(*limits)
         });
-        let (fbx, textures) = py.detach(|| {
-            materialize_python_output(maximum, "ASCII FBX with textures", |output| {
-                self.studio.write_fbx_with_textures(
-                    output,
-                    maximum_bytes,
-                    texture_format,
-                    texture_limits,
-                )
-            })
+        let (fbx, textures, skipped) = py.detach(|| {
+            let (fbx, mut textures) =
+                materialize_python_output(maximum, "ASCII FBX with textures", |output| {
+                    self.studio.write_fbx_with_textures(
+                        output,
+                        maximum_bytes,
+                        texture_format,
+                        texture_limits,
+                    )
+                })?;
+            let skipped = skipped_textures(std::mem::take(&mut textures.skipped))?;
+            Ok::<_, PyErr>((fbx, textures, skipped))
         })?;
         let texture_files = model_files(py, textures.textures)?;
-        let skipped = skipped_textures(textures.skipped)?;
         Ok(PyTexturedFbx {
             fbx,
             textures: texture_files,
@@ -3948,12 +3902,13 @@ impl PyAssetStudio {
                 .min(MaterialReadLimits::default().maximum_total_string_bytes),
             maximum_array_elements,
         };
-        let material = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let material = self
+                .object(file_index, path_id)?
                 .read_material(limits)
-                .map_err(core_error)
-        })?;
-        convert_material(material)
+                .map_err(core_error)?;
+            convert_material(material)
+        })
     }
 
     /// Reads one `MonoScript` identity without loading its managed assembly.
@@ -4370,21 +4325,11 @@ impl PyAssetStudio {
             maximum_metadata_bytes: limits.metadata_bytes,
             ..ExportOptions::default()
         };
-        let report = Python::attach(|py| py.detach(move || self.studio.export(output, options)))
-            .map_err(core_error)?;
-        let mut exported = reserve_metadata(report.exported.len(), "Python exported paths")?;
-        for record in report.exported {
-            exported.push(try_path_string(
-                &record.output_path,
-                "exported output path",
-            )?);
-        }
-        let failures = python_export_failures(report.failures, "Python export failures")?;
-        let unsupported = python_export_failures(report.unsupported, "Python unsupported exports")?;
-        Ok(PyExportReport {
-            exported,
-            failures,
-            unsupported,
+        Python::attach(|py| {
+            py.detach(move || {
+                let report = self.studio.export(output, options).map_err(core_error)?;
+                prepare_export_report(report)
+            })
         })
     }
 
@@ -4741,6 +4686,100 @@ fn python_cubism_clip_motion(
     })
 }
 
+fn prepare_load_diagnostic_page(
+    studio: &Studio,
+    offset: usize,
+    limit: usize,
+) -> PyResult<Vec<PyLoadDiagnostic>> {
+    check_metadata_page_limit(limit)?;
+    let diagnostics = studio.load_diagnostics();
+    let available = diagnostics.len().saturating_sub(offset);
+    let count = available.min(limit);
+    let mut output = reserve_metadata(count, "Python load diagnostic page")?;
+    for diagnostic in diagnostics.iter().skip(offset).take(count) {
+        output.push(python_load_diagnostic(diagnostic)?);
+    }
+    Ok(output)
+}
+
+fn prepare_files(studio: &Studio) -> PyResult<Vec<PyFileInfo>> {
+    checked_convenience_list(studio.file_count(), "files", "iter_files")?;
+    let mut output = reserve_metadata(studio.file_count(), "Python file metadata")?;
+    for file in studio.files() {
+        output.push(python_file_info(file)?);
+    }
+    Ok(output)
+}
+
+fn prepare_objects(studio: &Studio) -> PyResult<Vec<PyObjectInfo>> {
+    checked_convenience_list(studio.object_count(), "objects", "iter_objects")?;
+    let mut output = reserve_metadata(studio.object_count(), "Python object metadata")?;
+    for object in studio.objects() {
+        output.push(python_object_info(object)?);
+    }
+    Ok(output)
+}
+
+fn prepare_resources(studio: &Studio) -> PyResult<Vec<PyResourceInfo>> {
+    checked_convenience_list(studio.resource_count(), "resources", "iter_resources")?;
+    let mut output =
+        reserve_metadata(studio.resource_count(), "Python external resource metadata")?;
+    for resource in studio.resources() {
+        output.push(python_resource_info(resource)?);
+    }
+    Ok(output)
+}
+
+fn prepare_file_page(studio: &Studio, offset: usize, limit: usize) -> PyResult<Vec<PyFileInfo>> {
+    check_metadata_page_limit(limit)?;
+    let available = studio.file_count().saturating_sub(offset);
+    let count = available.min(limit);
+    let mut output = reserve_metadata(count, "Python file metadata page")?;
+    for file in studio.files().skip(offset).take(count) {
+        output.push(python_file_info(file)?);
+    }
+    Ok(output)
+}
+
+fn prepare_object_page(
+    studio: &Studio,
+    file_index: usize,
+    offset: usize,
+    limit: usize,
+) -> PyResult<Vec<PyObjectInfo>> {
+    check_metadata_page_limit(limit)?;
+    let file = studio
+        .file(file_index)
+        .ok_or_else(|| PyKeyError::new_err(format!("file index {file_index} was not found")))?;
+    let available = file.object_count().saturating_sub(offset);
+    let count = available.min(limit);
+    let mut output = reserve_metadata(count, "Python object metadata page")?;
+    for object_index in offset..offset + count {
+        let object = studio
+            .object_by_index(file_index, object_index)
+            .ok_or_else(|| {
+                PyValueError::new_err("object page could not resolve a validated object index")
+            })?;
+        output.push(python_object_info(object)?);
+    }
+    Ok(output)
+}
+
+fn prepare_resource_page(
+    studio: &Studio,
+    offset: usize,
+    limit: usize,
+) -> PyResult<Vec<PyResourceInfo>> {
+    check_metadata_page_limit(limit)?;
+    let available = studio.resource_count().saturating_sub(offset);
+    let count = available.min(limit);
+    let mut output = reserve_metadata(count, "Python external resource metadata page")?;
+    for resource in studio.resources().skip(offset).take(count) {
+        output.push(python_resource_info(resource)?);
+    }
+    Ok(output)
+}
+
 fn python_file_info(file: StudioFile<'_>) -> PyResult<PyFileInfo> {
     Ok(PyFileInfo {
         index: file.index(),
@@ -5057,21 +5096,20 @@ fn extract(
     });
     let oodle_decoder = python_oodle_decoder(py, oodle_decoder)?;
     let unity_cn_key = parse_unity_cn_key(py, unity_cn_key)?;
-    let report = py
-        .detach(move || {
-            Studio::extract(
-                input,
-                output,
-                ExtractionOptions {
-                    limits,
-                    overwrite_existing: overwrite,
-                    oodle_decoder,
-                    unity_cn_key,
-                },
-            )
-        })
+    py.detach(move || {
+        let report = Studio::extract(
+            input,
+            output,
+            ExtractionOptions {
+                limits,
+                overwrite_existing: overwrite,
+                oodle_decoder,
+                unity_cn_key,
+            },
+        )
         .map_err(core_error)?;
-    convert_extraction_report(report)
+        convert_extraction_report(report)
+    })
 }
 
 fn convert_extraction_report(report: ExtractionReport) -> PyResult<PyExtractionReport> {
@@ -5595,6 +5633,14 @@ fn convert_live2d_json(
     )
 }
 
+fn prepare_scene_nodes(nodes: Vec<SceneHierarchyNode>) -> PyResult<Vec<PySceneNode>> {
+    let mut output = reserve_metadata(nodes.len(), "Python scene nodes")?;
+    for node in nodes {
+        output.push(python_scene_node(node)?);
+    }
+    Ok(output)
+}
+
 fn python_scene_node(node: SceneHierarchyNode) -> PyResult<PySceneNode> {
     let (local_position, local_rotation, local_scale) =
         node.transform
@@ -5702,6 +5748,23 @@ fn python_fbx_candidates(
     let mut output = reserve_metadata(candidates.len(), field)?;
     output.extend(candidates.into_iter().map(PyFbxCandidate::from));
     Ok(output)
+}
+
+fn prepare_export_report(report: ExportReport) -> PyResult<PyExportReport> {
+    let mut exported = reserve_metadata(report.exported.len(), "Python exported paths")?;
+    for record in report.exported {
+        exported.push(try_path_string(
+            &record.output_path,
+            "exported output path",
+        )?);
+    }
+    let failures = python_export_failures(report.failures, "Python export failures")?;
+    let unsupported = python_export_failures(report.unsupported, "Python unsupported exports")?;
+    Ok(PyExportReport {
+        exported,
+        failures,
+        unsupported,
+    })
 }
 
 fn python_export_failures(

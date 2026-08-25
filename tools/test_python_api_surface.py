@@ -52,6 +52,9 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
         check_python_api_surface.validate_metadata_projection_gil_boundary(
             check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
         )
+        check_python_api_surface.validate_table_projection_gil_boundary(
+            check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        )
 
     def test_texture_row_conversion_must_stay_detached(self) -> None:
         binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
@@ -151,6 +154,27 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
                 check_python_api_surface.validate_metadata_projection_gil_boundary(
                     altered
                 )
+
+    def test_table_projection_must_stay_detached(self) -> None:
+        binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        for method_marker, preparation in (
+            *check_python_api_surface.TABLE_PROJECTION_GIL_EXPECTATIONS,
+        ):
+            method_offset = binding.find(method_marker)
+            self.assertGreaterEqual(method_offset, 0)
+            call_offset = binding.find(preparation, method_offset)
+            self.assertGreaterEqual(call_offset, 0)
+            altered = (
+                binding[:call_offset]
+                + "moved_outside("
+                + binding[call_offset + len(preparation) :]
+            )
+            method_name = method_marker.removeprefix("fn ").removesuffix("(")
+            with self.assertRaisesRegex(
+                check_python_api_surface.AuditError,
+                rf"{method_name}.*outside py\.detach",
+            ):
+                check_python_api_surface.validate_table_projection_gil_boundary(altered)
 
     def test_instance_method_omission_is_rejected(self) -> None:
         consumer = COMPLETE_CONSUMER.replace("    studio.read_text(0)\n", "")
