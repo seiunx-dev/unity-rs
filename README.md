@@ -96,6 +96,13 @@ Manual Rust construction is fallible as well: `SceneTextureSet::push_texture`
 returns `Result<usize>` and leaves the collection unchanged when capacity
 cannot be reserved, matching the existing fallible `bind` operation.
 
+Python's binding-specific GIL audit also requires collection metadata lists and
+pages, scene/candidate tables, Material properties, model skip diagnostics and
+export/extraction reports to finish their pure-Rust projection in the same
+detached closure as the Core operation. Only construction of actual Python
+objects remains attached; moving any of the 15 preparation calls outside the
+closure fails the source gate.
+
 The CLI's `split-objects` and `animator` batches retain one case-folded output
 name index across every candidate. `--maximum-name-index-bytes` bounds the
 exact UTF-8 bytes stored by that hidden index (64 MiB by default, configurable
