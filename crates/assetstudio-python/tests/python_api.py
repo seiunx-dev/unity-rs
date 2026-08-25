@@ -1998,6 +1998,16 @@ def assert_schema_construction_releases_gil() -> None:
     else:
         raise AssertionError("oversized schema input must be rejected before conversion")
 
+    oversized_collection = [None] * 100_001
+    try:
+        MonoBehaviourSchemas(oversized_collection)
+    except ValueError as error:
+        assert "100001 entries" in str(error)
+    else:
+        raise AssertionError(
+            "oversized schema collection must be rejected before element conversion"
+        )
+
     ready = threading.Event()
     start = threading.Event()
     ran = threading.Event()

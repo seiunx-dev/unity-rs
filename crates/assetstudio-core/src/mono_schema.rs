@@ -9,6 +9,7 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -294,6 +295,173 @@ impl MonoBehaviourSchemaRegistry {
             ))
         })?;
         Ok(registry)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SharedSchemaCandidate {
+    registry_index: usize,
+    entry_index: usize,
+}
+
+/// An indexed, immutable view over reusable schema registries.
+///
+/// This is useful at language boundaries where each caller-visible schema is
+/// independently reusable. The set retains those registries through `Arc`
+/// rather than cloning their trees or identity strings, while exact-version
+/// and fallback lookup still follows the order in which registries and entries
+/// were supplied. Embedded trees are overridden only when the set is non-empty
+/// and every supplied registry requests that policy.
+#[derive(Clone)]
+pub struct MonoBehaviourSchemaRegistrySet {
+    registries: Vec<Arc<MonoBehaviourSchemaRegistry>>,
+    identity_hash_builder: RandomState,
+    identity_buckets: HashMap<u64, Vec<SharedSchemaCandidate>>,
+    overrides_embedded_tree: bool,
+}
+
+impl fmt::Debug for MonoBehaviourSchemaRegistrySet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MonoBehaviourSchemaRegistrySet")
+            .field("registry_count", &self.registries.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for MonoBehaviourSchemaRegistrySet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonoBehaviourSchemaRegistrySet {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            registries: Vec::new(),
+            identity_hash_builder: RandomState::new(),
+            identity_buckets: HashMap::new(),
+            overrides_embedded_tree: false,
+        }
+    }
+
+    /// Builds one lookup index without copying any schema tree or identity.
+    pub fn from_registries(registries: Vec<Arc<MonoBehaviourSchemaRegistry>>) -> Result<Self> {
+        let entry_count = registries.iter().try_fold(0_usize, |total, registry| {
+            total
+                .checked_add(registry.entries.len())
+                .ok_or_else(|| Error::invalid_data("shared MonoBehaviour schema count overflowed"))
+        })?;
+        let identity_hash_builder = RandomState::new();
+        let mut identity_buckets: HashMap<u64, Vec<SharedSchemaCandidate>> = HashMap::new();
+        identity_buckets.try_reserve(entry_count).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate shared MonoBehaviour schema lookup index: {error}"
+            ))
+        })?;
+        for (registry_index, registry) in registries.iter().enumerate() {
+            for (entry_index, entry) in registry.entries.iter().enumerate() {
+                let identity_hash = schema_lookup_hash(
+                    &identity_hash_builder,
+                    &entry.assembly_name,
+                    &entry.namespace,
+                    &entry.class_name,
+                    entry.unity_version.as_deref(),
+                );
+                let candidate = SharedSchemaCandidate {
+                    registry_index,
+                    entry_index,
+                };
+                if let Some(bucket) = identity_buckets.get_mut(&identity_hash) {
+                    bucket.try_reserve(1).map_err(|error| {
+                        Error::invalid_data(format!(
+                            "cannot grow shared MonoBehaviour schema lookup bucket: {error}"
+                        ))
+                    })?;
+                    bucket.push(candidate);
+                } else {
+                    let mut bucket = Vec::new();
+                    bucket.try_reserve_exact(1).map_err(|error| {
+                        Error::invalid_data(format!(
+                            "cannot allocate shared MonoBehaviour schema lookup bucket: {error}"
+                        ))
+                    })?;
+                    bucket.push(candidate);
+                    identity_buckets.insert(identity_hash, bucket);
+                }
+            }
+        }
+        let overrides_embedded_tree = !registries.is_empty()
+            && registries
+                .iter()
+                .all(|registry| registry.overrides_embedded_tree);
+        Ok(Self {
+            registries,
+            identity_hash_builder,
+            identity_buckets,
+            overrides_embedded_tree,
+        })
+    }
+
+    #[must_use]
+    pub fn registry_count(&self) -> usize {
+        self.registries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.registries.is_empty()
+    }
+
+    fn lookup_tree(
+        &self,
+        identity: MonoBehaviourSchemaIdentity<'_>,
+        unity_version: Option<&str>,
+    ) -> Result<Option<&TypeTree>> {
+        let lookup_hash = schema_lookup_hash(
+            &self.identity_hash_builder,
+            identity.assembly_name,
+            identity.namespace,
+            identity.class_name,
+            unity_version,
+        );
+        let Some(candidates) = self.identity_buckets.get(&lookup_hash) else {
+            return Ok(None);
+        };
+        for candidate in candidates {
+            record_schema_lookup_probe();
+            let entry = self
+                .registries
+                .get(candidate.registry_index)
+                .and_then(|registry| registry.entries.get(candidate.entry_index))
+                .ok_or_else(|| {
+                    Error::invalid_data("shared MonoBehaviour schema lookup index is inconsistent")
+                })?;
+            if schema_lookup_key_matches(
+                entry,
+                identity.assembly_name,
+                identity.namespace,
+                identity.class_name,
+                unity_version,
+            ) {
+                return Ok(Some(&entry.tree));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl MonoBehaviourSchemaProvider for MonoBehaviourSchemaRegistrySet {
+    fn schema(&self, identity: MonoBehaviourSchemaIdentity<'_>) -> Result<Option<&TypeTree>> {
+        if let Some(tree) = self.lookup_tree(identity, Some(identity.unity_version))? {
+            return Ok(Some(tree));
+        }
+        self.lookup_tree(identity, None)
+    }
+
+    fn overrides_embedded_tree(&self) -> bool {
+        self.overrides_embedded_tree
     }
 }
 
@@ -1773,15 +1941,17 @@ impl Write for BoundedJsonOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::serialized::{SerializedFile, TypeTree, TypeTreeNode};
     use crate::source::Region;
 
     use super::{
         MonoBehaviourSchemaDocumentLimits, MonoBehaviourSchemaEntry, MonoBehaviourSchemaIdentity,
-        MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry, MonoBehaviourSchemaSource,
-        read_mono_behaviour_json_with_provider, read_mono_behaviour_value_with_provider,
-        reset_schema_lookup_probes, schema_lookup_probes,
+        MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry, MonoBehaviourSchemaRegistrySet,
+        MonoBehaviourSchemaSource, read_mono_behaviour_json_with_provider,
+        read_mono_behaviour_value_with_provider, reset_schema_lookup_probes, schema_lookup_probes,
     };
     use crate::monobehaviour::{
         MONO_BEHAVIOUR_CLASS_ID, MONO_SCRIPT_CLASS_ID, MonoBehaviourReadLimits,
@@ -2008,6 +2178,84 @@ mod tests {
         assert!(
             probes <= ENTRY_COUNT.saturating_mul(2),
             "indexed lookup inspected {probes} candidates for {ENTRY_COUNT} exact versions"
+        );
+    }
+
+    #[test]
+    fn shared_registry_set_indexes_without_cloning_trees_or_changing_priority() {
+        const REGISTRY_COUNT: usize = 20_000;
+        const TAGGED_VERSION: usize = 7_654;
+
+        let fallback = single_entry_registry(None, tagged_tree("shared-fallback-first"));
+        let mut registries = Vec::new();
+        registries.try_reserve_exact(REGISTRY_COUNT + 3).unwrap();
+        registries.push(Arc::clone(&fallback));
+        let mut tagged = None;
+        for version_index in 0..REGISTRY_COUNT {
+            let registry = single_entry_registry(
+                Some(format!("shared-version-{version_index}")),
+                if version_index == TAGGED_VERSION {
+                    tagged_tree("shared-exact-first")
+                } else {
+                    empty_tree()
+                },
+            );
+            if version_index == TAGGED_VERSION {
+                tagged = Some(Arc::clone(&registry));
+            }
+            registries.push(registry);
+        }
+        registries.push(single_entry_registry(
+            None,
+            tagged_tree("shared-fallback-second"),
+        ));
+        registries.push(single_entry_registry(
+            Some(format!("shared-version-{TAGGED_VERSION}")),
+            tagged_tree("shared-exact-second"),
+        ));
+
+        let set = MonoBehaviourSchemaRegistrySet::from_registries(registries).unwrap();
+        assert_eq!(set.registry_count(), REGISTRY_COUNT + 3);
+        assert!(!set.is_empty());
+        reset_schema_lookup_probes();
+        for version_index in (0..REGISTRY_COUNT).rev() {
+            let unity_version = format!("shared-version-{version_index}");
+            let tree = set
+                .schema(MonoBehaviourSchemaIdentity {
+                    unity_version: &unity_version,
+                    assembly_name: "assembly-csharp",
+                    namespace: "Game",
+                    class_name: "Stats",
+                })
+                .unwrap()
+                .unwrap();
+            if version_index == TAGGED_VERSION {
+                let tagged = tagged.as_ref().unwrap();
+                assert!(std::ptr::addr_eq(
+                    std::ptr::from_ref(tree),
+                    std::ptr::from_ref(&tagged.entries()[0].tree),
+                ));
+                assert_eq!(tree.nodes[0].field_name, "shared-exact-first");
+            }
+        }
+        let tree = set
+            .schema(MonoBehaviourSchemaIdentity {
+                unity_version: "missing-shared-version",
+                assembly_name: "folder/ASSEMBLY-CSHARP.dll",
+                namespace: "Game",
+                class_name: "Stats",
+            })
+            .unwrap()
+            .unwrap();
+        assert!(std::ptr::addr_eq(
+            std::ptr::from_ref(tree),
+            std::ptr::from_ref(&fallback.entries()[0].tree),
+        ));
+        assert_eq!(tree.nodes[0].field_name, "shared-fallback-first");
+        let probes = schema_lookup_probes();
+        assert!(
+            probes <= REGISTRY_COUNT.saturating_mul(2),
+            "shared lookup inspected {probes} candidates for {REGISTRY_COUNT} exact versions"
         );
     }
 
@@ -2415,6 +2663,30 @@ mod tests {
             nodes: vec![node("Tagged", tag, 0, 0)],
             string_buffer: Vec::new(),
         }
+    }
+
+    fn empty_tree() -> TypeTree {
+        TypeTree {
+            nodes: Vec::new(),
+            string_buffer: Vec::new(),
+        }
+    }
+
+    fn single_entry_registry(
+        unity_version: Option<String>,
+        tree: TypeTree,
+    ) -> Arc<MonoBehaviourSchemaRegistry> {
+        let mut registry = MonoBehaviourSchemaRegistry::new();
+        registry
+            .push(MonoBehaviourSchemaEntry {
+                assembly_name: "Assembly-CSharp".to_owned(),
+                namespace: "Game".to_owned(),
+                class_name: "Stats".to_owned(),
+                unity_version,
+                tree,
+            })
+            .unwrap();
+        Arc::new(registry)
     }
 
     fn node(type_name: &str, field_name: &str, level: u32, meta_flags: i32) -> TypeTreeNode {

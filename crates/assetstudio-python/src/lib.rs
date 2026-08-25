@@ -37,8 +37,8 @@ use assetstudio_core::material::{Material, MaterialReadLimits, NamedMaterialProp
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
 use assetstudio_core::mono_schema::{
-    MonoBehaviourSchemaEntry, MonoBehaviourSchemaIdentity, MonoBehaviourSchemaProvider,
-    MonoBehaviourSchemaRegistry, MonoBehaviourSchemaSource,
+    MonoBehaviourSchemaEntry, MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry,
+    MonoBehaviourSchemaRegistrySet, MonoBehaviourSchemaSource,
 };
 use assetstudio_core::monobehaviour::{MonoBehaviourReadLimits, MonoScript};
 use assetstudio_core::project_settings::ProjectSettingsReadLimits;
@@ -64,6 +64,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 
 const MAXIMUM_SCHEMA_NODES: usize = 1_000_000;
+const MAXIMUM_SCHEMA_ENTRIES: usize = 100_000;
 const MAXIMUM_SCHEMA_STRING_BYTES: usize = 256 * 1024 * 1024;
 const MAXIMUM_METADATA_PAGE_ITEMS: usize = 1_000_000;
 
@@ -925,68 +926,36 @@ impl PyMonoBehaviourSchema {
     }
 }
 
-#[derive(Debug)]
-struct PythonSchemaProviderEntry {
-    unity_version: Option<String>,
-    registry: Arc<MonoBehaviourSchemaRegistry>,
-}
-
-#[derive(Debug)]
-struct PythonSchemaProviderSet {
-    entries: Vec<PythonSchemaProviderEntry>,
-}
-
-impl MonoBehaviourSchemaProvider for PythonSchemaProviderSet {
-    fn schema(
-        &self,
-        identity: MonoBehaviourSchemaIdentity<'_>,
-    ) -> assetstudio_core::Result<Option<&TypeTree>> {
-        for entry in &self.entries {
-            if entry.unity_version.as_deref() == Some(identity.unity_version)
-                && let Some(tree) = entry.registry.schema(identity)?
-            {
-                return Ok(Some(tree));
-            }
-        }
-        for entry in &self.entries {
-            if entry.unity_version.is_none()
-                && let Some(tree) = entry.registry.schema(identity)?
-            {
-                return Ok(Some(tree));
-            }
-        }
-        Ok(None)
-    }
-}
-
 /// A reusable collection of trusted, complete managed object schemas.
 #[pyclass(name = "MonoBehaviourSchemas", frozen, skip_from_py_object)]
 #[derive(Debug)]
 struct PyMonoBehaviourSchemas {
     schema_count: usize,
-    provider: Arc<PythonSchemaProviderSet>,
+    provider: Arc<MonoBehaviourSchemaRegistrySet>,
 }
 
 #[pymethods]
 impl PyMonoBehaviourSchemas {
     #[new]
     fn new(schemas: &Bound<'_, PyList>) -> PyResult<Self> {
-        let mut entries =
+        if schemas.len() > MAXIMUM_SCHEMA_ENTRIES {
+            return Err(PyValueError::new_err(format!(
+                "MonoBehaviour schema collection has {} entries; maximum is {MAXIMUM_SCHEMA_ENTRIES}",
+                schemas.len()
+            )));
+        }
+        let mut registries =
             reserve_metadata(schemas.len(), "MonoBehaviour schema collection entries")?;
         for schema in schemas.iter() {
             let schema: PyRef<'_, PyMonoBehaviourSchema> = schema.extract()?;
-            entries.push(PythonSchemaProviderEntry {
-                unity_version: try_copy_optional_string(
-                    schema.unity_version.as_deref(),
-                    "schema collection Unity version",
-                )?,
-                registry: Arc::clone(&schema.registry),
-            });
+            registries.push(Arc::clone(&schema.registry));
         }
-        let schema_count = entries.len();
+        let schema_count = registries.len();
+        let provider =
+            MonoBehaviourSchemaRegistrySet::from_registries(registries).map_err(core_error)?;
         Ok(Self {
             schema_count,
-            provider: Arc::new(PythonSchemaProviderSet { entries }),
+            provider: Arc::new(provider),
         })
     }
 
