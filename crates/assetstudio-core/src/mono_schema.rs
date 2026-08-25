@@ -3,8 +3,12 @@
 //! Providers return a complete Unity `TypeTree` for the serialized object.
 //! The Core never opens or executes the named managed assembly.
 
+use std::fmt;
 use std::io::{self, Write};
 use std::str::FromStr;
+
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::endian::{Endian, EndianReader};
 use crate::json::write_type_value_json;
@@ -183,35 +187,20 @@ impl MonoBehaviourSchemaRegistry {
                 limits.maximum_document_bytes
             )));
         }
-        let parsed: serde_json::Value = serde_json::from_slice(document).map_err(|error| {
+        preflight_schema_json_strings(document, limits.maximum_string_bytes)?;
+        let mut deserializer = serde_json::Deserializer::from_slice(document);
+        let registry = SchemaDocumentSeed { limits }
+            .deserialize(&mut deserializer)
+            .map_err(|error| {
+                Error::invalid_data(format!(
+                    "MonoBehaviour schema document is not JSON: {error}"
+                ))
+            })?;
+        deserializer.end().map_err(|error| {
             Error::invalid_data(format!(
                 "MonoBehaviour schema document is not JSON: {error}"
             ))
         })?;
-        let version = parsed.get("version").and_then(serde_json::Value::as_u64);
-        if version != Some(1) {
-            return Err(Error::invalid_data(format!(
-                "MonoBehaviour schema document declares version {version:?}, expected 1"
-            )));
-        }
-        let entries = parsed
-            .get("entries")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                Error::invalid_data("MonoBehaviour schema document has no entries array")
-            })?;
-        if entries.len() > limits.maximum_entries {
-            return Err(Error::invalid_data(format!(
-                "MonoBehaviour schema document has {} entries, exceeding limit {}",
-                entries.len(),
-                limits.maximum_entries
-            )));
-        }
-        let mut registry = Self::new();
-        let mut budget = SchemaDocumentBudget::default();
-        for (index, entry) in entries.iter().enumerate() {
-            registry.push(schema_entry_from_json(entry, index, limits, &mut budget)?)?;
-        }
         Ok(registry)
     }
 }
@@ -222,224 +211,1092 @@ struct SchemaDocumentBudget {
     string_bytes: usize,
 }
 
-fn schema_entry_from_json(
-    entry: &serde_json::Value,
-    index: usize,
-    limits: MonoBehaviourSchemaDocumentLimits,
-    budget: &mut SchemaDocumentBudget,
-) -> Result<MonoBehaviourSchemaEntry> {
-    let nodes = entry
-        .get("nodes")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            Error::invalid_data(format!("MonoBehaviour schema entry {index} has no nodes"))
-        })?;
-    if nodes.is_empty() {
-        return Err(Error::invalid_data(format!(
-            "MonoBehaviour schema entry {index} has an empty node list, which describes nothing"
-        )));
-    }
-    if nodes.len() > limits.maximum_nodes_per_entry {
-        return Err(Error::invalid_data(format!(
-            "MonoBehaviour schema entry {index} has {} nodes, exceeding per-entry limit {}",
-            nodes.len(),
-            limits.maximum_nodes_per_entry
-        )));
-    }
-    budget.nodes = budget
-        .nodes
-        .checked_add(nodes.len())
-        .ok_or_else(|| Error::invalid_data("MonoBehaviour schema node count overflowed"))?;
-    if budget.nodes > limits.maximum_total_nodes {
-        return Err(Error::invalid_data(format!(
-            "MonoBehaviour schema document has {} nodes, exceeding total limit {}",
-            budget.nodes, limits.maximum_total_nodes
-        )));
-    }
-    let mut tree_nodes = Vec::new();
-    tree_nodes
-        .try_reserve_exact(nodes.len())
-        .map_err(|error| Error::invalid_data(format!("cannot allocate schema nodes: {error}")))?;
-    for (position, node) in nodes.iter().enumerate() {
-        tree_nodes.push(schema_node_from_json(
-            node, index, position, limits, budget,
-        )?);
-    }
-    if tree_nodes[0].level != 0 {
-        return Err(Error::invalid_data(format!(
-            "MonoBehaviour schema entry {index} starts at level {}, not 0",
-            tree_nodes[0].level
-        )));
-    }
-    // Checked here rather than left to the first read: a document with a level
-    // jump in it would otherwise load cleanly and then fail once per object,
-    // naming the object rather than the schema that is actually wrong.
-    validate_tree_shape(&tree_nodes).map_err(|error| {
-        Error::invalid_data(format!(
-            "MonoBehaviour schema entry {index} is not one tree: {error}"
-        ))
-    })?;
-    let unity_version = match entry.get("unity_version") {
-        None => None,
-        Some(serde_json::Value::String(version)) => {
-            UnityVersion::from_str(version).map_err(|error| {
-                Error::invalid_data(format!(
-                    "MonoBehaviour schema entry {index} has invalid unity_version: {error}"
-                ))
-            })?;
-            Some(copy_schema_document_string(
-                version,
-                "MonoBehaviour schema unity_version",
-                limits,
-                budget,
-            )?)
+const LONGEST_SCHEMA_FIELD_NAME_BYTES: usize = "unity_version".len();
+
+/// Bounds `serde_json`'s one-string unescape scratch before deserialization.
+///
+/// The retained-string limits below are enforced by the custom visitors. An
+/// escaped JSON string is decoded into `serde_json`'s scratch before a visitor
+/// sees it, though, so a lexical pass has to reject an oversized token first.
+/// Schema field names remain accepted even when a caller deliberately sets a
+/// smaller retained-value limit for a boundary test.
+fn preflight_schema_json_strings(document: &[u8], maximum_string_bytes: usize) -> Result<()> {
+    let maximum = maximum_string_bytes.max(LONGEST_SCHEMA_FIELD_NAME_BYTES);
+    let mut cursor = 0usize;
+    while cursor < document.len() {
+        if document[cursor] != b'"' {
+            cursor += 1;
+            continue;
         }
-        Some(_) => {
+        let Some((next, decoded_bytes)) = scan_json_string(document, cursor + 1) else {
+            // Syntax and UTF-8 diagnostics stay with serde_json. A malformed
+            // string cannot reach a later large token because parsing stops at
+            // this one first.
+            return Ok(());
+        };
+        if decoded_bytes > maximum {
             return Err(Error::invalid_data(format!(
-                "MonoBehaviour schema entry {index} unity_version is not a string"
+                "MonoBehaviour schema JSON string is {decoded_bytes} bytes, exceeding preflight limit {maximum}"
             )));
         }
-    };
-    Ok(MonoBehaviourSchemaEntry {
-        assembly_name: required_schema_document_string(entry, "assembly", index, limits, budget)?,
-        namespace: optional_schema_document_string(entry, "namespace", index, limits, budget)?
-            .unwrap_or_default(),
-        class_name: required_schema_document_string(entry, "class", index, limits, budget)?,
-        unity_version,
-        tree: TypeTree {
-            nodes: tree_nodes,
-            // A schema is a layout, not a slice of a file: nothing refers to
-            // these names by offset, so there is no string buffer behind them.
-            string_buffer: Vec::new(),
-        },
-    })
+        cursor = next;
+    }
+    Ok(())
 }
 
-fn schema_node_from_json(
-    node: &serde_json::Value,
-    entry: usize,
-    position: usize,
-    limits: MonoBehaviourSchemaDocumentLimits,
-    budget: &mut SchemaDocumentBudget,
-) -> Result<TypeTreeNode> {
-    let integer = |field: &str, default: i64| -> Result<i64> {
-        match node.get(field) {
-            None => Ok(default),
-            Some(value) => value.as_i64().ok_or_else(|| {
-                Error::invalid_data(format!(
-                    "MonoBehaviour schema entry {entry} node {position} has a non-integer {field}"
-                ))
-            }),
+fn scan_json_string(document: &[u8], mut cursor: usize) -> Option<(usize, usize)> {
+    let mut decoded_bytes = 0usize;
+    while cursor < document.len() {
+        match document[cursor] {
+            b'"' => return Some((cursor + 1, decoded_bytes)),
+            b'\\' => {
+                cursor += 1;
+                let escape = *document.get(cursor)?;
+                match escape {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                        decoded_bytes = decoded_bytes.checked_add(1)?;
+                        cursor += 1;
+                    }
+                    b'u' => {
+                        let first = json_hex_u16(document.get(cursor + 1..cursor + 5)?)?;
+                        cursor += 5;
+                        if (0xD800..=0xDBFF).contains(&first) {
+                            if document.get(cursor..cursor + 2)? != b"\\u" {
+                                return None;
+                            }
+                            let second = json_hex_u16(document.get(cursor + 2..cursor + 6)?)?;
+                            if !(0xDC00..=0xDFFF).contains(&second) {
+                                return None;
+                            }
+                            decoded_bytes = decoded_bytes.checked_add(4)?;
+                            cursor += 6;
+                        } else if (0xDC00..=0xDFFF).contains(&first) {
+                            return None;
+                        } else {
+                            decoded_bytes = decoded_bytes
+                                .checked_add(char::from_u32(u32::from(first))?.len_utf8())?;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            byte if byte < 0x20 => return None,
+            _ => {
+                // For both ASCII and an already UTF-8-encoded scalar, the
+                // decoded UTF-8 byte length is the raw byte length.
+                decoded_bytes = decoded_bytes.checked_add(1)?;
+                cursor += 1;
+            }
         }
-    };
-    let level = integer("level", -1)?;
-    let level = u32::try_from(level).map_err(|_| {
-        Error::invalid_data(format!(
-            "MonoBehaviour schema entry {entry} node {position} has level {level}, which is not a depth"
-        ))
-    })?;
-    let narrow = |value: i64, field: &str| -> Result<i32> {
-        i32::try_from(value).map_err(|_| {
-            Error::invalid_data(format!(
-                "MonoBehaviour schema entry {entry} node {position} has {field} {value}, which does not fit"
-            ))
+    }
+    None
+}
+
+fn json_hex_u16(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    bytes.iter().try_fold(0u16, |value, byte| {
+        let digit = match byte {
+            b'0'..=b'9' => u16::from(byte - b'0'),
+            b'a'..=b'f' => u16::from(byte - b'a' + 10),
+            b'A'..=b'F' => u16::from(byte - b'A' + 10),
+            _ => return None,
+        };
+        value.checked_mul(16)?.checked_add(digit)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum SchemaField {
+    Version,
+    Entries,
+    Assembly,
+    Namespace,
+    Class,
+    UnityVersion,
+    Nodes,
+    Level,
+    Type,
+    Name,
+    ByteSize,
+    Index,
+    TypeFlags,
+    MetaFlags,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for SchemaField {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_identifier(SchemaFieldVisitor)
+    }
+}
+
+struct SchemaFieldVisitor;
+
+impl Visitor<'_> for SchemaFieldVisitor {
+    type Value = SchemaField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a MonoBehaviour schema field name")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(match value {
+            "version" => SchemaField::Version,
+            "entries" => SchemaField::Entries,
+            "assembly" => SchemaField::Assembly,
+            "namespace" => SchemaField::Namespace,
+            "class" => SchemaField::Class,
+            "unity_version" => SchemaField::UnityVersion,
+            "nodes" => SchemaField::Nodes,
+            "level" => SchemaField::Level,
+            "type" => SchemaField::Type,
+            "name" => SchemaField::Name,
+            "byte_size" => SchemaField::ByteSize,
+            "index" => SchemaField::Index,
+            "type_flags" => SchemaField::TypeFlags,
+            "meta_flags" => SchemaField::MetaFlags,
+            _ => SchemaField::Other,
         })
-    };
-    Ok(TypeTreeNode {
-        type_name: required_schema_node_string(node, "type", entry, position, limits, budget)?,
-        field_name: required_schema_node_string(node, "name", entry, position, limits, budget)?,
-        byte_size: narrow(integer("byte_size", -1)?, "byte_size")?,
-        index: narrow(integer("index", 0)?, "index")?,
-        type_flags: narrow(integer("type_flags", 0)?, "type_flags")?,
-        version: narrow(integer("version", 1)?, "version")?,
-        meta_flags: narrow(integer("meta_flags", 0)?, "meta_flags")?,
-        level,
-        type_string_offset: None,
-        name_string_offset: None,
-        reference_type_hash: 0,
-    })
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'_ str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
 }
 
-fn required_schema_document_string(
-    entry: &serde_json::Value,
-    field: &str,
+struct SchemaDocumentSeed {
+    limits: MonoBehaviourSchemaDocumentLimits,
+}
+
+impl<'de> DeserializeSeed<'de> for SchemaDocumentSeed {
+    type Value = MonoBehaviourSchemaRegistry;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SchemaDocumentVisitor {
+            limits: self.limits,
+        })
+    }
+}
+
+struct SchemaDocumentVisitor {
+    limits: MonoBehaviourSchemaDocumentLimits,
+}
+
+impl<'de> Visitor<'de> for SchemaDocumentVisitor {
+    type Value = MonoBehaviourSchemaRegistry;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a MonoBehaviour schema document object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut version = None;
+        let mut entries = None;
+        let mut budget = SchemaDocumentBudget::default();
+        while let Some(field) = map.next_key::<SchemaField>()? {
+            match field {
+                SchemaField::Version => {
+                    if version.is_some() {
+                        return Err(de::Error::custom(
+                            "MonoBehaviour schema document repeats version",
+                        ));
+                    }
+                    version = Some(map.next_value_seed(SchemaVersionSeed)?);
+                }
+                SchemaField::Entries => {
+                    if entries.is_some() {
+                        return Err(de::Error::custom(
+                            "MonoBehaviour schema document repeats entries",
+                        ));
+                    }
+                    entries = Some(map.next_value_seed(SchemaEntriesSeed {
+                        limits: self.limits,
+                        budget: &mut budget,
+                    })?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let version = version.flatten();
+        if version != Some(1) {
+            return Err(de::Error::custom(format_args!(
+                "MonoBehaviour schema document declares version {version:?}, expected 1"
+            )));
+        }
+        entries
+            .ok_or_else(|| de::Error::custom("MonoBehaviour schema document has no entries array"))
+    }
+}
+
+struct SchemaVersionSeed;
+
+impl<'de> DeserializeSeed<'de> for SchemaVersionSeed {
+    type Value = Option<u64>;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SchemaVersionVisitor)
+    }
+}
+
+struct SchemaVersionVisitor;
+
+impl<'de> Visitor<'de> for SchemaVersionVisitor {
+    type Value = Option<u64>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("schema version 1")
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(Some(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(u64::try_from(value).ok())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+}
+
+struct SchemaEntriesSeed<'a> {
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for SchemaEntriesSeed<'_> {
+    type Value = MonoBehaviourSchemaRegistry;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SchemaEntriesVisitor {
+            limits: self.limits,
+            budget: self.budget,
+        })
+    }
+}
+
+struct SchemaEntriesVisitor<'a> {
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl<'de> Visitor<'de> for SchemaEntriesVisitor<'_> {
+    type Value = MonoBehaviourSchemaRegistry;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the MonoBehaviour schema entries array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut registry = MonoBehaviourSchemaRegistry::new();
+        let mut index = 0usize;
+        loop {
+            let entry = sequence.next_element_seed(SchemaEntrySeed {
+                index,
+                limits: self.limits,
+                budget: self.budget,
+            })?;
+            let Some(entry) = entry else {
+                break;
+            };
+            registry.push(entry).map_err(de::Error::custom)?;
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| de::Error::custom("MonoBehaviour schema entry count overflowed"))?;
+        }
+        Ok(registry)
+    }
+}
+
+struct SchemaEntrySeed<'a> {
     index: usize,
     limits: MonoBehaviourSchemaDocumentLimits,
-    budget: &mut SchemaDocumentBudget,
-) -> Result<String> {
-    optional_schema_document_string(entry, field, index, limits, budget)?.ok_or_else(|| {
-        Error::invalid_data(format!("MonoBehaviour schema entry {index} has no {field}"))
-    })
+    budget: &'a mut SchemaDocumentBudget,
 }
 
-fn optional_schema_document_string(
-    entry: &serde_json::Value,
-    field: &str,
+impl<'de> DeserializeSeed<'de> for SchemaEntrySeed<'_> {
+    type Value = MonoBehaviourSchemaEntry;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if self.index >= self.limits.maximum_entries {
+            return Err(de::Error::custom(format_args!(
+                "MonoBehaviour schema entries exceed limit {}",
+                self.limits.maximum_entries
+            )));
+        }
+        deserializer.deserialize_map(SchemaEntryVisitor {
+            index: self.index,
+            limits: self.limits,
+            budget: self.budget,
+        })
+    }
+}
+
+struct SchemaEntryVisitor<'a> {
     index: usize,
     limits: MonoBehaviourSchemaDocumentLimits,
-    budget: &mut SchemaDocumentBudget,
-) -> Result<Option<String>> {
-    let Some(value) = entry.get(field) else {
-        return Ok(None);
-    };
-    let value = value.as_str().ok_or_else(|| {
-        Error::invalid_data(format!(
-            "MonoBehaviour schema entry {index} {field} is not a string"
-        ))
-    })?;
-    copy_schema_document_string(value, "MonoBehaviour schema entry string", limits, budget)
-        .map(Some)
+    budget: &'a mut SchemaDocumentBudget,
 }
 
-fn required_schema_node_string(
-    node: &serde_json::Value,
-    field: &str,
-    entry: usize,
-    position: usize,
-    limits: MonoBehaviourSchemaDocumentLimits,
-    budget: &mut SchemaDocumentBudget,
-) -> Result<String> {
-    let value = node
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            Error::invalid_data(format!(
-                "MonoBehaviour schema entry {entry} node {position} has no {field}"
+impl<'de> Visitor<'de> for SchemaEntryVisitor<'_> {
+    type Value = MonoBehaviourSchemaEntry;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a MonoBehaviour schema entry object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut assembly_name = None;
+        let mut namespace = None;
+        let mut class_name = None;
+        let mut unity_version = None;
+        let mut has_unity_version = false;
+        let mut nodes = None;
+        while let Some(field) = map.next_key::<SchemaField>()? {
+            match field {
+                SchemaField::Assembly => {
+                    reject_duplicate::<A::Error>(assembly_name.is_some(), self.index, "assembly")?;
+                    assembly_name = Some(map.next_value_seed(SchemaStringSeed {
+                        label: SchemaStringLabel::Entry(self.index, "assembly"),
+                        limits: self.limits,
+                        budget: self.budget,
+                    })?);
+                }
+                SchemaField::Namespace => {
+                    reject_duplicate::<A::Error>(namespace.is_some(), self.index, "namespace")?;
+                    namespace = Some(map.next_value_seed(SchemaStringSeed {
+                        label: SchemaStringLabel::Entry(self.index, "namespace"),
+                        limits: self.limits,
+                        budget: self.budget,
+                    })?);
+                }
+                SchemaField::Class => {
+                    reject_duplicate::<A::Error>(class_name.is_some(), self.index, "class")?;
+                    class_name = Some(map.next_value_seed(SchemaStringSeed {
+                        label: SchemaStringLabel::Entry(self.index, "class"),
+                        limits: self.limits,
+                        budget: self.budget,
+                    })?);
+                }
+                SchemaField::UnityVersion => {
+                    reject_duplicate::<A::Error>(has_unity_version, self.index, "unity_version")?;
+                    has_unity_version = true;
+                    let value = map.next_value_seed(SchemaStringSeed {
+                        label: SchemaStringLabel::Entry(self.index, "unity_version"),
+                        limits: self.limits,
+                        budget: self.budget,
+                    })?;
+                    UnityVersion::from_str(&value).map_err(|error| {
+                        de::Error::custom(format_args!(
+                            "MonoBehaviour schema entry {} has invalid unity_version: {error}",
+                            self.index
+                        ))
+                    })?;
+                    unity_version = Some(value);
+                }
+                SchemaField::Nodes => {
+                    reject_duplicate::<A::Error>(nodes.is_some(), self.index, "nodes")?;
+                    nodes = Some(map.next_value_seed(SchemaNodesSeed {
+                        entry: self.index,
+                        limits: self.limits,
+                        budget: self.budget,
+                    })?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let nodes = nodes.ok_or_else(|| {
+            de::Error::custom(format_args!(
+                "MonoBehaviour schema entry {} has no nodes",
+                self.index
             ))
         })?;
-    copy_schema_document_string(value, "MonoBehaviour schema node string", limits, budget)
+        if nodes.is_empty() {
+            return Err(de::Error::custom(format_args!(
+                "MonoBehaviour schema entry {} has an empty node list, which describes nothing",
+                self.index
+            )));
+        }
+        if nodes[0].level != 0 {
+            return Err(de::Error::custom(format_args!(
+                "MonoBehaviour schema entry {} starts at level {}, not 0",
+                self.index, nodes[0].level
+            )));
+        }
+        validate_tree_shape(&nodes).map_err(|error| {
+            de::Error::custom(format_args!(
+                "MonoBehaviour schema entry {} is not one tree: {error}",
+                self.index
+            ))
+        })?;
+        Ok(MonoBehaviourSchemaEntry {
+            assembly_name: required_entry_string(assembly_name, self.index, "assembly")?,
+            namespace: namespace.unwrap_or_default(),
+            class_name: required_entry_string(class_name, self.index, "class")?,
+            unity_version,
+            tree: TypeTree {
+                nodes,
+                string_buffer: Vec::new(),
+            },
+        })
+    }
 }
 
-fn copy_schema_document_string(
-    value: &str,
+fn reject_duplicate<E: de::Error>(
+    duplicate: bool,
+    entry: usize,
     field: &str,
+) -> std::result::Result<(), E> {
+    if duplicate {
+        return Err(de::Error::custom(format_args!(
+            "MonoBehaviour schema entry {entry} repeats {field}"
+        )));
+    }
+    Ok(())
+}
+
+fn required_entry_string<E: de::Error>(
+    value: Option<String>,
+    entry: usize,
+    field: &str,
+) -> std::result::Result<String, E> {
+    value.ok_or_else(|| {
+        de::Error::custom(format_args!(
+            "MonoBehaviour schema entry {entry} has no {field}"
+        ))
+    })
+}
+
+struct SchemaNodesSeed<'a> {
+    entry: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for SchemaNodesSeed<'_> {
+    type Value = Vec<TypeTreeNode>;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SchemaNodesVisitor {
+            entry: self.entry,
+            limits: self.limits,
+            budget: self.budget,
+        })
+    }
+}
+
+struct SchemaNodesVisitor<'a> {
+    entry: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl<'de> Visitor<'de> for SchemaNodesVisitor<'_> {
+    type Value = Vec<TypeTreeNode>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a MonoBehaviour schema node array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut nodes = Vec::new();
+        let mut position = 0usize;
+        loop {
+            let node = sequence.next_element_seed(SchemaNodeSeed {
+                entry: self.entry,
+                position,
+                limits: self.limits,
+                budget: self.budget,
+            })?;
+            let Some(node) = node else {
+                break;
+            };
+            nodes.try_reserve(1).map_err(|error| {
+                de::Error::custom(format_args!("cannot allocate schema nodes: {error}"))
+            })?;
+            nodes.push(node);
+            self.budget.nodes =
+                self.budget.nodes.checked_add(1).ok_or_else(|| {
+                    de::Error::custom("MonoBehaviour schema node count overflowed")
+                })?;
+            position = position.checked_add(1).ok_or_else(|| {
+                de::Error::custom("MonoBehaviour schema node position overflowed")
+            })?;
+        }
+        Ok(nodes)
+    }
+}
+
+struct SchemaNodeSeed<'a> {
+    entry: usize,
+    position: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for SchemaNodeSeed<'_> {
+    type Value = TypeTreeNode;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if self.position >= self.limits.maximum_nodes_per_entry {
+            return Err(de::Error::custom(format_args!(
+                "MonoBehaviour schema entry {} nodes exceed per-entry limit {}",
+                self.entry, self.limits.maximum_nodes_per_entry
+            )));
+        }
+        if self.budget.nodes >= self.limits.maximum_total_nodes {
+            return Err(de::Error::custom(format_args!(
+                "MonoBehaviour schema document nodes exceed total limit {}",
+                self.limits.maximum_total_nodes
+            )));
+        }
+        deserializer.deserialize_map(SchemaNodeVisitor {
+            entry: self.entry,
+            position: self.position,
+            limits: self.limits,
+            budget: self.budget,
+        })
+    }
+}
+
+struct SchemaNodeVisitor<'a> {
+    entry: usize,
+    position: usize,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl<'de> Visitor<'de> for SchemaNodeVisitor<'_> {
+    type Value = TypeTreeNode;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a MonoBehaviour schema node object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let fields = read_schema_node_fields(
+            &mut map,
+            self.entry,
+            self.position,
+            self.limits,
+            self.budget,
+        )?;
+        let level = fields.level.unwrap_or(-1);
+        let level = u32::try_from(level).map_err(|_| {
+            de::Error::custom(format_args!(
+                "MonoBehaviour schema entry {} node {} has level {level}, which is not a depth",
+                self.entry, self.position
+            ))
+        })?;
+        Ok(TypeTreeNode {
+            type_name: required_node_string(fields.type_name, self.entry, self.position, "type")?,
+            field_name: required_node_string(fields.field_name, self.entry, self.position, "name")?,
+            byte_size: narrow_node_integer(
+                fields.byte_size.unwrap_or(-1),
+                self.entry,
+                self.position,
+                "byte_size",
+            )?,
+            index: narrow_node_integer(
+                fields.index.unwrap_or(0),
+                self.entry,
+                self.position,
+                "index",
+            )?,
+            type_flags: narrow_node_integer(
+                fields.type_flags.unwrap_or(0),
+                self.entry,
+                self.position,
+                "type_flags",
+            )?,
+            version: narrow_node_integer(
+                fields.version.unwrap_or(1),
+                self.entry,
+                self.position,
+                "version",
+            )?,
+            meta_flags: narrow_node_integer(
+                fields.meta_flags.unwrap_or(0),
+                self.entry,
+                self.position,
+                "meta_flags",
+            )?,
+            level,
+            type_string_offset: None,
+            name_string_offset: None,
+            reference_type_hash: 0,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SchemaNodeFields {
+    type_name: Option<String>,
+    field_name: Option<String>,
+    level: Option<i64>,
+    byte_size: Option<i64>,
+    index: Option<i64>,
+    type_flags: Option<i64>,
+    version: Option<i64>,
+    meta_flags: Option<i64>,
+}
+
+fn read_schema_node_fields<'de, A: MapAccess<'de>>(
+    map: &mut A,
+    entry: usize,
+    position: usize,
     limits: MonoBehaviourSchemaDocumentLimits,
     budget: &mut SchemaDocumentBudget,
-) -> Result<String> {
-    if value.len() > limits.maximum_string_bytes {
-        return Err(Error::invalid_data(format!(
-            "{field} is {} bytes, exceeding limit {}",
-            value.len(),
-            limits.maximum_string_bytes
+) -> std::result::Result<SchemaNodeFields, A::Error> {
+    let mut fields = SchemaNodeFields::default();
+    while let Some(field) = map.next_key::<SchemaField>()? {
+        match field {
+            SchemaField::Type => {
+                reject_node_duplicate::<A::Error>(
+                    fields.type_name.is_some(),
+                    entry,
+                    position,
+                    "type",
+                )?;
+                fields.type_name = Some(map.next_value_seed(SchemaStringSeed {
+                    label: SchemaStringLabel::Node(entry, position, "type"),
+                    limits,
+                    budget,
+                })?);
+            }
+            SchemaField::Name => {
+                reject_node_duplicate::<A::Error>(
+                    fields.field_name.is_some(),
+                    entry,
+                    position,
+                    "name",
+                )?;
+                fields.field_name = Some(map.next_value_seed(SchemaStringSeed {
+                    label: SchemaStringLabel::Node(entry, position, "name"),
+                    limits,
+                    budget,
+                })?);
+            }
+            SchemaField::Level => {
+                read_node_integer(map, &mut fields.level, entry, position, "level")?;
+            }
+            SchemaField::ByteSize => {
+                read_node_integer(map, &mut fields.byte_size, entry, position, "byte_size")?;
+            }
+            SchemaField::Index => {
+                read_node_integer(map, &mut fields.index, entry, position, "index")?;
+            }
+            SchemaField::TypeFlags => {
+                read_node_integer(map, &mut fields.type_flags, entry, position, "type_flags")?;
+            }
+            SchemaField::Version => {
+                read_node_integer(map, &mut fields.version, entry, position, "version")?;
+            }
+            SchemaField::MetaFlags => {
+                read_node_integer(map, &mut fields.meta_flags, entry, position, "meta_flags")?;
+            }
+            _ => {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn read_node_integer<'de, A: MapAccess<'de>>(
+    map: &mut A,
+    destination: &mut Option<i64>,
+    entry: usize,
+    position: usize,
+    field: &'static str,
+) -> std::result::Result<(), A::Error> {
+    reject_node_duplicate::<A::Error>(destination.is_some(), entry, position, field)?;
+    *destination = Some(map.next_value_seed(SchemaIntegerSeed {
+        entry,
+        position,
+        field,
+    })?);
+    Ok(())
+}
+
+fn reject_node_duplicate<E: de::Error>(
+    duplicate: bool,
+    entry: usize,
+    position: usize,
+    field: &str,
+) -> std::result::Result<(), E> {
+    if duplicate {
+        return Err(de::Error::custom(format_args!(
+            "MonoBehaviour schema entry {entry} node {position} repeats {field}"
         )));
     }
-    let total = budget
-        .string_bytes
-        .checked_add(value.len())
-        .ok_or_else(|| Error::invalid_data("MonoBehaviour schema string budget overflowed"))?;
-    if total > limits.maximum_total_string_bytes {
-        return Err(Error::invalid_data(format!(
-            "MonoBehaviour schema strings total {total} bytes, exceeding limit {}",
-            limits.maximum_total_string_bytes
-        )));
+    Ok(())
+}
+
+fn required_node_string<E: de::Error>(
+    value: Option<String>,
+    entry: usize,
+    position: usize,
+    field: &str,
+) -> std::result::Result<String, E> {
+    value.ok_or_else(|| {
+        de::Error::custom(format_args!(
+            "MonoBehaviour schema entry {entry} node {position} has no {field}"
+        ))
+    })
+}
+
+fn narrow_node_integer<E: de::Error>(
+    value: i64,
+    entry: usize,
+    position: usize,
+    field: &str,
+) -> std::result::Result<i32, E> {
+    i32::try_from(value).map_err(|_| {
+        de::Error::custom(format_args!(
+            "MonoBehaviour schema entry {entry} node {position} has {field} {value}, which does not fit"
+        ))
+    })
+}
+
+struct SchemaIntegerSeed {
+    entry: usize,
+    position: usize,
+    field: &'static str,
+}
+
+impl<'de> DeserializeSeed<'de> for SchemaIntegerSeed {
+    type Value = i64;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SchemaIntegerVisitor {
+            entry: self.entry,
+            position: self.position,
+            field: self.field,
+        })
     }
-    let mut copied = String::new();
-    copied
-        .try_reserve_exact(value.len())
-        .map_err(|error| Error::invalid_data(format!("cannot allocate {field}: {error}")))?;
-    copied.push_str(value);
-    budget.string_bytes = total;
-    Ok(copied)
+}
+
+struct SchemaIntegerVisitor {
+    entry: usize,
+    position: usize,
+    field: &'static str,
+}
+
+impl SchemaIntegerVisitor {
+    fn invalid<E: de::Error>(&self) -> E {
+        de::Error::custom(format_args!(
+            "MonoBehaviour schema entry {} node {} has a non-integer {}",
+            self.entry, self.position, self.field
+        ))
+    }
+}
+
+impl Visitor<'_> for SchemaIntegerVisitor {
+    type Value = i64;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "an integer {} for MonoBehaviour schema entry {} node {}",
+            self.field, self.entry, self.position
+        )
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(value)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        i64::try_from(value).map_err(|_| self.invalid())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.invalid())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.invalid())
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.invalid())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.invalid())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SchemaStringLabel {
+    Entry(usize, &'static str),
+    Node(usize, usize, &'static str),
+}
+
+impl fmt::Display for SchemaStringLabel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Entry(entry, field) => {
+                write!(formatter, "MonoBehaviour schema entry {entry} {field}")
+            }
+            Self::Node(entry, position, field) => write!(
+                formatter,
+                "MonoBehaviour schema entry {entry} node {position} {field}"
+            ),
+        }
+    }
+}
+
+struct SchemaStringSeed<'a> {
+    label: SchemaStringLabel,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for SchemaStringSeed<'_> {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SchemaStringVisitor {
+            label: self.label,
+            limits: self.limits,
+            budget: self.budget,
+        })
+    }
+}
+
+struct SchemaStringVisitor<'a> {
+    label: SchemaStringLabel,
+    limits: MonoBehaviourSchemaDocumentLimits,
+    budget: &'a mut SchemaDocumentBudget,
+}
+
+impl SchemaStringVisitor<'_> {
+    fn not_string<E: de::Error>(&self) -> E {
+        de::Error::custom(format_args!("{} is not a string", self.label))
+    }
+
+    fn validate<E: de::Error>(&self, length: usize) -> std::result::Result<usize, E> {
+        if length > self.limits.maximum_string_bytes {
+            return Err(de::Error::custom(format_args!(
+                "{} is {length} bytes, exceeding limit {}",
+                self.label, self.limits.maximum_string_bytes
+            )));
+        }
+        let total = self
+            .budget
+            .string_bytes
+            .checked_add(length)
+            .ok_or_else(|| de::Error::custom("MonoBehaviour schema string budget overflowed"))?;
+        if total > self.limits.maximum_total_string_bytes {
+            return Err(de::Error::custom(format_args!(
+                "MonoBehaviour schema strings total {total} bytes, exceeding limit {}",
+                self.limits.maximum_total_string_bytes
+            )));
+        }
+        Ok(total)
+    }
+
+    fn copy<E: de::Error>(self, value: &str) -> std::result::Result<String, E> {
+        let total = self.validate(value.len())?;
+        let mut copied = String::new();
+        copied.try_reserve_exact(value.len()).map_err(|error| {
+            de::Error::custom(format_args!("cannot allocate {}: {error}", self.label))
+        })?;
+        copied.push_str(value);
+        self.budget.string_bytes = total;
+        Ok(copied)
+    }
+}
+
+impl<'de> Visitor<'de> for SchemaStringVisitor<'_> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} string", self.label)
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.copy(value)
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.copy(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let total = self.validate(value.len())?;
+        self.budget.string_bytes = total;
+        Ok(value)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.not_string())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.not_string())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.not_string())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.not_string())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.not_string())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(self.not_string())
+    }
+
+    fn visit_seq<A>(self, _: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        Err(self.not_string())
+    }
+
+    fn visit_map<A>(self, _: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        Err(self.not_string())
+    }
 }
 
 impl MonoBehaviourSchemaProvider for MonoBehaviourSchemaRegistry {
@@ -1036,6 +1893,64 @@ mod tests {
         let error = MonoBehaviourSchemaRegistry::from_json(non_string_namespace).unwrap_err();
         assert!(
             error.to_string().contains("namespace is not a string"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn schema_document_rejects_limits_before_materializing_later_values() {
+        let defaults = MonoBehaviourSchemaDocumentLimits::default();
+        // The retained string limit is deliberately zero. The entry ceiling
+        // must fire before serde descends into the first entry and tries to
+        // decode or retain any of its strings.
+        let entry = br#"{"version":1,"entries":[{"assembly":"A","class":"C","nodes":[]}]}"#;
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            entry,
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_entries: 0,
+                maximum_string_bytes: 0,
+                maximum_total_string_bytes: 0,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("entries exceed limit 0"),
+            "{error}"
+        );
+
+        // Put nodes first so the node ceiling is likewise checked before any
+        // entry or node String is decoded into the returned registry.
+        let node_first = br#"{"version":1,"entries":[{"nodes":[{"level":0,"type":"T","name":"N"}],"assembly":"A","class":"C"}]}"#;
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            node_first,
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_nodes_per_entry: 0,
+                maximum_string_bytes: 0,
+                maximum_total_string_bytes: 0,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("per-entry limit 0"), "{error}");
+
+        // Escaped strings require serde_json scratch space. Fifteen decoded
+        // UTF-8 bytes exceed max(2, longest field name=13), so the lexical
+        // pass rejects this valid token before serde_json allocates that
+        // scratch buffer or enters the retained-string visitor.
+        let escaped = br#"{"version":1,"entries":[{"assembly":"\u4e16\u4e16\u4e16\u4e16\u4e16","class":"C","nodes":[]}]}"#;
+        let error = MonoBehaviourSchemaRegistry::from_json_with_limits(
+            escaped,
+            MonoBehaviourSchemaDocumentLimits {
+                maximum_string_bytes: 2,
+                ..defaults
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("JSON string is 15 bytes, exceeding preflight limit 13"),
             "{error}"
         );
     }
