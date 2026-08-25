@@ -1482,6 +1482,48 @@ struct PyRgbaImage {
     pixels: Vec<u8>,
 }
 
+/// A decoded texture whose pixels already use the top-down row order exposed
+/// to Python. Returning this type from `Python::detach` keeps the O(pixel
+/// bytes) row conversion outside the GIL; the attached path can only move the
+/// owned buffer into its Python wrapper.
+struct DisplayRowPyImage(assetstudio_core::texture::RgbaImage);
+
+impl DisplayRowPyImage {
+    fn from_decoded(mut image: assetstudio_core::texture::RgbaImage) -> PyResult<Self> {
+        flip_rgba_rows(&mut image)?;
+        Ok(Self(image))
+    }
+
+    fn into_python(self) -> PyRgbaImage {
+        let image = self.0;
+        PyRgbaImage {
+            width: image.width,
+            height: image.height,
+            pixels: image.pixels,
+        }
+    }
+}
+
+/// The same detached row-order invariant for every `Texture2DArray` layer.
+struct DisplayRowPyImages(Vec<assetstudio_core::texture::RgbaImage>);
+
+impl DisplayRowPyImages {
+    fn from_decoded(mut images: Vec<assetstudio_core::texture::RgbaImage>) -> PyResult<Self> {
+        for image in &mut images {
+            flip_rgba_rows(image)?;
+        }
+        Ok(Self(images))
+    }
+
+    fn into_python(self) -> PyResult<Vec<PyRgbaImage>> {
+        let mut output = reserve_metadata(self.0.len(), "Python Texture2DArray images")?;
+        for image in self.0 {
+            output.push(DisplayRowPyImage(image).into_python());
+        }
+        Ok(output)
+    }
+}
+
 #[pyclass(name = "AudioClip", frozen)]
 #[derive(Debug)]
 struct PyAudioClip {
@@ -3715,17 +3757,14 @@ impl PyAssetStudio {
             maximum_decoder_working_bytes: maximum_bytes,
             ..TextureReadLimits::default()
         };
-        let mut image = py.detach(|| {
-            self.object(file_index, path_id)?
+        let image = py.detach(|| {
+            let image = self
+                .object(file_index, path_id)?
                 .decode_texture_mip(mip_level, limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            DisplayRowPyImage::from_decoded(image)
         })?;
-        flip_rgba_rows(&mut image)?;
-        Ok(PyRgbaImage {
-            width: image.width,
-            height: image.height,
-            pixels: image.pixels,
-        })
+        Ok(image.into_python())
     }
 
     #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
@@ -3744,20 +3783,13 @@ impl PyAssetStudio {
             ..TextureArrayReadLimits::default()
         };
         let images = py.detach(|| {
-            self.object(file_index, path_id)?
+            let images = self
+                .object(file_index, path_id)?
                 .decode_texture_array_mip0(limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            DisplayRowPyImages::from_decoded(images)
         })?;
-        let mut output = reserve_metadata(images.len(), "Python Texture2DArray images")?;
-        for mut image in images {
-            flip_rgba_rows(&mut image)?;
-            output.push(PyRgbaImage {
-                width: image.width,
-                height: image.height,
-                pixels: image.pixels,
-            });
-        }
-        Ok(output)
+        images.into_python()
     }
 
     /// Parses one complete, bounded Unity `SpriteAtlas` metadata table.

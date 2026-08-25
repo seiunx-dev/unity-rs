@@ -40,6 +40,37 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
             check_python_api_surface.STUB.read_text(encoding="utf-8"),
         )
         self.assertEqual((core_methods, rust_only), (107, 4))
+        check_python_api_surface.validate_texture_gil_boundary(
+            check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        )
+
+    def test_texture_row_conversion_must_stay_detached(self) -> None:
+        binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        altered = binding.replace(
+            "            DisplayRowPyImage::from_decoded(image)\n        })?;",
+            "            Ok(image)\n        })?;\n"
+            "        let image = DisplayRowPyImage::from_decoded(image)?;",
+            1,
+        )
+        self.assertNotEqual(altered, binding)
+        with self.assertRaisesRegex(
+            check_python_api_surface.AuditError,
+            r"read_texture.*outside py\.detach",
+        ):
+            check_python_api_surface.validate_texture_gil_boundary(altered)
+
+        altered = binding.replace(
+            "            DisplayRowPyImages::from_decoded(images)\n        })?;",
+            "            Ok(images)\n        })?;\n"
+            "        let images = DisplayRowPyImages::from_decoded(images)?;",
+            1,
+        )
+        self.assertNotEqual(altered, binding)
+        with self.assertRaisesRegex(
+            check_python_api_surface.AuditError,
+            r"read_texture_array.*outside py\.detach",
+        ):
+            check_python_api_surface.validate_texture_gil_boundary(altered)
 
     def test_instance_method_omission_is_rejected(self) -> None:
         consumer = COMPLETE_CONSUMER.replace("    studio.read_text(0)\n", "")
