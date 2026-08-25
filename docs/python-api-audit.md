@@ -77,6 +77,14 @@ methods:
   Programmatic schema construction also uses the JSON document's version
   invariant: an invalid Unity version becomes `ValueError` and cannot leave a
   never-matching entry in the registry.
+- Texture2D and Texture2DArray reads keep both decoder work and the complete
+  O(pixel bytes) bottom-up-to-display row conversion inside one
+  `Python::detach` closure. The attached path receives `DisplayRowPyImage(s)`,
+  whose type invariant permits only ownership moves into `RgbaImage` wrappers;
+  it does not scan the pixel buffer. `check_python_api_surface.py` validates
+  both methods lexically and its negative tests move each conversion outside
+  `py.detach` to prove the gate fails. Installed wheel and sdist tests continue
+  to compare the resulting single-image and per-layer pixels exactly.
 - Public list-shaped inputs no longer rely on PyO3's eager `Vec` extraction.
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;
