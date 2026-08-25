@@ -103,6 +103,15 @@ methods:
   method. Installed wheel and sdist tests exercise expression/physics/fade plus
   standard and injected-ACL clip motion, parse every document, and verify both
   the exact output limit and its one-byte-short rejection.
+- Legacy `Animation`, `AnimatorOverrideController`, `AssetBundle`,
+  `ResourceManager`, `PreloadData`, `AnimatorController` and `Avatar` finish
+  their pure-Rust list/tuple/string projection in the same `Python::detach`
+  closure as parsing. Those tables may each contain up to one million entries;
+  the attached path now receives the final Python wrapper instead of reserving
+  and walking a second Rust vector while holding the GIL. The source audit
+  requires all seven preparation helpers to remain inside their corresponding
+  closure and has one negative mutation per method. Installed wheel and sdist
+  behavior tests continue to validate every returned field and reference table.
 - Public list-shaped inputs no longer rely on PyO3's eager `Vec` extraction.
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;
