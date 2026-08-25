@@ -66,6 +66,15 @@ version entry and then the first unversioned fallback, preserving document
 order without copying every identity string into a second table. Registry
 growth and multi-document index rebuilds remain fallible and transactional.
 
+Rust callers that keep schemas as independently reusable registries can build a
+`MonoBehaviourSchemaRegistrySet`. It retains each registry through `Arc` and
+indexes only `(registry, entry)` positions, so neither TypeTrees nor identity
+strings are cloned. Python's `MonoBehaviourSchemas` uses this set: collection
+construction rejects more than 100,000 schemas before converting the first
+Python element, then exact-version and fallback lookup stay indexed while
+preserving the supplied first-match order. This closes the otherwise quadratic
+case where every stripped object scanned every Python-visible schema.
+
 ## The document
 
 ```json
