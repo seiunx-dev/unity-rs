@@ -244,6 +244,34 @@ def validate_cubism_json_gil_boundary(source: str) -> None:
             )
 
 
+METADATA_PROJECTION_GIL_EXPECTATIONS = (
+    ("fn read_legacy_animation(", "prepare_legacy_animation("),
+    (
+        "fn read_animator_override_controller(",
+        "prepare_animator_override_controller(",
+    ),
+    ("fn read_asset_bundle(", "prepare_asset_bundle("),
+    ("fn read_resource_manager(", "prepare_resource_manager("),
+    ("fn read_preload_data(", "prepare_preload_data("),
+    ("fn read_animator_controller(", "prepare_animator_controller("),
+    ("fn read_avatar(", "prepare_avatar("),
+)
+
+
+def validate_metadata_projection_gil_boundary(source: str) -> None:
+    """Keep million-entry pure-Rust metadata projection outside the GIL."""
+    for method_marker, preparation in METADATA_PROJECTION_GIL_EXPECTATIONS:
+        method = rust_braced_block(source, method_marker)
+        detach_offset = method.find("py.detach")
+        if detach_offset < 0:
+            raise AuditError(f"{method_marker[:-1]} does not release the GIL")
+        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        if preparation not in detached:
+            raise AuditError(
+                f"{method_marker[:-1]} projects metadata outside py.detach"
+            )
+
+
 def has_decorator(function: ast.FunctionDef, name: str) -> bool:
     return any(
         isinstance(decorator, ast.Name) and decorator.id == name
@@ -422,13 +450,16 @@ def main() -> None:
         validate_texture_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
         validate_payload_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
         validate_cubism_json_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
+        validate_metadata_projection_gil_boundary(
+            PYTHON_BINDING.read_text(encoding="utf-8")
+        )
     except AuditError as error:
         raise SystemExit(str(error)) from error
     print(
         "Python API surface audit passed "
         f"({methods} methods, {properties} properties; "
         f"{core_methods} Core methods classified, {rust_only} Rust-only; "
-        "texture rows, binary payloads and Cubism JSON detached)"
+        "texture rows, binary payloads, Cubism JSON and metadata projection detached)"
     )
 
 
