@@ -122,6 +122,7 @@ extraction = extract(
     limits=ExtractionLimits(
         maximum_output_bytes=4 * 1024 * 1024 * 1024,
         maximum_total_path_bytes=64 * 1024 * 1024,
+        maximum_metadata_bytes=256 * 1024 * 1024,
     ),
 )
 # The same callback can be supplied to recursive extraction.
@@ -132,6 +133,10 @@ oodle_extraction = extract(
 )
 for failure in extraction.failures:
     print(failure.source, failure.error)
+
+# maximum_total_path_bytes bounds traversal and recursive labels;
+# maximum_metadata_bytes separately bounds the retained success, skip, and
+# failure report strings returned to Python.
 
 # Supply a complete Unity object tree produced by a trusted offline schema
 # tool. The assembly name is an identity only; no DLL is opened or executed.
