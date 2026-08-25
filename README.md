@@ -207,9 +207,17 @@ packages = studio.read_live2d_packages(maximum_total_bytes=2 * 1024 * 1024 * 102
 report = studio.export(
     "exported",
     image_format="png",
-    limits=ExportLimits(maximum_total_output_bytes=4 * 1024 * 1024 * 1024),
+    limits=ExportLimits(
+        maximum_total_output_bytes=4 * 1024 * 1024 * 1024,
+        maximum_metadata_bytes=256 * 1024 * 1024,
+    ),
 )
 ```
+
+The export metadata limit is separate from file payload bytes. It covers the
+UTF-8 source/error strings and encoded output paths retained by the returned
+report, plus the case-insensitive output-name keys held while resolving
+collisions. Core, Python, Node, and the CLI apply the same cumulative policy.
 
 For stripped `MonoBehaviour` data, the Python package also accepts a complete
 `MonoBehaviourSchema` produced by a trusted offline schema tool. Multiple

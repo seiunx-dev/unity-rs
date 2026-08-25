@@ -24,8 +24,9 @@ The first binding slice supports:
   verified decoder-free WAV paths while retaining `readAudio` as the raw-only
   compatibility entry point;
 - complete `exportWithOptions` coverage for Core's mode, filename, image,
-  audio, JSON, overwrite and per-payload/aggregate budget policy, while the
-  compact `export(outputRoot, overwrite?)` call remains compatible;
+  audio, JSON, overwrite and per-payload/aggregate budget policy, including a
+  cumulative report/output-name metadata budget, while the compact
+  `export(outputRoot, overwrite?)` call remains compatible;
 - worker-backed caller ACL decoders for whole-scene ASCII/binary FBX and
   selected-`GameObject` FBX, with Core validating callback shape and budgets;
 - direct bounded `MonoBehaviour` JSON through an embedded Unity TypeTree, plus

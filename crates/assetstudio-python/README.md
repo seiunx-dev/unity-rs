@@ -240,6 +240,7 @@ report = studio.export(
     limits=ExportLimits(
         maximum_objects=100_000,
         maximum_total_output_bytes=4 * 1024 * 1024 * 1024,
+        maximum_metadata_bytes=256 * 1024 * 1024,
     ),
 )
 for failure in report.failures:
