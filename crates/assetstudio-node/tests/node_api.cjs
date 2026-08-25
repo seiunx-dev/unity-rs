@@ -2837,6 +2837,18 @@ console.log('node api: textured fbx and acl inspection ok')
     /nodes.*maximum/i,
   )
   assert.equal(nodeElementRead, false)
+  assert.throws(
+    () =>
+      schemaStudio.readMonoBehaviourJsonWithSchemas(0, objects[0].pathId, [
+        {
+          assemblyName: 'A.dll',
+          className: 'A',
+          unityVersion: 'not-a-unity-version',
+          nodes: [{ typeName: 'A', fieldName: 'Base', level: 0, align: false }],
+        },
+      ]),
+    /invalid Unity version/i,
+  )
   // A TextAsset is not a MonoBehaviour, so the read is refused rather than
   // producing an object shaped by the schema.
   assert.throws(() =>
@@ -2942,6 +2954,24 @@ async function testLive2dPackageAdapters() {
   )
   assert.strictEqual(schemaRead.source, 'schema')
   assert.ok(JSON.parse(schemaRead.json.toString('utf8'))._moc)
+
+  // JavaScript values must be copied before this call returns, but complete
+  // Core schema validation and registry indexing belong to the worker. A bad
+  // Unity version therefore rejects the Promise instead of synchronously
+  // throwing while the event loop is still trying to queue the task.
+  const invalidSchemas = [
+    { ...schemas[0], unityVersion: 'not-a-unity-version' },
+  ]
+  let invalidSchemaRead
+  assert.doesNotThrow(() => {
+    invalidSchemaRead = studio.readMonoBehaviourJsonWithSchemasAsync(
+      0,
+      strippedBehaviour.pathId,
+      invalidSchemas,
+    )
+  })
+  await assert.rejects(invalidSchemaRead, /invalid Unity version/i)
+
   const schemaOnly = studio.readLive2DPackagesWithSchemas(
     schemas,
     1024 * 1024,
@@ -2975,6 +3005,19 @@ async function testLive2dPackageAdapters() {
     () => studio.readLive2DPackagesWithSchemas(schemas, 1024, -1),
     /maximumTotalBytes must be non-negative/i,
   )
+
+  let invalidPackageRead
+  assert.doesNotThrow(() => {
+    invalidPackageRead = studio.readLive2DPackagesWithAclDecoder(
+      () => {
+        throw new Error('invalid schema must fail before ACL decoding')
+      },
+      invalidSchemas,
+      1024 * 1024,
+      4 * 1024 * 1024,
+    )
+  })
+  await assert.rejects(invalidPackageRead, /invalid Unity version/i)
 
   let calls = 0
   const decoded = await studio.readLive2DPackagesWithAclDecoder(

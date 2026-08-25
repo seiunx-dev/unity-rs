@@ -2033,6 +2033,18 @@ def assert_schema_construction_releases_gil() -> None:
     # The binding must check each Python list length before asking PyO3 to
     # convert every element. Invalid entries prove the guards run first rather
     # than merely rejecting after conversion.
+    try:
+        MonoBehaviourSchema(
+            "Probe.dll",
+            "Probe",
+            [("MonoBehaviour", "Base", 0, False)],
+            unity_version="not-a-unity-version",
+        )
+    except ValueError as error:
+        assert "invalid Unity version" in str(error)
+    else:
+        raise AssertionError("programmatic schemas must reject invalid Unity versions")
+
     oversized_nodes = [None] * 1_000_001
     try:
         MonoBehaviourSchema("Probe.dll", "Probe", oversized_nodes)
