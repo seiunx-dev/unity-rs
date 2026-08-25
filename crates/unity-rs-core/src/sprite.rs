@@ -268,8 +268,10 @@ pub fn read_sprite(
 /// C# Sprite image. Rectangular packed sprites apply the same flip/rotation
 /// transforms as `SpriteHelper.CutImage`. An explicitly referenced `SpriteAtlas`
 /// is resolved locally or across files before its composite render-data key is
-/// queried. Once an atlas resolves, missing atlas data never falls back to the
-/// Sprite's resident render data, matching `SpriteHelper.GetImage`.
+/// queried. An atlas whose render-data map is present but does not contain the
+/// Sprite key remains an error. A completely empty map falls back to the
+/// Sprite's resident render data: shipping bundles use this shape for an atlas
+/// that retains its packed-Sprite table while omitting platform atlas pages.
 ///
 /// The collection-level `AssetsManager.ProcessAssets` pass is reproduced:
 /// `packedSprites` backfills null or unresolved atlas references, and a master
@@ -287,10 +289,12 @@ pub fn decode_sprite_rgba8(
     if let Some(atlas) = effective_sprite_atlas(collection, file, sprite, limits)? {
         return decode_sprite_from_atlas(
             collection,
+            SpriteSource {
+                file,
+                file_index: None,
+            },
             sprite,
-            atlas.file,
-            atlas.file_index,
-            atlas.object_index,
+            atlas,
             limits,
             texture_limits,
         );
@@ -327,10 +331,12 @@ pub fn decode_sprite_rgba8_by_file_index(
     {
         return decode_sprite_from_atlas(
             collection,
+            SpriteSource {
+                file,
+                file_index: Some(file_index),
+            },
             sprite,
-            atlas.file,
-            atlas.file_index,
-            atlas.object_index,
+            atlas,
             limits,
             texture_limits,
         );
@@ -343,6 +349,12 @@ pub fn decode_sprite_rgba8_by_file_index(
         limits,
         texture_limits,
     )
+}
+
+#[derive(Clone, Copy)]
+struct SpriteSource<'a> {
+    file: &'a SerializedFile,
+    file_index: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -581,29 +593,43 @@ fn decode_sprite_from_resident_data(
 
 fn decode_sprite_from_atlas(
     collection: &AssetCollection,
+    sprite_source: SpriteSource<'_>,
     sprite: &Sprite,
-    atlas_file: &SerializedFile,
-    atlas_file_index: Option<usize>,
-    atlas_index: usize,
+    selected_atlas: SelectedSpriteAtlas<'_>,
     limits: SpriteReadLimits,
     texture_limits: TextureReadLimits,
 ) -> Result<RgbaImage> {
-    let atlas = read_sprite_atlas(atlas_file, atlas_index, atlas_read_limits(limits))?;
+    let atlas = read_sprite_atlas(
+        selected_atlas.file,
+        selected_atlas.object_index,
+        atlas_read_limits(limits),
+    )?;
     let (guid_bytes, value) = sprite.render_data_key.ok_or_else(|| {
         Error::invalid_data("Sprite has a resolved SpriteAtlas but no render-data key")
     })?;
-    let data = atlas
-        .render_data_for_sprite_key(&guid_bytes, value)
-        .ok_or_else(|| {
-            Error::invalid_data(format!(
+    let data = match atlas.render_data_for_sprite_key(&guid_bytes, value) {
+        Some(data) => data,
+        None if atlas.render_data_entries.is_empty() => {
+            return decode_sprite_from_resident_data(
+                collection,
+                sprite_source.file,
+                sprite_source.file_index,
+                sprite,
+                limits,
+                texture_limits,
+            );
+        }
+        None => {
+            return Err(Error::invalid_data(format!(
                 "SpriteAtlas path ID {} has no render data for the Sprite key",
                 atlas.path_id
-            ))
-        })?;
+            )));
+        }
+    };
     decode_sprite_atlas_data(
         collection,
-        atlas_file,
-        atlas_file_index,
+        selected_atlas.file,
+        selected_atlas.file_index,
         sprite,
         data,
         limits,
@@ -3364,6 +3390,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_atlas_render_data_uses_resident_sprite_data() {
+        let sprite = modern_sprite_object(
+            2,
+            0,
+            [0.0, 0.0, 1.0, 1.0],
+            2,
+            ObjectReferenceFields {
+                atlas_path: 9,
+                ..ObjectReferenceFields::default()
+            },
+        );
+        let atlas = sprite_atlas_object(AtlasFixtureFields {
+            has_render_data: false,
+            ..AtlasFixtureFields::default()
+        });
+        let file = parse_asset(
+            "2022.3.62f1",
+            &[
+                (SPRITE_CLASS_ID, 1, sprite),
+                (28, 2, texture_object(1, 1, &[1, 2, 3, 255])),
+                (SPRITE_ATLAS_CLASS_ID, 9, atlas),
+            ],
+        );
+        let collection = collection_with(file.clone());
+        let sprite = read_sprite(&file, 0, SpriteReadLimits::default()).unwrap();
+        let image = decode_sprite_rgba8(
+            &collection,
+            &file,
+            &sprite,
+            SpriteReadLimits::default(),
+            TextureReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(image.pixels, [1, 2, 3, 255]);
+    }
+
+    #[test]
     fn unresolved_or_wrong_class_atlas_pptrs_use_resident_data() {
         for atlas_path in [99, 3] {
             let sprite = modern_sprite_object(
@@ -3617,6 +3680,7 @@ mod tests {
         settings: u32,
         downscale_multiplier: f32,
         is_variant: bool,
+        has_render_data: bool,
     }
 
     impl Default for AtlasFixtureFields {
@@ -3635,6 +3699,7 @@ mod tests {
                 settings: 2,
                 downscale_multiplier: 1.0,
                 is_variant: false,
+                has_render_data: true,
             }
         }
     }
@@ -3778,23 +3843,25 @@ mod tests {
         );
         push_i32(&mut output, 1);
         push_aligned_string(&mut output, "icon");
-        push_i32(&mut output, 1);
-        output.extend_from_slice(&fields.key_guid);
-        output.extend_from_slice(&fields.key_value.to_le_bytes());
-        push_pptr(&mut output, fields.texture_file, fields.texture_path);
-        push_pptr(
-            &mut output,
-            fields.alpha_texture_file,
-            fields.alpha_texture_path,
-        );
-        push_floats(&mut output, &fields.texture_rect);
-        push_floats(&mut output, &fields.texture_rect_offset);
-        push_floats(&mut output, &[0.0, 0.0]);
-        push_floats(&mut output, &[0.0, 0.0, 1.0, 1.0]);
-        push_floats(&mut output, &[fields.downscale_multiplier]);
-        push_u32(&mut output, fields.settings);
-        push_i32(&mut output, 0);
-        align(&mut output, 4);
+        push_i32(&mut output, i32::from(fields.has_render_data));
+        if fields.has_render_data {
+            output.extend_from_slice(&fields.key_guid);
+            output.extend_from_slice(&fields.key_value.to_le_bytes());
+            push_pptr(&mut output, fields.texture_file, fields.texture_path);
+            push_pptr(
+                &mut output,
+                fields.alpha_texture_file,
+                fields.alpha_texture_path,
+            );
+            push_floats(&mut output, &fields.texture_rect);
+            push_floats(&mut output, &fields.texture_rect_offset);
+            push_floats(&mut output, &[0.0, 0.0]);
+            push_floats(&mut output, &[0.0, 0.0, 1.0, 1.0]);
+            push_floats(&mut output, &[fields.downscale_multiplier]);
+            push_u32(&mut output, fields.settings);
+            push_i32(&mut output, 0);
+            align(&mut output, 4);
+        }
         push_aligned_string(&mut output, "ui");
         output.push(u8::from(fields.is_variant));
         align(&mut output, 4);
