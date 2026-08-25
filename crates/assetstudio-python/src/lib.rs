@@ -1688,6 +1688,7 @@ struct PyExtractionLimits {
     output_bytes: u64,
     path_bytes: usize,
     total_path_bytes: usize,
+    metadata_bytes: usize,
 }
 
 #[pymethods]
@@ -1705,7 +1706,8 @@ impl PyExtractionLimits {
         maximum_expanded_bytes=4_294_967_296,
         maximum_output_bytes=4_294_967_296,
         maximum_path_bytes=32_767,
-        maximum_total_path_bytes=67_108_864
+        maximum_total_path_bytes=67_108_864,
+        maximum_metadata_bytes=268_435_456
     ))]
     const fn new(
         maximum_input_files: usize,
@@ -1716,6 +1718,7 @@ impl PyExtractionLimits {
         maximum_output_bytes: u64,
         maximum_path_bytes: usize,
         maximum_total_path_bytes: usize,
+        maximum_metadata_bytes: usize,
     ) -> Self {
         Self {
             input_files: maximum_input_files,
@@ -1726,6 +1729,7 @@ impl PyExtractionLimits {
             output_bytes: maximum_output_bytes,
             path_bytes: maximum_path_bytes,
             total_path_bytes: maximum_total_path_bytes,
+            metadata_bytes: maximum_metadata_bytes,
         }
     }
 
@@ -1767,6 +1771,11 @@ impl PyExtractionLimits {
     #[getter]
     const fn maximum_total_path_bytes(&self) -> usize {
         self.total_path_bytes
+    }
+
+    #[getter]
+    const fn maximum_metadata_bytes(&self) -> usize {
+        self.metadata_bytes
     }
 }
 
@@ -1835,6 +1844,7 @@ impl From<PyExtractionLimits> for ExtractionLimits {
             maximum_output_bytes: value.output_bytes,
             maximum_path_bytes: value.path_bytes,
             maximum_total_path_bytes: value.total_path_bytes,
+            maximum_metadata_bytes: value.metadata_bytes,
             compression: CompressionLimits {
                 maximum_input_bytes: value.single_entry_bytes,
                 maximum_output_bytes: value.single_entry_bytes,

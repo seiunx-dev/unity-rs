@@ -37,6 +37,10 @@ pub struct ExtractionLimits {
     /// Maximum cumulative bytes retained for filesystem traversal paths and
     /// recursive diagnostic labels during one extraction.
     pub maximum_total_path_bytes: usize,
+    /// Maximum cumulative bytes retained by report source labels, output
+    /// paths, and failure messages. This is separate from traversal-path
+    /// storage because the returned report outlives the extractor's indexes.
+    pub maximum_metadata_bytes: usize,
     pub compression: CompressionLimits,
 }
 
@@ -51,6 +55,7 @@ impl Default for ExtractionLimits {
             maximum_output_bytes: 4 * 1024 * 1024 * 1024,
             maximum_path_bytes: 32_767,
             maximum_total_path_bytes: 64 * 1024 * 1024,
+            maximum_metadata_bytes: 256 * 1024 * 1024,
             compression: CompressionLimits::default(),
         }
     }
@@ -266,6 +271,7 @@ struct ExtractionBudget {
     paths: ExtractionPathBudget,
     entries: usize,
     expanded_bytes: u64,
+    report_metadata_bytes: usize,
 }
 
 struct Extractor {
@@ -695,6 +701,8 @@ impl Extractor {
             )));
         }
 
+        let metadata_bytes =
+            self.checked_report_metadata(label.len(), filesystem_path_byte_length(&output_path))?;
         let source = copy_extraction_label(label)?;
         reserve_report_entry(&mut self.report.extracted, "extraction records")?;
         // A no-clobber destination can appear between the initial check and
@@ -702,6 +710,7 @@ impl Extractor {
         // writing so success never creates a file and then fails to record it.
         reserve_report_entry(&mut self.report.skipped_existing, "extraction skips")?;
         let outcome = self.atomic_write(&output_path, length, copy)?;
+        self.budget.report_metadata_bytes = metadata_bytes;
         if outcome == PersistOutcome::SkippedExisting {
             self.report.skipped_existing.push(ExtractionSkip {
                 source,
@@ -719,8 +728,11 @@ impl Extractor {
     }
 
     fn push_skipped(&mut self, label: &str, output_path: PathBuf) -> Result<()> {
+        let metadata_bytes =
+            self.checked_report_metadata(label.len(), filesystem_path_byte_length(&output_path))?;
         let source = copy_extraction_label(label)?;
         reserve_report_entry(&mut self.report.skipped_existing, "extraction skips")?;
+        self.budget.report_metadata_bytes = metadata_bytes;
         self.report.skipped_existing.push(ExtractionSkip {
             source,
             output_path,
@@ -1210,12 +1222,33 @@ impl Extractor {
     }
 
     fn record_failure(&mut self, source: String, error: &Error) -> Result<()> {
+        let error_length = extraction_error_length(error)?;
+        let metadata_bytes = self.checked_report_metadata(source.len(), error_length)?;
         let error = format_extraction_error(error)?;
         reserve_report_entry(&mut self.report.failures, "extraction failures")?;
+        self.budget.report_metadata_bytes = metadata_bytes;
         self.report
             .failures
             .push(ExtractionFailure { source, error });
         Ok(())
+    }
+
+    fn checked_report_metadata(&self, first: usize, second: usize) -> Result<usize> {
+        let additional = first
+            .checked_add(second)
+            .ok_or_else(|| Error::invalid_data("extraction report metadata size overflowed"))?;
+        let next = self
+            .budget
+            .report_metadata_bytes
+            .checked_add(additional)
+            .ok_or_else(|| Error::invalid_data("extraction report metadata total overflowed"))?;
+        if next > self.options.limits.maximum_metadata_bytes {
+            return Err(Error::invalid_data(format!(
+                "extraction report metadata requires {next} bytes, exceeding limit {}",
+                self.options.limits.maximum_metadata_bytes
+            )));
+        }
+        Ok(next)
     }
 }
 
@@ -1992,10 +2025,35 @@ impl fmt::Write for FallibleFormatString {
     }
 }
 
+#[derive(Default)]
+struct FallibleFormatLength {
+    length: usize,
+}
+
+impl fmt::Write for FallibleFormatLength {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.length = self.length.checked_add(value.len()).ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn extraction_error_length(error: &Error) -> Result<usize> {
+    let mut output = FallibleFormatLength::default();
+    fmt::write(&mut output, format_args!("{error}"))
+        .map_err(|_| Error::invalid_data("extraction failure message length overflowed"))?;
+    Ok(output.length)
+}
+
 fn format_extraction_error(error: &Error) -> Result<String> {
-    let mut output = FallibleFormatString::default();
+    let length = extraction_error_length(error)?;
+    let mut value = String::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| Error::invalid_data("cannot allocate extraction failure message"))?;
+    let mut output = FallibleFormatString { value };
     fmt::write(&mut output, format_args!("{error}"))
         .map_err(|_| Error::invalid_data("cannot allocate extraction failure message"))?;
+    debug_assert_eq!(output.value.len(), length);
     Ok(output.value)
 }
 
@@ -2587,6 +2645,85 @@ mod tests {
             .unwrap(),
             "missing input"
         );
+    }
+
+    #[test]
+    fn report_metadata_is_exact_transactional_and_checked_before_publication() {
+        let root = TestDirectory::new("report-metadata");
+        let output = root.path().join("exact-output");
+        let label = "payload.bin";
+        let destination = output.join(label);
+        let required = label.len() + super::filesystem_path_byte_length(&destination);
+        let report = extract_region(
+            label,
+            Region::from_bytes(b"payload".to_vec()),
+            &output,
+            ExtractionOptions {
+                limits: ExtractionLimits {
+                    maximum_metadata_bytes: required,
+                    ..ExtractionLimits::default()
+                },
+                ..ExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.extracted.len(), 1);
+        assert_eq!(report.extracted[0].source, label);
+        assert_eq!(report.extracted[0].output_path, destination);
+
+        let short_output = root.path().join("short-output");
+        let short_destination = short_output.join(label);
+        let short_required = label.len() + super::filesystem_path_byte_length(&short_destination);
+        let short_report = extract_region(
+            label,
+            Region::from_bytes(b"payload".to_vec()),
+            &short_output,
+            ExtractionOptions {
+                limits: ExtractionLimits {
+                    maximum_metadata_bytes: short_required - 1,
+                    ..ExtractionLimits::default()
+                },
+                ..ExtractionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(short_report.extracted.is_empty());
+        assert_eq!(short_report.failures.len(), 1);
+        assert!(
+            short_report.failures[0]
+                .error
+                .contains("extraction report metadata requires"),
+            "{:?}",
+            short_report.failures
+        );
+        assert!(!short_destination.exists());
+
+        let failure = Error::unsupported("future layout");
+        let failure_source = "fixture".to_owned();
+        let failure_required = failure_source.len() + "unsupported: future layout".len();
+        let failure_limit = failure_required * 2;
+        let mut exact = Extractor::with_path_budget(
+            root.path().to_path_buf(),
+            ExtractionOptions {
+                limits: ExtractionLimits {
+                    maximum_metadata_bytes: failure_limit,
+                    ..ExtractionLimits::default()
+                },
+                ..ExtractionOptions::default()
+            },
+            ExtractionPathBudget::default(),
+        );
+        exact
+            .record_failure(failure_source.clone(), &failure)
+            .unwrap();
+        exact
+            .record_failure(failure_source.clone(), &failure)
+            .unwrap();
+        assert_eq!(exact.budget.report_metadata_bytes, failure_limit);
+        assert_eq!(exact.report.failures.len(), 2);
+        assert!(exact.record_failure(failure_source, &failure).is_err());
+        assert_eq!(exact.budget.report_metadata_bytes, failure_limit);
+        assert_eq!(exact.report.failures.len(), 2);
     }
 
     #[test]

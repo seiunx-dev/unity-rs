@@ -2491,6 +2491,18 @@ def main() -> None:
         assert not any(
             child.is_file() for child in extraction_limited_output.rglob("*")
         )
+        metadata_limited_output = Path(directory) / "extraction-metadata-limited"
+        metadata_limit = ExtractionLimits(maximum_metadata_bytes=0)
+        assert metadata_limit.maximum_metadata_bytes == 0
+        try:
+            extract(path, metadata_limited_output, limits=metadata_limit)
+        except ValueError as error:
+            assert "extraction report metadata requires" in str(error)
+        else:
+            raise AssertionError("extraction report metadata budget should be enforced")
+        assert not any(
+            child.is_file() for child in metadata_limited_output.rglob("*")
+        )
         path_budget_input = Path(directory) / "path-budget-input"
         path_budget_input.mkdir()
         (path_budget_input / "payload.bin").write_bytes(b"payload")

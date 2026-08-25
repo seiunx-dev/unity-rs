@@ -232,10 +232,15 @@ def consume_public_api(
         path,
         limits=ExportLimits(maximum_metadata_bytes=268_435_456),
     )
+    extraction_limits = ExtractionLimits(
+        maximum_total_path_bytes=67_108_864,
+        maximum_metadata_bytes=268_435_456,
+    )
+    extraction_metadata_bytes: int = extraction_limits.maximum_metadata_bytes
     extraction_report: ExtractionReport = extract(
         path,
         path,
-        limits=ExtractionLimits(maximum_total_path_bytes=67_108_864),
+        limits=extraction_limits,
         oodle_decoder=oodle_decoder,
     )
 
@@ -317,4 +322,5 @@ def consume_public_api(
         packages,
         export_report,
         extraction_report,
+        extraction_metadata_bytes,
     )

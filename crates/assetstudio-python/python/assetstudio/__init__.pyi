@@ -814,6 +814,7 @@ class ExtractionLimits:
         maximum_output_bytes: int = 4_294_967_296,
         maximum_path_bytes: int = 32_767,
         maximum_total_path_bytes: int = 67_108_864,
+        maximum_metadata_bytes: int = 268_435_456,
     ) -> ExtractionLimits: ...
     @property
     def maximum_input_files(self) -> int: ...
@@ -831,6 +832,8 @@ class ExtractionLimits:
     def maximum_path_bytes(self) -> int: ...
     @property
     def maximum_total_path_bytes(self) -> int: ...
+    @property
+    def maximum_metadata_bytes(self) -> int: ...
 
 class ExtractionRecord:
     @property
