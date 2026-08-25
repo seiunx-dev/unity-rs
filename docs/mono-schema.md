@@ -57,6 +57,15 @@ its one-string unescape scratch. Unknown document fields are consumed without
 materializing their value. The CLI additionally streams each repeatable file
 under one cumulative set of the same budgets.
 
+The final registry does not scan every schema for every object. It indexes the
+portable assembly name (case-insensitive and with an optional `.dll` suffix),
+namespace, class, and exact-or-fallback Unity version under a per-registry
+random hash. Hash candidates are still compared against the complete identity,
+so a collision cannot select the wrong tree. Lookup checks the first exact
+version entry and then the first unversioned fallback, preserving document
+order without copying every identity string into a second table. Registry
+growth and multi-document index rebuilds remain fallible and transactional.
+
 ## The document
 
 ```json
