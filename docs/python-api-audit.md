@@ -85,6 +85,14 @@ methods:
   both methods lexically and its negative tests move each conversion outside
   `py.detach` to prove the gate fails. Installed wheel and sdist tests continue
   to compare the resulting single-image and per-layer pixels exactly.
+- `SpriteAtlas` parsing and its complete packed-sprite, render-data and
+  secondary-texture projection share one `Python::detach` closure. The detached
+  preparation converts every PPtr, rect/vector/settings tuple and owned name
+  into the final Rust-side table; after the GIL is reacquired, only the
+  unavoidable per-entry `Py::new` calls and their final wrapper vectors remain.
+  A positive/negative source audit rejects moving the preparation outside the
+  detach closure, while installed wheel and sdist fixtures continue to verify
+  all public fields, ordering and entry/string limits.
 - AudioClip and the three source-bound simple binary readers use the same
   boundary. `read_audio_clip` parses metadata and produces its final bounded
   WAV/raw bytes inside one detach closure; `read_font`, `read_movie_texture`
