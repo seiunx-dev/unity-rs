@@ -235,7 +235,10 @@ value read through a supplied schema is only as good as that schema.
 The CLI takes the same schemas as a document: `--mono-schema <path>`,
 repeatable, on any command that opens a collection. `docs/mono-schema.md`
 describes the document, the generator that writes one, and how a generated
-schema is checked against builds that still carry Unity's own type trees.
+schema is checked against builds that still carry Unity's own type trees. The
+registry indexes assembly/namespace/class/version identities with collision
+verification, so resolving many stripped objects does not rescan every loaded
+schema; exact versions still outrank the first unversioned fallback.
 
 A game directory routinely mixes readable assets with encrypted, truncated or
 not-yet-supported containers. By default Core refuses the whole load over any
