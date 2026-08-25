@@ -372,8 +372,9 @@ export declare class AssetStudio {
    */
   readMonoBehaviourJsonWithSchemas(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): MonoBehaviourJson
   /**
-   * Worker-backed form of `readMonoBehaviourJsonWithSchemas`. Schema data
-   * is validated and converted before the task is queued; parsing and JSON
+   * Worker-backed form of `readMonoBehaviourJsonWithSchemas`. JavaScript
+   * values are count-checked and copied before the task is queued; schema
+   * identity validation, registry indexing, parsing and JSON
    * materialization happen on the worker.
    */
   readMonoBehaviourJsonWithSchemasAsync(fileIndex: number, pathId: bigint, schemas: Array<MonoBehaviourSchema>, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): Promise<MonoBehaviourJson>

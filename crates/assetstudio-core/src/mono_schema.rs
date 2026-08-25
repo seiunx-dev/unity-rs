@@ -146,6 +146,15 @@ impl MonoBehaviourSchemaRegistry {
     }
 
     pub fn push(&mut self, entry: MonoBehaviourSchemaEntry) -> Result<()> {
+        if entry
+            .unity_version
+            .as_deref()
+            .is_some_and(|version| UnityVersion::from_str(version).is_err())
+        {
+            return Err(Error::invalid_data(
+                "MonoBehaviour schema entry has invalid Unity version",
+            ));
+        }
         let identity_hash = schema_lookup_hash(
             &self.identity_hash_builder,
             &entry.assembly_name,
@@ -2097,6 +2106,22 @@ mod tests {
     }
 
     #[test]
+    fn programmatic_registry_rejects_invalid_unity_version_transactionally() {
+        let mut registry = MonoBehaviourSchemaRegistry::new();
+        let error = registry
+            .push(MonoBehaviourSchemaEntry {
+                assembly_name: "Assembly-CSharp".to_owned(),
+                namespace: "Game".to_owned(),
+                class_name: "Stats".to_owned(),
+                unity_version: Some("not-a-unity-version".to_owned()),
+                tree: empty_tree(),
+            })
+            .expect_err("a programmatic schema must obey the document version contract");
+        assert!(error.to_string().contains("invalid Unity version"));
+        assert!(registry.entries().is_empty());
+    }
+
+    #[test]
     fn schema_lookup_is_indexed_by_version_and_keeps_first_priority() {
         const ENTRY_COUNT: usize = 20_000;
         const TAGGED_VERSION: usize = 12_345;
@@ -2117,7 +2142,7 @@ mod tests {
                     assembly_name: "Assembly-CSharp".to_owned(),
                     namespace: "Game".to_owned(),
                     class_name: "Stats".to_owned(),
-                    unity_version: Some(format!("version-{version_index}")),
+                    unity_version: Some(indexed_unity_version(version_index)),
                     tree: if version_index == TAGGED_VERSION {
                         tagged_tree("exact-first")
                     } else {
@@ -2133,7 +2158,7 @@ mod tests {
         // exact nor fallback lookup may let them outrank the first document.
         for (unity_version, tag) in [
             (None, "fallback-second"),
-            (Some(format!("version-{TAGGED_VERSION}")), "exact-second"),
+            (Some(indexed_unity_version(TAGGED_VERSION)), "exact-second"),
         ] {
             registry
                 .push(MonoBehaviourSchemaEntry {
@@ -2149,7 +2174,7 @@ mod tests {
 
         reset_schema_lookup_probes();
         for version_index in (0..ENTRY_COUNT).rev() {
-            let unity_version = format!("version-{version_index}");
+            let unity_version = indexed_unity_version(version_index);
             let tree = registry
                 .schema(MonoBehaviourSchemaIdentity {
                     unity_version: &unity_version,
@@ -2165,7 +2190,7 @@ mod tests {
         }
         let fallback = registry
             .schema(MonoBehaviourSchemaIdentity {
-                unity_version: "missing-version",
+                unity_version: "2022.3.0f20001",
                 assembly_name: "archive:/folder/assembly-csharp.dll",
                 namespace: "Game",
                 class_name: "Stats",
@@ -2193,7 +2218,7 @@ mod tests {
         let mut tagged = None;
         for version_index in 0..REGISTRY_COUNT {
             let registry = single_entry_registry(
-                Some(format!("shared-version-{version_index}")),
+                Some(indexed_unity_version(version_index)),
                 if version_index == TAGGED_VERSION {
                     tagged_tree("shared-exact-first")
                 } else {
@@ -2210,7 +2235,7 @@ mod tests {
             tagged_tree("shared-fallback-second"),
         ));
         registries.push(single_entry_registry(
-            Some(format!("shared-version-{TAGGED_VERSION}")),
+            Some(indexed_unity_version(TAGGED_VERSION)),
             tagged_tree("shared-exact-second"),
         ));
 
@@ -2219,7 +2244,7 @@ mod tests {
         assert!(!set.is_empty());
         reset_schema_lookup_probes();
         for version_index in (0..REGISTRY_COUNT).rev() {
-            let unity_version = format!("shared-version-{version_index}");
+            let unity_version = indexed_unity_version(version_index);
             let tree = set
                 .schema(MonoBehaviourSchemaIdentity {
                     unity_version: &unity_version,
@@ -2240,7 +2265,7 @@ mod tests {
         }
         let tree = set
             .schema(MonoBehaviourSchemaIdentity {
-                unity_version: "missing-shared-version",
+                unity_version: "2022.3.0f20001",
                 assembly_name: "folder/ASSEMBLY-CSHARP.dll",
                 namespace: "Game",
                 class_name: "Stats",
@@ -2670,6 +2695,10 @@ mod tests {
             nodes: Vec::new(),
             string_buffer: Vec::new(),
         }
+    }
+
+    fn indexed_unity_version(index: usize) -> String {
+        format!("2022.3.0f{}", index + 1)
     }
 
     fn single_entry_registry(

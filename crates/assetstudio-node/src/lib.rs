@@ -2818,9 +2818,8 @@ impl AssetStudio {
         maximum_total_bytes: Option<i64>,
     ) -> Result<AsyncTask<Live2dPackagesWithAclTask>> {
         let schemas = schemas
-            .map(|schemas| build_schema_registry(env, schemas))
-            .transpose()?
-            .map(Arc::new);
+            .map(|schemas| parse_schema_entries(env, schemas))
+            .transpose()?;
         let (planning_limits, materialize_limits) =
             live2d_package_limits(maximum_file_bytes, maximum_total_bytes)?;
         Ok(AsyncTask::new(Live2dPackagesWithAclTask {
@@ -2987,7 +2986,7 @@ impl AssetStudio {
         self.mono_behaviour_json_task(
             file_index,
             path_id,
-            MonoBehaviourSchemaRegistry::new(),
+            PendingMonoBehaviourSchemas::default(),
             pretty,
             maximum_bytes,
         )
@@ -3014,8 +3013,9 @@ impl AssetStudio {
         self.mono_behaviour_json(file_index, path_id, &registry, pretty, maximum_bytes)
     }
 
-    /// Worker-backed form of `readMonoBehaviourJsonWithSchemas`. Schema data
-    /// is validated and converted before the task is queued; parsing and JSON
+    /// Worker-backed form of `readMonoBehaviourJsonWithSchemas`. JavaScript
+    /// values are count-checked and copied before the task is queued; schema
+    /// identity validation, registry indexing, parsing and JSON
     /// materialization happen on the worker.
     #[napi(ts_return_type = "Promise<MonoBehaviourJson>")]
     pub fn read_mono_behaviour_json_with_schemas_async(
@@ -3030,7 +3030,7 @@ impl AssetStudio {
         self.mono_behaviour_json_task(
             file_index,
             path_id,
-            build_schema_registry(env, schemas)?,
+            parse_schema_entries(env, schemas)?,
             pretty,
             maximum_bytes,
         )
@@ -3067,7 +3067,7 @@ impl AssetStudio {
         &self,
         file_index: u32,
         path_id: BigInt,
-        registry: MonoBehaviourSchemaRegistry,
+        schemas: PendingMonoBehaviourSchemas,
         pretty: Option<bool>,
         maximum_bytes: Option<i64>,
     ) -> Result<AsyncTask<ReadMonoBehaviourJsonTask>> {
@@ -3075,7 +3075,7 @@ impl AssetStudio {
             studio: Arc::clone(&self.studio),
             file_index: usize::try_from(file_index).expect("u32 fits usize"),
             path_id: bigint_i64(path_id, "pathId")?,
-            registry,
+            schemas,
             pretty: pretty.unwrap_or(false),
             maximum: byte_limit(maximum_bytes)?,
         }))
@@ -3492,7 +3492,7 @@ pub struct Live2dPackagesWithAclTask {
     studio: Arc<Studio>,
     planning_limits: Live2dPackageLimits,
     materialize_limits: Live2dPackageMaterializeLimits,
-    schemas: Option<Arc<MonoBehaviourSchemaRegistry>>,
+    schemas: Option<PendingMonoBehaviourSchemas>,
     decoder: Arc<JsAclDecoder>,
 }
 
@@ -3501,9 +3501,13 @@ impl Task for Live2dPackagesWithAclTask {
     type JsValue = Live2dPackageSet;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let provider = self
+        let schemas = self
             .schemas
-            .as_deref()
+            .take()
+            .map(PendingMonoBehaviourSchemas::into_registry)
+            .transpose()?;
+        let provider = schemas
+            .as_ref()
             .map(|value| value as &dyn MonoBehaviourSchemaProvider);
         self.studio
             .read_live2d_packages_with_adapters(
@@ -3647,7 +3651,7 @@ pub struct ReadMonoBehaviourJsonTask {
     studio: Arc<Studio>,
     file_index: usize,
     path_id: i64,
-    registry: MonoBehaviourSchemaRegistry,
+    schemas: PendingMonoBehaviourSchemas,
     pretty: bool,
     maximum: u64,
 }
@@ -3657,9 +3661,10 @@ impl Task for ReadMonoBehaviourJsonTask {
     type JsValue = MonoBehaviourJson;
 
     fn compute(&mut self) -> Result<Self::Output> {
+        let registry = std::mem::take(&mut self.schemas).into_registry()?;
         studio_object(&self.studio, self.file_index, self.path_id)?
             .read_mono_behaviour_json(
-                &self.registry,
+                &registry,
                 self.pretty,
                 MonoBehaviourReadLimits {
                     maximum_json_bytes: usize::try_from(self.maximum)
@@ -3894,13 +3899,32 @@ fn convert_live2d_package_set(set: CoreLive2dPackageBytesSet) -> Result<Live2dPa
 /// conversion allocates with `Vec::with_capacity` before this function could
 /// inspect either the schema or node count.
 fn build_schema_registry(env: Env, schemas: Array<'_>) -> Result<MonoBehaviourSchemaRegistry> {
+    parse_schema_entries(env, schemas)?.into_registry()
+}
+
+#[derive(Default)]
+struct PendingMonoBehaviourSchemas {
+    entries: Vec<MonoBehaviourSchemaEntry>,
+}
+
+impl PendingMonoBehaviourSchemas {
+    fn into_registry(self) -> Result<MonoBehaviourSchemaRegistry> {
+        let mut registry = MonoBehaviourSchemaRegistry::new();
+        for entry in self.entries {
+            registry.push(entry).map_err(core_error)?;
+        }
+        Ok(registry)
+    }
+}
+
+fn parse_schema_entries(env: Env, schemas: Array<'_>) -> Result<PendingMonoBehaviourSchemas> {
     let schema_count = usize::try_from(schemas.len()).expect("u32 fits usize");
     if schema_count > MAXIMUM_SCHEMA_ENTRIES {
         return Err(invalid_arg(format!(
             "MonoBehaviour schema collection has {schema_count} entries, exceeding limit {MAXIMUM_SCHEMA_ENTRIES}"
         )));
     }
-    let mut registry = MonoBehaviourSchemaRegistry::new();
+    let mut entries = reserve(schema_count, "MonoBehaviour schema entries")?;
     let mut budget = JsSchemaBudget::default();
     let raw_env = env.raw();
     for schema_index in 0..schemas.len() {
@@ -3908,11 +3932,9 @@ fn build_schema_registry(env: Env, schemas: Array<'_>) -> Result<MonoBehaviourSc
         let schema: Object<'_> = schemas
             .get(schema_index)?
             .ok_or_else(|| invalid_arg(format!("{owner} is missing")))?;
-        registry
-            .push(parse_schema_entry(raw_env, &schema, &owner, &mut budget)?)
-            .map_err(core_error)?;
+        entries.push(parse_schema_entry(raw_env, &schema, &owner, &mut budget)?);
     }
-    Ok(registry)
+    Ok(PendingMonoBehaviourSchemas { entries })
 }
 
 #[derive(Default)]
