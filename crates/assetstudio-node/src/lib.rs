@@ -3692,11 +3692,11 @@ pub struct ReadTextureTask {
 }
 
 impl Task for ReadTextureTask {
-    type Output = assetstudio_core::texture::RgbaImage;
+    type Output = DisplayRowImage;
     type JsValue = RgbaImage;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        studio_object(&self.studio, self.file_index, self.path_id)?
+        let image = studio_object(&self.studio, self.file_index, self.path_id)?
             .decode_texture_mip(
                 self.mip_level,
                 TextureReadLimits {
@@ -3706,11 +3706,12 @@ impl Task for ReadTextureTask {
                     ..TextureReadLimits::default()
                 },
             )
-            .map_err(core_error)
+            .map_err(core_error)?;
+        DisplayRowImage::from_decoded(image)
     }
 
     fn resolve(&mut self, _env: Env, image: Self::Output) -> Result<Self::JsValue> {
-        convert_decoded_image(image)
+        Ok(image.into_node())
     }
 }
 
@@ -3722,17 +3723,18 @@ pub struct ReadTextureArrayTask {
 }
 
 impl Task for ReadTextureArrayTask {
-    type Output = Vec<assetstudio_core::texture::RgbaImage>;
+    type Output = DisplayRowImages;
     type JsValue = Vec<RgbaImage>;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        studio_object(&self.studio, self.file_index, self.path_id)?
+        let images = studio_object(&self.studio, self.file_index, self.path_id)?
             .decode_texture_array_mip0(texture_array_limits(self.maximum))
-            .map_err(core_error)
+            .map_err(core_error)?;
+        DisplayRowImages::from_decoded(images)
     }
 
     fn resolve(&mut self, _env: Env, images: Self::Output) -> Result<Self::JsValue> {
-        convert_decoded_images(images)
+        images.into_nodes()
     }
 }
 
@@ -4561,21 +4563,56 @@ fn convert_image(image: assetstudio_core::texture::RgbaImage) -> RgbaImage {
     }
 }
 
+/// A decoded texture whose pixels already use the top-down row order exposed
+/// to JavaScript. Keeping this as the asynchronous task output makes the
+/// worker/event-loop boundary explicit: `resolve` can only wrap the owned
+/// bytes in a Node `Buffer`; it cannot accidentally inherit the O(pixel bytes)
+/// row flip again.
+#[doc(hidden)]
+pub struct DisplayRowImage(assetstudio_core::texture::RgbaImage);
+
+impl DisplayRowImage {
+    fn from_decoded(mut image: assetstudio_core::texture::RgbaImage) -> Result<Self> {
+        assetstudio_core::image_export::flip_rgba_rows(&mut image).map_err(core_error)?;
+        Ok(Self(image))
+    }
+
+    fn into_node(self) -> RgbaImage {
+        convert_image(self.0)
+    }
+}
+
+/// The same worker-completed row-order invariant for a `Texture2DArray`.
+#[doc(hidden)]
+pub struct DisplayRowImages(Vec<assetstudio_core::texture::RgbaImage>);
+
+impl DisplayRowImages {
+    fn from_decoded(mut images: Vec<assetstudio_core::texture::RgbaImage>) -> Result<Self> {
+        for image in &mut images {
+            assetstudio_core::image_export::flip_rgba_rows(image).map_err(core_error)?;
+        }
+        Ok(Self(images))
+    }
+
+    fn into_nodes(self) -> Result<Vec<RgbaImage>> {
+        let mut output = reserve(self.0.len(), "Texture2DArray images")?;
+        for image in self.0 {
+            output.push(convert_image(image));
+        }
+        Ok(output)
+    }
+}
+
 /// Converts a `Texture2D` decoder result, whose rows run bottom-up, into the
 /// top-down order every other surface hands to callers.
-fn convert_decoded_image(mut image: assetstudio_core::texture::RgbaImage) -> Result<RgbaImage> {
-    assetstudio_core::image_export::flip_rgba_rows(&mut image).map_err(core_error)?;
-    Ok(convert_image(image))
+fn convert_decoded_image(image: assetstudio_core::texture::RgbaImage) -> Result<RgbaImage> {
+    DisplayRowImage::from_decoded(image).map(DisplayRowImage::into_node)
 }
 
 fn convert_decoded_images(
     images: Vec<assetstudio_core::texture::RgbaImage>,
 ) -> Result<Vec<RgbaImage>> {
-    let mut output = reserve(images.len(), "Texture2DArray images")?;
-    for image in images {
-        output.push(convert_decoded_image(image)?);
-    }
-    Ok(output)
+    DisplayRowImages::from_decoded(images)?.into_nodes()
 }
 
 fn convert_animation_clip_info(
@@ -5304,14 +5341,37 @@ fn core_error(error: assetstudio_core::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelTextureLimits, OpenOptions, copy_path_string, load_options, materialize_core_bytes,
-        model_texture_limits, parse_audio_format, parse_export_mode, parse_filename_format,
-        parse_image_format,
+        DisplayRowImage, DisplayRowImages, ModelTextureLimits, OpenOptions, copy_path_string,
+        load_options, materialize_core_bytes, model_texture_limits, parse_audio_format,
+        parse_export_mode, parse_filename_format, parse_image_format,
     };
     use assetstudio_core::export::{AudioExportFormat, ExportMode, FilenameFormat};
     use assetstudio_core::image_export::ImageFormat;
     use assetstudio_core::loader::LoadFailurePolicy;
     use std::io::Write;
+
+    fn decoded_test_image(first: u8, second: u8) -> assetstudio_core::texture::RgbaImage {
+        assetstudio_core::texture::RgbaImage {
+            width: 1,
+            height: 2,
+            pixels: vec![first, 0, 0, 255, second, 0, 0, 255],
+        }
+    }
+
+    #[test]
+    fn worker_texture_outputs_already_use_display_row_order() {
+        let DisplayRowImage(image) =
+            DisplayRowImage::from_decoded(decoded_test_image(1, 2)).expect("one decoded texture");
+        assert_eq!(image.pixels, [2, 0, 0, 255, 1, 0, 0, 255]);
+
+        let DisplayRowImages(images) = DisplayRowImages::from_decoded(vec![
+            decoded_test_image(3, 4),
+            decoded_test_image(5, 6),
+        ])
+        .expect("decoded texture array");
+        assert_eq!(images[0].pixels, [4, 0, 0, 255, 3, 0, 0, 255]);
+        assert_eq!(images[1].pixels, [6, 0, 0, 255, 5, 0, 0, 255]);
+    }
 
     #[test]
     fn maps_the_model_texture_reference_budget() {

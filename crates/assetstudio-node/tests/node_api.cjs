@@ -260,6 +260,39 @@ function syntheticTexture2d() {
   return finishV22Asset(28, payload)
 }
 
+function syntheticTexture2dArray() {
+  const layer0 = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8])
+  const layer1 = Buffer.from([11, 12, 13, 14, 15, 16, 17, 18])
+  let payload = Buffer.concat([
+    alignedString('array'),
+    i32(0),
+    Buffer.from([0]), // texture fallback settings
+    Buffer.from([0]), // alpha-channel setting
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    i32(0), // color space
+    i32(4), // GraphicsFormat R8G8B8A8_UNorm
+    i32(1),
+    i32(2),
+    i32(2), // two layers
+    i32(1), // one mip
+    u32(layer0.length + layer1.length),
+    Buffer.alloc(24),
+    i32(7), // usage mode
+    Buffer.from([1]), // readable
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    i32(layer0.length + layer1.length),
+    layer0,
+    layer1,
+  ])
+  return finishV22Asset(187, payload)
+}
+
 function pptr(pathId) {
   return Buffer.concat([i32(0), i64(pathId)])
 }
@@ -1804,6 +1837,25 @@ async function testAsyncWorkers() {
   )
   const asyncTexture = await asyncTextureStudio.readTextureAsync(0, 7n)
   assert.deepEqual(Buffer.from(asyncTexture.pixels), DISPLAY_ORDER_PIXELS)
+
+  const textureArrayInput = syntheticTexture2dArray()
+  const asyncTextureArrayStudio = await addon.AssetStudio.fromBufferAsync(
+    textureArrayInput,
+    'async-texture-array.assets',
+    textureArrayInput.length,
+  )
+  const syncTextureArray = asyncTextureArrayStudio.readTextureArray(0, 7n)
+  const asyncTextureArray = await asyncTextureArrayStudio.readTextureArrayAsync(0, 7n)
+  assert.equal(asyncTextureArray.length, 2)
+  assert.deepEqual(asyncTextureArray, syncTextureArray)
+  assert.deepEqual(
+    Buffer.from(asyncTextureArray[0].pixels),
+    Buffer.from([5, 6, 7, 8, 1, 2, 3, 4]),
+  )
+  assert.deepEqual(
+    Buffer.from(asyncTextureArray[1].pixels),
+    Buffer.from([15, 16, 17, 18, 11, 12, 13, 14]),
+  )
 
   const treeInput = syntheticTypeTreeIntAsset()
   const treeStudio = await addon.AssetStudio.fromBufferAsync(
