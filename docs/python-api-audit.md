@@ -1,6 +1,6 @@
 # Python API audit
 
-Last verified: 2026-08-22.
+Last verified: 2026-08-25.
 
 `assetstudio-rs` is a direct PyO3 binding over `assetstudio-core`.  It does not
 load the removed custom C ABI or a .NET assembly.  This document records how
@@ -94,6 +94,15 @@ methods:
   remain lexically inside its method's `py.detach`, with one negative mutation
   per call site. Installed wheel/sdist behavior covers raw audio plus the
   verified FSB5 WAV codecs and all three simple assets, including output limits.
+- Cubism expression, physics, fade-motion, standard `AnimationClip` motion and
+  Tuanjie ACL motion keep their bounded JSON writer plus derived curve/keyframe
+  counts in the same `Python::detach` closure as parsing. Expression parameter
+  wrappers still use `Py::new` after reacquiring the GIL, but the potentially
+  256 MiB JSON scan has already finished. The source audit locks all five writer
+  helpers inside their corresponding closure and has one negative mutation per
+  method. Installed wheel and sdist tests exercise expression/physics/fade plus
+  standard and injected-ACL clip motion, parse every document, and verify both
+  the exact output limit and its one-byte-short rejection.
 - Public list-shaped inputs no longer rely on PyO3's eager `Vec` extraction.
   `from_memory_files` charges the Python-list count before reading even one
   tuple, then charges names and byte payloads before each fallible copy;
