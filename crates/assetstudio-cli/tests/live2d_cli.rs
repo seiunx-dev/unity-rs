@@ -178,6 +178,38 @@ fn live2d_usage_and_runtime_errors_have_stable_exit_codes() {
     assert!(!output.exists());
 }
 
+#[test]
+fn live2d_name_index_budget_rejects_before_creating_output() {
+    let root = TestDirectory::new("name-budget");
+    let input = root.path().join("models.assets");
+    let output = root.path().join("output");
+    fs::write(
+        &input,
+        synthetic_models_file(b"MOC3\x63first", b"MOC3\x63second", true),
+    )
+    .unwrap();
+
+    let result = cli(
+        root.path(),
+        [
+            "live2d".into(),
+            "--maximum-name-index-bytes".into(),
+            "0".into(),
+            input.as_os_str().into(),
+            output.as_os_str().into(),
+        ],
+    );
+
+    assert_eq!(result.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("Live2D output-name indexes require 16 UTF-8 bytes, exceeding limit 0"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn live2d_rejects_a_symbolic_link_output_root() {

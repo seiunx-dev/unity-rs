@@ -62,6 +62,8 @@ const MAX_LIVE2D_MODEL_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_LIVE2D_TOTAL_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_LIVE2D_BASE_NAME_BYTES: usize = 180;
 const MAX_LIVE2D_TEMPORARY_ATTEMPTS: u64 = 1_024;
+const DEFAULT_LIVE2D_NAME_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LIVE2D_NAME_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_FBX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FBX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FBX_TEMPORARY_ATTEMPTS: u64 = 1_024;
@@ -240,9 +242,7 @@ fn run_with_arguments(arguments: &[OsString], output: &mut impl Write) -> CliRes
         CliCommand::Fbx(command) => export_fbx(&command, &load, output),
         CliCommand::Obj(command) => export_obj(&command, &load, output),
         CliCommand::FbxBatch(command) => export_fbx_batch(&command, &load, output),
-        CliCommand::Live2d(command) => {
-            export_live2d(&command.input, &command.output, &load, output)
-        }
+        CliCommand::Live2d(command) => export_live2d(&command, &load, output),
         CliCommand::Live2dPackage(command) => {
             export_live2d_packages(&command.input, &command.output, &load, output)
         }
@@ -592,7 +592,7 @@ enum CliCommand {
     Fbx(FbxCommand),
     Obj(ObjCommand),
     FbxBatch(FbxBatchCommand),
-    Live2d(Live2dCommand),
+    Live2d(Live2dMocCommand),
     Live2dPackage(Live2dCommand),
     Export(ExportCommand),
     Extract(ExtractCommand),
@@ -918,7 +918,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          assetstudio <file-or-directory>\n  \
          assetstudio export <file-or-directory> <output-directory> [options]\n  \
          assetstudio extract <file-or-directory> <output-directory> [--overwrite]\n  \
-         assetstudio live2d <file-or-directory> <output-directory>\n  \
+         assetstudio live2d <file-or-directory> <output-directory> [options]\n  \
          assetstudio live2d-package <file-or-directory> <output-directory>\n\n\
          Invocation limits: {MAX_CLI_ARGUMENTS} arguments, {MAX_CLI_ARGUMENT_BYTES} encoded\n  \
          bytes per argument, and {MAX_CLI_ARGUMENT_TOTAL_BYTES} encoded bytes in total.\n\n\
@@ -972,6 +972,8 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          --compact-json\n\n\
          Extract options:\n  --overwrite\n\n\
          Live2D export:\n  Exports only MonoBehaviours whose resolved MonoScript class is CubismMoc.\n  \
+         --maximum-name-index-bytes <N>  Lowercase output-name index budget;\n  \
+         the default is 67108864 and the maximum is 536870912.\n  \
          Existing files are never overwritten.\n  \
          live2d-package exports verified MOC, texture PNG, model3.json, expression, motion,\n  \
          physics, pose, and display-info files when embedded or supplied schemas are available.\n\n\
@@ -999,6 +1001,13 @@ struct ExportCommand {
 struct Live2dCommand {
     input: PathBuf,
     output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Live2dMocCommand {
+    input: PathBuf,
+    output: PathBuf,
+    maximum_name_index_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1059,8 +1068,63 @@ impl PartialEq for ExtractCommand {
 
 impl Eq for ExtractCommand {}
 
-fn parse_live2d_arguments(arguments: &[OsString]) -> Result<Live2dCommand> {
-    parse_live2d_write_arguments("live2d", arguments)
+fn parse_live2d_arguments(arguments: &[OsString]) -> Result<Live2dMocCommand> {
+    let mut positional = positional_path_table("live2d")?;
+    let mut maximum_name_index_bytes = DEFAULT_LIVE2D_NAME_INDEX_BYTES;
+    let mut saw_name_limit = false;
+    let mut parse_options = true;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if parse_options && argument == "--" {
+            parse_options = false;
+        } else if parse_options && argument == "--maximum-name-index-bytes" {
+            if saw_name_limit {
+                return Err(Error::invalid_data(
+                    "--maximum-name-index-bytes may only be specified once",
+                ));
+            }
+            index += 1;
+            let value = arguments.get(index).ok_or_else(|| {
+                Error::invalid_data("--maximum-name-index-bytes requires a value")
+            })?;
+            maximum_name_index_bytes = value
+                .to_str()
+                .ok_or_else(|| Error::invalid_data("name-index limit must be UTF-8 digits"))?
+                .parse::<u64>()
+                .map_err(|_| {
+                    Error::invalid_data("name-index limit must be a non-negative integer")
+                })?;
+            if maximum_name_index_bytes > MAX_LIVE2D_NAME_INDEX_BYTES {
+                return Err(Error::invalid_data(format!(
+                    "--maximum-name-index-bytes must not exceed {MAX_LIVE2D_NAME_INDEX_BYTES}"
+                )));
+            }
+            saw_name_limit = true;
+        } else if parse_options
+            && argument
+                .to_str()
+                .is_some_and(|value| value.starts_with('-'))
+        {
+            return Err(Error::invalid_data(format!(
+                "unknown live2d option: {}",
+                CliArgumentDisplay(argument)
+            )));
+        } else {
+            push_positional_path(&mut positional, argument, "live2d")?;
+        }
+        index += 1;
+    }
+    if positional.len() != 2 {
+        return Err(Error::invalid_data(
+            "live2d requires an input path and an output directory",
+        ));
+    }
+    Ok(Live2dMocCommand {
+        input: positional.remove(0),
+        output: positional.remove(0),
+        maximum_name_index_bytes,
+    })
 }
 
 fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<FbxCommand> {
@@ -2473,9 +2537,57 @@ struct Live2dCandidate {
     object_index: usize,
 }
 
+#[derive(Debug)]
+struct Live2dOutputNames {
+    claimed_paths: HashSet<String>,
+    retained_name_bytes: u64,
+    maximum_name_bytes: u64,
+}
+
+impl Live2dOutputNames {
+    fn new(maximum_name_bytes: u64) -> Self {
+        Self {
+            claimed_paths: HashSet::new(),
+            retained_name_bytes: 0,
+            maximum_name_bytes,
+        }
+    }
+
+    fn claim(&mut self, portable: String) -> Result<bool> {
+        if self.claimed_paths.contains(&portable) {
+            return Ok(false);
+        }
+        let additional = u64::try_from(portable.len())
+            .map_err(|_| Error::invalid_data("Live2D output-name length does not fit in u64"))?;
+        let next = self
+            .retained_name_bytes
+            .checked_add(additional)
+            .ok_or_else(|| Error::invalid_data("Live2D output-name byte count overflowed"))?;
+        if next > self.maximum_name_bytes {
+            return Err(Error::invalid_data(format!(
+                "Live2D output-name indexes require {next} UTF-8 bytes, exceeding limit {}",
+                self.maximum_name_bytes
+            )));
+        }
+        self.claimed_paths.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow Live2D output-name index: {error}"))
+        })?;
+        let inserted = self.claimed_paths.insert(portable);
+        debug_assert!(inserted, "a prechecked Live2D output name must be new");
+        self.retained_name_bytes = next;
+        Ok(true)
+    }
+}
+
+impl Default for Live2dOutputNames {
+    fn default() -> Self {
+        Self::new(DEFAULT_LIVE2D_NAME_INDEX_BYTES)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Live2dExportState {
-    claimed_paths: HashSet<String>,
+    names: Live2dOutputNames,
     temporary_sequence: u64,
     output_ready: bool,
     models_found: usize,
@@ -2485,22 +2597,24 @@ struct Live2dExportState {
 }
 
 fn export_live2d(
-    input: &Path,
-    output_directory: &Path,
+    command: &Live2dMocCommand,
     load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(input, load, output)?;
+    let collection = load_asset_collection(&command.input, load, output)?;
     let candidates = collect_live2d_candidates(&collection)?;
     let read_limits = CubismMocReadLimits {
         maximum_model_bytes: MAX_LIVE2D_MODEL_OUTPUT_BYTES,
         ..CubismMocReadLimits::default()
     };
-    let mut state = Live2dExportState::default();
+    let mut state = Live2dExportState {
+        names: Live2dOutputNames::new(command.maximum_name_index_bytes),
+        ..Live2dExportState::default()
+    };
     for candidate in candidates {
         export_live2d_candidate(
             &collection,
-            output_directory,
+            &command.output,
             candidate,
             read_limits,
             &mut state,
@@ -2608,18 +2722,18 @@ fn export_live2d_candidate(
         }
     };
 
-    if !state.output_ready {
-        create_live2d_output_root(output_directory)?;
-        state.output_ready = true;
-    }
     let base_name = sanitize_live2d_base_name(&model.name)?;
     let output_path = allocate_live2d_output_path(
         output_directory,
         &base_name,
         object.path_id,
         candidate,
-        &mut state.claimed_paths,
+        &mut state.names,
     )?;
+    if !state.output_ready {
+        create_live2d_output_root(output_directory)?;
+        state.output_ready = true;
+    }
     match atomic_write_cubism_moc(
         &output_path,
         &model,
@@ -2749,16 +2863,12 @@ fn allocate_live2d_output_path(
     base_name: &str,
     path_id: i64,
     candidate: Live2dCandidate,
-    claimed_paths: &mut HashSet<String>,
+    names: &mut Live2dOutputNames,
 ) -> Result<PathBuf> {
     for variant in 0..3 {
         let file_name = fallible_live2d_output_name(base_name, path_id, candidate, variant)?;
         let portable = fallible_lowercase(&file_name, "Live2D portable output name")?;
-        if !claimed_paths.contains(&portable) {
-            claimed_paths.try_reserve(1).map_err(|error| {
-                Error::invalid_data(format!("cannot grow Live2D output-name index: {error}"))
-            })?;
-            claimed_paths.insert(portable);
+        if names.claim(portable)? {
             return Ok(output_directory.join(file_name));
         }
     }
@@ -4327,18 +4437,18 @@ mod tests {
         AudioExportFormat, CliArgumentDisplay, CliArgumentLimits, CliCommand, CliError,
         EscapedOsStr, ExportMode, FbxBatchNames, FbxTemporaryFile, FilenameFormat, ImageFormat,
         InspectLabelComponent, InspectPathBudget, Live2dCommand, Live2dExportState,
-        Live2dPublicationLock, LoadOptions, LossyOsStr, MAX_LIVE2D_OUTPUT_MODELS,
-        MAX_LIVE2D_TOTAL_OUTPUT_BYTES, MAX_MONO_SCHEMA_DOCUMENTS, ModelExportCandidate,
-        MonoSchemaDocumentBudget, NestedInspectLabel, SceneObjectKey, allocate_fbx_batch_name,
-        allocate_fbx_batch_name_with_probe, charge_live2d_model, collect_cli_arguments_with_limits,
-        copy_inspect_path, copy_path_argument, escape_text, fallible_lowercase,
-        increment_class_count, increment_string_count, join_inspect_path,
-        obj_material_library_name, parse_cli_arguments, parse_export_arguments,
-        parse_extract_arguments, parse_live2d_arguments, parse_live2d_package_arguments,
-        persist_temporary_hard_link, positional_path_table, publish_fbx_with_textures,
-        push_class_filter, push_positional_path, read_bounded_schema_document,
-        sanitize_live2d_base_name, sorted_map_entries, split_load_options, write_object_reference,
-        write_scene_key,
+        Live2dOutputNames, Live2dPublicationLock, LoadOptions, LossyOsStr,
+        MAX_LIVE2D_OUTPUT_MODELS, MAX_LIVE2D_TOTAL_OUTPUT_BYTES, MAX_MONO_SCHEMA_DOCUMENTS,
+        ModelExportCandidate, MonoSchemaDocumentBudget, NestedInspectLabel, SceneObjectKey,
+        allocate_fbx_batch_name, allocate_fbx_batch_name_with_probe, allocate_live2d_output_path,
+        charge_live2d_model, collect_cli_arguments_with_limits, copy_inspect_path,
+        copy_path_argument, escape_text, fallible_lowercase, increment_class_count,
+        increment_string_count, join_inspect_path, obj_material_library_name, parse_cli_arguments,
+        parse_export_arguments, parse_extract_arguments, parse_live2d_arguments,
+        parse_live2d_package_arguments, persist_temporary_hard_link, positional_path_table,
+        publish_fbx_with_textures, push_class_filter, push_positional_path,
+        read_bounded_schema_document, sanitize_live2d_base_name, sorted_map_entries,
+        split_load_options, write_object_reference, write_scene_key,
     };
     use assetstudio_core::loader::AssetLoadLimits;
     use assetstudio_core::mono_schema::{
@@ -5114,8 +5224,35 @@ mod tests {
         let command = parse_live2d_arguments(&arguments(&["--", "-input", "-output"])).unwrap();
         assert_eq!(command.input, PathBuf::from("-input"));
         assert_eq!(command.output, PathBuf::from("-output"));
+        assert_eq!(command.maximum_name_index_bytes, 64 * 1024 * 1024);
+        let command = parse_live2d_arguments(&arguments(&[
+            "--maximum-name-index-bytes",
+            "0",
+            "input",
+            "output",
+        ]))
+        .unwrap();
+        assert_eq!(command.maximum_name_index_bytes, 0);
         assert!(parse_live2d_arguments(&arguments(&["input"])).is_err());
         assert!(parse_live2d_arguments(&arguments(&["--overwrite", "input", "output"])).is_err());
+        assert!(
+            parse_live2d_arguments(&arguments(&[
+                "--maximum-name-index-bytes",
+                "536870913",
+                "input",
+                "output",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_live2d_arguments(&arguments(&[
+                "--maximum-name-index-bytes",
+                "-1",
+                "input",
+                "output",
+            ]))
+            .is_err()
+        );
         let command =
             parse_live2d_package_arguments(&arguments(&["--", "-input", "-output"])).unwrap();
         assert_eq!(command.input, PathBuf::from("-input"));
@@ -5151,6 +5288,51 @@ mod tests {
         );
         state.exported_bytes = next;
         assert!(charge_live2d_model(&mut state, 1).is_err());
+
+        let candidate = super::Live2dCandidate {
+            file_index: 0,
+            object_index: 0,
+        };
+        let mut too_small = Live2dOutputNames::new(8);
+        assert!(
+            allocate_live2d_output_path(Path::new("output"), "Face", 7, candidate, &mut too_small,)
+                .is_err()
+        );
+        assert_eq!(too_small.retained_name_bytes, 0);
+        assert!(too_small.claimed_paths.is_empty());
+
+        let mut exact = Live2dOutputNames::new(9);
+        assert_eq!(
+            allocate_live2d_output_path(Path::new("output"), "Face", 7, candidate, &mut exact,)
+                .unwrap(),
+            PathBuf::from("output/Face.moc3")
+        );
+        assert_eq!(exact.retained_name_bytes, 9);
+        assert_eq!(exact.claimed_paths.len(), 1);
+        assert!(
+            allocate_live2d_output_path(Path::new("output"), "FACE", 7, candidate, &mut exact,)
+                .is_err()
+        );
+        assert_eq!(exact.retained_name_bytes, 9);
+        assert_eq!(exact.claimed_paths.len(), 1);
+
+        let mut unicode_too_small = Live2dOutputNames::new(7);
+        assert!(
+            allocate_live2d_output_path(
+                Path::new("output"),
+                "İ",
+                7,
+                candidate,
+                &mut unicode_too_small,
+            )
+            .is_err()
+        );
+        assert_eq!(unicode_too_small.retained_name_bytes, 0);
+        assert!(unicode_too_small.claimed_paths.is_empty());
+        let mut unicode_exact = Live2dOutputNames::new(8);
+        allocate_live2d_output_path(Path::new("output"), "İ", 7, candidate, &mut unicode_exact)
+            .unwrap();
+        assert_eq!(unicode_exact.retained_name_bytes, 8);
     }
 
     #[test]
