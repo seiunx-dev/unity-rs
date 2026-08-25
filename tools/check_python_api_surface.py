@@ -231,6 +231,26 @@ def validate_texture_gil_boundary(source: str) -> None:
             )
 
 
+def validate_sprite_atlas_gil_boundary(source: str) -> None:
+    """Keep input-amplifiable SpriteAtlas table projection outside the GIL."""
+    method_marker = "fn read_sprite_atlas("
+    method = rust_braced_block(source, method_marker)
+    detach_offset = method.find("py.detach")
+    if detach_offset < 0:
+        raise AuditError("read_sprite_atlas does not release the GIL")
+    detached = rust_braced_block(method[detach_offset:], "py.detach")
+    preparation = "prepare_sprite_atlas(atlas)"
+    if preparation not in detached:
+        raise AuditError(
+            "read_sprite_atlas performs metadata projection outside py.detach"
+        )
+    wrapping = "python_sprite_atlas(py, atlas)"
+    if wrapping not in method or wrapping in detached:
+        raise AuditError(
+            "read_sprite_atlas does not keep Python object wrapping after py.detach"
+        )
+
+
 PAYLOAD_GIL_EXPECTATIONS = (
     ("fn read_audio_clip(", "materialize_audio_clip(audio, format, maximum_bytes)"),
     ("fn read_font(", "materialize_binary_asset(asset, maximum_bytes)"),
@@ -513,6 +533,9 @@ def main() -> None:
             STUB.read_text(encoding="utf-8"),
         )
         validate_texture_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
+        validate_sprite_atlas_gil_boundary(
+            PYTHON_BINDING.read_text(encoding="utf-8")
+        )
         validate_payload_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
         validate_cubism_json_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
         validate_metadata_projection_gil_boundary(
@@ -527,7 +550,8 @@ def main() -> None:
         "Python API surface audit passed "
         f"({methods} methods, {properties} properties; "
         f"{core_methods} Core methods classified, {rust_only} Rust-only; "
-        "texture rows, binary payloads, Cubism JSON and result tables detached)"
+        "texture rows, SpriteAtlas tables, binary payloads, Cubism JSON and "
+        "result tables detached)"
     )
 
 

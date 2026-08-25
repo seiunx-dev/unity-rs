@@ -58,7 +58,7 @@ use assetstudio_core::simple_assets::{
 };
 use assetstudio_core::source::Region;
 use assetstudio_core::sprite::{Sprite, SpriteMeshType, SpritePackingMode, SpriteReadLimits};
-use assetstudio_core::sprite_atlas::SpriteAtlasReadLimits;
+use assetstudio_core::sprite_atlas::{SpriteAtlas, SpriteAtlasReadLimits};
 use assetstudio_core::studio::{Studio, StudioFile, StudioObject, StudioResource};
 use assetstudio_core::texture::TextureReadLimits;
 use assetstudio_core::texture_array::TextureArrayReadLimits;
@@ -483,6 +483,33 @@ struct PySpriteAtlas {
     #[pyo3(get)]
     tag: String,
     #[pyo3(get)]
+    is_variant: bool,
+}
+
+struct PreparedSpriteAtlasRenderData {
+    key: PySpriteAtlasRenderDataKey,
+    texture: PyObjectReference,
+    alpha_texture: PyObjectReference,
+    texture_rect: (f32, f32, f32, f32),
+    texture_rect_offset: (f32, f32),
+    atlas_rect_offset: (f32, f32),
+    uv_transform: (f32, f32, f32, f32),
+    downscale_multiplier: f32,
+    settings_raw: u32,
+    packed: bool,
+    packing_mode: u8,
+    packing_rotation: u8,
+    mesh_type: u8,
+    secondary_textures: Option<Vec<PySpriteAtlasSecondaryTexture>>,
+}
+
+struct PreparedSpriteAtlas {
+    path_id: i64,
+    name: String,
+    packed_sprites: Vec<PyObjectReference>,
+    packed_sprite_names: Vec<String>,
+    render_data_entries: Vec<PreparedSpriteAtlasRenderData>,
+    tag: String,
     is_variant: bool,
 }
 
@@ -3647,96 +3674,13 @@ impl PyAssetStudio {
             maximum_secondary_textures: maximum_entries,
         };
         let atlas = py.detach(|| {
-            self.object(file_index, path_id)?
+            let atlas = self
+                .object(file_index, path_id)?
                 .read_sprite_atlas(limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            prepare_sprite_atlas(atlas)
         })?;
-
-        let mut packed_sprites = reserve_metadata(
-            atlas.packed_sprites.len(),
-            "Python SpriteAtlas packed sprite references",
-        )?;
-        for reference in atlas.packed_sprites {
-            packed_sprites.push(object_reference_tuple(reference));
-        }
-
-        let mut render_data_entries = reserve_metadata(
-            atlas.render_data_entries.len(),
-            "Python SpriteAtlas render-data entries",
-        )?;
-        for entry in atlas.render_data_entries {
-            let key = Py::new(
-                py,
-                PySpriteAtlasRenderDataKey {
-                    guid_bytes: entry.key.guid_bytes,
-                    value: entry.key.value,
-                },
-            )?;
-            let settings = entry.data.settings;
-            let secondary_textures = entry
-                .data
-                .secondary_textures
-                .map(|textures| {
-                    let mut output =
-                        reserve_metadata(textures.len(), "Python SpriteAtlas secondary textures")?;
-                    for texture in textures {
-                        output.push(Py::new(
-                            py,
-                            PySpriteAtlasSecondaryTexture {
-                                texture: object_reference_tuple(texture.texture),
-                                name: texture.name,
-                            },
-                        )?);
-                    }
-                    Ok::<_, PyErr>(output)
-                })
-                .transpose()?;
-            render_data_entries.push(Py::new(
-                py,
-                PySpriteAtlasRenderData {
-                    key,
-                    texture: object_reference_tuple(entry.data.texture),
-                    alpha_texture: object_reference_tuple(entry.data.alpha_texture),
-                    texture_rect: (
-                        entry.data.texture_rect.x,
-                        entry.data.texture_rect.y,
-                        entry.data.texture_rect.width,
-                        entry.data.texture_rect.height,
-                    ),
-                    texture_rect_offset: (
-                        entry.data.texture_rect_offset.x,
-                        entry.data.texture_rect_offset.y,
-                    ),
-                    atlas_rect_offset: (
-                        entry.data.atlas_rect_offset.x,
-                        entry.data.atlas_rect_offset.y,
-                    ),
-                    uv_transform: (
-                        entry.data.uv_transform.x,
-                        entry.data.uv_transform.y,
-                        entry.data.uv_transform.z,
-                        entry.data.uv_transform.w,
-                    ),
-                    downscale_multiplier: entry.data.downscale_multiplier,
-                    settings_raw: settings.raw,
-                    packed: settings.packed(),
-                    packing_mode: settings.packing_mode(),
-                    packing_rotation: settings.packing_rotation(),
-                    mesh_type: settings.mesh_type(),
-                    secondary_textures,
-                },
-            )?);
-        }
-
-        Ok(PySpriteAtlas {
-            path_id: atlas.path_id,
-            name: atlas.name,
-            packed_sprites,
-            packed_sprite_names: atlas.packed_sprite_names,
-            render_data_entries,
-            tag: atlas.tag,
-            is_variant: atlas.is_variant,
-        })
+        python_sprite_atlas(py, atlas)
     }
 
     /// Parses one complete, bounded Unity `Sprite` without resolving or
@@ -5933,6 +5877,134 @@ const fn object_reference_tuple(
     reference: assetstudio_core::serialized::ObjectReference,
 ) -> PyObjectReference {
     (reference.file_id, reference.path_id)
+}
+
+fn prepare_sprite_atlas(atlas: SpriteAtlas) -> PyResult<PreparedSpriteAtlas> {
+    let mut packed_sprites = reserve_metadata(
+        atlas.packed_sprites.len(),
+        "Python SpriteAtlas packed sprite references",
+    )?;
+    for reference in atlas.packed_sprites {
+        packed_sprites.push(object_reference_tuple(reference));
+    }
+
+    let mut render_data_entries = reserve_metadata(
+        atlas.render_data_entries.len(),
+        "Python SpriteAtlas render-data entries",
+    )?;
+    for entry in atlas.render_data_entries {
+        let settings = entry.data.settings;
+        let secondary_textures = entry
+            .data
+            .secondary_textures
+            .map(|textures| {
+                let mut output =
+                    reserve_metadata(textures.len(), "Python SpriteAtlas secondary textures")?;
+                for texture in textures {
+                    output.push(PySpriteAtlasSecondaryTexture {
+                        texture: object_reference_tuple(texture.texture),
+                        name: texture.name,
+                    });
+                }
+                Ok::<_, PyErr>(output)
+            })
+            .transpose()?;
+        render_data_entries.push(PreparedSpriteAtlasRenderData {
+            key: PySpriteAtlasRenderDataKey {
+                guid_bytes: entry.key.guid_bytes,
+                value: entry.key.value,
+            },
+            texture: object_reference_tuple(entry.data.texture),
+            alpha_texture: object_reference_tuple(entry.data.alpha_texture),
+            texture_rect: (
+                entry.data.texture_rect.x,
+                entry.data.texture_rect.y,
+                entry.data.texture_rect.width,
+                entry.data.texture_rect.height,
+            ),
+            texture_rect_offset: (
+                entry.data.texture_rect_offset.x,
+                entry.data.texture_rect_offset.y,
+            ),
+            atlas_rect_offset: (
+                entry.data.atlas_rect_offset.x,
+                entry.data.atlas_rect_offset.y,
+            ),
+            uv_transform: (
+                entry.data.uv_transform.x,
+                entry.data.uv_transform.y,
+                entry.data.uv_transform.z,
+                entry.data.uv_transform.w,
+            ),
+            downscale_multiplier: entry.data.downscale_multiplier,
+            settings_raw: settings.raw,
+            packed: settings.packed(),
+            packing_mode: settings.packing_mode(),
+            packing_rotation: settings.packing_rotation(),
+            mesh_type: settings.mesh_type(),
+            secondary_textures,
+        });
+    }
+
+    Ok(PreparedSpriteAtlas {
+        path_id: atlas.path_id,
+        name: atlas.name,
+        packed_sprites,
+        packed_sprite_names: atlas.packed_sprite_names,
+        render_data_entries,
+        tag: atlas.tag,
+        is_variant: atlas.is_variant,
+    })
+}
+
+fn python_sprite_atlas(py: Python<'_>, atlas: PreparedSpriteAtlas) -> PyResult<PySpriteAtlas> {
+    let mut render_data_entries = reserve_metadata(
+        atlas.render_data_entries.len(),
+        "Python SpriteAtlas render-data entries",
+    )?;
+    for entry in atlas.render_data_entries {
+        let key = Py::new(py, entry.key)?;
+        let secondary_textures = entry
+            .secondary_textures
+            .map(|textures| {
+                let mut output =
+                    reserve_metadata(textures.len(), "Python SpriteAtlas secondary textures")?;
+                for texture in textures {
+                    output.push(Py::new(py, texture)?);
+                }
+                Ok::<_, PyErr>(output)
+            })
+            .transpose()?;
+        render_data_entries.push(Py::new(
+            py,
+            PySpriteAtlasRenderData {
+                key,
+                texture: entry.texture,
+                alpha_texture: entry.alpha_texture,
+                texture_rect: entry.texture_rect,
+                texture_rect_offset: entry.texture_rect_offset,
+                atlas_rect_offset: entry.atlas_rect_offset,
+                uv_transform: entry.uv_transform,
+                downscale_multiplier: entry.downscale_multiplier,
+                settings_raw: entry.settings_raw,
+                packed: entry.packed,
+                packing_mode: entry.packing_mode,
+                packing_rotation: entry.packing_rotation,
+                mesh_type: entry.mesh_type,
+                secondary_textures,
+            },
+        )?);
+    }
+
+    Ok(PySpriteAtlas {
+        path_id: atlas.path_id,
+        name: atlas.name,
+        packed_sprites: atlas.packed_sprites,
+        packed_sprite_names: atlas.packed_sprite_names,
+        render_data_entries,
+        tag: atlas.tag,
+        is_variant: atlas.is_variant,
+    })
 }
 
 const fn sprite_object_reference_tuple(
