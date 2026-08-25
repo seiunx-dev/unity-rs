@@ -1847,11 +1847,12 @@ impl From<PyExtractionLimits> for ExtractionLimits {
     }
 }
 
-#[pyclass(name = "ExportLimits", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "ExportLimits", frozen, skip_from_py_object)]
 #[derive(Debug, Clone, Copy)]
 struct PyExportLimits {
-    maximum_objects: usize,
-    maximum_total_output_bytes: u64,
+    objects: usize,
+    total_output_bytes: u64,
+    metadata_bytes: u64,
 }
 
 /// One file a model export names by file name.
@@ -2170,12 +2171,32 @@ impl PyLive2dPackageSet {
 #[pymethods]
 impl PyExportLimits {
     #[new]
-    #[pyo3(signature = (*, maximum_objects=1_000_000, maximum_total_output_bytes=17_179_869_184))]
-    const fn new(maximum_objects: usize, maximum_total_output_bytes: u64) -> Self {
+    #[pyo3(signature = (*, maximum_objects=1_000_000, maximum_total_output_bytes=17_179_869_184, maximum_metadata_bytes=268_435_456))]
+    const fn new(
+        maximum_objects: usize,
+        maximum_total_output_bytes: u64,
+        maximum_metadata_bytes: u64,
+    ) -> Self {
         Self {
-            maximum_objects,
-            maximum_total_output_bytes,
+            objects: maximum_objects,
+            total_output_bytes: maximum_total_output_bytes,
+            metadata_bytes: maximum_metadata_bytes,
         }
+    }
+
+    #[getter]
+    const fn maximum_objects(&self) -> usize {
+        self.objects
+    }
+
+    #[getter]
+    const fn maximum_total_output_bytes(&self) -> u64 {
+        self.total_output_bytes
+    }
+
+    #[getter]
+    const fn maximum_metadata_bytes(&self) -> u64 {
+        self.metadata_bytes
     }
 }
 
@@ -4450,8 +4471,9 @@ impl PyAssetStudio {
             || {
                 let defaults = ExportOptions::default();
                 PyExportLimits {
-                    maximum_objects: defaults.maximum_objects,
-                    maximum_total_output_bytes: defaults.maximum_total_output_bytes,
+                    objects: defaults.maximum_objects,
+                    total_output_bytes: defaults.maximum_total_output_bytes,
+                    metadata_bytes: defaults.maximum_metadata_bytes,
                 }
             },
             |limits| *limits,
@@ -4461,8 +4483,9 @@ impl PyAssetStudio {
             image_format,
             jpeg_quality,
             overwrite_existing: overwrite,
-            maximum_objects: limits.maximum_objects,
-            maximum_total_output_bytes: limits.maximum_total_output_bytes,
+            maximum_objects: limits.objects,
+            maximum_total_output_bytes: limits.total_output_bytes,
+            maximum_metadata_bytes: limits.metadata_bytes,
             ..ExportOptions::default()
         };
         let report = Python::attach(|py| py.detach(move || self.studio.export(output, options)))

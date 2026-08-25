@@ -228,7 +228,10 @@ def consume_public_api(
         acl_decoder=acl_decoder,
     )
 
-    export_report: ExportReport = studio.export(path, limits=ExportLimits())
+    export_report: ExportReport = studio.export(
+        path,
+        limits=ExportLimits(maximum_metadata_bytes=268_435_456),
+    )
     extraction_report: ExtractionReport = extract(
         path,
         path,
