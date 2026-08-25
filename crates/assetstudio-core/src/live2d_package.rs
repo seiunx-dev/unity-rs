@@ -6,6 +6,7 @@
 //! objects. Opaque `MonoBehaviour` tails are never guessed.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -71,6 +72,8 @@ pub struct Live2dPackageLimits {
     pub maximum_total_auxiliary_bytes: u64,
     pub maximum_auxiliary_file_bytes: u64,
     pub maximum_total_name_bytes: usize,
+    /// Maximum cumulative UTF-8 bytes retained by package diagnostics.
+    /// Messages are measured against this limit before their exact allocation.
     pub maximum_total_diagnostic_bytes: usize,
     pub maximum_total_manifest_bytes: u64,
     pub mono_behaviour: MonoBehaviourReadLimits,
@@ -1848,7 +1851,7 @@ impl<'a> PackageState<'a> {
                     self.push_diagnostic(
                         renderer.object,
                         Live2dPackageDiagnosticKind::TextureReadFailed,
-                        format!("CubismRenderer._mainTexture cannot be parsed: {error}"),
+                        format_args!("CubismRenderer._mainTexture cannot be parsed: {error}"),
                     )?;
                     continue;
                 }
@@ -2037,7 +2040,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     object,
                     Live2dPackageDiagnosticKind::ExpressionReadFailed,
-                    format!("CubismExpressionData cannot be projected: {error}"),
+                    format_args!("CubismExpressionData cannot be projected: {error}"),
                 )?;
                 return Ok(None);
             }
@@ -2320,7 +2323,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     key,
                     Live2dPackageDiagnosticKind::MotionReadFailed,
-                    format!("CubismFadeMotionData cannot be projected: {error}"),
+                    format_args!("CubismFadeMotionData cannot be projected: {error}"),
                 )?;
                 return Ok(None);
             }
@@ -2445,7 +2448,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     key,
                     Live2dPackageDiagnosticKind::MotionReadFailed,
-                    format!("AnimationClip cannot be projected to motion3: {error}"),
+                    format_args!("AnimationClip cannot be projected to motion3: {error}"),
                 )?;
                 return Ok(None);
             }
@@ -2643,7 +2646,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     key,
                     Live2dPackageDiagnosticKind::PhysicsReadFailed,
-                    format!("CubismPhysicsController cannot be projected: {error}"),
+                    format_args!("CubismPhysicsController cannot be projected: {error}"),
                 )?;
                 return Ok(None);
             }
@@ -2709,7 +2712,7 @@ impl<'a> PackageState<'a> {
                     self.push_diagnostic(
                         component.object,
                         Live2dPackageDiagnosticKind::AuxiliaryReadFailed,
-                        format!("CubismPosePart cannot be projected: {error}"),
+                        format_args!("CubismPosePart cannot be projected: {error}"),
                     )?;
                     continue;
                 }
@@ -2793,7 +2796,7 @@ impl<'a> PackageState<'a> {
                     self.push_diagnostic(
                         component.object,
                         Live2dPackageDiagnosticKind::AuxiliaryReadFailed,
-                        format!("Cubism display info cannot be projected: {error}"),
+                        format_args!("Cubism display info cannot be projected: {error}"),
                     )?;
                     continue;
                 }
@@ -2941,7 +2944,7 @@ impl<'a> PackageState<'a> {
             self.push_diagnostic(
                 component.object,
                 Live2dPackageDiagnosticKind::MalformedRequiredField,
-                format!("{}.{field_name} is not a valid PPtr", component.role_name()),
+                format_args!("{}.{field_name} is not a valid PPtr", component.role_name()),
             )?;
             return Ok(None);
         };
@@ -2949,7 +2952,7 @@ impl<'a> PackageState<'a> {
             self.push_diagnostic(
                 component.object,
                 Live2dPackageDiagnosticKind::NullReference,
-                format!("{}.{field_name} is null", component.role_name()),
+                format_args!("{}.{field_name} is null", component.role_name()),
             )?;
             return Ok(None);
         }
@@ -2971,7 +2974,7 @@ impl<'a> PackageState<'a> {
             self.push_diagnostic(
                 component.object,
                 Live2dPackageDiagnosticKind::MalformedRequiredField,
-                format!("{}.{field_name} is not an array", component.role_name()),
+                format_args!("{}.{field_name} is not an array", component.role_name()),
             )?;
             return Ok(None);
         };
@@ -2984,7 +2987,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     component.object,
                     Live2dPackageDiagnosticKind::MalformedRequiredField,
-                    format!(
+                    format_args!(
                         "{}.{field_name}[{index}] is not a valid PPtr",
                         component.role_name()
                     ),
@@ -3026,7 +3029,7 @@ impl<'a> PackageState<'a> {
             self.push_diagnostic(
                 component.object,
                 Live2dPackageDiagnosticKind::MissingEmbeddedTypeTree,
-                format!(
+                format_args!(
                     "{}.{field_name} cannot be inspected because the serialized type has no embedded TypeTree",
                     component.role_name()
                 ),
@@ -3049,7 +3052,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     component.object,
                     kind,
-                    format!(
+                    format_args!(
                         "{}.{field_name} cannot be inspected through its schema: {message}",
                         component.role_name()
                     ),
@@ -3065,7 +3068,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     component.object,
                     kind,
-                    format!(
+                    format_args!(
                         "{} object schema cannot be decoded: {error}",
                         component.role_name()
                     ),
@@ -3077,7 +3080,7 @@ impl<'a> PackageState<'a> {
             self.push_diagnostic(
                 component.object,
                 Live2dPackageDiagnosticKind::MalformedEmbeddedTypeTree,
-                format!(
+                format_args!(
                     "{} embedded TypeTree root is not an object",
                     component.role_name()
                 ),
@@ -3145,7 +3148,7 @@ impl<'a> PackageState<'a> {
             self.push_diagnostic(
                 component.object,
                 Live2dPackageDiagnosticKind::MissingRequiredField,
-                format!(
+                format_args!(
                     "{} embedded TypeTree has no {field_name} field",
                     component.role_name()
                 ),
@@ -3168,7 +3171,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     owner,
                     Live2dPackageDiagnosticKind::NullReference,
-                    format!("{field} is null"),
+                    format_args!("{field} is null"),
                 )?;
                 return Ok(None);
             }
@@ -3176,7 +3179,7 @@ impl<'a> PackageState<'a> {
                 self.push_diagnostic(
                     owner,
                     Live2dPackageDiagnosticKind::UnresolvedReference,
-                    format!("{field} cannot be resolved: {error}"),
+                    format_args!("{field} cannot be resolved: {error}"),
                 )?;
                 return Ok(None);
             }
@@ -3186,7 +3189,7 @@ impl<'a> PackageState<'a> {
             self.push_diagnostic(
                 owner,
                 Live2dPackageDiagnosticKind::WrongReferenceClass,
-                format!("{field} resolves to class {actual}, expected {expected_class}"),
+                format_args!("{field} resolves to class {actual}, expected {expected_class}"),
             )?;
             return Ok(None);
         }
@@ -3207,18 +3210,17 @@ impl<'a> PackageState<'a> {
         &mut self,
         object: SceneObjectKey,
         kind: Live2dPackageDiagnosticKind,
-        message: impl Into<String>,
+        message: impl fmt::Display,
     ) -> Result<()> {
-        let message = message.into();
-        self.diagnostic_bytes = charge_usize(
+        let (message, diagnostic_bytes) = prepare_diagnostic_message(
+            &message,
             self.diagnostic_bytes,
-            message.len(),
             self.limits.maximum_total_diagnostic_bytes,
-            "Live2D diagnostics",
         )?;
         self.diagnostics.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!("cannot grow Live2D diagnostics: {error}"))
         })?;
+        self.diagnostic_bytes = diagnostic_bytes;
         self.diagnostics.push(Live2dPackageDiagnostic {
             object,
             kind,
@@ -3226,6 +3228,78 @@ impl<'a> PackageState<'a> {
         });
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct DiagnosticMessageLength {
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl fmt::Write for DiagnosticMessageLength {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let Some(bytes) = self.bytes.checked_add(value.len()) else {
+            self.overflowed = true;
+            return Err(fmt::Error);
+        };
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+struct DiagnosticMessage {
+    value: String,
+    maximum: usize,
+    overflowed: bool,
+}
+
+impl fmt::Write for DiagnosticMessage {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let Some(end) = self.value.len().checked_add(value.len()) else {
+            self.overflowed = true;
+            return Err(fmt::Error);
+        };
+        if end > self.maximum {
+            self.overflowed = true;
+            return Err(fmt::Error);
+        }
+        self.value.push_str(value);
+        Ok(())
+    }
+}
+
+fn prepare_diagnostic_message<M: fmt::Display>(
+    message: &M,
+    current: usize,
+    maximum: usize,
+) -> Result<(String, usize)> {
+    let mut length = DiagnosticMessageLength::default();
+    if fmt::write(&mut length, format_args!("{message}")).is_err() {
+        return Err(if length.overflowed {
+            Error::invalid_data("Live2D diagnostic message byte count overflowed")
+        } else {
+            Error::invalid_data("cannot measure Live2D diagnostic message")
+        });
+    }
+    let total = charge_usize(current, length.bytes, maximum, "Live2D diagnostics")?;
+    let mut value = String::new();
+    value.try_reserve_exact(length.bytes).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate Live2D diagnostic: {error}"))
+    })?;
+    let mut output = DiagnosticMessage {
+        value,
+        maximum: length.bytes,
+        overflowed: false,
+    };
+    if fmt::write(&mut output, format_args!("{message}")).is_err() {
+        return Err(if output.overflowed {
+            Error::invalid_data("Live2D diagnostic message changed while formatting")
+        } else {
+            Error::invalid_data("cannot format Live2D diagnostic message")
+        });
+    }
+    debug_assert_eq!(output.value.len(), length.bytes);
+    Ok((output.value, total))
 }
 
 impl ScriptedComponent {
@@ -3902,6 +3976,9 @@ impl<W: Write> Write for BoundedWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::fmt;
+
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::mono_schema::{MonoBehaviourSchemaEntry, MonoBehaviourSchemaRegistry};
     use crate::scene_hierarchy::{SceneHierarchy, SceneHierarchyNode, SceneObjectKey};
@@ -3922,6 +3999,89 @@ mod tests {
     const TEXTURE_2D: i32 = 28;
     const MONO_BEHAVIOUR: i32 = 114;
     const MONO_SCRIPT: i32 = 115;
+
+    struct RepeatedDiagnostic<'a> {
+        writes: &'a Cell<usize>,
+        count: usize,
+    }
+
+    impl fmt::Display for RepeatedDiagnostic<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            for _ in 0..self.count {
+                self.writes.set(self.writes.get() + 1);
+                formatter.write_str("é")?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn diagnostic_messages_are_preflighted_before_exact_allocation() {
+        let collection = AssetCollection::from_loaded_parts(Vec::new(), Vec::new());
+        let key = SceneObjectKey {
+            file_index: 0,
+            path_id: 1,
+        };
+        let writes = Cell::new(0);
+
+        let mut exact_limits = Live2dPackageLimits {
+            maximum_total_diagnostic_bytes: 10,
+            ..Live2dPackageLimits::default()
+        };
+        let mut exact = PackageState::new(
+            &collection,
+            &exact_limits,
+            SceneHierarchy::from_test_parts(Vec::new(), Vec::new()),
+            None,
+            None,
+        );
+        exact
+            .push_diagnostic(key, Live2dPackageDiagnosticKind::NullReference, "ok")
+            .unwrap();
+        exact
+            .push_diagnostic(
+                key,
+                Live2dPackageDiagnosticKind::UnresolvedReference,
+                RepeatedDiagnostic {
+                    writes: &writes,
+                    count: 4,
+                },
+            )
+            .unwrap();
+        assert_eq!(exact.diagnostic_bytes, 10);
+        assert_eq!(exact.diagnostics[1].message, "éééé");
+        assert_eq!(
+            writes.get(),
+            8,
+            "accepted text needs measure and write passes"
+        );
+
+        writes.set(0);
+        exact_limits.maximum_total_diagnostic_bytes = 9;
+        let mut low = PackageState::new(
+            &collection,
+            &exact_limits,
+            SceneHierarchy::from_test_parts(Vec::new(), Vec::new()),
+            None,
+            None,
+        );
+        low.push_diagnostic(key, Live2dPackageDiagnosticKind::NullReference, "ok")
+            .unwrap();
+        let error = low
+            .push_diagnostic(
+                key,
+                Live2dPackageDiagnosticKind::UnresolvedReference,
+                RepeatedDiagnostic {
+                    writes: &writes,
+                    count: 4,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("total 10 exceeds limit 9"));
+        assert_eq!(writes.get(), 4, "over-budget text was formatted twice");
+        assert_eq!(low.diagnostic_bytes, 2);
+        assert_eq!(low.diagnostics.len(), 1);
+    }
 
     #[test]
     fn indexes_loose_roles_logarithmically_in_discovery_order() {
