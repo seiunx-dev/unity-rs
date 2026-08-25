@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import threading
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Optional, TypeVar
@@ -982,7 +983,53 @@ def synthetic_acl_tracks() -> bytes:
     return bytes(tracks)
 
 
-def synthetic_tuanjie_animation_clip() -> bytes:
+def synthetic_standard_animation_clip() -> bytes:
+    payload = bytearray()
+    push_aligned_string(payload, "python-standard-animation")
+    payload.extend((0, 0, 0))
+    align(payload, 4)
+    for _ in range(7):
+        push_i32(payload, 0)
+    push_f32s(payload, (60.0,))
+    push_i32(payload, 2)
+    push_f32s(payload, (0.0,) * 6)
+    push_u32(payload, 0)
+
+    push_tuanjie_animation_xform(payload)
+    push_f32s(payload, (0.0,) * 7)
+    push_i32(payload, 0)
+    for _ in range(2):
+        push_tuanjie_animation_xform(payload)
+        push_i32(payload, 0)
+        push_f32s(payload, (0.0,) * 4)
+    push_i32(payload, 0)
+    push_i32(payload, 0)
+    for _ in range(4):
+        push_tuanjie_animation_xform(payload)
+    push_f32s(payload, (0.0,) * 3)
+    push_i32(payload, 0)
+    payload.extend(struct.pack("<HH", 2, 1))
+    push_i32(payload, 0)
+    push_u32(payload, 0)
+    push_f32s(payload, (30.0, 0.0))
+    push_i32(payload, 0)
+    push_i32(payload, 0)
+    push_f32s(payload, (0.0,) * 6)
+    for _ in range(3):
+        push_i32(payload, 0)
+    payload.extend(bytes(11))
+    align(payload, 4)
+
+    push_i32(payload, 0)  # generic bindings
+    push_i32(payload, 0)  # PPtr curve mapping
+    payload.extend((1, 0))
+    align(payload, 4)
+    push_i32(payload, 0)  # events
+    align(payload, 4)
+    return finish_v22_asset(74, payload, "6000.2.0f1")
+
+
+def synthetic_tuanjie_animation_clip(*, cubism_binding: bool = False) -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "python-tuanjie-animation")
     payload.extend((0, 0, 0))
@@ -1018,7 +1065,7 @@ def synthetic_tuanjie_animation_clip() -> bytes:
     push_u32(payload, 12)
     push_u32(payload, 3)
     push_f32s(payload, (30.0,))
-    push_u32(payload, 7)
+    push_u32(payload, 1 if cubism_binding else 7)
     acl_tracks = synthetic_acl_tracks()
     push_i32(payload, len(acl_tracks))
     payload.extend(acl_tracks)
@@ -1036,7 +1083,16 @@ def synthetic_tuanjie_animation_clip() -> bytes:
     payload.extend(struct.pack("<q", 0x1020304050607080))
     push_u32(payload, 0x1234)
     push_aligned_string(payload, "archive:/animation.resS")
-    push_i32(payload, 0)
+    push_i32(payload, 1 if cubism_binding else 0)
+    if cubism_binding:
+        # Unity stores the standard CRC32 of the binding path. One scalar
+        # binding is enough to make the ACL callback reach the motion writer.
+        push_u32(payload, zlib.crc32(b"Parameters/ParamAngleX") & 0xFFFFFFFF)
+        push_u32(payload, 0)  # attribute
+        push_pptr(payload, 0)  # script
+        push_i32(payload, 0)  # type ID
+        payload.extend((0, 0, 0, 0))
+        align(payload, 4)
     push_i32(payload, 0)
     payload.extend((0, 0))
     align(payload, 4)
@@ -3531,6 +3587,104 @@ def main() -> None:
             pass
         else:
             raise AssertionError("AnimationClip object limit should be enforced")
+
+        standard_motion_path = Path(directory) / "standard-motion.assets"
+        standard_motion_path.write_bytes(synthetic_standard_animation_clip())
+        standard_motion_studio = AssetStudio(standard_motion_path)
+        standard_motion = standard_motion_studio.read_cubism_clip_motion(
+            0,
+            7,
+            targets=CubismMotionTargets(parameters=["ParamAngleX"]),
+        )
+        assert isinstance(standard_motion, CubismClipMotion)
+        assert standard_motion.file_index == 0
+        assert standard_motion.path_id == 7
+        assert standard_motion.name == "python-standard-animation"
+        assert standard_motion.fps == 60.0
+        assert standard_motion.curve_count == 0
+        assert standard_motion.keyframe_count == 0
+        standard_motion_json = json.loads(standard_motion.json)
+        assert standard_motion_json["Meta"]["CurveCount"] == 0
+        exact_standard_motion = standard_motion_studio.read_cubism_clip_motion(
+            0,
+            7,
+            maximum_output_bytes=len(standard_motion.json),
+        )
+        assert exact_standard_motion.json == standard_motion.json
+        try:
+            standard_motion_studio.read_cubism_clip_motion(
+                0,
+                7,
+                maximum_output_bytes=len(standard_motion.json) - 1,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("standard Cubism clip output limits must be enforced")
+
+        acl_motion_path = Path(directory) / "acl-motion.assets"
+        acl_motion_path.write_bytes(
+            synthetic_tuanjie_animation_clip(cubism_binding=True)
+        )
+        acl_motion_studio = AssetStudio(acl_motion_path)
+
+        def decode_cubism_acl(
+            compressed_tracks: bytes,
+            map_values: list[int],
+            frame_count: int,
+            bone_count: int,
+            sample_rate: float,
+            declared_curve_count: Optional[int],
+            fast_sample: Optional[bool],
+        ) -> tuple[list[float], list[int], list[float], int]:
+            assert compressed_tracks == synthetic_acl_tracks()
+            assert map_values == [0x10, 0x20]
+            assert frame_count == 12
+            assert bone_count == 3
+            assert sample_rate == 30.0
+            assert declared_curve_count == 1
+            assert fast_sample is True
+            return (
+                [index / sample_rate for index in range(frame_count)],
+                [0],
+                [float(index) / 10.0 for index in range(frame_count)],
+                1,
+            )
+
+        acl_motion = acl_motion_studio.read_cubism_acl_clip_motion(
+            0,
+            7,
+            decode_cubism_acl,
+            targets=CubismMotionTargets(parameters=["ParamAngleX"]),
+        )
+        assert isinstance(acl_motion, CubismClipMotion)
+        assert acl_motion.name == "python-tuanjie-animation"
+        assert acl_motion.curve_count == 1
+        assert acl_motion.keyframe_count == 12
+        acl_motion_json = json.loads(acl_motion.json)
+        assert acl_motion_json["Meta"]["CurveCount"] == 1
+        assert acl_motion_json["Curves"][0]["Target"] == "Parameter"
+        assert acl_motion_json["Curves"][0]["Id"] == "ParamAngleX"
+        exact_acl_motion = acl_motion_studio.read_cubism_acl_clip_motion(
+            0,
+            7,
+            decode_cubism_acl,
+            targets=CubismMotionTargets(parameters=["ParamAngleX"]),
+            maximum_output_bytes=len(acl_motion.json),
+        )
+        assert exact_acl_motion.json == acl_motion.json
+        try:
+            acl_motion_studio.read_cubism_acl_clip_motion(
+                0,
+                7,
+                decode_cubism_acl,
+                targets=CubismMotionTargets(parameters=["ParamAngleX"]),
+                maximum_output_bytes=len(acl_motion.json) - 1,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("ACL Cubism clip output limits must be enforced")
 
         legacy_animation_path = Path(directory) / "legacy-animation.assets"
         legacy_animation_path.write_bytes(synthetic_legacy_animation_component())

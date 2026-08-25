@@ -21,14 +21,15 @@ use assetstudio_core::extraction::{ExtractionLimits, ExtractionOptions, Extracti
 use assetstudio_core::image_export::ImageFormat;
 use assetstudio_core::live2d_clip_motion::CubismClipMotionReadLimits;
 use assetstudio_core::live2d_motion::{
-    CubismFadeMotionReadLimits, CubismMotionTargetIndexLimits, CubismMotionTargetNames,
+    CubismFadeMotion, CubismFadeMotionReadLimits, CubismMotionTargetIndexLimits,
+    CubismMotionTargetNames,
 };
 use assetstudio_core::live2d_package::{
     Live2dPackageBytes, Live2dPackageBytesSet, Live2dPackageLimits, Live2dPackageMaterializeLimits,
 };
-use assetstudio_core::live2d_physics::CubismPhysicsReadLimits;
+use assetstudio_core::live2d_physics::{CubismPhysicsReadLimits, CubismPhysicsRig};
 use assetstudio_core::live2d_schema::{
-    CubismAuxiliaryReadLimits, CubismExpressionBlend, CubismExpressionReadLimits,
+    CubismAuxiliaryReadLimits, CubismExpression, CubismExpressionBlend, CubismExpressionReadLimits,
 };
 use assetstudio_core::loader::{
     AssetLoadLimits, AssetLoadOptions, LoadDiagnostic, LoadFailurePolicy,
@@ -4191,15 +4192,14 @@ impl PyAssetStudio {
             maximum_output_bytes: output_limit,
             ..CubismExpressionReadLimits::default()
         };
-        let expression = py.detach(|| {
-            self.object(file_index, path_id)?
+        let prepared = py.detach(|| {
+            let expression = self
+                .object(file_index, path_id)?
                 .read_cubism_expression(limits)
-                .map_err(core_error)
+                .map_err(core_error)?;
+            prepare_cubism_expression(expression, maximum_output_bytes, output_limit)
         })?;
-        let json =
-            materialize_python_bytes(maximum_output_bytes, "Cubism expression JSON", |output| {
-                expression.write_exp3_json(output, output_limit)
-            })?;
+        let PreparedCubismExpression { expression, json } = prepared;
         let mut parameters = Vec::new();
         parameters
             .try_reserve(expression.parameters.len())
@@ -4316,11 +4316,6 @@ impl PyAssetStudio {
             maximum_output_bytes: output_limit,
             ..CubismPhysicsReadLimits::default()
         };
-        let rig = py.detach(|| {
-            self.object(file_index, path_id)?
-                .read_cubism_physics(limits)
-                .map_err(core_error)
-        })?;
         // The physics document is a float document; Python has only doubles,
         // so the width changes at this boundary in both directions.
         #[expect(
@@ -4328,32 +4323,12 @@ impl PyAssetStudio {
             reason = "physics3.json's fps field is a float"
         )]
         let motion_fps = motion_fps as f32;
-        let json =
-            materialize_python_bytes(maximum_output_bytes, "Cubism physics JSON", |output| {
-                rig.write_physics3_json(motion_fps, output, output_limit)
-            })?;
-        let input_count = checked_element_count(
-            rig.sub_rigs.iter().map(|value| value.inputs.len()),
-            "physics inputs",
-        )?;
-        let output_count = checked_element_count(
-            rig.sub_rigs.iter().map(|value| value.outputs.len()),
-            "physics outputs",
-        )?;
-        let particle_count = checked_element_count(
-            rig.sub_rigs.iter().map(|value| value.particles.len()),
-            "physics particles",
-        )?;
-        Ok(PyCubismPhysics {
-            path_id: rig.path_id,
-            fps: f64::from(rig.fps),
-            gravity: (f64::from(rig.gravity.x), f64::from(rig.gravity.y)),
-            wind: (f64::from(rig.wind.x), f64::from(rig.wind.y)),
-            sub_rig_count: rig.sub_rigs.len(),
-            input_count,
-            output_count,
-            particle_count,
-            json,
+        py.detach(|| {
+            let rig = self
+                .object(file_index, path_id)?
+                .read_cubism_physics(limits)
+                .map_err(core_error)?;
+            python_cubism_physics(&rig, motion_fps, maximum_output_bytes, output_limit)
         })
     }
 
@@ -4381,34 +4356,12 @@ impl PyAssetStudio {
             maximum_output_bytes: output_limit,
             ..CubismFadeMotionReadLimits::default()
         };
-        let motion = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let motion = self
+                .object(file_index, path_id)?
                 .read_cubism_fade_motion(limits)
-                .map_err(core_error)
-        })?;
-        let json =
-            materialize_python_bytes(maximum_output_bytes, "Cubism motion JSON", |output| {
-                motion.write_motion3_json(
-                    &CubismMotionTargetNames::default(),
-                    force_bezier,
-                    output,
-                    output_limit,
-                )
-            })?;
-        let keyframe_count = checked_element_count(
-            motion.curves.iter().map(|curve| curve.keyframes.len()),
-            "motion keyframes",
-        )?;
-        Ok(PyCubismFadeMotion {
-            path_id: motion.path_id,
-            source_name: motion.source_name,
-            motion_name: motion.motion_name,
-            fade_in_time: f64::from(motion.fade_in_time),
-            fade_out_time: f64::from(motion.fade_out_time),
-            motion_length: f64::from(motion.motion_length),
-            curve_count: motion.curves.len(),
-            keyframe_count,
-            json,
+                .map_err(core_error)?;
+            python_cubism_fade_motion(motion, force_bezier, maximum_output_bytes, output_limit)
         })
     }
 
@@ -4439,12 +4392,13 @@ impl PyAssetStudio {
             maximum_output_bytes: output_limit,
             ..CubismClipMotionReadLimits::default()
         };
-        let motion = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let motion = self
+                .object(file_index, path_id)?
                 .read_cubism_clip_motion(&targets, limits)
-                .map_err(core_error)
-        })?;
-        python_cubism_clip_motion(motion, force_bezier, maximum_output_bytes, output_limit)
+                .map_err(core_error)?;
+            python_cubism_clip_motion(motion, force_bezier, maximum_output_bytes, output_limit)
+        })
     }
 
     /// Projects one Tuanjie ACL-backed clip through Cubism bindings using a
@@ -4479,8 +4433,9 @@ impl PyAssetStudio {
             maximum_output_bytes: output_limit,
             ..CubismClipMotionReadLimits::default()
         };
-        let motion = py.detach(|| {
-            self.object(file_index, path_id)?
+        py.detach(|| {
+            let motion = self
+                .object(file_index, path_id)?
                 .read_cubism_clip_motion_with_acl_decoder(
                     &targets,
                     limits,
@@ -4489,9 +4444,9 @@ impl PyAssetStudio {
                         limits: AclDecodeLimits::default(),
                     },
                 )
-                .map_err(core_error)
-        })?;
-        python_cubism_clip_motion(motion, false, maximum_output_bytes, output_limit)
+                .map_err(core_error)?;
+            python_cubism_clip_motion(motion, false, maximum_output_bytes, output_limit)
+        })
     }
 
     #[pyo3(signature = (
@@ -4637,6 +4592,88 @@ impl PyAssetStudio {
             ))
         })
     }
+}
+
+struct PreparedCubismExpression {
+    expression: CubismExpression,
+    json: Vec<u8>,
+}
+
+fn prepare_cubism_expression(
+    expression: CubismExpression,
+    maximum_output_bytes: usize,
+    output_limit: u64,
+) -> PyResult<PreparedCubismExpression> {
+    let json =
+        materialize_python_bytes(maximum_output_bytes, "Cubism expression JSON", |output| {
+            expression.write_exp3_json(output, output_limit)
+        })?;
+    Ok(PreparedCubismExpression { expression, json })
+}
+
+fn python_cubism_physics(
+    rig: &CubismPhysicsRig,
+    motion_fps: f32,
+    maximum_output_bytes: usize,
+    output_limit: u64,
+) -> PyResult<PyCubismPhysics> {
+    let json = materialize_python_bytes(maximum_output_bytes, "Cubism physics JSON", |output| {
+        rig.write_physics3_json(motion_fps, output, output_limit)
+    })?;
+    let input_count = checked_element_count(
+        rig.sub_rigs.iter().map(|value| value.inputs.len()),
+        "physics inputs",
+    )?;
+    let output_count = checked_element_count(
+        rig.sub_rigs.iter().map(|value| value.outputs.len()),
+        "physics outputs",
+    )?;
+    let particle_count = checked_element_count(
+        rig.sub_rigs.iter().map(|value| value.particles.len()),
+        "physics particles",
+    )?;
+    Ok(PyCubismPhysics {
+        path_id: rig.path_id,
+        fps: f64::from(rig.fps),
+        gravity: (f64::from(rig.gravity.x), f64::from(rig.gravity.y)),
+        wind: (f64::from(rig.wind.x), f64::from(rig.wind.y)),
+        sub_rig_count: rig.sub_rigs.len(),
+        input_count,
+        output_count,
+        particle_count,
+        json,
+    })
+}
+
+fn python_cubism_fade_motion(
+    motion: CubismFadeMotion,
+    force_bezier: bool,
+    maximum_output_bytes: usize,
+    output_limit: u64,
+) -> PyResult<PyCubismFadeMotion> {
+    let json = materialize_python_bytes(maximum_output_bytes, "Cubism motion JSON", |output| {
+        motion.write_motion3_json(
+            &CubismMotionTargetNames::default(),
+            force_bezier,
+            output,
+            output_limit,
+        )
+    })?;
+    let keyframe_count = checked_element_count(
+        motion.curves.iter().map(|curve| curve.keyframes.len()),
+        "motion keyframes",
+    )?;
+    Ok(PyCubismFadeMotion {
+        path_id: motion.path_id,
+        source_name: motion.source_name,
+        motion_name: motion.motion_name,
+        fade_in_time: f64::from(motion.fade_in_time),
+        fade_out_time: f64::from(motion.fade_out_time),
+        motion_length: f64::from(motion.motion_length),
+        curve_count: motion.curves.len(),
+        keyframe_count,
+        json,
+    })
 }
 
 fn python_cubism_clip_motion(
