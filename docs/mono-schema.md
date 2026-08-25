@@ -78,6 +78,15 @@ preserving the supplied first-match order. This closes the otherwise quadratic
 case where every stripped object scanned every Python-visible schema without
 making a 100,000-entry index build monopolize the interpreter.
 
+Programmatic Rust/Python/Node entries obey the same Unity-version invariant as
+the JSON document: a present version must parse as a Unity version, and a failed
+insert leaves the registry unchanged. Node's Promise APIs must first inspect and
+copy JavaScript-owned values on the event-loop thread, but they defer this
+version validation, random-keyed Core registry construction, asset parsing and
+result materialization to the worker. Their synchronous counterparts keep
+immediate validation errors; asynchronous calls return a Promise and reject it
+from worker execution.
+
 ## The document
 
 ```json

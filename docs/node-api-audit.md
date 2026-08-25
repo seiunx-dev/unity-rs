@@ -1,6 +1,6 @@
 # Node API audit
 
-Last verified: 2026-08-23.
+Last verified: 2026-08-25.
 
 `assetstudio-rs-node` is an optional direct napi-rs binding over
 `assetstudio-core`. It does not load the removed custom C ABI or a .NET
@@ -66,6 +66,13 @@ methods:
   `maximumPathBytes` reaches synchronous and worker-backed path/one-buffer Core
   loads, while `maximumInputFiles` rejects a multi-buffer collection before
   napi walks its elements.
+- Promise APIs that accept external MonoBehaviour schemas count-check and copy
+  the JavaScript-owned values before queueing, then validate Unity-version
+  identity and build the random-keyed Core registry on the worker. Behavioral
+  tests distinguish this from the synchronous API: an invalid version throws
+  immediately from the synchronous call, while both the MonoBehaviour JSON and
+  Live2D/ACL asynchronous calls return normally and reject their Promises before
+  parsing or invoking the decoder callback.
 - `tests/installed_package.cjs` loads the packed tarball from a temporary
   consumer, parses the installed `index.d.ts`, and compares its static methods,
   instance methods, and getters bidirectionally with the installed native
