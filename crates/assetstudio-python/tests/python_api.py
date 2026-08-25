@@ -6,8 +6,9 @@ import struct
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypeVar
 
 from assetstudio import (
     AclCompressedTracks,
@@ -67,6 +68,8 @@ if not __debug__:
         "refusing to run with assertions disabled (-O / PYTHONOPTIMIZE): "
         "every check in this suite is an assert"
     )
+
+T = TypeVar("T")
 
 
 def push_i32(output: bytearray, value: int) -> None:
@@ -1984,12 +1987,52 @@ def finish_v22_asset(
     return bytes(output)
 
 
-def assert_schema_construction_releases_gil() -> None:
-    """The pure-Rust 100k-node validation must not monopolize Python."""
+def assert_constructor_releases_gil(
+    operation: Callable[[], T], description: str
+) -> T:
+    ready = threading.Event()
+    start = threading.Event()
+    ran = threading.Event()
 
-    # The binding must check the Python list length before asking PyO3 to
-    # convert every element into owned Rust strings. Invalid entries prove the
-    # count guard runs first rather than merely rejecting after conversion.
+    def worker() -> None:
+        ready.set()
+        start.wait()
+        ran.set()
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert ready.wait(5), "GIL probe worker did not start"
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1_000.0)
+    try:
+        start.set()
+        assert not ran.is_set(), "GIL probe ran before entering the Rust constructor"
+        # Releasing the GIL makes the worker runnable, but it does not force the
+        # operating system to schedule that thread before a very fast Rust
+        # call returns. Give it several bounded constructor windows. With the
+        # switch interval above, a binding which actually holds the GIL cannot
+        # pass by switching between these Python loop iterations.
+        result: Optional[T] = None
+        for _ in range(8):
+            result = operation()
+            if ran.is_set():
+                break
+        assert result is not None
+        assert ran.is_set(), f"{description} construction held the GIL"
+    finally:
+        sys.setswitchinterval(previous_interval)
+        start.set()
+        thread.join(5)
+    assert not thread.is_alive(), "GIL probe worker did not finish"
+    return result
+
+
+def assert_schema_construction_releases_gil() -> None:
+    """Pure-Rust schema validation and indexing must not monopolize Python."""
+
+    # The binding must check each Python list length before asking PyO3 to
+    # convert every element. Invalid entries prove the guards run first rather
+    # than merely rejecting after conversion.
     oversized_nodes = [None] * 1_000_001
     try:
         MonoBehaviourSchema("Probe.dll", "Probe", oversized_nodes)
@@ -2008,44 +2051,21 @@ def assert_schema_construction_releases_gil() -> None:
             "oversized schema collection must be rejected before element conversion"
         )
 
-    ready = threading.Event()
-    start = threading.Event()
-    ran = threading.Event()
-
-    def worker() -> None:
-        ready.set()
-        start.wait()
-        ran.set()
-
-    thread = threading.Thread(target=worker)
-    thread.start()
-    assert ready.wait(5), "GIL probe worker did not start"
     nodes = [("MonoBehaviour", "Base", 0, False)] + [
         ("SInt32", "value", 1, False)
     ] * 99_999
-    previous_interval = sys.getswitchinterval()
-    sys.setswitchinterval(1_000.0)
-    try:
-        start.set()
-        assert not ran.is_set(), "GIL probe ran before entering the Rust constructor"
-        # Releasing the GIL makes the worker runnable, but it does not force the
-        # operating system to schedule that thread before a very fast Rust
-        # call returns. Give it several bounded constructor windows. With the
-        # switch interval above, a binding which actually holds the GIL cannot
-        # pass by switching between these Python loop iterations.
-        schema = None
-        for _ in range(8):
-            schema = MonoBehaviourSchema("Probe.dll", "Probe", nodes)
-            if ran.is_set():
-                break
-        assert schema is not None
-        assert schema.node_count == 100_000
-        assert ran.is_set(), "MonoBehaviourSchema construction held the GIL"
-    finally:
-        sys.setswitchinterval(previous_interval)
-        start.set()
-        thread.join(5)
-    assert not thread.is_alive(), "GIL probe worker did not finish"
+    schema = assert_constructor_releases_gil(
+        lambda: MonoBehaviourSchema("Probe.dll", "Probe", nodes),
+        "MonoBehaviourSchema",
+    )
+    assert schema.node_count == 100_000
+
+    schema_collection = [schema] * 100_000
+    schemas = assert_constructor_releases_gil(
+        lambda: MonoBehaviourSchemas(schema_collection),
+        "MonoBehaviourSchemas",
+    )
+    assert schemas.schema_count == 100_000
 
 
 def main() -> None:
