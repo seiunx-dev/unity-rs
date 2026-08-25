@@ -50,6 +50,10 @@ pub struct AssetLoadLimits {
     ///
     /// Moving the same path through a gzip or Brotli wrapper is not charged again.
     pub maximum_total_path_bytes: usize,
+    /// Maximum cumulative UTF-8 bytes retained by skipped-input diagnostic
+    /// paths and messages. This is separate from traversal paths because the
+    /// returned diagnostics outlive the loader's temporary path table.
+    pub maximum_diagnostic_bytes: usize,
     pub maximum_container_assignments: usize,
     pub maximum_object_name_assignments: usize,
     pub maximum_total_object_name_bytes: usize,
@@ -83,6 +87,7 @@ impl Default for AssetLoadLimits {
             maximum_single_entry_bytes: 512 * 1024 * 1024,
             maximum_path_bytes: DEFAULT_MAXIMUM_LOAD_PATH_BYTES,
             maximum_total_path_bytes: DEFAULT_MAXIMUM_TOTAL_LOAD_PATH_BYTES,
+            maximum_diagnostic_bytes: 256 * 1024 * 1024,
             maximum_container_assignments: 10_000_000,
             maximum_object_name_assignments: 1_000_000,
             maximum_total_object_name_bytes: 256 * 1024 * 1024,
@@ -800,24 +805,29 @@ impl AssetCollection {
             self.record_skipped_input(
                 diagnostic_path.expect("skip policy prepared a diagnostic path"),
                 &error,
+                settings.limits,
+                budget,
             )?;
         }
         Ok(())
     }
 
     /// Records one skipped input, truncating its message to a bounded length.
-    fn record_skipped_input(&mut self, path: String, error: &Error) -> Result<()> {
-        let mut message = error.to_string();
-        if message.len() > MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES {
-            let mut end = MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES;
-            while end > 0 && !message.is_char_boundary(end) {
-                end -= 1;
-            }
-            message.truncate(end);
-        }
+    fn record_skipped_input(
+        &mut self,
+        path: String,
+        error: &Error,
+        limits: &AssetLoadLimits,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        let message_length = load_diagnostic_message_length(error)?;
+        let diagnostic_bytes =
+            budget.checked_diagnostic_bytes(path.len(), message_length, limits)?;
+        let message = format_load_diagnostic(error, message_length)?;
         self.diagnostics.try_reserve(1).map_err(|error| {
             Error::invalid_data(format!("cannot grow load diagnostics: {error}"))
         })?;
+        budget.diagnostic_bytes = diagnostic_bytes;
         self.diagnostics.push(LoadDiagnostic { path, message });
         Ok(())
     }
@@ -1723,6 +1733,7 @@ struct AssetLoadBudget {
     discovered_files: usize,
     expanded_bytes: u64,
     path_bytes: usize,
+    diagnostic_bytes: usize,
     input_directories: usize,
     directory_entries: usize,
 }
@@ -1747,6 +1758,28 @@ impl AssetLoadBudget {
         }
         self.path_bytes = total;
         Ok(())
+    }
+
+    fn checked_diagnostic_bytes(
+        &self,
+        path_bytes: usize,
+        message_bytes: usize,
+        limits: &AssetLoadLimits,
+    ) -> Result<usize> {
+        let additional = path_bytes
+            .checked_add(message_bytes)
+            .ok_or_else(|| Error::invalid_data("load diagnostic byte count overflowed"))?;
+        let total = self
+            .diagnostic_bytes
+            .checked_add(additional)
+            .ok_or_else(|| Error::invalid_data("load diagnostic byte total overflowed"))?;
+        if total > limits.maximum_diagnostic_bytes {
+            return Err(Error::invalid_data(format!(
+                "load diagnostics require {total} UTF-8 bytes, exceeding limit {}",
+                limits.maximum_diagnostic_bytes
+            )));
+        }
+        Ok(total)
     }
 
     fn charge_input_directory(&mut self, limits: &AssetLoadLimits) -> Result<()> {
@@ -1776,6 +1809,73 @@ impl AssetLoadBudget {
         }
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct LoadDiagnosticLength {
+    length: usize,
+    saturated: bool,
+}
+
+impl fmt::Write for LoadDiagnosticLength {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.saturated {
+            return Ok(());
+        }
+        let remaining = MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES - self.length;
+        let prefix = bounded_utf8_prefix_length(value, remaining);
+        self.length += prefix;
+        self.saturated = prefix < value.len();
+        Ok(())
+    }
+}
+
+struct LoadDiagnosticString {
+    value: String,
+    saturated: bool,
+}
+
+impl fmt::Write for LoadDiagnosticString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.saturated {
+            return Ok(());
+        }
+        let remaining = MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES - self.value.len();
+        let prefix = bounded_utf8_prefix_length(value, remaining);
+        self.value.push_str(&value[..prefix]);
+        self.saturated = prefix < value.len();
+        Ok(())
+    }
+}
+
+fn bounded_utf8_prefix_length(value: &str, maximum: usize) -> usize {
+    let mut end = value.len().min(maximum);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn load_diagnostic_message_length(error: &Error) -> Result<usize> {
+    let mut output = LoadDiagnosticLength::default();
+    fmt::write(&mut output, format_args!("{error}"))
+        .map_err(|_| Error::invalid_data("cannot measure load diagnostic message"))?;
+    Ok(output.length)
+}
+
+fn format_load_diagnostic(error: &Error, length: usize) -> Result<String> {
+    let mut value = String::new();
+    value
+        .try_reserve_exact(length)
+        .map_err(|_| Error::invalid_data("cannot allocate load diagnostic message"))?;
+    let mut output = LoadDiagnosticString {
+        value,
+        saturated: false,
+    };
+    fmt::write(&mut output, format_args!("{error}"))
+        .map_err(|_| Error::invalid_data("cannot format load diagnostic message"))?;
+    debug_assert_eq!(output.value.len(), length);
+    Ok(output.value)
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2457,6 +2557,7 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
+    use crate::Error;
     use crate::serialized::{ContainerMetadataReadLimits, SerializedFile};
     use crate::source::Region;
     use crate::unity_version::UnityVersion;
@@ -2466,6 +2567,7 @@ mod tests {
         LoadFailurePolicy, LoadPath, LoadedResource, LoadedSerializedFile, ObjectMetadataBuilder,
         ObjectMetadataEntry, ObjectMetadataIndexBudget, ObjectMetadataKey, PendingInput,
         PendingObjectNames, SpriteAtlasAssignment, SpriteAtlasIndex, charge_pending_inputs,
+        format_load_diagnostic, load_diagnostic_message_length,
         object_metadata_position_with_probe,
     };
 
@@ -3657,6 +3759,102 @@ mod tests {
         assert!(collection.diagnostics[0].message.contains("UnityArchive"));
 
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn skipped_input_diagnostics_have_an_exact_cumulative_string_budget() {
+        const MESSAGE: &str = "unsupported: UnityArchive bundles are recognized, but their layout is not documented or sample-verified";
+        let archive = || {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"UnityArchive\0");
+            bytes.extend_from_slice(&5_u32.to_be_bytes());
+            bytes.extend_from_slice(b"5.x.x\0");
+            bytes.extend_from_slice(b"5.0.0f4\0");
+            bytes
+        };
+        let first = "a-archive.unity3d";
+        let second = "b-archive.unity3d";
+        assert_eq!(first.len(), second.len());
+        let one_record = first.len() + MESSAGE.len();
+
+        let exact = AssetCollection::load_regions_with_options(
+            [(first.to_owned(), Region::from_bytes(archive()))],
+            AssetLoadOptions {
+                limits: AssetLoadLimits {
+                    maximum_diagnostic_bytes: one_record,
+                    ..AssetLoadLimits::default()
+                },
+                failure_policy: LoadFailurePolicy::SkipInput,
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(exact.diagnostics.len(), 1);
+        assert_eq!(exact.diagnostics[0].path, first);
+        assert_eq!(exact.diagnostics[0].message, MESSAGE);
+
+        let low = AssetCollection::load_regions_with_options(
+            [(first.to_owned(), Region::from_bytes(archive()))],
+            AssetLoadOptions {
+                limits: AssetLoadLimits {
+                    maximum_diagnostic_bytes: one_record - 1,
+                    ..AssetLoadLimits::default()
+                },
+                failure_policy: LoadFailurePolicy::SkipInput,
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            low.to_string().contains("load diagnostics require"),
+            "{low}"
+        );
+
+        let cumulative = AssetCollection::load_regions_with_options(
+            [
+                (first.to_owned(), Region::from_bytes(archive())),
+                (second.to_owned(), Region::from_bytes(archive())),
+            ],
+            AssetLoadOptions {
+                limits: AssetLoadLimits {
+                    maximum_diagnostic_bytes: one_record * 2,
+                    ..AssetLoadLimits::default()
+                },
+                failure_policy: LoadFailurePolicy::SkipInput,
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cumulative.diagnostics.len(), 2);
+
+        let cumulative_low = AssetCollection::load_regions_with_options(
+            [
+                (first.to_owned(), Region::from_bytes(archive())),
+                (second.to_owned(), Region::from_bytes(archive())),
+            ],
+            AssetLoadOptions {
+                limits: AssetLoadLimits {
+                    maximum_diagnostic_bytes: one_record * 2 - 1,
+                    ..AssetLoadLimits::default()
+                },
+                failure_policy: LoadFailurePolicy::SkipInput,
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            cumulative_low
+                .to_string()
+                .contains("load diagnostics require"),
+            "{cumulative_low}"
+        );
+
+        let long_error = Error::unsupported("é".repeat(4096));
+        let length = load_diagnostic_message_length(&long_error).unwrap();
+        let bounded = format_load_diagnostic(&long_error, length).unwrap();
+        assert!(bounded.len() <= super::MAXIMUM_DIAGNOSTIC_MESSAGE_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded.len(), length);
     }
 
     #[test]

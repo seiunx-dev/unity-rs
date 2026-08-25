@@ -11,6 +11,7 @@ import type {
   ExportConfiguration,
   LegacyAnimationInfo,
   Live2DPackageSet,
+  LoadDiagnosticInfo,
   ModelTextureLimits,
   MonoBehaviourJson,
   MonoBehaviourSchema,
@@ -36,6 +37,7 @@ declare const studio: AssetStudio;
 const openOptions: OpenOptions = {
   maximumPathBytes: 1024 * 1024,
   maximumTotalPathBytes: 64 * 1024 * 1024,
+  maximumDiagnosticBytes: 256 * 1024 * 1024,
 };
 const openedWithPathLimits: AssetStudio = AssetStudio.openWith(
   "fixture.assets",
@@ -291,6 +293,9 @@ function consumeEveryAssetStudioMember(studio: AssetStudio): void {
   void studio.fileCount;
   void studio.objectCount;
   void studio.resourceCount;
+  void studio.loadDiagnosticCount;
+  const loadDiagnostics: Array<LoadDiagnosticInfo> = studio.loadDiagnosticPage(0, 1);
+  void loadDiagnostics;
   void studio.filePage(0, 1);
   void studio.objectPage(0, 0, 1);
   void studio.resourcePage(0, 1);

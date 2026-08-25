@@ -98,6 +98,12 @@ pub struct ResourceInfo {
     pub byte_size: BigInt,
 }
 
+#[napi(object)]
+pub struct LoadDiagnosticInfo {
+    pub path: String,
+    pub message: String,
+}
+
 /// One Unity serialized-object pointer.
 #[napi(object)]
 pub struct ObjectReference {
@@ -837,6 +843,8 @@ pub struct OpenOptions {
     pub maximum_path_bytes: Option<u32>,
     /// Maximum cumulative UTF-8 bytes of paths discovered during one load.
     pub maximum_total_path_bytes: Option<u32>,
+    /// Maximum cumulative UTF-8 bytes retained by skipped-input diagnostics.
+    pub maximum_diagnostic_bytes: Option<i64>,
 }
 
 /// Complete caller-configurable Core export policy.
@@ -953,6 +961,11 @@ fn load_options(
                 options.maximum_total_path_bytes,
                 defaults.maximum_total_path_bytes,
             ),
+            maximum_diagnostic_bytes: usize_non_negative_limit(
+                options.maximum_diagnostic_bytes,
+                defaults.maximum_diagnostic_bytes,
+                "maximumDiagnosticBytes",
+            )?,
             ..defaults
         },
         unity_version_override,
@@ -1410,6 +1423,34 @@ impl AssetStudio {
     #[napi(getter)]
     pub fn resource_count(&self) -> Result<u32> {
         count_u32(self.studio.resource_count(), "resource count")
+    }
+
+    #[napi(getter)]
+    pub fn load_diagnostic_count(&self) -> Result<u32> {
+        count_u32(
+            self.studio.load_diagnostics().len(),
+            "load diagnostic count",
+        )
+    }
+
+    #[napi]
+    pub fn load_diagnostic_page(
+        &self,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Vec<LoadDiagnosticInfo>> {
+        let (offset, limit) = page(offset, limit)?;
+        let diagnostics = self.studio.load_diagnostics();
+        let available = diagnostics.len().saturating_sub(offset);
+        let count = available.min(limit);
+        let mut output = reserve(count, "load diagnostic page")?;
+        for diagnostic in diagnostics.iter().skip(offset).take(count) {
+            output.push(LoadDiagnosticInfo {
+                path: copy_string(&diagnostic.path, "load diagnostic path")?,
+                message: copy_string(&diagnostic.message, "load diagnostic message")?,
+            });
+        }
+        Ok(output)
     }
 
     #[napi]
@@ -5241,11 +5282,13 @@ fn core_error(error: assetstudio_core::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelTextureLimits, copy_path_string, materialize_core_bytes, model_texture_limits,
-        parse_audio_format, parse_export_mode, parse_filename_format, parse_image_format,
+        ModelTextureLimits, OpenOptions, copy_path_string, load_options, materialize_core_bytes,
+        model_texture_limits, parse_audio_format, parse_export_mode, parse_filename_format,
+        parse_image_format,
     };
     use assetstudio_core::export::{AudioExportFormat, ExportMode, FilenameFormat};
     use assetstudio_core::image_export::ImageFormat;
+    use assetstudio_core::loader::LoadFailurePolicy;
     use std::io::Write;
 
     #[test]
@@ -5274,6 +5317,29 @@ mod tests {
             configured.maximum_metadata_bytes,
             defaults.maximum_metadata_bytes
         );
+    }
+
+    #[test]
+    fn maps_the_load_diagnostic_budget() {
+        let defaults = load_options(None, None).unwrap();
+        assert_eq!(defaults.limits.maximum_diagnostic_bytes, 256 * 1024 * 1024);
+        let configured = load_options(
+            Some(OpenOptions {
+                unity_version: None,
+                unity_cn_key: None,
+                skip_unreadable_inputs: Some(true),
+                maximum_input_files: None,
+                maximum_input_directories: None,
+                maximum_directory_entries: None,
+                maximum_path_bytes: None,
+                maximum_total_path_bytes: None,
+                maximum_diagnostic_bytes: Some(0),
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(configured.limits.maximum_diagnostic_bytes, 0);
+        assert_eq!(configured.failure_policy, LoadFailurePolicy::SkipInput);
     }
 
     fn assert_bounded_option_error(error: &napi::Error, field: &str, oversized: &str) {

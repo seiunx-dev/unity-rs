@@ -34,6 +34,7 @@ CORE_TO_PYTHON = {
     "Studio.file_count": "AssetStudio.file_count",
     "Studio.object_count": "AssetStudio.object_count",
     "Studio.resource_count": "AssetStudio.resource_count",
+    "Studio.load_diagnostics": "AssetStudio.load_diagnostic_page",
     "Studio.files": "AssetStudio.files",
     "Studio.file": "AssetStudio.file_page",
     "Studio.resources": "AssetStudio.resources",

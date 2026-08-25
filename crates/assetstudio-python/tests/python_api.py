@@ -2303,6 +2303,21 @@ def main() -> None:
             tolerant = AssetStudio(mixed, skip_unreadable_inputs=True)
             assert tolerant.file_count == 2, tolerant.file_count
             assert tolerant.object_count == 2, tolerant.object_count
+            assert tolerant.load_diagnostic_count == 1
+            diagnostic = tolerant.load_diagnostic_page(limit=1)[0]
+            assert "b-archive" in diagnostic.path
+            assert "UnityArchive" in diagnostic.message
+            assert tolerant.load_diagnostic_page(offset=1) == []
+            try:
+                AssetStudio(
+                    mixed,
+                    skip_unreadable_inputs=True,
+                    maximum_diagnostic_bytes=0,
+                )
+            except ValueError as error:
+                assert "load diagnostics require" in str(error)
+            else:
+                raise AssertionError("load diagnostic budget should be enforced")
         assert studio.file_count == 1
         assert studio.object_count == 1
         assert studio.resource_count == 0

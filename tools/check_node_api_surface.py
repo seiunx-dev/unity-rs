@@ -39,6 +39,7 @@ CORE_TO_NODE = {
     "Studio.file_count": "AssetStudio.fileCount",
     "Studio.object_count": "AssetStudio.objectCount",
     "Studio.resource_count": "AssetStudio.resourceCount",
+    "Studio.load_diagnostics": "AssetStudio.loadDiagnosticPage",
     "Studio.files": "AssetStudio.filePage",
     "Studio.file": "AssetStudio.filePage",
     "Studio.resources": "AssetStudio.resourcePage",

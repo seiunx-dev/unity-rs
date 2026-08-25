@@ -36,6 +36,7 @@ from assetstudio import (
     FileInfo,
     LegacyAnimation,
     Live2dPackageSet,
+    LoadDiagnostic,
     Material,
     ModelObj,
     ModelTextureLimits,
@@ -105,6 +106,7 @@ def consume_public_api(
         path,
         maximum_path_bytes=1_048_576,
         maximum_total_path_bytes=67_108_864,
+        maximum_diagnostic_bytes=268_435_456,
         oodle_decoder=oodle_decoder,
     )
     memory: AssetStudio = AssetStudio.from_bytes(
@@ -117,12 +119,15 @@ def consume_public_api(
         [("fixture.assets", b"")],
         maximum_path_bytes=1_048_576,
         maximum_total_path_bytes=67_108_864,
+        maximum_diagnostic_bytes=268_435_456,
         oodle_decoder=oodle_decoder,
     )
 
     file_count: int = studio.file_count
     object_count: int = studio.object_count
     resource_count: int = studio.resource_count
+    load_diagnostic_count: int = studio.load_diagnostic_count
+    load_diagnostics: list[LoadDiagnostic] = studio.load_diagnostic_page(limit=1)
     files: list[FileInfo] = studio.files()
     objects: list[ObjectInfo] = studio.objects()
     resources: list[ResourceInfo] = studio.resources()
@@ -251,6 +256,8 @@ def consume_public_api(
         file_count,
         object_count,
         resource_count,
+        load_diagnostic_count,
+        load_diagnostics,
         files,
         objects,
         resources,

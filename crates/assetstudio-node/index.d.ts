@@ -71,6 +71,8 @@ export declare class AssetStudio {
   get fileCount(): number
   get objectCount(): number
   get resourceCount(): number
+  get loadDiagnosticCount(): number
+  loadDiagnosticPage(offset?: number | undefined | null, limit?: number | undefined | null): Array<LoadDiagnosticInfo>
   filePage(offset?: number | undefined | null, limit?: number | undefined | null): Array<FileInfo>
   objectPage(fileIndex: number, offset?: number | undefined | null, limit?: number | undefined | null): Array<ObjectInfo>
   resourcePage(offset?: number | undefined | null, limit?: number | undefined | null): Array<ResourceInfo>
@@ -792,6 +794,11 @@ export interface Live2DPackageSet {
   diagnostics: Array<Live2DDiagnostic>
 }
 
+export interface LoadDiagnosticInfo {
+  path: string
+  message: string
+}
+
 /** A `Material`'s shader reference and its named property sheets. */
 export interface Material {
   name: string
@@ -927,6 +934,8 @@ export interface OpenOptions {
   maximumPathBytes?: number
   /** Maximum cumulative UTF-8 bytes of paths discovered during one load. */
   maximumTotalPathBytes?: number
+  /** Maximum cumulative UTF-8 bytes retained by skipped-input diagnostics. */
+  maximumDiagnosticBytes?: number
 }
 
 /** The identity fields of a `PlayerSettings` object. */
