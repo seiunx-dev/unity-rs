@@ -49,11 +49,11 @@ methods:
 
 - `tools/check_node_api_surface.py` parses the four high-level Core impl blocks,
   the `#[napi] impl AssetStudio` block, mapped napi object fields, generated
-  `index.d.ts`, and the strict TypeScript consumer. All 106 public Core methods
+  `index.d.ts`, and the strict TypeScript consumer. All 107 public Core methods
   must map to a real symbol in both Rust and TypeScript or one of the four
   Rust-only ownership entries above.
 - The Rust class and generated declaration must expose exactly the same current
-  84 methods and 3 properties. A stale checked-in declaration, an addon method
+  85 methods and 4 properties. A stale checked-in declaration, an addon method
   missing from the declaration, or a declaration with no Rust export fails
   `quality` before a platform-specific addon is loaded.
 - Every public `AssetStudio` member is called by `tests/types.ts`; pinned `tsc`
@@ -69,8 +69,8 @@ methods:
 - `tests/installed_package.cjs` loads the packed tarball from a temporary
   consumer, parses the installed `index.d.ts`, and compares its static methods,
   instance methods, and getters bidirectionally with the installed native
-  `AssetStudio` class. The installed surface is therefore also locked at 84
-  methods and 3 properties; a reverse check renames one declaration method and
+  `AssetStudio` class. The installed surface is therefore also locked at 85
+  methods and 4 properties; a reverse check renames one declaration method and
   proves that an otherwise count-preserving drift is rejected. A source-tree
   addon cannot hide a missing platform binary, declaration, or runtime member
   from the published package.

@@ -74,9 +74,12 @@ accept `maximumPathBytes` and `maximumTotalPathBytes` through `OpenOptions`.
 They bound both caller labels and fully qualified paths created while
 recursively opening bundles, WebData and ZIP entries; gzip and Brotli wrappers
 retain the same path and are not charged a second time. The defaults match the
-in-memory input contract: 1 MiB per path and 64 MiB across one load. The
-complete Core-to-Node disposition and the source/declaration/consumer checks
-are recorded in
+in-memory input contract: 1 MiB per path and 64 MiB across one load. When
+`skipUnreadableInputs` is enabled, `maximumDiagnosticBytes` separately limits
+the retained skipped-input path and message strings (256 MiB by default), and
+`loadDiagnosticCount` plus `loadDiagnosticPage` expose them without copying
+the complete table. The complete Core-to-Node disposition and the
+source/declaration/consumer checks are recorded in
 [`docs/node-api-audit.md`](../../docs/node-api-audit.md).
 
 ACL callback results stay as opaque JavaScript values until the returned

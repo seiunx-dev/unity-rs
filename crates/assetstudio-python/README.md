@@ -88,6 +88,8 @@ studio = AssetStudio(
     maximum_directory_entries=200_000,
     maximum_path_bytes=1_048_576,
     maximum_total_path_bytes=67_108_864,
+    maximum_diagnostic_bytes=256 * 1024 * 1024,
+    skip_unreadable_inputs=True,
 )
 
 memory_studio = AssetStudio.from_bytes(downloaded_bundle, name="download.bundle")
@@ -112,6 +114,12 @@ for resource in studio.iter_resources():
     print(resource.index, resource.path, resource.byte_size)
 resource_bytes = studio.read_resource_by_path("sharedassets0.resource")
 header = studio.read_resource_range(0, offset=0, length=4096)
+
+# Tolerant loads retain only bounded skipped-input metadata and expose it by
+# page instead of copying the whole diagnostic table at once.
+print(studio.load_diagnostic_count)
+for diagnostic in studio.load_diagnostic_page(offset=0, limit=4096):
+    print(diagnostic.path, diagnostic.message)
 
 # Page one serialized file without copying the rest of its object table.
 page = studio.object_page(0, offset=0, limit=4096)
