@@ -30,7 +30,9 @@ use assetstudio_core::live2d_physics::CubismPhysicsReadLimits;
 use assetstudio_core::live2d_schema::{
     CubismAuxiliaryReadLimits, CubismExpressionBlend, CubismExpressionReadLimits,
 };
-use assetstudio_core::loader::{AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy};
+use assetstudio_core::loader::{
+    AssetLoadLimits, AssetLoadOptions, LoadDiagnostic, LoadFailurePolicy,
+};
 use assetstudio_core::material::{Material, MaterialReadLimits, NamedMaterialProperty};
 use assetstudio_core::mesh::MeshReadLimits;
 use assetstudio_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
@@ -258,6 +260,13 @@ struct PyResourceInfo {
     index: usize,
     path: String,
     byte_size: u64,
+}
+
+#[pyclass(name = "LoadDiagnostic", frozen, get_all)]
+#[derive(Debug)]
+struct PyLoadDiagnostic {
+    path: String,
+    message: String,
 }
 
 /// Bounded metadata for one parsed Unity or Tuanjie `AnimationClip`.
@@ -2342,6 +2351,7 @@ impl PyAssetStudio {
         maximum_directory_entries=2_000_000,
         maximum_path_bytes=1_048_576,
         maximum_total_path_bytes=67_108_864,
+        maximum_diagnostic_bytes=268_435_456,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
         unity_cn_key=None
@@ -2358,6 +2368,7 @@ impl PyAssetStudio {
         maximum_directory_entries: usize,
         maximum_path_bytes: usize,
         maximum_total_path_bytes: usize,
+        maximum_diagnostic_bytes: usize,
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
         unity_cn_key: Option<Py<PyAny>>,
@@ -2371,6 +2382,7 @@ impl PyAssetStudio {
                 maximum_directory_entries,
                 maximum_path_bytes,
                 maximum_total_path_bytes,
+                maximum_diagnostic_bytes,
                 ..AssetLoadLimits::default()
             },
             unity_version_override,
@@ -2443,6 +2455,7 @@ impl PyAssetStudio {
         maximum_total_bytes=4_294_967_296,
         maximum_path_bytes=1_048_576,
         maximum_total_path_bytes=67_108_864,
+        maximum_diagnostic_bytes=268_435_456,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
         unity_cn_key=None
@@ -2459,6 +2472,7 @@ impl PyAssetStudio {
         maximum_total_bytes: u64,
         maximum_path_bytes: usize,
         maximum_total_path_bytes: usize,
+        maximum_diagnostic_bytes: usize,
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
         unity_cn_key: Option<Py<PyAny>>,
@@ -2478,6 +2492,7 @@ impl PyAssetStudio {
                 maximum_single_entry_bytes: maximum_file_bytes,
                 maximum_path_bytes,
                 maximum_total_path_bytes,
+                maximum_diagnostic_bytes,
                 ..AssetLoadLimits::default()
             },
             unity_version_override: parse_unity_version_override(unity_version)?,
@@ -2503,6 +2518,25 @@ impl PyAssetStudio {
     #[getter]
     fn resource_count(&self) -> usize {
         self.studio.resource_count()
+    }
+
+    #[getter]
+    fn load_diagnostic_count(&self) -> usize {
+        self.studio.load_diagnostics().len()
+    }
+
+    /// Returns a bounded page of inputs skipped by the tolerant load policy.
+    #[pyo3(signature = (*, offset=0, limit=4_096))]
+    fn load_diagnostic_page(&self, offset: usize, limit: usize) -> PyResult<Vec<PyLoadDiagnostic>> {
+        check_metadata_page_limit(limit)?;
+        let diagnostics = self.studio.load_diagnostics();
+        let available = diagnostics.len().saturating_sub(offset);
+        let count = available.min(limit);
+        let mut output = reserve_metadata(count, "Python load diagnostic page")?;
+        for diagnostic in diagnostics.iter().skip(offset).take(count) {
+            output.push(python_load_diagnostic(diagnostic)?);
+        }
+        Ok(output)
     }
 
     /// Returns all file metadata for convenience. Use `iter_files()` or
@@ -4651,6 +4685,13 @@ fn python_resource_info(resource: StudioResource<'_>) -> PyResult<PyResourceInfo
     })
 }
 
+fn python_load_diagnostic(diagnostic: &LoadDiagnostic) -> PyResult<PyLoadDiagnostic> {
+    Ok(PyLoadDiagnostic {
+        path: try_copy_string(&diagnostic.path, "load diagnostic path")?,
+        message: try_copy_string(&diagnostic.message, "load diagnostic message")?,
+    })
+}
+
 /// Parses a caller-supplied `UnityCN` key from 16 bytes or a 16-byte string.
 ///
 /// The package never ships or derives keys; obtaining one for a title is the
@@ -6043,6 +6084,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyFileInfo>()?;
     module.add_class::<PyObjectInfo>()?;
     module.add_class::<PyResourceInfo>()?;
+    module.add_class::<PyLoadDiagnostic>()?;
     module.add_class::<PyAnimationClip>()?;
     module.add_class::<PyLegacyAnimation>()?;
     module.add_class::<PyAnimatorOverrideController>()?;

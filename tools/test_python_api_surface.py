@@ -34,12 +34,12 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
             check_python_api_surface.STUB.read_text(encoding="utf-8"),
             check_python_api_surface.CONSUMER.read_text(encoding="utf-8"),
         )
-        self.assertEqual((methods, properties), (65, 3))
+        self.assertEqual((methods, properties), (66, 4))
         core_methods, rust_only = check_python_api_surface.validate_core_mapping(
             check_python_api_surface.CORE_STUDIO.read_text(encoding="utf-8"),
             check_python_api_surface.STUB.read_text(encoding="utf-8"),
         )
-        self.assertEqual((core_methods, rust_only), (106, 4))
+        self.assertEqual((core_methods, rust_only), (107, 4))
 
     def test_instance_method_omission_is_rejected(self) -> None:
         consumer = COMPLETE_CONSUMER.replace("    studio.read_text(0)\n", "")

@@ -22,7 +22,7 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
                 self.rust,
                 self.declarations,
             ),
-            (84, 3),
+            (85, 4),
         )
         self.assertEqual(
             check_node_api_surface.validate_core_mapping(
@@ -30,14 +30,14 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
                 self.rust,
                 self.declarations,
             ),
-            (106, 4),
+            (107, 4),
         )
         self.assertEqual(
             check_node_api_surface.validate_surface(
                 self.declarations,
                 self.consumer,
             ),
-            (84, 3),
+            (85, 4),
         )
 
     def test_new_core_method_must_be_classified(self) -> None:

@@ -2343,6 +2343,33 @@ console.log('node api: multi-buffer, resource range and scene ok')
     const extraction = addon.AssetStudio.extract(source, extractRoot)
     assert.equal(extraction.failureCount, 0)
     assert.ok(extraction.outputBytes > 0n)
+
+    const mixed = path.join(outputDirectory, 'mixed-load')
+    fs.mkdirSync(mixed)
+    fs.writeFileSync(path.join(mixed, 'a-good.assets'), syntheticTextAsset())
+    const archive = Buffer.concat([
+      Buffer.from('UnityArchive\0'),
+      Buffer.from([0, 0, 0, 5]),
+      Buffer.from('5.x.x\0'),
+      Buffer.from('5.0.0f4\0'),
+    ])
+    fs.writeFileSync(path.join(mixed, 'b-archive.unity3d'), archive)
+    const tolerant = addon.AssetStudio.openWith(mixed, {
+      skipUnreadableInputs: true,
+      maximumDiagnosticBytes: 256 * 1024 * 1024,
+    })
+    assert.equal(tolerant.loadDiagnosticCount, 1)
+    const loadDiagnostic = tolerant.loadDiagnosticPage(0, 1)[0]
+    assert.match(loadDiagnostic.path, /b-archive/)
+    assert.match(loadDiagnostic.message, /UnityArchive/)
+    assert.deepStrictEqual(tolerant.loadDiagnosticPage(1), [])
+    assert.throws(
+      () => addon.AssetStudio.openWith(mixed, {
+        skipUnreadableInputs: true,
+        maximumDiagnosticBytes: 0,
+      }),
+      /load diagnostics require/i,
+    )
   } finally {
     fs.rmSync(outputDirectory, { recursive: true, force: true })
   }

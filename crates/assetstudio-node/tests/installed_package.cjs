@@ -65,8 +65,8 @@ function assertAssetStudioSurface(assetStudio, declaration, checkCounts = true) 
   assert.deepEqual(runtime.instanceMethods, declared.instanceMethods);
   assert.deepEqual(runtime.getters, declared.getters);
   if (checkCounts) {
-    assert.equal(declared.staticMethods.length + declared.instanceMethods.length, 84);
-    assert.equal(declared.getters.length, 3);
+    assert.equal(declared.staticMethods.length + declared.instanceMethods.length, 85);
+    assert.equal(declared.getters.length, 4);
   }
 }
 

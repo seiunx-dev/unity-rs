@@ -45,6 +45,12 @@ class ResourceInfo:
     @property
     def byte_size(self) -> int: ...
 
+class LoadDiagnostic:
+    @property
+    def path(self) -> str: ...
+    @property
+    def message(self) -> str: ...
+
 class FileIterator(Iterator[FileInfo]):
     def __iter__(self) -> FileIterator: ...
     def __next__(self) -> FileInfo: ...
@@ -952,6 +958,7 @@ class AssetStudio:
         maximum_directory_entries: int = 2_000_000,
         maximum_path_bytes: int = 1_048_576,
         maximum_total_path_bytes: int = 67_108_864,
+        maximum_diagnostic_bytes: int = 268_435_456,
         oodle_decoder: Optional[OodleDecoder] = None,
         skip_unreadable_inputs: bool = False,
         unity_cn_key: Union[bytes, str, None] = None,
@@ -977,6 +984,7 @@ class AssetStudio:
         maximum_total_bytes: int = 4_294_967_296,
         maximum_path_bytes: int = 1_048_576,
         maximum_total_path_bytes: int = 67_108_864,
+        maximum_diagnostic_bytes: int = 268_435_456,
         oodle_decoder: Optional[OodleDecoder] = None,
         skip_unreadable_inputs: bool = False,
         unity_cn_key: Union[bytes, str, None] = None,
@@ -987,6 +995,14 @@ class AssetStudio:
     def object_count(self) -> int: ...
     @property
     def resource_count(self) -> int: ...
+    @property
+    def load_diagnostic_count(self) -> int: ...
+    def load_diagnostic_page(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 4096,
+    ) -> list[LoadDiagnostic]: ...
     def files(self) -> list[FileInfo]: ...
     def objects(self) -> list[ObjectInfo]: ...
     def resources(self) -> list[ResourceInfo]: ...

@@ -38,7 +38,9 @@ use crate::live2d_schema::{
     CubismAuxiliaryReadLimits, CubismDisplayInfo, CubismExpression, CubismExpressionReadLimits,
     CubismPosePart, read_cubism_display_info, read_cubism_expression, read_cubism_pose_part,
 };
-use crate::loader::{AssetCollection, AssetLoadOptions, LoadedResource, LoadedSerializedFile};
+use crate::loader::{
+    AssetCollection, AssetLoadOptions, LoadDiagnostic, LoadedResource, LoadedSerializedFile,
+};
 use crate::material::{Material, MaterialReadLimits, read_material};
 use crate::mesh::{MeshReadLimits, write_mesh_object_obj_with_collection};
 use crate::model_animation::{ModelAnimationLimits, build_model_animations_with_acl_decoder};
@@ -168,6 +170,12 @@ impl Studio {
     #[must_use]
     pub fn resource_count(&self) -> usize {
         self.collection.resources.len()
+    }
+
+    /// Returns skipped-input diagnostics in deterministic discovery order.
+    #[must_use]
+    pub fn load_diagnostics(&self) -> &[LoadDiagnostic] {
+        &self.collection.diagnostics
     }
 
     /// Iterates files in deterministic collection order.
