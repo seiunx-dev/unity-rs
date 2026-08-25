@@ -103,7 +103,7 @@ static object? Live2DPackages(AssetsManager manager)
     CubismLive2DExtractor.Live2DExtractor.MocDict = mocDict;
     var destination = Path.Combine(
         Path.GetTempPath(),
-        $"assetstudio-oracle-live2d-{Environment.ProcessId}-{Guid.NewGuid():N}");
+        $"unity-rs-oracle-live2d-{Environment.ProcessId}-{Guid.NewGuid():N}");
     try
     {
         var extractor = new CubismLive2DExtractor.Live2DExtractor(

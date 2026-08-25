@@ -396,12 +396,12 @@ def export_and_validate() -> int:
     import tempfile
 
     root = Path(__file__).resolve().parent.parent
-    with tempfile.TemporaryDirectory(prefix="assetstudio-fbx-") as directory:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-fbx-") as directory:
         assets = Path(directory) / "model.assets"
         assets.write_bytes(synthetic_model())
         output = Path(directory) / "model.fbx"
         result = subprocess.run(
-            ["cargo", "run", "--quiet", "-p", "assetstudio-cli", "--locked", "--",
+            ["cargo", "run", "--quiet", "-p", "unity-rs-cli", "--locked", "--",
              "fbx", "--binary", str(assets), str(output)],
             cwd=root, capture_output=True, text=True,
         )

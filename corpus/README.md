@@ -31,8 +31,8 @@ belong in the repository.
    one:
 
    ```shell
-   ASSETSTUDIO_CORPUS_MANIFEST=/private/corpus/manifest.json \
-     cargo test -p assetstudio-core --test real_corpus --locked \
+   UNITY_RS_CORPUS_MANIFEST=/private/corpus/manifest.json \
+     cargo test -p unity-rs-core --test real_corpus --locked \
        -- --ignored --nocapture
    ```
 

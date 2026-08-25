@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
-NODE_PACKAGE = ROOT / "crates/assetstudio-node/package.json"
+NODE_PACKAGE = ROOT / "crates/unity-rs-node/package.json"
 EXPECTED_PLATFORMS = [
     ("ubuntu-latest", "linux-x64"),
     ("ubuntu-24.04-arm", "linux-arm64"),
@@ -185,14 +185,14 @@ def validate_platform_job(workflow: str, job_name: str) -> None:
         if job_name == "package-cli":
             windows = entry["artifact"].startswith("windows-")
             expected_binary = (
-                "target/release/assetstudio.exe"
+                "target/release/unity-rs.exe"
                 if windows
-                else "target/release/assetstudio"
+                else "target/release/unity-rs"
             )
             expected_smoke = (
-                ".\\target\\release\\artifact\\assetstudio.exe --help"
+                ".\\target\\release\\artifact\\unity-rs.exe --help"
                 if windows
-                else "./target/release/artifact/assetstudio --help"
+                else "./target/release/artifact/unity-rs --help"
             )
             if entry["binary"] != expected_binary or entry["smoke"] != expected_smoke:
                 raise AuditError(
@@ -217,14 +217,14 @@ def validate_workflow(workflow: str) -> None:
         ),
     )
     require_fragments(
-        python_block, "python", ("path: crates/assetstudio-python/dist/*.whl",)
+        python_block, "python", ("path: crates/unity-rs-python/dist/*.whl",)
     )
     cli_block = job_block(workflow, "package-cli")
     require_run_commands(
         cli_block,
         "package-cli",
         (
-            "cargo +1.88.0 build --release --locked -p assetstudio-cli",
+            "cargo +1.88.0 build --release --locked -p unity-rs-cli",
             "${{ matrix.smoke }}",
             "python tools/stage_cli_artifact.py",
         ),
@@ -248,7 +248,7 @@ def validate_workflow(workflow: str) -> None:
         ),
     )
     require_fragments(
-        node_block, "package-node", ("path: crates/assetstudio-node/*.tgz",)
+        node_block, "package-node", ("path: crates/unity-rs-node/*.tgz",)
     )
     require_run_commands(
         job_block(workflow, "quality"),

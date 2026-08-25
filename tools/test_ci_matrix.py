@@ -50,8 +50,8 @@ class CiMatrixAuditTests(unittest.TestCase):
 
     def test_cli_smoke_must_name_the_staged_binary(self) -> None:
         altered = self.workflow.replace(
-            "            smoke: ./target/release/artifact/assetstudio --help\n",
-            "            smoke: ./target/release/assetstudio --help\n",
+            "            smoke: ./target/release/artifact/unity-rs --help\n",
+            "            smoke: ./target/release/unity-rs --help\n",
             1,
         )
         self.assertNotEqual(altered, self.workflow)

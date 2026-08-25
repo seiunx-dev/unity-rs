@@ -24,52 +24,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "assetstudio-cli"
-version = "0.1.0"
-dependencies = [
- "assetstudio-core",
-]
-
-[[package]]
-name = "assetstudio-core"
-version = "0.1.0"
-dependencies = [
- "brotli",
- "flate2",
- "image-webp",
- "jpeg-encoder",
- "lewton",
- "lz4_flex",
- "lzma-rust2",
- "ruopus",
- "serde",
- "serde_json",
- "symphonia",
- "texture2ddecoder",
- "zip",
- "zstd",
- "zune-jpeg",
-]
-
-[[package]]
-name = "assetstudio-node"
-version = "0.1.0"
-dependencies = [
- "assetstudio-core",
- "napi",
- "napi-build",
- "napi-derive",
-]
-
-[[package]]
-name = "assetstudio-python"
-version = "0.1.0"
-dependencies = [
- "assetstudio-core",
- "pyo3",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,6 +765,52 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unity-rs-cli"
+version = "0.1.0"
+dependencies = [
+ "unity-rs-core",
+]
+
+[[package]]
+name = "unity-rs-core"
+version = "0.1.0"
+dependencies = [
+ "brotli",
+ "flate2",
+ "image-webp",
+ "jpeg-encoder",
+ "lewton",
+ "lz4_flex",
+ "lzma-rust2",
+ "ruopus",
+ "serde",
+ "serde_json",
+ "symphonia",
+ "texture2ddecoder",
+ "zip",
+ "zstd",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "unity-rs-node"
+version = "0.1.0"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "unity-rs-core",
+]
+
+[[package]]
+name = "unity-rs-python"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "unity-rs-core",
+]
 
 [[package]]
 name = "windows-link"

@@ -12,33 +12,33 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_PRIMARY_TARGET = {
-    "assetstudio-cli": ("assetstudio", ("bin",), ("bin",)),
-    "assetstudio-core": ("assetstudio_core", ("lib",), ("lib",)),
-    "assetstudio-node": ("assetstudio_node", ("cdylib",), ("cdylib",)),
-    "assetstudio-python": ("_native", ("cdylib",), ("cdylib",)),
+    "unity-rs-cli": ("unity-rs", ("bin",), ("bin",)),
+    "unity-rs-core": ("unity_rs_core", ("lib",), ("lib",)),
+    "unity-rs-node": ("unity_rs_node", ("cdylib",), ("cdylib",)),
+    "unity-rs-python": ("_native", ("cdylib",), ("cdylib",)),
 }
 NON_DELIVERY_TARGET_KINDS = {"bench", "custom-build", "example", "test"}
-BINDINGS = ("assetstudio-cli", "assetstudio-node", "assetstudio-python")
+BINDINGS = ("unity-rs-cli", "unity-rs-node", "unity-rs-python")
 FORBIDDEN_PACKAGE_NAMES = {
-    "assetstudio-ffi",
-    "assetstudio-gui",
-    "assetstudiogui",
-    "haruki-assetstudio-ffi",
+    "unity-rs-ffi",
+    "unity-rs-gui",
+    "unity-rsgui",
+    "haruki-unity-rs-ffi",
 }
 FORBIDDEN_SOURCE_FILES = (
-    Path("crates/assetstudio-ffi/Cargo.toml"),
-    Path("crates/assetstudio-ffi/src/lib.rs"),
+    Path("crates/unity-rs-ffi/Cargo.toml"),
+    Path("crates/unity-rs-ffi/src/lib.rs"),
 )
-FORBIDDEN_REPOSITORY_PATHS = (Path("crates/assetstudio-ffi"),)
+FORBIDDEN_REPOSITORY_PATHS = (Path("crates/unity-rs-ffi"),)
 DELIVERY_CONFIGURATION_FILES = (Path("Cargo.toml"), Path(".gitignore"))
 PUBLIC_API_FILES = (
-    Path("crates/assetstudio-core/src/lib.rs"),
-    Path("crates/assetstudio-core/src/studio.rs"),
-    Path("crates/assetstudio-python/python/assetstudio/__init__.pyi"),
-    Path("crates/assetstudio-node/index.d.ts"),
+    Path("crates/unity-rs-core/src/lib.rs"),
+    Path("crates/unity-rs-core/src/studio.rs"),
+    Path("crates/unity-rs-python/python/unity_rs/__init__.pyi"),
+    Path("crates/unity-rs-node/index.d.ts"),
 )
 FORBIDDEN_PUBLIC_API_PATTERN = re.compile(
-    r"\b(?:AssetStudio|Studio)?Context\b|\bcontext_id\b|\bcontextId\b|"
+    r"\b(?:UnityRs|Studio)?Context\b|\bcontext_id\b|\bcontextId\b|"
     r"\bContextOpen\b|\bContextClose\b|\bfor_each_os_str_char_lossy\b|"
     r"\blossy_os_str_utf8_length\b"
 )
@@ -80,7 +80,7 @@ def check_retired_surfaces(root: Path = ROOT) -> None:
         )
     for relative in DELIVERY_CONFIGURATION_FILES:
         configuration = (root / relative).read_text(encoding="utf-8")
-        assert "assetstudio-ffi" not in configuration.casefold(), (
+        assert "unity-rs-ffi" not in configuration.casefold(), (
             "the retired custom C ABI crate must not remain as a workspace or ignore rule",
             relative,
         )
@@ -95,9 +95,9 @@ def check_retired_surfaces(root: Path = ROOT) -> None:
             match.group(0) if match else None,
         )
     rust_source_roots = (
-        root / "crates/assetstudio-core/src",
-        root / "crates/assetstudio-python/src",
-        root / "crates/assetstudio-node/src",
+        root / "crates/unity-rs-core/src",
+        root / "crates/unity-rs-python/src",
+        root / "crates/unity-rs-node/src",
     )
     for source_root in rust_source_roots:
         for rust_source in source_root.rglob("*.rs"):
@@ -108,7 +108,7 @@ def check_retired_surfaces(root: Path = ROOT) -> None:
                 rust_source.relative_to(root),
                 match.group(0) if match else None,
             )
-    first_party_rust_roots = (*rust_source_roots, root / "crates/assetstudio-cli/src")
+    first_party_rust_roots = (*rust_source_roots, root / "crates/unity-rs-cli/src")
     for source_root in first_party_rust_roots:
         for rust_source in source_root.rglob("*.rs"):
             source = rust_source.read_text(encoding="utf-8")
@@ -183,7 +183,7 @@ def main() -> int:
         )
         assert not forbidden, (name, forbidden)
         if name in BINDINGS:
-            assert "assetstudio-core" in normal_dependencies, (name, normal_dependencies)
+            assert "unity-rs-core" in normal_dependencies, (name, normal_dependencies)
         else:
             assert not (normal_dependencies & set(BINDINGS)), normal_dependencies
 

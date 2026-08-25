@@ -1,0 +1,47 @@
+{
+  "name": "unity-rs-node",
+  "version": "0.1.0",
+  "description": "Native Node.js bindings for unity-rs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Team-Haruki/unity-rs.git",
+    "directory": "crates/unity-rs-node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "THIRD_PARTY_LICENSES.txt",
+    "*.node"
+  ],
+  "engines": {
+    "node": ">=20.17"
+  },
+  "scripts": {
+    "build": "napi build --platform --release -- --locked",
+    "build:debug": "napi build --platform -- --locked",
+    "test": "node tests/node_api.cjs && npm run test:types",
+    "test:types": "tsc --project tests/tsconfig.json",
+    "test:package": "node tests/package_contents.cjs && node tests/installed_package.cjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.8.6",
+    "@types/node": "24.13.3",
+    "typescript": "6.0.3"
+  },
+  "napi": {
+    "binaryName": "unity-rs-node",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ]
+  }
+}

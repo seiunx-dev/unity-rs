@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compares decoded textures against UnityPy's, and bounds how far they may differ.
 
-`crates/assetstudio-python/tests/unitypy_oracle.py` compares the
+`crates/unity-rs-python/tests/unitypy_oracle.py` compares the
 serialized-file layer and deliberately stops there, on the grounds that UnityPy
 decodes textures with the same `texture2ddecoder` crate this crate depends on,
 so agreement would prove nothing. That reasoning does not survive contact with
@@ -89,7 +89,7 @@ def decoded_by_this_crate(
     bundle: Path, output: Path, unity_version: str | None
 ) -> dict[int, bytes]:
     """Exports every texture as raw RGBA, keyed by path ID."""
-    command = ["cargo", "run", "--release", "--quiet", "-p", "assetstudio-cli", "--locked", "--"]
+    command = ["cargo", "run", "--release", "--quiet", "-p", "unity-rs-cli", "--locked", "--"]
     if unity_version:
         command += ["--unity-version", unity_version]
     # Only the class this compares. Exporting the whole bundle means an
@@ -138,7 +138,7 @@ def main() -> int:
     compared = 0
     skipped = 0
 
-    with tempfile.TemporaryDirectory(prefix="assetstudio-texdiff-") as work:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-texdiff-") as work:
         for bundle in bundles:
             output = Path(work) / bundle.stem
             ours = decoded_by_this_crate(bundle, output, unity_version)

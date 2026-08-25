@@ -88,8 +88,8 @@ survive the clamp, and avoids `f32::round`, which the crate cannot use in
 Decode any HDR payload with both this crate and the reference C++ decoder and
 compare. In this repository:
 
-* `cargo test -p assetstudio-core --lib bc6h_decodes_exactly_like_the_managed_decoder`
-* `cargo test -p assetstudio-core --lib hdr_astc_decodes_exactly_like_the_managed_decoder`
+* `cargo test -p unity-rs-core --lib bc6h_decodes_exactly_like_the_managed_decoder`
+* `cargo test -p unity-rs-core --lib hdr_astc_decodes_exactly_like_the_managed_decoder`
 
 Both compare against blobs of reference output committed beside the fixtures
 (`tests/fixtures/bc6h/`, `tests/fixtures/astc/`). Before the fix they asserted
@@ -104,7 +104,7 @@ malformed block produces.
 
 Present on `master` as of 2026-08-15; 0.1.2 is the latest release. Not filed.
 
-**Fixed here by vendoring.** `crates/assetstudio-core/src/vendor/texture2ddecoder/`
+**Fixed here by vendoring.** `crates/unity-rs-core/src/vendor/texture2ddecoder/`
 carries the ASTC and BC6H decoders with the two expressions above corrected
 and nothing else changed, so the copy diffs cleanly against the published
 source. Every other format still comes from the crate. All eighteen ASTC
@@ -200,7 +200,7 @@ and the same for `colors[5]` and `colors[6]`.
 Present on `master` as of 2026-08-15; 0.1.2 is the latest release. Not filed.
 
 **Fixed here by vendoring**, alongside the two rounding defects above:
-`crates/assetstudio-core/src/vendor/texture2ddecoder/atc.rs` carries the
+`crates/unity-rs-core/src/vendor/texture2ddecoder/atc.rs` carries the
 decoder with that one expression corrected. `ATC_RGB4` and `ATC_RGBA8` are now
 in the managed differential and agree exactly, which is also how the defect
 was found -- adding the two formats to the comparison was an audit's

@@ -1,4 +1,4 @@
-# AssetStudio Rust 重写进度与缺口
+# unity-rs 重写进度与缺口
 
 最后更新：2026-08-25（Asia/Shanghai）
 
@@ -8,10 +8,10 @@
 
 重写的正式交付面为：
 
-- `assetstudio-core`：不依赖 .NET 的安全 Rust 解析和导出内核；
-- `assetstudio-rs`：通过 PyO3 直接调用 Rust Core 的 Python 3.9+ abi3 包；
-- `assetstudio`：用于批处理、调试和回归验证的原生 CLI；
-- `assetstudio-rs-node`：通过 napi-rs 直接调用 Rust Core 的可选 Node-API 包。
+- `unity-rs-core`：不依赖 .NET 的安全 Rust 解析和导出内核；
+- `unity-rs`：通过 PyO3 直接调用 Rust Core 的 Python 3.9+ abi3 包；
+- `unity-rs`：用于批处理、调试和回归验证的原生 CLI；
+- `unity-rs-node`：通过 napi-rs 直接调用 Rust Core 的可选 Node-API 包。
 
 以下内容明确不属于重写目标，也不计入完成条件：
 
@@ -22,7 +22,7 @@
 `corpus/` 验收工程和兼容矩阵中，继续稳定返回 `Unsupported`，不猜布局。它们仍是未来
 兼容性 1.0 的证据缺口，但按本次迁移约定不阻塞无头 Rust/Python 运行时重写的完成。
 
-托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `ASSETSTUDIO_REPO` 或同级目录定位它。旧 `assetstudio-ffi`/context handle 源码已从仓库删除，不再只是排除在 Cargo workspace 之外。
+托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `UNITY_RS_ORACLE_REPO` 或同级目录定位它。旧 `unity-rs-ffi`/context handle 源码已从仓库删除，不再只是排除在 Cargo workspace 之外。
 
 ## 当前阶段
 
@@ -40,7 +40,7 @@
 这些状态是风险分级，不是按代码行数计算的完成百分比。
 Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classifier；安装后门禁同时
 拒绝旧 Alpha classifier，避免代码、文档与包索引显示不同成熟度。Python 本地开发与发布
-命令也已改用独立仓库根下的 `crates/assetstudio-python`，不再引用迁仓前的 `rust/` 前缀。
+命令也已改用独立仓库根下的 `crates/unity-rs-python`，不再引用迁仓前的 `rust/` 前缀。
 
 ### 距离 1.0 还差什么
 
@@ -169,7 +169,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   再显式建立引用/资源索引或解析对象元数据。外部安全 Rust 代码不能在索引建立后直接改
   PathID、换序或插入同名资源，因此不会让首匹配语义与缓存表静默分叉；编译失败 rustdoc
   回归锁定这条边界，parts 往返回归则锁定诊断保留、派生 metadata/index 丢弃和重建；
-- 旧 `assetstudio-ffi` 已于 2026-08-23 从仓库删除，而不是继续作为 excluded crate 保留；
+- 旧 `unity-rs-ffi` 已于 2026-08-23 从仓库删除，而不是继续作为 excluded crate 保留；
   root workspace 不再需要 `exclude` 例外，本地遗留的独立 target/Cargo.lock/dylib 缓存也已清理。
   Rust 公开 `Studio`、Python stub 与 Node 声明本来已经直接持有高层对象、没有 context handle；
   交付范围门禁现在同时拒绝旧 FFI 源文件和 `StudioContext`/`context_id`/`contextId` 回流，
@@ -180,7 +180,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   绑定内部接口。Core walker 现为 `pub(crate)`，Python 和 Node 各自保留私有两趟实现，并
   分别维持 `MemoryError` 与 napi 错误分类；交付范围门禁会阻止这两个 helper 名称重新从
   Core 根部导出。
-  整个 `crates/assetstudio-ffi` 路径（包括仅含 ignored cache 的空壳）、root `Cargo.toml` 与
+  整个 `crates/unity-rs-ffi` 路径（包括仅含 ignored cache 的空壳）、root `Cargo.toml` 与
   `.gitignore` 都不得保留旧 crate；全部 Core、
   Python 与 Node Rust 源文件还会扫描公开声明，避免非根模块重新引入 `pub *Context`。
   每个 workspace package 的生产 target 还必须精确等于 Core lib、CLI bin、Python cdylib 或
@@ -191,27 +191,27 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `outputs quality rust python node typing security cross` 与 Linux amd64/arm64 原生矩阵，
   Core/CLI、release CLI、Python wheel 和 Node addon/npm 全部通过且零组跳过。Python
   安装后公开面本就双向核对 `__all__` 与 stub；Node addon 另新增精确顶层导出断言，当前
-  `Object.keys` 必须恰为 `AssetStudio`，不能静默多出未声明的 `Context` runtime class；
+  `Object.keys` 必须恰为 `UnityRs`，不能静默多出未声明的 `Context` runtime class；
   Python/Node 的 `cdylib` 仍会由 PyO3/napi 生成各自宿主规定的模块入口，这是两种语言加载
   native extension 所必需的 ABI，不是本项目另行设计、发布或承诺兼容的 C API/context；
 - Node 提供本地模块、TypeScript 声明、同步 API 和 libuv worker Promise API；`readAudioClip` 与 Core/Python 共用 `auto`/`raw`/`wav` 策略和输出预算，旧的 raw-only `readAudio` 继续兼容；`exportWithOptions` 完整暴露 Core 的模式、命名、图片/音频、JSON、覆盖和全部单项/累计预算，旧的紧凑 export 调用继续兼容；Tuanjie ACL decoder 可通过 worker 注入整场景 ASCII/binary FBX、选定 GameObject FBX、Cubism motion 和完整 Live2D 包，完整包调用还能同时消费可信外部 schema；旧的 `scene(maximumGameObjects?)` 调用保持兼容，`sceneWithLimits` 可分别限制 GameObject、组件、Transform 子项、材质、骨骼和层级边；
 - Node tarball 门禁不再只数 `.node` 文件个数：它按当前 CI 平台精确要求
   `darwin-{x64,arm64}`、`linux-{x64,arm64}-gnu` 或 `win32-{x64,arm64}-msvc` 文件名，随后
   真正 `npm pack`、在临时消费者中离线安装该 `.tgz`，再从安装目录 `require()` 并断言运行时
-  顶层导出恰为 `AssetStudio`。安装后的 `index.d.ts` 还会被重新解析，并与安装后的 native
+  顶层导出恰为 `UnityRs`。安装后的 `index.d.ts` 还会被重新解析，并与安装后的 native
   class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 85 个方法与 4 个
   属性，另以保持数量不变的重命名反向测试证明不是只数成员。源码树能加载但发布包漏文件、
   声明/运行时漂移或带错架构时都会直接失败。macOS
   arm64 debug/release 与 Linux amd64/arm64 release 容器已实际通过；2026-08-24 的正式
   GitHub runner 又完成 Windows x64/arm64 以及其余五个平台的发布包验证；
 - 原生 CLI 发布任务会先把二进制、`LICENSE`、第三方 notices 与完整许可证集合 stage 到最终
-  上传目录，再执行该目录中的 `assetstudio[.exe] --help`；不再只运行构建目录原件后假定复制品
+  上传目录，再执行该目录中的 `unity-rs[.exe] --help`；不再只运行构建目录原件后假定复制品
   等价。矩阵审计同时锁定六个平台的 staged 路径和 stage-before-smoke 顺序，本地临时 artifact
   与 Linux amd64/arm64 容器也执行同一份复制后的二进制；2026-08-24 的手工发布矩阵已让六个
   CLI artifact 和六个 Node artifact 全部在对应 GitHub runner 上构建、smoke 并上传；
 - Rust Core crate、Python wheel/sdist、Node 包和原生 CLI 都有独立发布校验。
 - 四类发布产物都携带项目 `LICENSE`、第三方归属摘要和由锁定依赖图生成的完整许可证文本；生成器当前覆盖 97 个非开发依赖，遇到缺少许可证文件、依赖更新或分发副本漂移会直接失败。
-- 交付范围由 `tools/check_delivery_scope.py` 与各产物内容检查共同锁定：workspace 只能包含 Core、CLI、Python 和可选 Node，三个前端必须直接依赖 Core；仓库不得重新出现旧 `assetstudio-ffi` 源文件，Rust `Studio`、Python stub 与 Node 声明不得公开 `Context`/`context_id` handle；发布 crate、wheel/sdist 与 npm 包拒绝 GUI、旧 FFI 和 C# 工程文件。托管 oracle 仍可作为仓库测试输入存在，但不会进入运行时依赖或二进制交付面。
+- 交付范围由 `tools/check_delivery_scope.py` 与各产物内容检查共同锁定：workspace 只能包含 Core、CLI、Python 和可选 Node，三个前端必须直接依赖 Core；仓库不得重新出现旧 `unity-rs-ffi` 源文件，Rust `Studio`、Python stub 与 Node 声明不得公开 `Context`/`context_id` handle；发布 crate、wheel/sdist 与 npm 包拒绝 GUI、旧 FFI 和 C# 工程文件。托管 oracle 仍可作为仓库测试输入存在，但不会进入运行时依赖或二进制交付面。
 
 ## 当前验证证据
 
@@ -1138,12 +1138,12 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   adapter 分配超限输出。现只依赖请求头的三项检查在 decoder 调用前完成，返回后的 shape、
   binding、时间和值验证仍完整保留；Core 用会 panic 的 decoder 锁定三种超限请求均不可达
   callback，Python 另以标志位和无效列表元素分别证明前置拒绝与返回列表长度闸门；
-- **CI 的常规作业步骤已于 2026-08-15 在本机完整复跑一遍**（`cargo fmt --check`、`clippy -D warnings`、`cargo doc -D warnings`、`cargo package -p assetstudio-core`、workspace 测试、Node 的 build/test/pack、Python 的 release wheel 与 sdist 两条路各跑 `installed_wheel.py` 与 `python_api.py`、UnityPy 差分、托管差分、vgmstream 音频差分），全部通过；当前主机上的 release CLI 与 Node tarball 也按发布作业的命令构建、直接执行/测试并检查了包内容。工作流另经锁定的 `actionlint` 1.7.12 验证，六个平台使用的 runner label 也逐项对过 [GitHub 当前官方清单](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)。六平台发布矩阵本身尚未在 GitHub runner 上跑过，无法在本机复现的仍是 Windows 运行及其他架构的 runner 环境。之所以要手工跑一遍：CI 自 LZMA 那次提交起就没跑过，而这一跑就发现 Python 侧其实已经坏了一段时间（见上面 sprite fixture 那条）。
+- **CI 的常规作业步骤已于 2026-08-15 在本机完整复跑一遍**（`cargo fmt --check`、`clippy -D warnings`、`cargo doc -D warnings`、`cargo package -p unity-rs-core`、workspace 测试、Node 的 build/test/pack、Python 的 release wheel 与 sdist 两条路各跑 `installed_wheel.py` 与 `python_api.py`、UnityPy 差分、托管差分、vgmstream 音频差分），全部通过；当前主机上的 release CLI 与 Node tarball 也按发布作业的命令构建、直接执行/测试并检查了包内容。工作流另经锁定的 `actionlint` 1.7.12 验证，六个平台使用的 runner label 也逐项对过 [GitHub 当前官方清单](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)。六平台发布矩阵本身尚未在 GitHub runner 上跑过，无法在本机复现的仍是 Windows 运行及其他架构的 runner 环境。之所以要手工跑一遍：CI 自 LZMA 那次提交起就没跑过，而这一跑就发现 Python 侧其实已经坏了一段时间（见上面 sprite fixture 那条）。
 - **Linux 双架构交付面已于 2026-08-15 实跑**：`python3 tools/local_ci.py linux` 在 `linux/amd64` 与 `linux/arm64` 容器中分别完成 Core+CLI 全量测试、release CLI 构建/执行/法律文件 staging、`cp39-abi3` Python wheel 的 release 构建/安装/公开 API 测试，以及 Node 24 release addon 的构建/加载、JavaScript 与严格 TypeScript 消费测试、包内容检查和真实 npm tarball 构建。Node 在只读源码的干净临时副本中打包，宿主机已有的其他平台 addon 不可能混入产物；六个当前步骤均已实跑通过。该结果证明当前工作树的 Linux x86-64/ARM64 运行与发布产物面，不替代仍待 GitHub runner 验证的 Windows/macOS 六路发布矩阵。
 - **发布法律文件已按实际产物验证（2026-08-15）**：根目录补齐项目 MIT `LICENSE`，`tools/generate_dependency_licenses.py` 从 `Cargo.lock` 与 `cargo metadata` 的非开发依赖闭包生成 97 个依赖的许可证全文聚合，并同步 Core、Python、Node 的分发副本。Core `.crate`、实际 npm tarball、Python wheel、Python sdist 及由 sdist 重建的 wheel、release CLI staging 目录均检查三份法律文件存在且与根副本逐字节一致；门禁第一次运行就抓到了 Core 内陈旧的 NOTICE，而不是只确认“有同名文件”。同轮还发现并修复 Python 3.9 测试文件使用 `int | str` 却未延迟求值的支持下限回归；3.9 wheel/API 已重新通过。
 - **输出格式的独立校验已建立（2026-08-15）**：本项目产出的几种文件此前只有自己校自己——binary FBX 的读写是一起写的（记录头里存的是绝对结束偏移，写入端事后回填，读取端若与写入端理解一致，错的偏移一样会被接受），ASCII FBX 根本没有 oracle（托管走 FBX SDK），WAV 头由本项目写、又由本项目的 helper 读回去比对采样；PNG 的 chunk 分帧、CRC、IHDR 与逐行 filter 全是本项目手写的，而它的单元测试用本项目自己的 `png_crc32` 去核对 CRC——CRC 表要是错了，测试照样过，每个看图软件都打不开。现在四者都有了照格式另写的第二实现：`tools/validate_fbx_binary.py`（有界输入、节点/属性/深度/数组预算，magic、版本、每条记录的结束偏移、属性数与属性区长度、raw/deflated 数组的实际长度与单一完整 zlib member、嵌套列表的 null 记录、footer 的 id/对齐/重复版本/结尾 magic）、`tools/validate_fbx_ascii.py`（括号配平、必备段、`Definitions` 声明的 Count 与实际对象数、`C:` 连线引用的 id 是否存在、`*N` 数组的值个数）、`tools/validate_wav_output.py`（直接交给 Python 标准库的 `wave` 模块读，它不是为本项目写的，字段自相矛盾就会拒绝）、`tools/validate_png_output.py`（用标准库 `zlib` 提供独立的 CRC-32 与 inflate：逐 chunk 核对 CRC、校验 IHDR 为 8 位色彩类型 6 且非隔行、解压 IDAT、还原 0–4 号 filter、要求 IHDR 在首 IEND 在尾且其后无残留，最后把像素与源数据逐字节比对，包含 Unity 自下而上到 PNG 自上而下的翻行）。另外 `json.rs`（TypeTree dump 的 JSON emitter）也是手写分帧，而它原有的测试同样是拿手写字符串对比——两边同一套理解，天然一致，且覆盖的形状都很浅。现补了随机树的往返测试：确定性 xorshift 生成任意 `TypeValue` 树，pretty 与 compact 两种形式都交给 serde_json 的 parser（与 writer 不共享任何代码）解析，再与本模块声明的映射逐值比对；对象键序不比（解析后的对象无序），那部分仍由原有手写测试覆盖。末尾的覆盖断言不是装饰：十一个 variant、空容器、容器套容器、非有限浮点、未配对代理项各至少出现一次，把生成器限制成只出叶子会让 variant 断言失败。五种人为破坏均被抓住（裸 `NaN`、对象字段间少逗号、typeless 元数据少逗号、map 的 key/value 互换、float 加宽成 f64），其中前三种只有真正的 parser 才看得见。BMP 与 TGA 同理：两者都是本项目手写的二进制布局，而且是那种「写错了也照样能看」的布局——32 位 BMP 的通道掩码写错、TGA 的 descriptor 把行序写反，任何按惯例假定 BGRA/top-down 的读取器都会照样显示正确的图，直到遇上一个真按文件头来读的读取器；file size、pixel offset、image size 这类冗余字段更是错了也不影响解码。`tools/validate_image_output.py` 按两个格式的规则解码：行序取自文件头而不是假定，BMP 的通道排列取自文件声明的掩码而不是假定 BGRA，再与源像素逐字节比对。六种人为破坏均被抓住（BMP 红蓝掩码互换、BMP 高度写成正数即声称 bottom-up、BMP file size 少算文件头、BMP image size 清零、TGA descriptor 声称 bottom-up、行数据按 RGBA 而非 BGRA 写）。五者都接进了 `tools/local_ci.py` 的 `outputs` 组，并且都反向验证过：人为破坏 zlib 数组的截断、尾随垃圾、声明元素数，或改坏任一条记录的结束偏移、footer 区段、PNG IDAT 的 CRC、IEND 截断，都会由对应第二实现准确拒绝。
   值得记一笔的是，写这些校验器的过程中有三次是**校验器自己错了**——binary FBX 的 footer 最初漏了版本前的 4 个零字节；随后又把 `body + footer ID` 已经 16 字节对齐时规范要求的完整 padding 块误算成 0，普通 CLI fixture 因未落在该边界而一直通过，现由不调用 Rust writer 的 11 字节根名 fixture 锁定；WAV 那边则把 legacy AudioClip 的第一个字段当成了声道数（实际是 `format`，声道数是 `format >> 1`）。这恰恰是第二实现的价值：分歧会逼人去对格式或对读取端的实现，而不是让代码自我确认。
-- **畸形输入扫描已建立（2026-08-15）**：`crates/assetstudio-core/tests/malformed_input.rs`。"不可信输入不崩溃"此前只有各模块零散的拒绝用例背书——那些覆盖的是有人想到的情况。现在拿有效输入批量损坏（单比特翻转、截断、把长度字段改成 `0xFFFFFFFF`/`0x80000000` 一类的毒值），每个结果只允许是解析成功或 `Err`，panic 即失败并报出确切的偏移量以便复现。两处防自欺的断言：种子本身必须能解析（否则损坏的是本来就坏的东西，全是空洞的 Err），以及损坏后仍能解析的比例必须够高（否则全被文件头挡掉，根本进不到对象表）。另有三条把损坏的数据送到真正的解码器：一条把真实压缩载荷（ASTC LDR/HDR、BC6H、Crunch）包进 Texture2D 再损坏后解码——第一版直接喂原始载荷，而那些不是序列化文件，reader 在嗅探阶段就退掉了，解码器一次都没跑到，正是这份文件要防的那种测试。这条验证的是外部解码器的 catch_unwind 护栏确实生效（已反向验证：把护栏外面插一个 panic，扫描立刻失败）。另一条损坏真实 FSB5 音频后走 `detect_direct_wav`/`write_direct_wav`，覆盖 codec 分发与 Vorbis 解码——Vorbis 尤其值得测，它的 setup header 是从表里重建的而不是从流里读的，损坏的流可以配上一个解析得干干净净的 setup。第三条损坏 MOC3 头：那是本项目里唯一一处由载荷自己决定 reader 下一步去哪儿看的地方（四个表偏移在固定位置，然后按定宽切标识符记录），因此偏移或计数被改就是直接的越界邀请，翻转位置也刻意偏向头部。三条都要求"损坏后仍有成功解出的样本"，否则说明解码器压根没跑到。
+- **畸形输入扫描已建立（2026-08-15）**：`crates/unity-rs-core/tests/malformed_input.rs`。"不可信输入不崩溃"此前只有各模块零散的拒绝用例背书——那些覆盖的是有人想到的情况。现在拿有效输入批量损坏（单比特翻转、截断、把长度字段改成 `0xFFFFFFFF`/`0x80000000` 一类的毒值），每个结果只允许是解析成功或 `Err`，panic 即失败并报出确切的偏移量以便复现。两处防自欺的断言：种子本身必须能解析（否则损坏的是本来就坏的东西，全是空洞的 Err），以及损坏后仍能解析的比例必须够高（否则全被文件头挡掉，根本进不到对象表）。另有三条把损坏的数据送到真正的解码器：一条把真实压缩载荷（ASTC LDR/HDR、BC6H、Crunch）包进 Texture2D 再损坏后解码——第一版直接喂原始载荷，而那些不是序列化文件，reader 在嗅探阶段就退掉了，解码器一次都没跑到，正是这份文件要防的那种测试。这条验证的是外部解码器的 catch_unwind 护栏确实生效（已反向验证：把护栏外面插一个 panic，扫描立刻失败）。另一条损坏真实 FSB5 音频后走 `detect_direct_wav`/`write_direct_wav`，覆盖 codec 分发与 Vorbis 解码——Vorbis 尤其值得测，它的 setup header 是从表里重建的而不是从流里读的，损坏的流可以配上一个解析得干干净净的 setup。第三条损坏 MOC3 头：那是本项目里唯一一处由载荷自己决定 reader 下一步去哪儿看的地方（四个表偏移在固定位置，然后按定宽切标识符记录），因此偏移或计数被改就是直接的越界邀请，翻转位置也刻意偏向头部。三条都要求"损坏后仍有成功解出的样本"，否则说明解码器压根没跑到。
 - **第二份提取的差分从 400 个 bundle 跑到了全部 2,778 个（2026-08-16），三处发现全在"报告方式"上而不在解析上**：此前这条差分只跑过前 400 个 case，而 637 个 OBJ 里有 636 个、577 个 txt 里几乎全部都在 400 之后——也就是说网格与文本这两类其实基本没被这条差分覆盖过。跑完之后：**OBJ 637 个比对、598 个逐值相同、39 个"本项目没导出"**；**txt 577 个里 571 个"不一致"**；**PNG 2,609 个里 214 个"超出容差"**。后两条查下来都不是本项目的问题，但也都不该就这么放着：
   - **txt 那 571 个是那份提取把二进制 TextAsset 当文本解码后写回去了**。抓到的证据是逐字节的：本项目导出的 `0039_02.txt` 以 `1f 8b 08` 开头（gzip magic），交给 Python 标准库 `gzip` 能解出 17,635 字节的 JSON；那份提取的同名文件第二个字节是 `?`（0x3f），`gzip` 直接拒绝，而且它有 1,044 个 `?` 字节、本项目只有 8 个。机制也已精确复现：把本项目的字节按 UTF-8 解码、每个解不出来的字节替换成一个 `?` 再编码回去，得到的就是那份提取的文件，**逐字节相等**（长度都是 2,403，因为每个坏字节换一个 `?`）。所以这一行比的不是两个实现的分歧，是一个被破坏了的 oracle。工具现在按这个精确变换归因，记成 `.txt oracle re-encoded` 而不是不一致；**没有放宽任何东西**：只要差异不能被这个变换完全解释就照样失败。已知盲点写在代码注释里——差异如果只落在本来就解不出来的字节上，两边都会塌成 `?`，这条看不见。
   - **PNG 那 214 个是报告方式把边界情况说成了灾难**。工具只报最坏的那个像素，于是一张 4,171,800 像素里只有 **21 个**像素超容差的 sprite，报出来是"alpha differs by 255, drawn value by 109.00"——和一张整体解码错误的贴图长得一模一样。实测那张最吓人的：373,063 个像素与提取不同，其中 324,432 个 alpha 完全相同、48,603 个 alpha 差 1（都是解码器容差内的颜色差），真正超限的只有 21 个，且全是本项目透明、提取那边有内容的遮罩边缘像素——正是本文早已记录的紧密网格边规则分歧，而本项目的光栅器由托管差分逐字节钉住。工具现在同时报出"超限像素数 / 总像素数"，于是"21 / 4,171,800"和"两百万 / 四百万"再也不会长得一样。带计数重跑全量后可以给出一句以前给不出的话：**2,609 张图里 214 张有分歧，逐张最多 62 个像素（占那张的 0.0015%），被报出来的这批合计 578 个坏像素 / 113,262,530 个像素 = 0.0005%**，且无一例外落在遮罩边缘。这不是"容差内"，是"分歧的规模已经量化"。
@@ -1158,10 +1158,10 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - **收口后的完整本机复跑（2026-08-15）**：在最终提交的树上跑了 `tools/local_ci.py` 的**全部 13 组**（quality、rust、cli-package、oracle、audio、outputs、cross、linux、node、python、python314、typing、unitypy），**全部通过、零跳过**——也就是说 .NET 托管差分、vgmstream 音频差分、UnityPy 第三实现差分、输出格式的独立校验器、Linux amd64/arm64 容器里的运行与发布产物、Python 3.14 abi3 前向兼容、严格 mypy 消费端这些可选组这一轮都真的执行了，而不是因为缺工具被记成跳过。另外收口时带源码的提交逐个在独立 worktree 里用 `cargo check --workspace --all-targets --locked` 验证过能单独编译，没有哪个要靠后面的提交才能构建；只改仓库元数据或 Markdown 的提交不进构建。
 - **收口门禁新增严格跳过策略（2026-08-16）**：`tools/local_ci.py --fail-on-skip ...` 在任何请求分组因缺少工具或语义前置条件而跳过时返回失败，日常不带该选项的兼容行为仍会报告并允许可选组跳过。七项回归分别锁定默认跳过成功、严格跳过失败、严格可运行成功、复合平台组缺第二工具必须跳过、未知组用法错误，以及锁定工具版本不符时必须跳过/精确相同时才可运行；测试本身已接入 `quality`。随后按路线图原样执行严格 `quality rust node python typing` 与 `linux`，本机和 Linux amd64/arm64 的全部步骤均通过、零跳过。
 - **Python 主接口审计已闭环（2026-08-22）**：逐组对照 Core 的加载、枚举、资源、专用 reader、场景/模型、Live2D、导出和解包能力后，没有发现仍缺失的稳定 Python 主能力；Rust 的 borrowed view、`write_*` 与低层 ownership escape 分别由 Python 的拥有型元数据/键读取、bytes 或原子路径输出和内部所有权边界替代，映射记录在 `docs/python-api-audit.md`。原来的严格 mypy 消费端漏掉了分页/迭代、按路径资源、静态 binary FBX、ACL 原始输入和 TypeTree JSON/dump 等 11 个真实方法；现已全部调用。随后对托管对象构造分派的机械复核先发现 class 111 `Animation` 与 class 221 `AnimatorOverrideController` 已有完整 Core parser，却没有高层 Rust/Python 入口；现分别增加有界的 GameObject/default/ordered-clip reader 与 base-controller/ordered-substitution reader。继续复核又确认 class 142 `AssetBundle`、147 `ResourceManager`、150 `PreloadData` 的生产 loader 解析器虽已建立容器索引，却没有高层直接读取入口；现同样暴露 inherited/effective 名称、bundle dependencies 和有序 preload/container/reference 表，Python 可分别收紧条目、单字符串和累计字符串预算，兼容 effective-name 的额外字符串副本也计入累计预算。最后补齐了此前只被渲染链间接使用的 class 213 `Sprite` 和 class 687078895 `SpriteAtlas` 完整元数据：Sprite 返回 rect/pivot/border、复合 atlas key/tags/PPtr、resident texture/alpha/secondary references、settings/UV/downscale 和规范化 tight-mesh 三角形，SpriteAtlas 返回原始复合 GUID key、有序 render-data、颜色/alpha PPtr、裁剪/UV/settings、secondary textures、tag 与 variant 标志；版本范围仍严格限定在已有 parser、fixture 和差分证据覆盖的边界。release wheel 和 sdist 重建 wheel 用合成 v22 普通/tight Sprite 与 atlas 对象逐字段、顺序和预算验证这些 reader。审计器同时解析 `studio.rs` 的四个高层 impl，当前 **107 个公开 Core 方法**中 103 个必须指向实际存在的 Python symbol，`from_collection`/`collection`/`into_collection`/`object_by_index` 四个接受、借用或返回 Rust 内部类型的入口明确保留 Rust-only；Core 新增公开方法未分类、映射目标从 stub 消失都会失败。Python 方向则要求 **66 个公开方法和 4 个属性**全在严格消费端出现。六项正反回归覆盖当前计数、漏方法/属性、缺少类/消费函数、Core 新方法未分类和 Python target 消失；GitHub workflow 结构门禁还要求这组自测不能被移除。当前树重新执行严格 `quality typing`、release wheel、sdist、从 sdist 重建 wheel、两条安装后公开面和两条完整 API 测试，全部通过、零跳过。
-- **可选 Node 主接口也有了独立机器审计（2026-08-23）**：`tools/check_node_api_surface.py` 不复用 Python 的映射结论，只复用 Core 方法解析器；同样对 107 个 Core 高层方法逐项分类，要求 103 个真实 Node target 同时存在于 `#[napi]` Rust 源和 `index.d.ts`，仅保留与 Python 相同的 4 个 Rust ownership/borrow 入口。反向再要求 Rust addon 与生成声明的 `AssetStudio` 精确一致，并让当前 **85 个方法和 4 个属性**全部出现在严格 TypeScript 消费端；注释先被剥离，不能冒充调用。八项反向测试覆盖新 Core 方法、Rust/声明 target 消失、addon/声明漂移、漏消费、注释掉调用和对象字段消失，GitHub workflow 结构门禁又要求审计及其自测都不能被移除。盘点没有只产出表格：它发现 `fromBuffer`/`fromBuffers` 只能限制绑定复制字节，不能把 `OpenOptions` 交给 Core，导致内存 UnityCN、stripped version、skip policy 和路径预算与磁盘入口不等价；现把 options 作为旧字节上限之后的末尾可选参数，旧位置调用不变。JavaScript 回归真实证明单 buffer 的 `maximumPathBytes` 与多 buffer 的 `maximumInputFiles` 在遍历/解析前生效，生成声明与 pinned TypeScript 编译通过。详细映射和边界见 `docs/node-api-audit.md`；Node 仍是可选交付面，不会反过来成为 Rust/Python 完成的前置条件。变更后严格 `quality` 已增长为 15/15，Node 的 debug/release addon、JavaScript/TypeScript、包内容和 tarball 8/8，以及 workspace build/test 2/2 全部通过且零组跳过。
+- **可选 Node 主接口也有了独立机器审计（2026-08-23）**：`tools/check_node_api_surface.py` 不复用 Python 的映射结论，只复用 Core 方法解析器；同样对 107 个 Core 高层方法逐项分类，要求 103 个真实 Node target 同时存在于 `#[napi]` Rust 源和 `index.d.ts`，仅保留与 Python 相同的 4 个 Rust ownership/borrow 入口。反向再要求 Rust addon 与生成声明的 `UnityRs` 精确一致，并让当前 **85 个方法和 4 个属性**全部出现在严格 TypeScript 消费端；注释先被剥离，不能冒充调用。八项反向测试覆盖新 Core 方法、Rust/声明 target 消失、addon/声明漂移、漏消费、注释掉调用和对象字段消失，GitHub workflow 结构门禁又要求审计及其自测都不能被移除。盘点没有只产出表格：它发现 `fromBuffer`/`fromBuffers` 只能限制绑定复制字节，不能把 `OpenOptions` 交给 Core，导致内存 UnityCN、stripped version、skip policy 和路径预算与磁盘入口不等价；现把 options 作为旧字节上限之后的末尾可选参数，旧位置调用不变。JavaScript 回归真实证明单 buffer 的 `maximumPathBytes` 与多 buffer 的 `maximumInputFiles` 在遍历/解析前生效，生成声明与 pinned TypeScript 编译通过。详细映射和边界见 `docs/node-api-audit.md`；Node 仍是可选交付面，不会反过来成为 Rust/Python 完成的前置条件。变更后严格 `quality` 已增长为 15/15，Node 的 debug/release addon、JavaScript/TypeScript、包内容和 tarball 8/8，以及 workspace build/test 2/2 全部通过且零组跳过。
   同一轮继续核对 worker 入口，发现 `openAsync`/`fromBufferAsync` 仍丢失同一份 options；现同样在旧参数之后追加可选 `OpenOptions`，task 持有配置并在 worker 内调用 Core 的 `*_with_options`，实际 Promise 回归分别证明路径和内存标签预算生效，旧一/三参数调用保持通过。
   最后把发布包本身纳入同一约束：临时消费者从实际 `.tgz` 安装后，测试会解析安装后的
-  `index.d.ts`，再与加载出来的 native `AssetStudio` class 双向比较 85 个方法和 4 个 getter；
+  `index.d.ts`，再与加载出来的 native `UnityRs` class 双向比较 85 个方法和 4 个 getter；
   保持成员总数不变、只重命名一个声明方法也必须失败。隔离 npm 缓存下该安装门禁已通过，
   因此当前证据不再依赖源码树中的 addon 或声明碰巧正确。随后重新执行完整
   `outputs quality rust python node typing security cross` 以及 `linux`：本机全部构建、测试、
@@ -1197,7 +1197,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - C#→Rust 托管差分 oracle 通过；
 - TypeTree dump 浮点文本对照 .NET 10 实测生成的 849 个取值（边界值 + 位模式扫描）逐字节一致，期望值以 fixture 形式入库；
 - `cargo doc --workspace --no-deps` 在 `-D warnings` 下通过；
-- `cargo package -p assetstudio-core` 的包内容和独立重建通过；
+- `cargo package -p unity-rs-core` 的包内容和独立重建通过；
 - Python 锁定 wheel、sdist 及从 sdist 重建的 wheel 均可安装并通过 API/类型桩测试；wheel 的运行时公开面与 `.pyi` 双向核对，主读取路径另由严格 Python 3.9 mypy 消费端编译；
 - Node 原生 addon 测试、严格 TypeScript 消费端声明编译和实际 npm 包内容检查通过；
 - `git diff --check` 通过。
@@ -1229,7 +1229,7 @@ expected snapshot 的 manifest 在 release 模式重新执行 `real_corpus`，21
 `read_fbx_with_textures` 的 `.pyi` 把默认输出上限写成 1 GiB，实际 PyO3
 方法使用的是全局 512 MiB 默认。原 wheel 门禁只比较名称，且 PyO3 对 Rust
 const 形式的默认值在 `inspect.signature` 里显示为 `Ellipsis`，所以两边漂移
-仍会全绿。现已统一为 512 MiB，并把所有 `AssetStudio` 签名默认值展开成
+仍会全绿。现已统一为 512 MiB，并把所有 `UnityRs` 签名默认值展开成
 运行时可观察的字面量；安装后门禁逐方法解析 `.pyi`，比较每一个可求值默认
 参数，遇到 `Ellipsis`、缺失或数值不一致即失败。修复后的当前 abi3 wheel
 已通过完整 API 测试、UnityPy 差分和严格 mypy 消费测试；workspace 测试、
@@ -1295,7 +1295,7 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
    - **Live2D 组件归属不再按组件反复向根扫描（2026-08-24）**：旧 planner 为 Renderer 和八类辅助组件各建一次模型表，然后让每个组件沿 `GameObject.parent` 一直走到最近的 `CubismModel`；在允许百万节点、百万组件的公开预算下，深链可以把这一阶段放大成 O(组件数 × 层级深度)。现在先以有界、可失败预留建立 GameObject→节点与 GameObject→模型索引，再从每个根迭代地向叶传播“最近祖先模型”，九类组件共用同一张结果表；祖先归属阶段为 O(层级节点+模型+组件)，后续为了稳定输出进行的分组排序仍单独是 O(组件 log 组件)。传播刻意先记录继承值、再把当前节点的模型传给子节点，因此模型自身 GameObject 上的 Renderer 不会错误归给自己，嵌套模型则会覆盖更远祖先，保持托管 `TryGetModelGameObject` 语义。新增 20,000 节点深链在中点嵌套模型的回归，逐节点断言这两个边界；现有 17 项整包/组件顺序/跨文件/schema/预算测试、严格 Clippy、托管差分以及 Rust/Python/Node 零跳过本地门禁均通过。
    - **容器、Live2D 与 Shader 差分状态**：UnityWebData（Unity/Tuanjie 两种签名）、ZIP、split 组、LZMA 块和 Live2D 整包均已补齐；LZMA 编码器来自仅开发期启用的 `lzma-rust2/encoder` feature，发布 crate 仍然只解压。Shader 5.3-5.4 的 subprogram blob 也已补齐；5.5+ 序列化程序无法接入托管 oracle，原因已查实：托管仓库 `AssetStudioUtility/ShaderConverter.cs` 的 `HeaderBytes`（第 15 行）用第 893 行才声明的 `header` 初始化，按 C# 静态初始化顺序必然得到 null 并使类型初始化抛 `ArgumentNullException`。5.5+ 所需转换方法又是该类型的私有静态方法，反射同样触发故障；在 oracle 里重写它只会变成另一份自实现，不能构成独立证据。上游修复只需把 `header` 改为 `const`，或移到 `HeaderBytes` 之前。
    - oracle harness 接受任意输入路径，上述补强全部不需要专有样本。
-   - **第二 oracle 已就位，并于 2026-08-15 扩到 TypeTree 值**：`crates/assetstudio-python/tests/unitypy_oracle.py` 用 UnityPy（独立实现，不需要 .NET）对照对象顺序、PathID、classID、字节大小、名称和原始载荷哈希，14 个 fixture 首轮全对。新增第 15 个 fixture：一个自带 TypeTree 的 MonoBehaviour，专门覆盖 reader 容易出错的形状——单字节字段后的对齐、长度前缀字符串、基本类型数组、以及元素里同时含字符串和字节的结构体数组（对齐放错在这里会直接读出垃圾而不是读错一个数）。此前 TypeTree 解析只有托管一个 oracle 背书，现在有了第二份独立解析。两处刻意的处理：只比较文件自带树的对象（UnityPy 在没有内嵌树时会回落到它自带的数据库，那样比的是数据库而不是同一份字节的第二次解析），以及浮点两边都收窄到 f32 再比（UnityPy 的 Python float 是 double，会把 `0.8f` 变成 `0.800000011920929`）——收窄会让真正的 double 字段掩盖掉低位差异，因此 fixture 里放了一个 f32 表示不出来的 double 并单独直读断言。运行时统计真正比较了多少棵树，为零直接失败，避免两边都是 None 的假通过。
+   - **第二 oracle 已就位，并于 2026-08-15 扩到 TypeTree 值**：`crates/unity-rs-python/tests/unitypy_oracle.py` 用 UnityPy（独立实现，不需要 .NET）对照对象顺序、PathID、classID、字节大小、名称和原始载荷哈希，14 个 fixture 首轮全对。新增第 15 个 fixture：一个自带 TypeTree 的 MonoBehaviour，专门覆盖 reader 容易出错的形状——单字节字段后的对齐、长度前缀字符串、基本类型数组、以及元素里同时含字符串和字节的结构体数组（对齐放错在这里会直接读出垃圾而不是读错一个数）。此前 TypeTree 解析只有托管一个 oracle 背书，现在有了第二份独立解析。两处刻意的处理：只比较文件自带树的对象（UnityPy 在没有内嵌树时会回落到它自带的数据库，那样比的是数据库而不是同一份字节的第二次解析），以及浮点两边都收窄到 f32 再比（UnityPy 的 Python float 是 double，会把 `0.8f` 变成 `0.800000011920929`）——收窄会让真正的 double 字段掩盖掉低位差异，因此 fixture 里放了一个 f32 表示不出来的 double 并单独直读断言。运行时统计真正比较了多少棵树，为零直接失败，避免两边都是 None 的假通过。
    - **顺带查出两处一直没跑到的失效测试（2026-08-15）**：本机第一次跑通 Python 侧全套（`maturin` 建 wheel 装进 venv）后发现 `python_api.py` 一直是失败的——sprite fixture 里 submesh 的 localAABB 仍然写 8 个 float，而 reader 早在 sprite AABB 缺陷修好时就改成了正确的 6 个，于是它后面每个字段都错位；这正是当初"fixture 照着同样错的布局手写"那条的残留，Rust 侧的 fixture 当时修了、Python 侧漏了。另一处是 physics3.json 的 `"Fps": 60.0` 断言，在数字格式改成 `0.###` 之后应当是 `60`。两处都是 CI 会拦下的，但 CI 自 LZMA 那次提交起就没跑过。刻意不比较解码后的像素与网格——UnityPy 走的是本项目已链接的同一个 `texture2ddecoder`，网格/shader 又是 AssetStudio 的转写，比了不构成独立证据。UnityPy 解析不出名字时（它的名称查找依赖自带的 TypeTree 数据库，不覆盖所有 class/版本）记为跳过并报数，而不是当成"双方都认为是空串"。
 
 2. **真实游戏语料覆盖不足**
@@ -1391,7 +1391,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 - `texture2ddecoder` 0.1.2 的 `f32_to_u8` 有两份移植（ASTC 一份、BC6H 一份），都把参考实现的 `roundf` 丢了；影响 6 个 ASTC HDR 格式加 BC6H，每个受影响通道恒低一格。上游 master 至今未修，仓库通过 vendored ASTC/BC6H 解码器修正并由托管差分把守。
 - `ruopus` 0.1.2 的 SILK 路径在此前本地 oracle/build 中偏早且不精确（宽带早 2 个采样、窄带早 4 个，对齐后约差峰值的 3%）；固定 r2117 Linux amd64 对 CI fixture 完全一致。CELT 路径在两类测量中都准确。
 
-纹理那处已于 2026-08-15 决定采用 vendor 修复：`crates/assetstudio-core/src/vendor/texture2ddecoder/` 收入 ASTC 与 BC6H 解码器，只改两个舍入表达式（就地标 `VENDOR FIX`），并删除一段本项目不用、依赖 `paste` 的宏（标 `VENDOR DELTA`），其余保持可与上游直接 diff。18 个 ASTC 格式加 BC6H 现在与托管解码器**完全一致**，测试也由“钉住已知偏差”改为要求相等。Opus 未采用同一路线：独立纯 Rust 候选 `opus-rs` 0.1.26/0.1.28 已实测仍有更大的时序偏差并使 CELT 精度回退，剩余已知替代只有 libopus 绑定，会为仅 SILK 路径的偏差引入新的原生运行时依赖并终结该解码链的纯 Rust 性质，而当前 CELT 路径本身已经准确；因此现阶段保留明确记录与有界偏差测试，等待可审计的纯 Rust 修复或上游版本。
+纹理那处已于 2026-08-15 决定采用 vendor 修复：`crates/unity-rs-core/src/vendor/texture2ddecoder/` 收入 ASTC 与 BC6H 解码器，只改两个舍入表达式（就地标 `VENDOR FIX`），并删除一段本项目不用、依赖 `paste` 的宏（标 `VENDOR DELTA`），其余保持可与上游直接 diff。18 个 ASTC 格式加 BC6H 现在与托管解码器**完全一致**，测试也由“钉住已知偏差”改为要求相等。Opus 未采用同一路线：独立纯 Rust 候选 `opus-rs` 0.1.26/0.1.28 已实测仍有更大的时序偏差并使 CELT 精度回退，剩余已知替代只有 libopus 绑定，会为仅 SILK 路径的偏差引入新的原生运行时依赖并终结该解码链的纯 Rust 性质，而当前 CELT 路径本身已经准确；因此现阶段保留明确记录与有界偏差测试，等待可审计的纯 Rust 修复或上游版本。
 
 公开 runner 的完全一致 profile 进一步降低了立即替换 decoder 的收益，但并未解释另一环境的
 稳定偏差；在原因被隔离前，不能据此删除第二个已测 profile，也不能声称 SILK 已在所有平台修复。

@@ -124,7 +124,7 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
         self.assertNotEqual(altered, self.rust)
         with self.assertRaisesRegex(
             check_node_api_surface.AuditError,
-            r"StudioObject.read_shader_text -> AssetStudio.readShader",
+            r"StudioObject.read_shader_text -> UnityRs.readShader",
         ):
             check_node_api_surface.validate_core_mapping(
                 self.core,
@@ -141,7 +141,7 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
         self.assertNotEqual(altered, self.declarations)
         with self.assertRaisesRegex(
             check_node_api_surface.AuditError,
-            r"StudioObject.read_shader_text -> AssetStudio.readShader",
+            r"StudioObject.read_shader_text -> UnityRs.readShader",
         ):
             check_node_api_surface.validate_core_mapping(
                 self.core,
@@ -151,13 +151,13 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
 
     def test_rust_and_generated_class_declarations_must_agree(self) -> None:
         altered = self.rust.replace(
-            "#[napi]\nimpl AssetStudio {",
-            "#[napi]\nimpl AssetStudio {\n    #[napi]\n    pub fn extra_export(&self) {}",
+            "#[napi]\nimpl UnityRs {",
+            "#[napi]\nimpl UnityRs {\n    #[napi]\n    pub fn extra_export(&self) {}",
             1,
         )
         with self.assertRaisesRegex(
             check_node_api_surface.AuditError,
-            r"missing declarations: AssetStudio.extraExport",
+            r"missing declarations: UnityRs.extraExport",
         ):
             check_node_api_surface.validate_node_declarations(
                 altered,

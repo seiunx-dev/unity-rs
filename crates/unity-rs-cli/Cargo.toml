@@ -1,0 +1,19 @@
+[package]
+name = "unity-rs-cli"
+description = "Native command-line frontend for unity-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "unity-rs"
+path = "src/main.rs"
+
+[dependencies]
+unity-rs-core = { version = "0.1.0", path = "../unity-rs-core" }
+
+[lints]
+workspace = true

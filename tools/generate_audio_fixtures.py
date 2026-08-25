@@ -39,7 +39,7 @@ from pathlib import Path
 FIXTURES = (
     Path(__file__).resolve().parent.parent
     / "crates"
-    / "assetstudio-core"
+    / "unity-rs-core"
     / "tests"
     / "fixtures"
     / "audio"

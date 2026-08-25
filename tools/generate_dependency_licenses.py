@@ -19,15 +19,15 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 SHIPPED_PACKAGES = (
-    "assetstudio-core",
-    "assetstudio-cli",
-    "assetstudio-python",
-    "assetstudio-node",
+    "unity-rs-core",
+    "unity-rs-cli",
+    "unity-rs-python",
+    "unity-rs-node",
 )
 PACKAGE_DIRECTORIES = (
-    ROOT / "crates" / "assetstudio-core",
-    ROOT / "crates" / "assetstudio-node",
-    ROOT / "crates" / "assetstudio-python" / "python" / "assetstudio",
+    ROOT / "crates" / "unity-rs-core",
+    ROOT / "crates" / "unity-rs-node",
+    ROOT / "crates" / "unity-rs-python" / "python" / "unity_rs",
 )
 GENERATED_LICENSE_OUTPUTS = (ROOT / "THIRD_PARTY_LICENSES.txt",) + tuple(
     directory / "THIRD_PARTY_LICENSES.txt" for directory in PACKAGE_DIRECTORIES
