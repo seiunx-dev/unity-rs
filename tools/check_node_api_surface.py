@@ -233,6 +233,37 @@ def validate_live2d_worker_projection(rust_source: str) -> None:
         )
 
 
+def validate_texture_array_worker_projection(rust_source: str) -> None:
+    """Keep the fallible multi-layer result projection off the Node event loop."""
+    task = braced_block(rust_source, "impl Task for ReadTextureArrayTask")
+    output = re.search(r"\btype Output\s*=\s*([^;]+);", task)
+    if output is None or output.group(1).strip() != "DisplayRowImages":
+        raise AuditError(
+            "ReadTextureArrayTask must return the worker-projected DisplayRowImages"
+        )
+    compute = braced_block(task, "fn compute")
+    if "DisplayRowImages::from_decoded(images)" not in compute:
+        raise AuditError(
+            "ReadTextureArrayTask must project Texture2DArray layers inside compute"
+        )
+    wrapper = braced_block(rust_source, "impl DisplayRowImages")
+    from_decoded = braced_block(wrapper, "fn from_decoded")
+    into_nodes = braced_block(wrapper, "fn into_nodes")
+    if "reserve(images.len(), \"Texture2DArray images\")" not in from_decoded:
+        raise AuditError(
+            "DisplayRowImages must reserve its final Node-facing layer table on the worker"
+        )
+    if "convert_image(image)" not in from_decoded:
+        raise AuditError(
+            "DisplayRowImages must build each final Node-facing image on the worker"
+        )
+    forbidden_resolve_work = ("reserve(", "convert_image", "for ")
+    if any(fragment in into_nodes for fragment in forbidden_resolve_work):
+        raise AuditError(
+            "DisplayRowImages::into_nodes must not allocate or project layers on the event loop"
+        )
+
+
 def rust_node_symbols(source: str) -> set[str]:
     """Extract exported class members and mapped object fields from Rust."""
     implementation = block_between(
@@ -393,6 +424,7 @@ def main() -> None:
     declaration_source = DECLARATIONS.read_text(encoding="utf-8")
     try:
         validate_live2d_worker_projection(rust_source)
+        validate_texture_array_worker_projection(rust_source)
         methods, properties = validate_node_declarations(rust_source, declaration_source)
         core_methods, rust_only = validate_core_mapping(
             core_source,

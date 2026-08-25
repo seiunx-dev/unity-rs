@@ -18,6 +18,7 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
 
     def test_current_core_rust_declarations_and_consumer_are_complete(self) -> None:
         check_node_api_surface.validate_live2d_worker_projection(self.rust)
+        check_node_api_surface.validate_texture_array_worker_projection(self.rust)
         self.assertEqual(
             check_node_api_surface.validate_node_declarations(
                 self.rust,
@@ -72,6 +73,35 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
             r"inside compute",
         ):
             check_node_api_surface.validate_live2d_worker_projection(altered)
+
+    def test_texture_array_task_must_return_the_worker_projection(self) -> None:
+        altered = self.rust.replace(
+            "    type Output = DisplayRowImages;\n",
+            "    type Output = Vec<RgbaImage>;\n",
+            1,
+        )
+        self.assertNotEqual(altered, self.rust)
+        with self.assertRaisesRegex(
+            check_node_api_surface.AuditError,
+            r"must return the worker-projected DisplayRowImages",
+        ):
+            check_node_api_surface.validate_texture_array_worker_projection(altered)
+
+    def test_texture_array_projection_cannot_move_back_to_resolve(self) -> None:
+        altered = self.rust.replace(
+            "    fn into_nodes(self) -> Vec<RgbaImage> {\n"
+            "        self.0\n",
+            "    fn into_nodes(self) -> Vec<RgbaImage> {\n"
+            "        let _event_loop_regression = convert_image;\n"
+            "        self.0\n",
+            1,
+        )
+        self.assertNotEqual(altered, self.rust)
+        with self.assertRaisesRegex(
+            check_node_api_surface.AuditError,
+            r"must not allocate or project layers on the event loop",
+        ):
+            check_node_api_surface.validate_texture_array_worker_projection(altered)
 
     def test_new_core_method_must_be_classified(self) -> None:
         altered = self.core.replace(
