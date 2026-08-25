@@ -330,6 +330,11 @@ does not misreport an already visible destination as a failed publication.
 For a complete Live2D package, the synced directory rename is the commit point;
 removing and syncing the per-destination publication lock is likewise
 best-effort cleanup with a `Drop` retry.
+Package-planning diagnostics share a cumulative byte budget. Their exact UTF-8
+length is measured without allocating, rejected before allocation when the
+remaining budget is too small, then written into one exactly reserved string;
+the report and its budget are committed together only after fallible capacity
+growth succeeds.
 The 16 GiB cumulative batch ceiling charges each FBX plus the exact size of
 texture files newly published for that candidate; shared or pre-existing files
 that were skipped are not charged again, and exhaustion is checked before the
