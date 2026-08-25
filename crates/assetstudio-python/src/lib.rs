@@ -937,7 +937,7 @@ struct PyMonoBehaviourSchemas {
 #[pymethods]
 impl PyMonoBehaviourSchemas {
     #[new]
-    fn new(schemas: &Bound<'_, PyList>) -> PyResult<Self> {
+    fn new(py: Python<'_>, schemas: &Bound<'_, PyList>) -> PyResult<Self> {
         if schemas.len() > MAXIMUM_SCHEMA_ENTRIES {
             return Err(PyValueError::new_err(format!(
                 "MonoBehaviour schema collection has {} entries; maximum is {MAXIMUM_SCHEMA_ENTRIES}",
@@ -951,8 +951,9 @@ impl PyMonoBehaviourSchemas {
             registries.push(Arc::clone(&schema.registry));
         }
         let schema_count = registries.len();
-        let provider =
-            MonoBehaviourSchemaRegistrySet::from_registries(registries).map_err(core_error)?;
+        let provider = py
+            .detach(move || MonoBehaviourSchemaRegistrySet::from_registries(registries))
+            .map_err(core_error)?;
         Ok(Self {
             schema_count,
             provider: Arc::new(provider),
