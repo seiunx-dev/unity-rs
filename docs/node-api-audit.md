@@ -79,6 +79,12 @@ methods:
   to wrap already-final bytes. Rust tests cover one image and multiple layers;
   installed-addon tests compare synchronous and Promise output for real
   Texture2D and Texture2DArray fixtures pixel by pixel.
+- `readLive2DPackagesWithAclDecoder` materializes its packages on a worker and
+  now also flattens every MOC, manifest, texture, JSON document and diagnostic
+  into the final fallibly allocated `Live2DPackageSet` there. Its `resolve`
+  method only returns that already-final table. A positive/negative source
+  audit rejects changing the task output back to the Core set or moving the
+  O(packages + files + diagnostics) projection onto the event loop.
 - `tests/installed_package.cjs` loads the packed tarball from a temporary
   consumer, parses the installed `index.d.ts`, and compares its static methods,
   instance methods, and getters bidirectionally with the installed native
