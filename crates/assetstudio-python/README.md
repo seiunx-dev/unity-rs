@@ -1,6 +1,7 @@
-# assetstudio-rs
+# unity-rs for Python
 
-`assetstudio-rs` is the native Python package for AssetStudio's Rust rewrite.
+`assetstudio-rs` is the compatibility distribution name of the native Python
+package for `unity-rs`.
 It binds directly to the safe, bounded `assetstudio-core::studio::Studio` API
 through PyO3; it does not load or call the legacy C ABI.
 

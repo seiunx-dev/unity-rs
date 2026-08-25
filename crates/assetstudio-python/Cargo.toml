@@ -1,6 +1,6 @@
 [package]
 name = "assetstudio-python"
-description = "Native Python bindings for the AssetStudio Rust core"
+description = "Native Python bindings for unity-rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

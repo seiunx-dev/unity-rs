@@ -2,7 +2,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 
-/// Error returned by the native `AssetStudio` parser.
+/// Error returned by the native `unity-rs` parser.
 #[derive(Debug)]
 pub enum Error {
     /// An underlying stream or filesystem operation failed.

@@ -1,4 +1,4 @@
-"""Native, bounded Unity asset parsing powered by AssetStudio's Rust core."""
+"""Native, bounded Unity asset parsing powered by unity-rs."""
 
 from typing import Callable as _Callable, Optional as _Optional
 

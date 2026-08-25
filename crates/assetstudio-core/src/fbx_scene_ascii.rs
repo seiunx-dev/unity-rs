@@ -400,7 +400,7 @@ FBXHeaderExtension:  {{\n\
     FBXHeaderVersion: 1003\n\
     FBXVersion: 7400\n\
     EncryptionType: 0\n\
-    Creator: \"AssetStudio Rust static ASCII FBX writer\"\n\
+    Creator: \"unity-rs ASCII FBX writer\"\n\
 }}\n\
 GlobalSettings:  {{\n\
     Version: 1000\n\

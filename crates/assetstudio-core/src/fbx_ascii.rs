@@ -331,7 +331,7 @@ FBXHeaderExtension:  {{\n\
     FBXHeaderVersion: 1003\n\
     FBXVersion: 7400\n\
     EncryptionType: 0\n\
-    Creator: \"AssetStudio Rust static ASCII FBX writer\"\n\
+    Creator: \"unity-rs ASCII FBX writer\"\n\
 }}\n\
 GlobalSettings:  {{\n\
     Version: 1000\n\
@@ -755,7 +755,7 @@ mod tests {
         // semantic meaning, and the structural assertions keep failures local.
         assert_eq!(
             (output.len(), fnv1a64(&output)),
-            (2453, 9_022_500_223_057_990_588)
+            (2438, 11_197_871_998_926_011_157)
         );
         assert!(text.starts_with("; FBX 7.4.0 project file\n"));
         assert!(text.ends_with("Current: \"\"\n}\n"));
