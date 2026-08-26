@@ -1,6 +1,6 @@
 # unity-rs
 
-[![CI](https://github.com/Team-Haruki/unity-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Team-Haruki/unity-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/seiunx-dev/unity-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/seiunx-dev/unity-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `unity-rs` is a headless Unity asset reader, inspector, extractor, and exporter
@@ -51,7 +51,7 @@ name:
 
 ```toml
 [dependencies]
-unity_rs_core = { package = "unity-rs-core", git = "https://github.com/Team-Haruki/unity-rs" }
+unity_rs_core = { package = "unity-rs-core", git = "https://github.com/seiunx-dev/unity-rs" }
 ```
 
 ```rust,no_run

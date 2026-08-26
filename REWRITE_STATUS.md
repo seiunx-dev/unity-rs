@@ -380,7 +380,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   文件名计算少一字节预算并验证同一错误，TypeScript 与 Python 3.9 类型消费也显式传入新字段。
   提交 `31d1288` 的 scene-texture 定向测试 16/16、严格 workspace Clippy，以及
   完整 `quality rust python node typing oracle` 零跳过本地门禁通过；公开常规矩阵
-  [32785686979](https://github.com/Team-Haruki/unity-rs/actions/runs/32785686979) 为 16 个实际 job
+  [32785686979](https://github.com/seiunx-dev/unity-rs/actions/runs/32785686979) 为 16 个实际 job
   全绿、2 个手工发布条件 job 正常跳过、0 失败；
 - **FBX/OBJ/贴图的多文件发布已于 2026-08-22 改为整批事务**：旧 CLI 的单文件 FBX、
   `split-objects`/`animator` 候选和 OBJ 都会先发布模型，再写同级贴图或 MTL；例如目标 OBJ
@@ -487,7 +487,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`，Rust/Python/Node 构建、
   workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过；提交 `ee6f668`
   的公开常规矩阵
-  [32700977598](https://github.com/Team-Haruki/unity-rs/actions/runs/32700977598) 为 16/16 验证 job 全绿；
+  [32700977598](https://github.com/seiunx-dev/unity-rs/actions/runs/32700977598) 为 16/16 验证 job 全绿；
 - **Live2D clip fallback 的 Animator 扫描已于 2026-08-24 收口**：`PackageState::model_clip_keys`
   原先虽然只构建一次 `AnimationGraph`，却会为每个需要动画回退的模型再对全部 Animator binding
   执行一次 `.iter().find`；默认十万模型和百万 binding 足以把已验证的普通对象布局放大为
@@ -501,7 +501,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   工作树随后执行 `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`，
   Rust/Python/Node 构建、workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过。
   提交 `b8d0766` 的公开常规矩阵
-  [32704054064](https://github.com/Team-Haruki/unity-rs/actions/runs/32704054064) 为 16/16 验证 job 全绿；
+  [32704054064](https://github.com/seiunx-dev/unity-rs/actions/runs/32704054064) 为 16/16 验证 job 全绿；
 - **Live2D 输出名称的重复后缀扫描已于 2026-08-25 收口**：包目录、纹理、expression、
   fade/clip/loose motion 原先各自用 `HashSet<String>` 记住规范化名称，但每次重名都从无后缀、
   ` @f{file}_p{path}`、`_2` 重新扫描；合法的重复 PathID 或显式占用后续候选可以把一组
@@ -512,7 +512,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   以及 16,384 次相同 base/身份恰为 `2 × N - 1` 次候选探测、末项为 `_16383`。提交 `f88cb53`
   的 Live2D 定向测试 22/22、严格 Core Clippy、Rust/Python/Node/typing/oracle 零跳过本地门禁通过；
   公开常规矩阵
-  [32768660736](https://github.com/Team-Haruki/unity-rs/actions/runs/32768660736) 为 16/16 验证 job 全绿，
+  [32768660736](https://github.com/seiunx-dev/unity-rs/actions/runs/32768660736) 为 16/16 验证 job 全绿，
   另两项仅 tag/release 条件 artifact 任务按设计跳过；
 - **Live2D 隐藏名称索引的未计费驻留已于 2026-08-25 收口**：`maximum_total_name_bytes`
   原先计入资产来源名称和最终输出名称，却没有计入包目录、纹理、expression、motion claim 表中
@@ -523,7 +523,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   且状态不变，并用 `İ` 证明 2 字节来源折叠为 3 字节 key 时会在分配前拒绝。提交 `f8f630e`
   的 Live2D 定向测试 23/23、严格 Core Clippy，以及完整 Rust/Python/Node/typing/oracle 零跳过
   本地门禁通过；公开常规矩阵
-  [32781978836](https://github.com/Team-Haruki/unity-rs/actions/runs/32781978836) 为 16 个实际 job
+  [32781978836](https://github.com/seiunx-dev/unity-rs/actions/runs/32781978836) 为 16 个实际 job
   全绿、2 个手工发布条件 job 正常跳过、0 失败；
 - **FBX 批量输出名称的错误上限与重复扫描已于 2026-08-25 收口**：SplitObjects/Animator
   规划允许最多 1,000,000 个候选，但 CLI 原先以 `HashSet<String>` 保存名称，并让每个同名
@@ -536,7 +536,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   继续 `face~3`，不可能容量请求后状态不变，以及 16,384 个同名候选成功得到
   `Shared~16383` 且恰为 `2 × N - 1` 次探测。提交 `a9b0665` 的 CLI 定向测试、全目标严格
   Clippy、Rust/Python/Node/typing/oracle 零跳过本地门禁通过；公开常规矩阵
-  [32772105204](https://github.com/Team-Haruki/unity-rs/actions/runs/32772105204) 为 16/16 验证 job 全绿，
+  [32772105204](https://github.com/seiunx-dev/unity-rs/actions/runs/32772105204) 为 16/16 验证 job 全绿，
   另两项仅 tag/release 条件 artifact 任务按设计跳过；
 - **SceneHierarchy 的不可失败索引分配已于 2026-08-24 收口**：场景读取本来已经对
   GameObject、组件、Transform 子项、材质、骨骼和层级边执行集合级计数，并对输出 Vec 使用
@@ -554,7 +554,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`，Rust/Python/Node 构建、
   workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过。提交 `b77192a`
   的公开常规矩阵
-  [32706872352](https://github.com/Team-Haruki/unity-rs/actions/runs/32706872352) 为 16/16 验证 job 全绿；
+  [32706872352](https://github.com/seiunx-dev/unity-rs/actions/runs/32706872352) 为 16/16 验证 job 全绿；
 - **AnimationGraph 的 controller/clip 不可失败树索引已于 2026-08-24 收口**：旧构建状态以
   `BTreeSet` 保存最多 1,000,000 个待解析 controller，并以两个 `BTreeMap` 保存最多 1,000,000 个
   controller 和 2,000,000 个 clip；每项都进行不可失败的树节点分配，而且待解析集合是在数量
@@ -569,7 +569,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`，Rust/Python/Node 构建、
   workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过。提交 `21ede89`
   的公开常规矩阵
-  [32709579106](https://github.com/Team-Haruki/unity-rs/actions/runs/32709579106) 为 16/16 验证 job 全绿，
+  [32709579106](https://github.com/seiunx-dev/unity-rs/actions/runs/32709579106) 为 16/16 验证 job 全绿，
   另两项仅手工 release 条件任务按设计跳过；
 - **ModelIr 的四类构建/最终树索引已于 2026-08-24 收口**：旧实现同时以四张 `BTreeMap`
   构建 GameObject、Mesh、Material、Avatar 的 key→源数组位置，并把相同四张树直接保留在最终
@@ -586,7 +586,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`，Rust/Python/Node 构建、
   workspace 测试、wheel/sdist/npm 包、严格类型和托管差分全部通过，零组跳过。提交 `01594a2`
   的公开常规矩阵
-  [32712675787](https://github.com/Team-Haruki/unity-rs/actions/runs/32712675787) 为 16/16 验证 job 全绿，
+  [32712675787](https://github.com/seiunx-dev/unity-rs/actions/runs/32712675787) 为 16/16 验证 job 全绿，
   另两项仅手工 release 条件任务按设计跳过；
 - **Loader 的 collection-wide 对象元数据树索引已于 2026-08-24 收口**：旧实现以一张长期保留的
   `BTreeMap` 同时承载对象名称和 container，并在重建时再以 `BTreeMap` 构建；MonoScript class
@@ -603,7 +603,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   Material 命名路径。Loader 28/28、Core 严格 Clippy 和完整
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过；提交
   `e53210a` 的公开常规矩阵
-  [32716234330](https://github.com/Team-Haruki/unity-rs/actions/runs/32716234330) 为 16/16 验证 job 全绿；
+  [32716234330](https://github.com/seiunx-dev/unity-rs/actions/runs/32716234330) 为 16/16 验证 job 全绿；
 - **Loader 递归待处理队列与最终 collection 表的不可失败增长已于 2026-08-24 收口**：旧实现只在
   `PendingInput` 出队时递增 `maximum_discovered_files` 计数；一个已经解析出百万目录项的 bundle、
   WebData 或 ZIP 会先用普通 `VecDeque::push_back` 把整批路径、Region 和版本 hint 留在内存中，
@@ -616,7 +616,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   精确上限完整、稳定地产生 16,384 个资源，而低一项在入队前拒绝。Loader 30/30、Core 严格 Clippy
   和完整 `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过；
   提交 `e5ee1a4` 的公开常规矩阵
-  [32719238507](https://github.com/Team-Haruki/unity-rs/actions/runs/32719238507) 为 16/16 验证 job 全绿；
+  [32719238507](https://github.com/seiunx-dev/unity-rs/actions/runs/32719238507) 为 16/16 验证 job 全绿；
 - **ASCII FBX 的材质/贴图二次规划分配已于 2026-08-24 收口**：场景贴图集合本身已有输入数量与
   可失败分配边界，但 ASCII FBX 写入前会把已识别的 Material texture environment 再复制成每材质
   binding plan，并另外建立唯一贴图索引与 texture plan；旧实现使用逐节点分配的 `BTreeMap`，两个
@@ -629,7 +629,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   offset/scale；13/13 ASCII FBX 定向测试、严格 Core Clippy 以及完整
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过。提交
   `122a946` 的公开常规矩阵
-  [32722019278](https://github.com/Team-Haruki/unity-rs/actions/runs/32722019278) 为 16/16 验证 job 全绿，
+  [32722019278](https://github.com/seiunx-dev/unity-rs/actions/runs/32722019278) 为 16/16 验证 job 全绿，
   另两项仅手工 release 条件任务按设计跳过；
 - **Cubism clip motion 目标索引的 CPU/分配放大已于 2026-08-24 收口**：旧实现对每个
   Parameter/Part 用 `named.iter().any` 去重，逆序唯一目标会形成二次方比较；哈希表只按
@@ -644,7 +644,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   同时锁定完整路径、中间后缀和末级后缀，另有每类预算低一项/精确相等回归。7/7 定向测试、严格
   workspace Clippy 以及完整 `tools/local_ci.py --fail-on-skip quality rust python node typing oracle`
   均通过，后者零组跳过。提交 `ca3171d` 的公开常规矩阵
-  [32725964995](https://github.com/Team-Haruki/unity-rs/actions/runs/32725964995) 为 16/16 验证 job 全绿，
+  [32725964995](https://github.com/seiunx-dev/unity-rs/actions/runs/32725964995) 为 16/16 验证 job 全绿，
   另两项仅手工 release 条件任务按设计跳过；
 - **Cubism FadeMotion 曲线目标分类的 CPU 放大已于 2026-08-24 收口**：旧实现对每条曲线先线扫
   全部 parameter，再线扫全部 part；默认最多允许 1,000,000 条曲线，而 MOC 目标表可合计达到
@@ -659,7 +659,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   预算传播回归。FadeMotion 5/5、package 19/19、严格 workspace Clippy 和完整
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过。
   提交 `42fe0b2` 的公开常规矩阵
-  [32730428675](https://github.com/Team-Haruki/unity-rs/actions/runs/32730428675) 为 16/16 验证 job 全绿，
+  [32730428675](https://github.com/seiunx-dev/unity-rs/actions/runs/32730428675) 为 16/16 验证 job 全绿，
   另两项仅手工 release 条件任务按设计跳过；
 - **ModelIr 目标资产解析的 `assets × object table` 放大已于 2026-08-24 收口**：场景 PPtr
   已经通过 Loader 的 `(file, pathID) → object_index` 排序索引解析并验证类型，但 Mesh、Material、
@@ -672,7 +672,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   0.02 秒；完整 Core 单测、严格 workspace Clippy、fmt/diff-check 以及
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过。
   提交 `a646d15` 的公开常规矩阵
-  [32733901273](https://github.com/Team-Haruki/unity-rs/actions/runs/32733901273) 为 16/16 验证 job 全绿，
+  [32733901273](https://github.com/seiunx-dev/unity-rs/actions/runs/32733901273) 为 16/16 验证 job 全绿，
   另两项仅手工 release 条件任务按设计跳过；
 - **TypeTree 子树边界的 `schema nodes × runtime values` 放大已于 2026-08-24 收口**：reader、
   root-field projection 和 legacy dump 原先每次需要跳到下一兄弟时都从当前节点向后线扫。普通类的
@@ -688,7 +688,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   malformed-input 6/6、严格 workspace Clippy/fmt/diff-check，以及
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过。
   提交 `d9cff60` 的公开常规矩阵
-  [32738542372](https://github.com/Team-Haruki/unity-rs/actions/runs/32738542372) 为 16/16 验证 job 全绿，
+  [32738542372](https://github.com/seiunx-dev/unity-rs/actions/runs/32738542372) 为 16/16 验证 job 全绿，
   另两项仅手工 release 条件任务按设计跳过；
 - **SpriteAtlas 回填的 `sprites × atlases × packedSprites` 放大已于 2026-08-24 收口**：旧的
   `effective_sprite_atlas` 为每个待解码 Sprite 重新遍历 collection 的所有对象，完整解析每个
@@ -707,7 +707,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   在总门禁实际执行，malformed-input 6/6、严格 workspace Clippy/fmt/diff-check，以及
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过。
   提交 `2c9fb42` 的公开常规矩阵
-  [32743479062](https://github.com/Team-Haruki/unity-rs/actions/runs/32743479062) 为 16/16 验证 job 全绿，
+  [32743479062](https://github.com/seiunx-dev/unity-rs/actions/runs/32743479062) 为 16/16 验证 job 全绿，
   覆盖 Rust、Python、Node、UnityPy、managed 与 vgmstream，另两项仅手工 release 条件任务按设计跳过；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
@@ -722,7 +722,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   在总门禁实际执行，malformed-input 6/6、严格 workspace Clippy/fmt/diff-check，以及
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 均通过，后者零组跳过。
   提交 `9daca17` 的公开常规矩阵
-  [32746907255](https://github.com/Team-Haruki/unity-rs/actions/runs/32746907255) 为 16/16 验证 job 全绿，
+  [32746907255](https://github.com/seiunx-dev/unity-rs/actions/runs/32746907255) 为 16/16 验证 job 全绿，
   覆盖 Rust、Python、Node、UnityPy、managed 与 vgmstream，另两项仅手工 release 条件任务按设计跳过；
 - **FBX blend-shape 动画的 `tracks × morph channels` 放大已于 2026-08-25 收口**：ASCII 与
   binary FBX 共用的场景 planner 原先会为每条 `ModelBlendShapeTrack` 重新扫描全部 geometry 与
@@ -738,7 +738,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   6/6；严格 workspace Clippy/fmt/diff-check 与
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 全部通过且零组跳过。
   提交 `90f572d` 的公开常规矩阵
-  [32750879788](https://github.com/Team-Haruki/unity-rs/actions/runs/32750879788) 为 16/16 验证 job 全绿，
+  [32750879788](https://github.com/seiunx-dev/unity-rs/actions/runs/32750879788) 为 16/16 验证 job 全绿，
   覆盖 Rust、Python、Node、UnityPy、managed 与 vgmstream，另两项仅手工 release 条件任务按设计跳过；
 - **AnimationGraph 的 `Animators × bound clips` 未计费复制已于 2026-08-25 收口**：图构建器会把
   direct `AnimatorController` 的完整 clip 列表复制到每个绑定 Animator（override controller 使用其
@@ -754,7 +754,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   外部 oracle 在总门禁实际执行，malformed-input 6/6；严格 workspace Clippy/fmt/diff-check 与
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 全部通过且零组跳过。
   提交 `5482d07` 的公开常规矩阵
-  [32755098612](https://github.com/Team-Haruki/unity-rs/actions/runs/32755098612) 为 16/16 验证 job 全绿，
+  [32755098612](https://github.com/seiunx-dev/unity-rs/actions/runs/32755098612) 为 16/16 验证 job 全绿，
   覆盖 Rust、Python、Node、UnityPy、managed 与 vgmstream，另两项仅手工 release 条件任务按设计跳过；
 - **`SerializeReference` 身份字符串已于 2026-08-22 纳入现有物化预算**：TypeTree reader
   已经把 `ReferencedManagedType` 的 class/namespace/assembly 三条字符串保留在输出树中，
@@ -1006,7 +1006,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   加 16,384 个子项只探测 `4,096+16,384` 次；5 字节恰好预算成功、4 字节拒绝且 claims/
   游标/预算均不部分提交。23 项 extraction、完整 Core 614 项、畸形输入 6/6、严格 Clippy、
   Rust/Python/Node/typing/oracle 零跳过本地门禁及公开矩阵
-  [32764678899](https://github.com/Team-Haruki/unity-rs/actions/runs/32764678899) 全绿；
+  [32764678899](https://github.com/seiunx-dev/unity-rs/actions/runs/32764678899) 全绿；
 - **解包输出路径的构造已于 2026-08-22 改为 checked/fallible**：claims 安全化之后，
   Bundle/WebData/ZIP 条目、`_unpacked` 容器目录、父目录碰撞重建、wrapper 解码名、`~N`
   碰撞后缀、最终绝对候选和临时发布名仍分别通过 `PathBuf::join`、`collect::<PathBuf>`、
@@ -1119,7 +1119,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   误报；`3ca4c20` 把探针改为最多八个有界的 detached 构造窗口，同时继续把 Python 线程
   切换间隔保持在 1,000 秒，因此真正持有 GIL 的实现仍无法通过，正确释放 GIL 的实现则不再
   依赖单个操作系统调度瞬间。公开矩阵
-  [32760790292](https://github.com/Team-Haruki/unity-rs/actions/runs/32760790292) 已在六平台
+  [32760790292](https://github.com/seiunx-dev/unity-rs/actions/runs/32760790292) 已在六平台
   Rust/Python/Node 作业中验证该探针；
   当前工作树随后执行 `tools/local_ci.py --fail-on-skip quality rust python node typing`
   全绿，零组跳过；
@@ -1170,16 +1170,16 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - **可选 Node 绑定同步了完整 `Sprite`/`SpriteAtlas` 元数据（2026-08-22）**：`readSpriteMetadata` 与 `readSpriteAtlas` 直接复用同一组 Core reader。Sprite 返回 object index/name/rect/pivot/border、原始 16-byte GUID `Buffer` 与 `bigint` key/PathID、atlas tags/PPtr、resident color/alpha/secondary references、解码后的 settings、UV/downscale 和规范化 tight-mesh triangles；条目、单字符串、累计字符串和 mesh bytes 预算可分别收紧。SpriteAtlas 返回有序 render-data、颜色/alpha PPtr、Rect/Vector/UV、settings、secondary textures、tag 和 variant 标志。JavaScript fixture 对普通 Sprite 逐字段核对并覆盖四个低预算拒绝分支，另一个有效 tight fixture 证明 triangle 跨过 napi 转换；atlas fixture 则故意把较大的原始 GUID key 写在前面并带一项 secondary texture，验证绑定保留 Core 的确定排序和全部嵌套字段。napi-rs 重生成的声明由严格 TypeScript 消费端实际调用，release addon build、JavaScript 和 TypeScript 测试全部通过。
 - **Node 的 `AnimationClipInfo` 已从简略 shape 补到完整稳定元数据（2026-08-22）**：保留原方法名和旧字段，新增 PathID、high-quality 标志、PPtr 曲线、muscle size 与 streamed/dense/constant 计数、ACL frame/bone/rate/curve/track bytes/decoder/fast-sample 字段，以及外部 streaming offset/size/path。`maximumBytes` 现在同时收紧对象、字符串、packed/reference 与累计分配预算，两个 clip 入口共用同一限制构造。现有完整 Unity 2022.2 muscle fixture 验证无 ACL/streaming 时所有 optional 字段保持 `undefined`；Tuanjie 2022.3.55t4 fixture 验证 32-byte ACL 容器、decoder map、fast-sample 与空路径 StreamingInfo。生成声明中的 `bigint`/optional 字段由严格 TypeScript 消费端实际赋值，不再只做方法存在性 smoke。
 - **Node 的 `Avatar` 已从四字段摘要补到完整稳定元数据（2026-08-22）**：`readAvatar` 现在返回 PathID、声明大小、普通/人形骨架节点数、保序 TOS `(hash,path)`、HumanDescription 的人形骨/骨架骨计数和 root-motion bone name；旧 `declaredSize` 保留为 `declaredAvatarSize` 的兼容别名。`maximumBytes` 同时收紧对象、单/累计字符串、引用与累计分配预算。由 Python 已通过的 Tuanjie 2022.3.55t4 fixture 逐字节移植到 JavaScript，完整对象解析后逐字段核对 `0xfeedbeef -> Root/Hips` 与 `Hips` root motion，并证明一字节预算拒绝；生成声明的 `AvatarPathEntry[]` 与 `bigint` PathID 进入严格 TypeScript 消费。
-- **六平台发布配置有了自动结构门禁（2026-08-22，2026-08-24 加固）**：`tools/check_ci_matrix.py` 不把“workflow 里看起来有 matrix”当证据，而是逐 job 要求 Python wheel、CLI 和可选 Node 包各自恰好包含 Linux/Windows/macOS × x86-64/ARM64 六个 `(runner, artifact)` 对；Python 必须安装并跑 wheel API/mypy，CLI 必须执行精确 release 二进制的 `--help` 并带法律文件 staging，Node 必须测试 release addon、检查 npm 内容并真正 `npm pack`。门禁自身接入本地与 GitHub `quality`。公开 PR 评审随后指出，仅删除整行注释仍不足以证明命令真的执行：`env` 值或 `echo` 可以携带同样文本，CLI 的顺序比较也仍在原始 job 字符串上搜索，注释掉的 staging 能冒充提交点。现审计器只从步骤缩进下的 YAML `run` scalar/literal/folded block 提取可执行命令；命令必须是完整命令或受控前缀，环境字段、step 名称、注释与 `echo` 都不计证据；staging 与 staged-binary smoke 的顺序按实际命令位置比较，同一个 multiline block 内也不能逆序。20 项回归覆盖当前配置、缺平台、重复键、移除步骤、注释命令、`env`/`echo` 冒充、multiline `echo`、“注释 staging 在前、真实 staging 在 smoke 后”以及“同一 run block 内 smoke 在 staging 前”的绕过。收口审查还发现 GitHub `quality` 原先没有执行 `tools/test_local_ci.py`，所以 `--fail-on-skip` 的正反策略虽在本地跑、却可能在正式 CI 中退化；现已补上并由反向测试锁定。锁定的 `actionlint 1.7.12` 继续承担通用 YAML/Actions 表达式检查，专用脚本只验证项目声明的发布证据。外部状态也已按 API 核实：`81b02a5` 的 [run 31947620200](https://github.com/Team-Haruki/unity-rs/actions/runs/31947620200) 在 2026-08-16 启动后约六秒即失败，所有 16 个主 job 都是 `steps=[]` 且没有日志，两个依赖 job 被跳过，因此没有一条仓库命令实际执行；仓库级 Actions 当前为 enabled、允许全部 actions，默认 workflow 权限为 write，所以不是仓库禁用了 Actions。API 没有给出可进一步归因的错误文本；组织计费端点需要当前 token 没有的 `admin:org` 权限，不能越权把根因写成某一种计费状态，也不能把这次 run 写成代码失败或绿色证据。后续 2026-08-24 的正式六平台绿色记录见下方执行清单。
+- **六平台发布配置有了自动结构门禁（2026-08-22，2026-08-24 加固）**：`tools/check_ci_matrix.py` 不把“workflow 里看起来有 matrix”当证据，而是逐 job 要求 Python wheel、CLI 和可选 Node 包各自恰好包含 Linux/Windows/macOS × x86-64/ARM64 六个 `(runner, artifact)` 对；Python 必须安装并跑 wheel API/mypy，CLI 必须执行精确 release 二进制的 `--help` 并带法律文件 staging，Node 必须测试 release addon、检查 npm 内容并真正 `npm pack`。门禁自身接入本地与 GitHub `quality`。公开 PR 评审随后指出，仅删除整行注释仍不足以证明命令真的执行：`env` 值或 `echo` 可以携带同样文本，CLI 的顺序比较也仍在原始 job 字符串上搜索，注释掉的 staging 能冒充提交点。现审计器只从步骤缩进下的 YAML `run` scalar/literal/folded block 提取可执行命令；命令必须是完整命令或受控前缀，环境字段、step 名称、注释与 `echo` 都不计证据；staging 与 staged-binary smoke 的顺序按实际命令位置比较，同一个 multiline block 内也不能逆序。20 项回归覆盖当前配置、缺平台、重复键、移除步骤、注释命令、`env`/`echo` 冒充、multiline `echo`、“注释 staging 在前、真实 staging 在 smoke 后”以及“同一 run block 内 smoke 在 staging 前”的绕过。收口审查还发现 GitHub `quality` 原先没有执行 `tools/test_local_ci.py`，所以 `--fail-on-skip` 的正反策略虽在本地跑、却可能在正式 CI 中退化；现已补上并由反向测试锁定。锁定的 `actionlint 1.7.12` 继续承担通用 YAML/Actions 表达式检查，专用脚本只验证项目声明的发布证据。外部状态也已按 API 核实：`81b02a5` 的 [run 31947620200](https://github.com/seiunx-dev/unity-rs/actions/runs/31947620200) 在 2026-08-16 启动后约六秒即失败，所有 16 个主 job 都是 `steps=[]` 且没有日志，两个依赖 job 被跳过，因此没有一条仓库命令实际执行；仓库级 Actions 当前为 enabled、允许全部 actions，默认 workflow 权限为 write，所以不是仓库禁用了 Actions。API 没有给出可进一步归因的错误文本；组织计费端点需要当前 token 没有的 `admin:org` 权限，不能越权把根因写成某一种计费状态，也不能把这次 run 写成代码失败或绿色证据。后续 2026-08-24 的正式六平台绿色记录见下方执行清单。
 - **仓库公开后正式 runner 与发布矩阵全绿（2026-08-24）**：
-  [`Team-Haruki/unity-rs`](https://github.com/Team-Haruki/unity-rs) 已从 Private 改为 Public，
+  [`seiunx-dev/unity-rs`](https://github.com/seiunx-dev/unity-rs) 已从 Private 改为 Public，
   此前在分配 runner 前由账户账单策略拒绝的阻塞随之解除。收口分支位于
-  [PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)，上述绿色运行验证的代码 head 为
+  [PR #1](https://github.com/seiunx-dev/unity-rs/pull/1)，上述绿色运行验证的代码 head 为
   `a07642e`。
-  [PR run 32659993206](https://github.com/Team-Haruki/unity-rs/actions/runs/32659993206)
+  [PR run 32659993206](https://github.com/seiunx-dev/unity-rs/actions/runs/32659993206)
   的 16 个主 job 全部成功，覆盖三平台 Rust、三平台 Node、六平台 Python wheel、质量门禁和
   managed/UnityPy/vgmstream 三类差分 oracle；随后
-  [workflow_dispatch run 32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990)
+  [workflow_dispatch run 32660298990](https://github.com/seiunx-dev/unity-rs/actions/runs/32660298990)
   28/28 成功，其中额外 12 项为 Linux/Windows/macOS × x64/arm64 的 CLI 与 Node 发布制品。
   公开 runner 首轮实际发现并修正了 vgmstream 安装目录、其信息命令的特殊退出码、Windows
   npm 启动方式、已加载 `.node` DLL 的 Windows 清理锁，以及 SILK fixture 在固定 r2117 Linux
@@ -1411,10 +1411,10 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 下表是后续工作的执行入口，按顺序推进。只有“完成证据”真实存在时才勾掉，
 不能用缩小目标、删除失败样本或把未验证格式改名为已支持来结项。2026-08-15
 整理出的主体提交已经推送；2026-08-25 最近一次绿色矩阵验证代码 head 为 `c661a39`。收口改动及公开 runner 修复已进入
-[PR #1](https://github.com/Team-Haruki/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
-[32859413104](https://github.com/Team-Haruki/unity-rs/actions/runs/32859413104) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败，
+[PR #1](https://github.com/seiunx-dev/unity-rs/pull/1)。仓库现为 Public；常规 PR 矩阵
+[32859413104](https://github.com/seiunx-dev/unity-rs/actions/runs/32859413104) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败，
 包含六平台 CLI/Node 制品的手工发布矩阵
-[32660298990](https://github.com/Team-Haruki/unity-rs/actions/runs/32660298990) 28/28 全绿。
+[32660298990](https://github.com/seiunx-dev/unity-rs/actions/runs/32660298990) 28/28 全绿。
 
 | 顺序 | 接下来要做的事 | 完成证据 |
 | --- | --- | --- |
@@ -1434,27 +1434,27 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 3A-28 | **已完成模型贴图共享名称索引的累计驻留与跨平台大小写碰撞治理**：`SceneTextureNames` 的实际对象文件名与 lowercase collision key 受独立累计字节预算约束，跨模型复用不会重置；同名不同大小写在发布前分配稳定后缀，而不是依赖目标文件系统是否区分大小写 | `31d1288`：`Body.rgba` 17/18 字节公开读取边界，`Body.png`/`body.png` 39/40 字节事务边界，`İ.png` 6+7 字节扩张；Python/Node 安装后测试按真实 fixture 名称验证少一字节拒绝，类型桩/声明显式消费 `maximum_name_index_bytes`/`maximumNameIndexBytes`。Core 16/16、严格 workspace Clippy及完整 `quality rust python node typing oracle` 本地门禁零跳过；公开常规矩阵 32785686979 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第二十八项完成证据 |
 | 3A-29 | **已完成模型贴图 binding/skip 返回 metadata 的累计驻留治理**：`SceneTextureLimits.maximum_metadata_bytes`、Python `ModelTextureLimits.maximum_metadata_bytes` 与 Node `maximumMetadataBytes` 共同限制成功绑定 property 和跳过项 property/reason 的精确 UTF-8 字节；成功路径在解码和共享名称 claim 前预检，失败原因通过有界 formatter 构造，确定性超限不会消耗共享名称状态 | `7726bdb`：`_MainTex` 在 7/8 字节边界拒绝/成功，且 7 字节拒绝发生于损坏 Texture2D 解码之前并保持共享名称表为空；悬空 PPtr 在 property 恰好占满 8 字节后因 reason 无空间稳定拒绝。Core 17/17、workspace 严格 Clippy、Python wheel/sdist 真实安装、Node debug/release addon/npm、严格 typing 与完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 32788921665 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第二十九项完成证据 |
 | 3A-30 | **已完成 SplitObjects/Animator FBX 批量隐藏 lowercase 名称索引的累计驻留治理**：候选数上限和 fallible HashMap 增长之外，新增精确 UTF-8 key 字节预算；现代 CLI 通过 `--maximum-name-index-bytes` 暴露 0–512 MiB 配置，默认 64 MiB，legacy WorkMode 使用同一默认值。按预算可容纳的最小 claim 数限制批次开始时的预留，低预算不会先按百万候选分配整张表 | `117f5a8`：首个 `Face` 的 3/4 字节边界；已有 `face` 后 `face~1` 的总计 9/10 字节事务边界，失败不改变 claim、retained bytes 或 suffix cursor；`İ` 的 2→3 字节 lowercase 扩张；真实 `split-objects` 进程在 3 字节上限下于发布 `root.fbx` 前拒绝且无临时文件。CLI 单元/进程测试、workspace 严格 Clippy 与完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 32790889498 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十项完成证据 |
-| 3A-31 | **已完成通用 export 返回报告与隐藏 lowercase 路径索引的累计驻留治理**：`ExportOptions.maximum_metadata_bytes` 默认 256 MiB，精确计入成功记录的 source/编码后 output path、失败/unsupported 的 source/error，以及逐文件 collision claim key；预算错误在解码前可判定时提前拒绝，写入前的记录预算拒绝不会创建临时文件，失败原因用有界 formatter 构造且终止性预算错误不会继续被包装成更多失败记录。CLI `--maximum-metadata-bytes`、Python `ExportLimits.maximum_metadata_bytes` 与 Node `maximumMetadataBytes` 使用同一语义 | `bd297b6`：成功 TextAsset 报告按 source + output path + lowercase key 的精确/少一字节边界；unsupported MonoBehaviour 报告按 source + error 的精确/少一字节边界；`İ` 的 2→3 字节 lowercase 扩张在低预算下不改变 claim 或预算；Python wheel/sdist 与 Node addon 的真实导出调用以零预算拒绝且不落文件，CLI 接受 0 并拒绝负数/非数字。workspace 严格 Clippy 与完整 `quality rust python node typing oracle` 本地门禁零跳过；公开常规矩阵 [32794197624](https://github.com/Team-Haruki/unity-rs/actions/runs/32794197624) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十一项完成证据 |
-| 3A-32 | **已完成独立 `live2d` MOC 导出隐藏 lowercase 名称索引的累计驻留治理**：输出名 claim 现在精确计入 UTF-8 key 字节，默认 64 MiB、可由 `--maximum-name-index-bytes` 在 0–512 MiB 内配置；重复 key 不重复计费，新 key 的预算或分配失败不会改变集合和累计值；名称预算在创建输出目录前检查。完整 `live2d-package` 继续使用 Core 已有、更广的包名称和 diagnostics 预算，不混用这个 CLI 专用索引 | `3ddcfc1`：`Face.moc3` 的 9/8 字节精确边界、已有 claim 后候选失败不改变状态、`İ.moc3` lowercase 扩张后的 8/7 字节边界；真实 CLI 进程用零预算拒绝第一份 MOC，退出码为运行错误且不创建输出目录。6 个 Live2D 进程测试、3 个相关 CLI 单测、严格 CLI Clippy，以及完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 [32796030129](https://github.com/Team-Haruki/unity-rs/actions/runs/32796030129) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十二项完成证据 |
-| 3A-33 | **已完成递归 extraction 返回报告的累计驻留治理**：`ExtractionLimits.maximum_metadata_bytes` 默认 256 MiB，与遍历用 `maximum_total_path_bytes` 分离，精确累计 success/skip 的 source 与编码后 output path，以及 failure 的 source 与完整错误文本；所有检查在报告提交前事务性完成，成功记录预算不足不会发布文件，失败记录预算耗尽也不会继续无界增长。Python 运行时、类型桩和严格消费端暴露同一配置；Node 紧凑 `extract` 继续继承 Core 默认值 | `59bfb36`：成功记录按 source+output path 的精确/少一字节边界，少一字节时文件不发布而形成受限失败；两条失败记录恰好耗尽累计预算，第三条稳定拒绝且预算与报告长度不变；Python 真实安装后以零预算拒绝并不落文件。workspace 严格 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 [32798794256](https://github.com/Team-Haruki/unity-rs/actions/runs/32798794256) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十三项完成证据 |
-| 3A-34 | **已完成逐输入容错诊断的累计驻留治理**：`AssetLoadLimits.maximum_diagnostic_bytes` 默认 256 MiB，与发现路径预算分离，精确累计 `LoadFailurePolicy::SkipInput` 最终保留的 path/message UTF-8 字节；每条错误通过有界 formatter 直接生成最多 4096 字节的合法 UTF-8 前缀，不再先物化任意长 `Display` 输出。Rust `Studio` 提供借用 slice，Python/Node 均暴露独立预算及 bounded count/page API | `62287c9`：单条 path+message 精确/少一字节边界，两条记录累计精确/少一字节边界，以及多字节 UTF-8 长错误的量测/格式化一致性；Python wheel/sdist 与 Node debug/release/npm 真实混合目录调用验证正常容错、分页和零预算稳定拒绝。workspace 严格 Clippy 与完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 [32802131674](https://github.com/Team-Haruki/unity-rs/actions/runs/32802131674) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十四项完成证据 |
-| 3A-35 | **已完成 Live2D 包 diagnostics 的预算前临时分配治理**：26 条诊断路径统一接受借用 `Display`，其中 18 条动态消息由 `format!` 改为 `format_args!`；先 allocation-free 量测完整 UTF-8 长度并检查 `maximum_total_diagnostic_bytes`，再精确可失败分配和二次写入，最后与 diagnostics 容量一起事务性提交累计预算。原消息文本与公开 Rust/Python/Node 包结构不变 | `a789d45`：已有 2 字节诊断后，8 字节多字节 UTF-8 消息在累计 10 字节精确成功并只分配最终字符串；累计上限 9 字节时只执行量测遍历，第二次格式化不发生，报告长度和已消费预算保持不变。Core 定向回归、严格全目标 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32804544428](https://github.com/Team-Haruki/unity-rs/actions/runs/32804544428) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十五项完成证据 |
-| 3A-36 | **已完成外部 MonoBehaviour schema JSON 的整树中间物化治理**：`from_json_with_limits` 不再先构造一份无结构预算的 `serde_json::Value` 树再复制最终 registry；自定义 serde seed 直接、稳定地读取 document→entries→nodes，entry/node 上限在进入下一个元素前检查，所有 Vec 增长可失败，未知字段由 `IgnoredAny` 消费而不保留。对转义字符串另做 allocation-free JSON lexical preflight，按解码后 UTF-8 字节精确量测，在 `serde_json` 建立单字符串 unescape scratch 前拒绝；低于最长合法字段名的调用方 value limit 仍只给字段名保留 13 字节常量窗口，最终拥有字符串继续按原 per-string/total budget 精确计费 | `7dd88ab`：entry 上限 0 + string 上限 0 时在首个 entry 的字符串解析前拒绝；nodes-first 文档在 node 上限 0 时同样先拒绝；5 个 `\u4e16` 的 15 字节解码结果在 13 字节 preflight 边界拒绝。原有 8 项 schema 语义/错误/Unicode/累计预算回归加新用例为 9/9，Core 全目标严格 Clippy及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32822319496](https://github.com/Team-Haruki/unity-rs/actions/runs/32822319496) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十六项完成证据 |
-| 3A-37 | **已完成外部 MonoBehaviour schema 的 `objects × entries` 查找放大治理**：注册表不再为每个 stripped 对象线扫最多 100,000 条 schema；以每个 registry 独立随机键对 portable assembly（ASCII-insensitive、忽略可选 `.dll` 后缀）、namespace、class 和 exact/fallback Unity version 建索引，hash collision 仍逐项复验完整 identity，不会选错树。查询先取首个 exact version，再取首个 unversioned fallback；后载文档和重复条目仍不能覆盖首条。索引只保留 entry index，不复制第二份身份字符串；`push` 与多文档 `extend` 的 map/bucket/entries 增长全部可失败，`extend` 先在临时索引完成重建再事务性提交 | `0888585`：20,000 条同 assembly/class、不同 version 的 schema 逆序逐一查询，candidate probe 不超过 `2 × N`；同 key 的 exact/fallback 后置重复项仍选首条，跨文档 `extend` 也保持第一份文档优先。schema 定向测试 10/10、Core 全目标严格 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32826196935](https://github.com/Team-Haruki/unity-rs/actions/runs/32826196935) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十七项完成证据 |
-| 3A-38 | **已完成 Python 外部 MonoBehaviour schema 集合的 `objects × schemas` 查找放大治理**：Python 不再把每个可见 schema 包成一个单项 provider，再对整张列表执行 exact/fallback 两轮线扫；Core 新增不可变共享 registry set，以每个集合独立随机键索引 `(registry, entry)`，通过 `Arc` 保留原 registry，只保存位置而不复制 TypeTree 或 identity。Python API 形状不变，并在转换首个元素前拒绝超过 100,000 项的集合 | `98f7069`：20,000 个独立 registry 逆序逐一查询，candidate probe 不超过 `2 × N`；指针身份断言证明返回原 registry 的 TypeTree，重复 exact/fallback 保持首项优先；安装后 Python 测试用 100,001 个 `None` 证明计数上限先于元素转换。schema 定向测试 11/11、Core/Python 严格 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32830773426](https://github.com/Team-Haruki/unity-rs/actions/runs/32830773426) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十八项完成证据 |
-| 3A-39 | **已完成 Python schema 集合索引构建的 GIL 独占治理**：Python 列表计数与元素类型检查仍在 GIL 内完成，随后最多 100,000 个已验证 registry 的纯 Rust random-keyed 索引构建通过 `Python::detach` 在锁外执行；公开构造器、first-match、exact/fallback 和错误语义不变 | `a78a8a9`：安装后 wheel 与 sdist 测试分别构造 100,000-node 单 schema 和 100,000-entry schema collection，把 Python 线程切换间隔设为 1,000 秒，并要求辅助线程只能在 Rust 构造窗口内获得运行机会；不释放 GIL 的集合构造无法通过。Python 严格 Clippy、真实 wheel/sdist 两套 API 测试，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32832857909](https://github.com/Team-Haruki/unity-rs/actions/runs/32832857909) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十九项完成证据 |
-| 3A-40 | **已完成 Node Promise schema 索引的 event-loop 独占治理，并统一程序化版本校验**：两个接收外部 schema 的 Promise API 仍在主线程对 JavaScript 数组做计数、节点/字符串预算检查和必要的值复制，但 Unity 版本身份校验、random-keyed Core registry 构建、对象解析与 JSON/Live2D 物化全部移到 worker。同步 API 保持立即报错；Core 程序化 `push` 现在与 JSON loader 一样事务性拒绝非法 Unity 版本，Rust/Python/Node 不再产生永远无法命中的无效条目 | `0c291d0`：Node 行为回归证明同步调用对非法版本立即抛错，而 `readMonoBehaviourJsonWithSchemasAsync` 与带 ACL decoder 的 Live2D Promise 均先正常返回、再在 worker 中 reject，且 decoder 不会被调用；Core 验证失败后 registry 仍为空，安装后 Python 对同一非法版本稳定给出 `ValueError`。完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32837018171](https://github.com/Team-Haruki/unity-rs/actions/runs/32837018171) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十项完成证据 |
-| 3A-41 | **已完成 Node 异步 Texture2D/Texture2DArray 行翻转的 event-loop 治理**：解码原本在 libuv worker，但把 bottom-up RGBA 转为 JavaScript top-down 行序的 O(pixel bytes) 原地翻转留在 `Task::resolve`；大纹理会在 worker 完成后再次阻塞事件循环。任务输出现在由 `DisplayRowImage(s)` 类型保证已在 `compute` 完成行序转换，`resolve` 只做 Node `Buffer`/数组包装；同步 API 继续复用同一转换语义 | `13ee8f7`：Rust 单测分别对单图和两层数组断言 worker 输出已经翻转；安装后 Node addon 用真实 1×2 RGBA32 Texture2DArray 同时调用同步与 Promise API，逐层核对 top-down 像素完全一致，既有 2×2 Texture2D Promise 行序回归继续通过。Node debug/release addon、npm tarball、严格 TypeScript 及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32839865245](https://github.com/Team-Haruki/unity-rs/actions/runs/32839865245) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十一项完成证据 |
-| 3A-42 | **已完成 Python Texture2D/Texture2DArray 行翻转的 GIL 治理**：两个读取入口原本只把解码放进 `Python::detach`，随后重新持有 GIL 执行最多 512 MiB 的 O(pixel bytes) bottom-up-to-display 原地翻转；其他 Python 线程会在解码结束后再次停顿。现在 `DisplayRowPyImage(s)` 作为 detach 闭包输出，保证完整行序转换已在锁外完成，attached 路径只按层可失败预留 wrapper 列表并搬移像素所有权 | `dd44509`：源码审计同时要求单图与数组转换位于各自 `py.detach` 闭包内，正反测试逐一把调用移到闭包外并确认门禁失败；真实 wheel 与 sdist 安装后测试继续逐像素验证 2×2 Texture2D 和两层 1×2 Texture2DArray 的 top-down 结果，严格 mypy 公开消费保持通过。Python 严格 Clippy、格式、API/GIL 审计及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32842974806](https://github.com/Team-Haruki/unity-rs/actions/runs/32842974806) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十二项完成证据 |
-| 3A-43 | **已完成 Python AudioClip 与简单二进制资产的 GIL 治理**：`read_audio_clip` 原本只在 `Python::detach` 内解析对象，随后持有 GIL 读取 raw Region 或估算、分配并写出 WAV；Font、MovieTexture、VideoClip 也在 attached 路径才把 source-bound Region 复制成最多 512 MiB 的完整载荷。现在四个入口均在同一 detach 闭包内完成解析和最终有界载荷物化，attached 路径只搬移已完成的 Rust wrapper | `f061b90`：源码审计要求 `materialize_audio_clip` 及三个 `materialize_binary_asset` 调用位于对应 `py.detach` 内，四个负向变体逐一把调用移出闭包并确认门禁失败。真实 wheel/sdist 测试覆盖 AudioClip raw/PCM 以及 FSB5 IMA/DSP/VAG/HEVAG/FADPCM/MPEG/Opus/Vorbis 的 WAV 路径，Font/MovieTexture/VideoClip 字节和预算拒绝保持一致；Python 严格 Clippy、格式、API/GIL 审计及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32845001314](https://github.com/Team-Haruki/unity-rs/actions/runs/32845001314) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十三项完成证据 |
-| 3A-44 | **已完成 Python Cubism JSON 的 GIL 治理**：expression、physics、fade-motion、标准 `AnimationClip` motion 与 Tuanjie ACL motion 原本都在 detach 内解析 Core 对象，却在重新持有 GIL 后才写出最多 256 MiB JSON并扫描曲线/关键帧计数。现在五个入口都在同一 detach 闭包内完成有界 writer 和派生计数；expression 只有必须调用 `Py::new` 的参数 wrapper 留在 attached 路径 | `03e490b`：源码审计要求五个 writer helper 位于各自 `py.detach` 内，五个负向变体逐一移出调用并确认门禁失败。真实 wheel/sdist 测试除了既有 expression/physics/fade 文档外，新增标准 Unity clip 和带单 Cubism binding 的 Tuanjie ACL clip，完整解析 motion3 JSON，并逐路径验证精确输出预算成功、少一字节稳定 `ValueError`；完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32848377924](https://github.com/Team-Haruki/unity-rs/actions/runs/32848377924) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十四项完成证据 |
-| 3A-45 | **已完成 Python 大型元数据表的 GIL 治理**：legacy `Animation` clips、`AnimatorOverrideController` overrides、`AssetBundle` preload/container、`ResourceManager` container、`PreloadData` assets、`AnimatorController` TOS/clips 与 `Avatar` paths 原本都在 detach 内完成 Core 解析，却在重新持有 GIL 后才预留并遍历最多百万项的第二张 Python-facing Rust 表。现在七个入口均在原 detach 闭包内完成可失败投影，attached 路径只接收最终 wrapper，公开 API 与字段语义不变 | `734d931`：源码审计要求七个 preparation helper 位于各自 `py.detach` 内，七个负向变体逐一移出调用并确认门禁失败；严格 Python Clippy、真实 wheel/sdist 重建与安装后 API 套件、严格 Python 3.9 mypy 均通过，完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32850532392](https://github.com/Team-Haruki/unity-rs/actions/runs/32850532392) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十五项完成证据 |
-| 3A-46 | **已完成 Python 集合/场景/报告表的 GIL 治理**：file/object/resource convenience lists 与 pages、容错加载 diagnostics、SceneHierarchy nodes、SplitObjects/Animator FBX candidates、Material properties、模型贴图 skip 文本以及 export/extraction reports 原本都会在 Core detach 返回后再次持有 GIL 执行最多百万项的纯 Rust 预留、字符串复制和 tuple/wrapper 投影。现在 15 个 preparation 路径都在对应 Core 调用的 detach 内完成；模型唯一纹理文件仍只把必须调用 `Py::new` 的包装留在 attached 路径，公开 Python 签名和返回字段不变 | `a9f09d7`：call-aware 源码审计同时覆盖 block 和 single-expression detach closure，要求 15 个 helper 位于对应调用内，并以 15 个负向变体逐一改写后确认门禁失败；严格 Python Clippy、真实 wheel/sdist 重建与安装后 API 套件、严格 Python 3.9 mypy 均通过，完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32853842338](https://github.com/Team-Haruki/unity-rs/actions/runs/32853842338) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十六项完成证据 |
-| 3A-47 | **已完成 Node ACL-backed Live2D 包表的 event-loop 治理**：完整包的 MOC、manifest、贴图、expression/motion/physics/pose/display-info 与 diagnostics 虽已在 libuv worker 物化，旧任务却在 `resolve` 才按包重新计算文件数、可失败分配并展开最终文件/诊断表、格式化诊断类型；大包会在 worker 返回后再次占用事件循环。任务输出现在就是最终 `Live2dPackageSet`，全部 O(packages + files + diagnostics) 的纯 Rust 投影在 `compute` 完成，`resolve` 只把已完成表交给 napi-rs，JavaScript API 与字段不变 | `4cbdbce`：源码门禁要求 task output 为最终表、转换 helper 只出现在 `compute`，两条负向变体分别恢复 Core 输出和把转换移回 `resolve` 后均稳定失败。Node debug/release addon、运行时 API、严格 TypeScript、包内容、安装后临时消费者与 npm tarball 全部通过；完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32856570477](https://github.com/Team-Haruki/unity-rs/actions/runs/32856570477) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十七项完成证据 |
-| 3A-48 | **已完成 Node 异步 Texture2DArray 最终层表的 event-loop 治理**：此前 O(pixel bytes) 行翻转已在 worker，但最多 4,096 层、累计 1 GiB 像素的最终 Vec 仍在 `resolve` 才可失败预留，并逐层把 Core image 转为 napi-facing `RgbaImage`/`Buffer`。`DisplayRowImages` 现在直接持有 worker 构造完成的最终层表；`compute` 完成行翻转、表预留和每层投影，`resolve` 的 `into_nodes` 只移动一个现成 Vec，同步 API 和 JavaScript 像素/字段顺序不变 | `bb2eb98`：源码门禁要求 async task 继续输出 `DisplayRowImages`、worker helper 必须预留最终表并调用 `convert_image`，同时禁止 `into_nodes` 出现分配、循环或 image projection；两条负向变体分别改回未投影输出和把转换塞回 event-loop helper 后均稳定失败。Rust worker 单测确认两层 Buffer 已按 top-down 行序完成；Node debug/release addon、运行时 API、严格 TypeScript、包内容、安装后临时消费者与 npm tarball 全部通过。完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32859413104](https://github.com/Team-Haruki/unity-rs/actions/runs/32859413104) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十八项完成证据 |
-| 3A-49 | **已完成 Python `SpriteAtlas` 大型元数据表的 GIL 治理**：对象解析原本在 `Python::detach` 内完成，但随后重新持有 GIL 才遍历最多 1,000,000 条 packed-sprite/render-data/secondary-texture 记录，转换 PPtr、展开 rect/vector/settings tuple 并移动名称表。现在 `prepare_sprite_atlas` 在同一 detach 闭包内完成全部纯 Rust 可失败表投影；attached 路径只为最终 key/render-data/secondary-texture 调用必须由 PyO3 执行的 `Py::new`，公开字段、顺序和预算语义不变 | `e8c9365`：源码门禁要求 preparation 位于 `py.detach` 且 Python wrapping 位于闭包外，负向变体把 preparation 移走后稳定失败。Python crate check/严格 Clippy、真实 wheel 与 sdist 重建和安装后 SpriteAtlas 行为测试、公开面检查、严格 Python 3.9 mypy，以及完整 `quality rust python node typing oracle` 本地门禁均全部通过、零组跳过；公开常规矩阵 [32862849606](https://github.com/Team-Haruki/unity-rs/actions/runs/32862849606) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十九项完成证据 |
+| 3A-31 | **已完成通用 export 返回报告与隐藏 lowercase 路径索引的累计驻留治理**：`ExportOptions.maximum_metadata_bytes` 默认 256 MiB，精确计入成功记录的 source/编码后 output path、失败/unsupported 的 source/error，以及逐文件 collision claim key；预算错误在解码前可判定时提前拒绝，写入前的记录预算拒绝不会创建临时文件，失败原因用有界 formatter 构造且终止性预算错误不会继续被包装成更多失败记录。CLI `--maximum-metadata-bytes`、Python `ExportLimits.maximum_metadata_bytes` 与 Node `maximumMetadataBytes` 使用同一语义 | `bd297b6`：成功 TextAsset 报告按 source + output path + lowercase key 的精确/少一字节边界；unsupported MonoBehaviour 报告按 source + error 的精确/少一字节边界；`İ` 的 2→3 字节 lowercase 扩张在低预算下不改变 claim 或预算；Python wheel/sdist 与 Node addon 的真实导出调用以零预算拒绝且不落文件，CLI 接受 0 并拒绝负数/非数字。workspace 严格 Clippy 与完整 `quality rust python node typing oracle` 本地门禁零跳过；公开常规矩阵 [32794197624](https://github.com/seiunx-dev/unity-rs/actions/runs/32794197624) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十一项完成证据 |
+| 3A-32 | **已完成独立 `live2d` MOC 导出隐藏 lowercase 名称索引的累计驻留治理**：输出名 claim 现在精确计入 UTF-8 key 字节，默认 64 MiB、可由 `--maximum-name-index-bytes` 在 0–512 MiB 内配置；重复 key 不重复计费，新 key 的预算或分配失败不会改变集合和累计值；名称预算在创建输出目录前检查。完整 `live2d-package` 继续使用 Core 已有、更广的包名称和 diagnostics 预算，不混用这个 CLI 专用索引 | `3ddcfc1`：`Face.moc3` 的 9/8 字节精确边界、已有 claim 后候选失败不改变状态、`İ.moc3` lowercase 扩张后的 8/7 字节边界；真实 CLI 进程用零预算拒绝第一份 MOC，退出码为运行错误且不创建输出目录。6 个 Live2D 进程测试、3 个相关 CLI 单测、严格 CLI Clippy，以及完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 [32796030129](https://github.com/seiunx-dev/unity-rs/actions/runs/32796030129) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十二项完成证据 |
+| 3A-33 | **已完成递归 extraction 返回报告的累计驻留治理**：`ExtractionLimits.maximum_metadata_bytes` 默认 256 MiB，与遍历用 `maximum_total_path_bytes` 分离，精确累计 success/skip 的 source 与编码后 output path，以及 failure 的 source 与完整错误文本；所有检查在报告提交前事务性完成，成功记录预算不足不会发布文件，失败记录预算耗尽也不会继续无界增长。Python 运行时、类型桩和严格消费端暴露同一配置；Node 紧凑 `extract` 继续继承 Core 默认值 | `59bfb36`：成功记录按 source+output path 的精确/少一字节边界，少一字节时文件不发布而形成受限失败；两条失败记录恰好耗尽累计预算，第三条稳定拒绝且预算与报告长度不变；Python 真实安装后以零预算拒绝并不落文件。workspace 严格 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 [32798794256](https://github.com/seiunx-dev/unity-rs/actions/runs/32798794256) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十三项完成证据 |
+| 3A-34 | **已完成逐输入容错诊断的累计驻留治理**：`AssetLoadLimits.maximum_diagnostic_bytes` 默认 256 MiB，与发现路径预算分离，精确累计 `LoadFailurePolicy::SkipInput` 最终保留的 path/message UTF-8 字节；每条错误通过有界 formatter 直接生成最多 4096 字节的合法 UTF-8 前缀，不再先物化任意长 `Display` 输出。Rust `Studio` 提供借用 slice，Python/Node 均暴露独立预算及 bounded count/page API | `62287c9`：单条 path+message 精确/少一字节边界，两条记录累计精确/少一字节边界，以及多字节 UTF-8 长错误的量测/格式化一致性；Python wheel/sdist 与 Node debug/release/npm 真实混合目录调用验证正常容错、分页和零预算稳定拒绝。workspace 严格 Clippy 与完整 `quality rust python node typing oracle` 本地门禁均零跳过；公开常规矩阵 [32802131674](https://github.com/seiunx-dev/unity-rs/actions/runs/32802131674) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十四项完成证据 |
+| 3A-35 | **已完成 Live2D 包 diagnostics 的预算前临时分配治理**：26 条诊断路径统一接受借用 `Display`，其中 18 条动态消息由 `format!` 改为 `format_args!`；先 allocation-free 量测完整 UTF-8 长度并检查 `maximum_total_diagnostic_bytes`，再精确可失败分配和二次写入，最后与 diagnostics 容量一起事务性提交累计预算。原消息文本与公开 Rust/Python/Node 包结构不变 | `a789d45`：已有 2 字节诊断后，8 字节多字节 UTF-8 消息在累计 10 字节精确成功并只分配最终字符串；累计上限 9 字节时只执行量测遍历，第二次格式化不发生，报告长度和已消费预算保持不变。Core 定向回归、严格全目标 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32804544428](https://github.com/seiunx-dev/unity-rs/actions/runs/32804544428) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十五项完成证据 |
+| 3A-36 | **已完成外部 MonoBehaviour schema JSON 的整树中间物化治理**：`from_json_with_limits` 不再先构造一份无结构预算的 `serde_json::Value` 树再复制最终 registry；自定义 serde seed 直接、稳定地读取 document→entries→nodes，entry/node 上限在进入下一个元素前检查，所有 Vec 增长可失败，未知字段由 `IgnoredAny` 消费而不保留。对转义字符串另做 allocation-free JSON lexical preflight，按解码后 UTF-8 字节精确量测，在 `serde_json` 建立单字符串 unescape scratch 前拒绝；低于最长合法字段名的调用方 value limit 仍只给字段名保留 13 字节常量窗口，最终拥有字符串继续按原 per-string/total budget 精确计费 | `7dd88ab`：entry 上限 0 + string 上限 0 时在首个 entry 的字符串解析前拒绝；nodes-first 文档在 node 上限 0 时同样先拒绝；5 个 `\u4e16` 的 15 字节解码结果在 13 字节 preflight 边界拒绝。原有 8 项 schema 语义/错误/Unicode/累计预算回归加新用例为 9/9，Core 全目标严格 Clippy及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32822319496](https://github.com/seiunx-dev/unity-rs/actions/runs/32822319496) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十六项完成证据 |
+| 3A-37 | **已完成外部 MonoBehaviour schema 的 `objects × entries` 查找放大治理**：注册表不再为每个 stripped 对象线扫最多 100,000 条 schema；以每个 registry 独立随机键对 portable assembly（ASCII-insensitive、忽略可选 `.dll` 后缀）、namespace、class 和 exact/fallback Unity version 建索引，hash collision 仍逐项复验完整 identity，不会选错树。查询先取首个 exact version，再取首个 unversioned fallback；后载文档和重复条目仍不能覆盖首条。索引只保留 entry index，不复制第二份身份字符串；`push` 与多文档 `extend` 的 map/bucket/entries 增长全部可失败，`extend` 先在临时索引完成重建再事务性提交 | `0888585`：20,000 条同 assembly/class、不同 version 的 schema 逆序逐一查询，candidate probe 不超过 `2 × N`；同 key 的 exact/fallback 后置重复项仍选首条，跨文档 `extend` 也保持第一份文档优先。schema 定向测试 10/10、Core 全目标严格 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32826196935](https://github.com/seiunx-dev/unity-rs/actions/runs/32826196935) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十七项完成证据 |
+| 3A-38 | **已完成 Python 外部 MonoBehaviour schema 集合的 `objects × schemas` 查找放大治理**：Python 不再把每个可见 schema 包成一个单项 provider，再对整张列表执行 exact/fallback 两轮线扫；Core 新增不可变共享 registry set，以每个集合独立随机键索引 `(registry, entry)`，通过 `Arc` 保留原 registry，只保存位置而不复制 TypeTree 或 identity。Python API 形状不变，并在转换首个元素前拒绝超过 100,000 项的集合 | `98f7069`：20,000 个独立 registry 逆序逐一查询，candidate probe 不超过 `2 × N`；指针身份断言证明返回原 registry 的 TypeTree，重复 exact/fallback 保持首项优先；安装后 Python 测试用 100,001 个 `None` 证明计数上限先于元素转换。schema 定向测试 11/11、Core/Python 严格 Clippy，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32830773426](https://github.com/seiunx-dev/unity-rs/actions/runs/32830773426) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十八项完成证据 |
+| 3A-39 | **已完成 Python schema 集合索引构建的 GIL 独占治理**：Python 列表计数与元素类型检查仍在 GIL 内完成，随后最多 100,000 个已验证 registry 的纯 Rust random-keyed 索引构建通过 `Python::detach` 在锁外执行；公开构造器、first-match、exact/fallback 和错误语义不变 | `a78a8a9`：安装后 wheel 与 sdist 测试分别构造 100,000-node 单 schema 和 100,000-entry schema collection，把 Python 线程切换间隔设为 1,000 秒，并要求辅助线程只能在 Rust 构造窗口内获得运行机会；不释放 GIL 的集合构造无法通过。Python 严格 Clippy、真实 wheel/sdist 两套 API 测试，以及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32832857909](https://github.com/seiunx-dev/unity-rs/actions/runs/32832857909) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第三十九项完成证据 |
+| 3A-40 | **已完成 Node Promise schema 索引的 event-loop 独占治理，并统一程序化版本校验**：两个接收外部 schema 的 Promise API 仍在主线程对 JavaScript 数组做计数、节点/字符串预算检查和必要的值复制，但 Unity 版本身份校验、random-keyed Core registry 构建、对象解析与 JSON/Live2D 物化全部移到 worker。同步 API 保持立即报错；Core 程序化 `push` 现在与 JSON loader 一样事务性拒绝非法 Unity 版本，Rust/Python/Node 不再产生永远无法命中的无效条目 | `0c291d0`：Node 行为回归证明同步调用对非法版本立即抛错，而 `readMonoBehaviourJsonWithSchemasAsync` 与带 ACL decoder 的 Live2D Promise 均先正常返回、再在 worker 中 reject，且 decoder 不会被调用；Core 验证失败后 registry 仍为空，安装后 Python 对同一非法版本稳定给出 `ValueError`。完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32837018171](https://github.com/seiunx-dev/unity-rs/actions/runs/32837018171) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十项完成证据 |
+| 3A-41 | **已完成 Node 异步 Texture2D/Texture2DArray 行翻转的 event-loop 治理**：解码原本在 libuv worker，但把 bottom-up RGBA 转为 JavaScript top-down 行序的 O(pixel bytes) 原地翻转留在 `Task::resolve`；大纹理会在 worker 完成后再次阻塞事件循环。任务输出现在由 `DisplayRowImage(s)` 类型保证已在 `compute` 完成行序转换，`resolve` 只做 Node `Buffer`/数组包装；同步 API 继续复用同一转换语义 | `13ee8f7`：Rust 单测分别对单图和两层数组断言 worker 输出已经翻转；安装后 Node addon 用真实 1×2 RGBA32 Texture2DArray 同时调用同步与 Promise API，逐层核对 top-down 像素完全一致，既有 2×2 Texture2D Promise 行序回归继续通过。Node debug/release addon、npm tarball、严格 TypeScript 及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32839865245](https://github.com/seiunx-dev/unity-rs/actions/runs/32839865245) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十一项完成证据 |
+| 3A-42 | **已完成 Python Texture2D/Texture2DArray 行翻转的 GIL 治理**：两个读取入口原本只把解码放进 `Python::detach`，随后重新持有 GIL 执行最多 512 MiB 的 O(pixel bytes) bottom-up-to-display 原地翻转；其他 Python 线程会在解码结束后再次停顿。现在 `DisplayRowPyImage(s)` 作为 detach 闭包输出，保证完整行序转换已在锁外完成，attached 路径只按层可失败预留 wrapper 列表并搬移像素所有权 | `dd44509`：源码审计同时要求单图与数组转换位于各自 `py.detach` 闭包内，正反测试逐一把调用移到闭包外并确认门禁失败；真实 wheel 与 sdist 安装后测试继续逐像素验证 2×2 Texture2D 和两层 1×2 Texture2DArray 的 top-down 结果，严格 mypy 公开消费保持通过。Python 严格 Clippy、格式、API/GIL 审计及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32842974806](https://github.com/seiunx-dev/unity-rs/actions/runs/32842974806) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十二项完成证据 |
+| 3A-43 | **已完成 Python AudioClip 与简单二进制资产的 GIL 治理**：`read_audio_clip` 原本只在 `Python::detach` 内解析对象，随后持有 GIL 读取 raw Region 或估算、分配并写出 WAV；Font、MovieTexture、VideoClip 也在 attached 路径才把 source-bound Region 复制成最多 512 MiB 的完整载荷。现在四个入口均在同一 detach 闭包内完成解析和最终有界载荷物化，attached 路径只搬移已完成的 Rust wrapper | `f061b90`：源码审计要求 `materialize_audio_clip` 及三个 `materialize_binary_asset` 调用位于对应 `py.detach` 内，四个负向变体逐一把调用移出闭包并确认门禁失败。真实 wheel/sdist 测试覆盖 AudioClip raw/PCM 以及 FSB5 IMA/DSP/VAG/HEVAG/FADPCM/MPEG/Opus/Vorbis 的 WAV 路径，Font/MovieTexture/VideoClip 字节和预算拒绝保持一致；Python 严格 Clippy、格式、API/GIL 审计及完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32845001314](https://github.com/seiunx-dev/unity-rs/actions/runs/32845001314) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十三项完成证据 |
+| 3A-44 | **已完成 Python Cubism JSON 的 GIL 治理**：expression、physics、fade-motion、标准 `AnimationClip` motion 与 Tuanjie ACL motion 原本都在 detach 内解析 Core 对象，却在重新持有 GIL 后才写出最多 256 MiB JSON并扫描曲线/关键帧计数。现在五个入口都在同一 detach 闭包内完成有界 writer 和派生计数；expression 只有必须调用 `Py::new` 的参数 wrapper 留在 attached 路径 | `03e490b`：源码审计要求五个 writer helper 位于各自 `py.detach` 内，五个负向变体逐一移出调用并确认门禁失败。真实 wheel/sdist 测试除了既有 expression/physics/fade 文档外，新增标准 Unity clip 和带单 Cubism binding 的 Tuanjie ACL clip，完整解析 motion3 JSON，并逐路径验证精确输出预算成功、少一字节稳定 `ValueError`；完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32848377924](https://github.com/seiunx-dev/unity-rs/actions/runs/32848377924) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十四项完成证据 |
+| 3A-45 | **已完成 Python 大型元数据表的 GIL 治理**：legacy `Animation` clips、`AnimatorOverrideController` overrides、`AssetBundle` preload/container、`ResourceManager` container、`PreloadData` assets、`AnimatorController` TOS/clips 与 `Avatar` paths 原本都在 detach 内完成 Core 解析，却在重新持有 GIL 后才预留并遍历最多百万项的第二张 Python-facing Rust 表。现在七个入口均在原 detach 闭包内完成可失败投影，attached 路径只接收最终 wrapper，公开 API 与字段语义不变 | `734d931`：源码审计要求七个 preparation helper 位于各自 `py.detach` 内，七个负向变体逐一移出调用并确认门禁失败；严格 Python Clippy、真实 wheel/sdist 重建与安装后 API 套件、严格 Python 3.9 mypy 均通过，完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32850532392](https://github.com/seiunx-dev/unity-rs/actions/runs/32850532392) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十五项完成证据 |
+| 3A-46 | **已完成 Python 集合/场景/报告表的 GIL 治理**：file/object/resource convenience lists 与 pages、容错加载 diagnostics、SceneHierarchy nodes、SplitObjects/Animator FBX candidates、Material properties、模型贴图 skip 文本以及 export/extraction reports 原本都会在 Core detach 返回后再次持有 GIL 执行最多百万项的纯 Rust 预留、字符串复制和 tuple/wrapper 投影。现在 15 个 preparation 路径都在对应 Core 调用的 detach 内完成；模型唯一纹理文件仍只把必须调用 `Py::new` 的包装留在 attached 路径，公开 Python 签名和返回字段不变 | `a9f09d7`：call-aware 源码审计同时覆盖 block 和 single-expression detach closure，要求 15 个 helper 位于对应调用内，并以 15 个负向变体逐一改写后确认门禁失败；严格 Python Clippy、真实 wheel/sdist 重建与安装后 API 套件、严格 Python 3.9 mypy 均通过，完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32853842338](https://github.com/seiunx-dev/unity-rs/actions/runs/32853842338) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十六项完成证据 |
+| 3A-47 | **已完成 Node ACL-backed Live2D 包表的 event-loop 治理**：完整包的 MOC、manifest、贴图、expression/motion/physics/pose/display-info 与 diagnostics 虽已在 libuv worker 物化，旧任务却在 `resolve` 才按包重新计算文件数、可失败分配并展开最终文件/诊断表、格式化诊断类型；大包会在 worker 返回后再次占用事件循环。任务输出现在就是最终 `Live2dPackageSet`，全部 O(packages + files + diagnostics) 的纯 Rust 投影在 `compute` 完成，`resolve` 只把已完成表交给 napi-rs，JavaScript API 与字段不变 | `4cbdbce`：源码门禁要求 task output 为最终表、转换 helper 只出现在 `compute`，两条负向变体分别恢复 Core 输出和把转换移回 `resolve` 后均稳定失败。Node debug/release addon、运行时 API、严格 TypeScript、包内容、安装后临时消费者与 npm tarball 全部通过；完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过。公开常规矩阵 [32856570477](https://github.com/seiunx-dev/unity-rs/actions/runs/32856570477) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十七项完成证据 |
+| 3A-48 | **已完成 Node 异步 Texture2DArray 最终层表的 event-loop 治理**：此前 O(pixel bytes) 行翻转已在 worker，但最多 4,096 层、累计 1 GiB 像素的最终 Vec 仍在 `resolve` 才可失败预留，并逐层把 Core image 转为 napi-facing `RgbaImage`/`Buffer`。`DisplayRowImages` 现在直接持有 worker 构造完成的最终层表；`compute` 完成行翻转、表预留和每层投影，`resolve` 的 `into_nodes` 只移动一个现成 Vec，同步 API 和 JavaScript 像素/字段顺序不变 | `bb2eb98`：源码门禁要求 async task 继续输出 `DisplayRowImages`、worker helper 必须预留最终表并调用 `convert_image`，同时禁止 `into_nodes` 出现分配、循环或 image projection；两条负向变体分别改回未投影输出和把转换塞回 event-loop helper 后均稳定失败。Rust worker 单测确认两层 Buffer 已按 top-down 行序完成；Node debug/release addon、运行时 API、严格 TypeScript、包内容、安装后临时消费者与 npm tarball 全部通过。完整 `quality rust python node typing oracle` 本地门禁全部通过且零组跳过；公开常规矩阵 [32859413104](https://github.com/seiunx-dev/unity-rs/actions/runs/32859413104) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十八项完成证据 |
+| 3A-49 | **已完成 Python `SpriteAtlas` 大型元数据表的 GIL 治理**：对象解析原本在 `Python::detach` 内完成，但随后重新持有 GIL 才遍历最多 1,000,000 条 packed-sprite/render-data/secondary-texture 记录，转换 PPtr、展开 rect/vector/settings tuple 并移动名称表。现在 `prepare_sprite_atlas` 在同一 detach 闭包内完成全部纯 Rust 可失败表投影；attached 路径只为最终 key/render-data/secondary-texture 调用必须由 PyO3 执行的 `Py::new`，公开字段、顺序和预算语义不变 | `e8c9365`：源码门禁要求 preparation 位于 `py.detach` 且 Python wrapping 位于闭包外，负向变体把 preparation 移走后稳定失败。Python crate check/严格 Clippy、真实 wheel 与 sdist 重建和安装后 SpriteAtlas 行为测试、公开面检查、严格 Python 3.9 mypy，以及完整 `quality rust python node typing oracle` 本地门禁均全部通过、零组跳过；公开常规矩阵 [32862849606](https://github.com/seiunx-dev/unity-rs/actions/runs/32862849606) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。这是 hostile-input 审计的第四十九项完成证据 |
 | 4 | **完成 Python 主接口审计**：以 Rust Core 的稳定高层能力为源，逐项核对 Python 的加载、读取、导出、预算、错误类型和类型桩；Node 只作为可选绑定跟进稳定接口，不作为 Python 完成的前置条件 | **本地完成（2026-08-22；2026-08-25 随诊断分页扩展）**：107 个高层 Core 方法均被机器检查为 103 个真实 Python 映射或 4 个明确 Rust-only ownership/borrow 入口；66 个公开 Python 方法和 4 个属性全部进入严格 Python 3.9 mypy 消费端并由源码门禁防漂移；安装后的 release wheel、sdist 与重建 wheel 公开面和 `.pyi` 双向一致，完整 API 测试通过；大结果继续使用有界、可失败分配，Rust/Python 路径不经过 C ABI 或 .NET |
-| 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | **无头运行时退役完成（2026-08-25）**：`check_delivery_scope.py` 与 8 项反向自测确认 workspace 只有 Core/CLI/Python/可选 Node，三个前端均直接依赖 Core，源码、公开 API 和发布物均无 GUI、旧 C ABI 或 context handle；`cargo metadata` 独立复核一致。最终 HEAD `0c23ac1` 的公开矩阵 [32863442940](https://github.com/Team-Haruki/unity-rs/actions/runs/32863442940) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。兼容性 1.0 仍等待本文明确列出的外部 corpus，不把未验证格式冒充完成 |
+| 5 | **做 1.0 退役审计**：重新逐条核对本文“完成判定”，把 C# 从日常运行链彻底降为可选 oracle | **无头运行时退役完成（2026-08-25）**：`check_delivery_scope.py` 与 8 项反向自测确认 workspace 只有 Core/CLI/Python/可选 Node，三个前端均直接依赖 Core，源码、公开 API 和发布物均无 GUI、旧 C ABI 或 context handle；`cargo metadata` 独立复核一致。最终 HEAD `0c23ac1` 的公开矩阵 [32863442940](https://github.com/seiunx-dev/unity-rs/actions/runs/32863442940) 为 16 个实际 job 全绿、2 个手工发布条件 job 正常跳过、0 失败。兼容性 1.0 仍等待本文明确列出的外部 corpus，不把未验证格式冒充完成 |
 | 6 | **处理非阻断上游事项**：有可审计方案时向上游提交 `ruopus` SILK 与 vendored 纹理解码器修复；拿到可验证 ACL 样本后再评估纯 Rust Tuanjie ACL decoder | 上游 issue/PR 或本仓库可复现记录可独立运行；任何替换不得使已精确通过的 CELT/纹理路径回退，也不得引入未授权专有二进制 |
 
 贯穿所有步骤的范围约束不变：**不做 GUI，不恢复或扩展旧自定义 C ABI，

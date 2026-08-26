@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Team-Haruki/unity-rs"
+Repository = "https://github.com/seiunx-dev/unity-rs"
 
 [tool.maturin]
 features = ["extension-module"]
