@@ -55,14 +55,24 @@ or an exact upstream behavior contract.
   input.
 - Prefer a narrow, verifiable implementation over a speculative compatibility
   claim. Do not infer an undocumented layout from an adjacent Unity version.
+  One sanctioned exception exists: for a standard-Unity version **above** a
+  class's verified ceiling, the default runtime behavior is to attempt the
+  newest known layout (with `strict_unity_versions` restoring rejection).
+  Verified-range claims still move only with fixtures, and this exception
+  never extends to versions below a floor, Tuanjie builds, stripped versions,
+  or container/format gates.
 - Preserve existing public behavior unless the task explicitly authorizes a
   breaking change. Keep Rust, CLI, Python, and Node behavior aligned.
 - Make the smallest coherent change. Do not opportunistically rewrite nearby
   code, generated files, vendored sources, or user-owned worktree changes.
 - Never weaken a limit, validation, test, or error distinction merely to make a
-  sample pass. Fix the cause or document the missing evidence.
+  sample pass. Fix the cause or document the missing evidence. The
+  above-ceiling lenient path is policy, not a weakened validation: a failure
+  there must surface as `Unsupported` carrying the inner diagnostic verbatim.
 - Do not add silent fallbacks that turn corrupted or unknown input into
-  plausible-looking output.
+  plausible-looking output. Above-ceiling lenient parsing is not such a
+  fallback: it either fully succeeds with the newest known layout or fails
+  with an explicit `Unsupported` naming the attempt.
 - Do not rewrite Git history, amend another contributor's commit, move tags,
   publish packages, create releases, merge pull requests, or force-push unless
   the user explicitly requests that exact operation and scope.
@@ -86,10 +96,19 @@ or an exact upstream behavior contract.
 - Use fallible reservation before growing large `Vec`, `String`, map, set, or
   result-table allocations derived from input.
 - Validate a complete known layout. If a tail or version gate is not verified,
-  reject it rather than partially parsing it as success.
+  reject it rather than partially parsing it as success. Strict rejection
+  applies to below-floor versions, Tuanjie builds outside their verified
+  range, stripped versions, and container/format gates. A standard-Unity
+  version above a class's verified ceiling is parsed with the newest known
+  layout by default (`strict_unity_versions` restores rejection); such a
+  lenient parse either fully succeeds or fails — never partial success.
 - Keep error families meaningful: malformed bytes are `InvalidData`, missing
   verified support is `Unsupported`, resource limits are limit errors, and I/O
   failures remain I/O failures. Do not collapse them into one generic error.
+  One addition for the lenient path: an above-ceiling parse failure —
+  including end-of-input and budget diagnostics reached through untrusted
+  above-ceiling counts — is reported as `Unsupported` with the original
+  message preserved, because the layout, not the bytes, is the suspect.
 - Exports and extraction must keep traversal protection, symlink rejection,
   bounded names, same-directory temporary files, atomic publication, and
   no-clobber semantics unless overwrite was explicitly requested.
@@ -100,6 +119,9 @@ or an exact upstream behavior contract.
 
 - New format/version support needs a representative fixture, boundary and
   malformed-input tests, and an independent source of truth where practical.
+  Lenient above-ceiling parsing is not verification: widening a documented
+  verified ceiling still requires bringing a fixture with it, as the
+  sprite-atlas and animation-stack 6000.3 precedents did.
 - Prefer real sample-backed version gates. Synthetic fixtures must encode the
   actual layout, endianness, absolute alignment, PathID width, and resource
   offsets rather than mirror only the reader's assumptions.
@@ -161,6 +183,9 @@ or an exact upstream behavior contract.
   tested** when that is the underlying evidence state.
 - Distinguish **Not tested** from **Not implemented**, **Intentionally not
   supported**, and **Invalid data**. Do not imply that untested input works.
+- A standard-Unity version above a class's verified ceiling remains
+  **Not tested**. Document it as "attempted with the newest known layout by
+  default; failures return `Unsupported`", never as supported.
 - Keep `README.md` concise and user-facing. Put detailed chronology, evidence,
   limits, and remaining work in `REWRITE_STATUS.md`, and keep its last-updated
   date accurate when materially changing it.

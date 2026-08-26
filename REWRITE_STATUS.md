@@ -19,9 +19,12 @@
 - 旧版自定义 C ABI 的兼容、发布或语义复刻。
 
 暂时拿不到真实样本或独立 oracle 的 Unity/Tuanjie 版本与平台格式保留在
-`corpus/` 验收工程，并在兼容矩阵中标记为 **Not tested**；实际命中时继续稳定返回
-`Unsupported`，不猜布局。它们仍是未来兼容性 1.0 的证据缺口，但按本次迁移约定不阻塞
-无头 Rust/Python 运行时重写的完成。
+`corpus/` 验收工程，并在兼容矩阵中标记为 **Not tested**。版本处理采用两层策略
+（2026-08-26 起）：容器格式门、各资产类的版本下限、Tuanjie 构建和 stripped 版本
+命中时继续稳定返回 `Unsupported`，不猜布局；而**高于已验证上限的标准 Unity 版本**
+默认按最新已知布局尝试解析（UnityPy 风格），解析不匹配时仍以 `Unsupported` 报错并
+注明该次尝试，`strict_unity_versions` 选项可恢复直接拒绝。它们仍是未来兼容性 1.0
+的证据缺口，但按本次迁移约定不阻塞无头 Rust/Python 运行时重写的完成。
 
 托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `UNITY_RS_ORACLE_REPO` 或同级目录定位它。旧 `unity-rs-ffi`/context handle 源码已从仓库删除，不再只是排除在 Cargo workspace 之外。
 
@@ -55,8 +58,9 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 2. **需要真实样本的验收**：补 Tuanjie 2022.3.x、Nintendo Switch、Unity 4/5/2017 和
    带完整托管快照的代表性 corpus。只对样本实际命中的长尾补实现；UnityArchive、虚拟几何
    cluster、Switch stripped/低 mip 及平台 codec 在没有可验证布局或独立 oracle 时在兼容
-   矩阵中标记为 **Not tested**；实际命中时继续稳定返回 `Unsupported`，不猜字段，也不作为
-   已经支持的能力宣传。
+   矩阵中标记为 **Not tested**；这些路径命中时继续稳定返回 `Unsupported`，不猜字段，也不
+   作为已经支持的能力宣传。高于已验证上限的标准 Unity 版本按默认宽松策略尝试最新已知
+   布局，但同样保持 **Not tested** 状态——宽松解析不是验证，提升文档化上限仍需带 fixture。
 3. **退役证据**：用上述 corpus 生成版本化 manifest，覆盖对象顺序、PathID/class、名称和
    container、原始载荷 hash、主要解码结果或稳定错误族。C# 只保留为可选历史 oracle；默认
    构建、安装和用户工作流必须继续完全不需要 .NET。
@@ -1475,7 +1479,8 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 1. 让 CI 重新跑起来（GitHub Actions 计费）。本机已把 CI 的常规步骤复跑过一遍且全绿；Linux 运行面现已在 amd64/arm64 容器中覆盖，仍无法本机复现的是 Windows 运行与 GitHub 托管发布矩阵。为降低这条的代价，新增 `tools/local_ci.py`：一条命令跑完 CI 的全部步骤（现为 62 步、14 组）（格式、Python/Node API、六平台矩阵与交付范围审计及其反向自测、RustSec、Clippy、rustdoc、打包、许可证聚合、无 GUI/旧 C ABI 的交付范围与产物校验、workspace 构建/测试、托管差分、MonoBehaviour schema 生成器、音频差分、输出格式校验、release CLI 的构建/smoke/staging、Node debug/release 构建/测试/打包、Python wheel 与 sdist 的构建/安装/两套测试、Python 3.14 abi3 前向兼容、严格 Python 类型消费、UnityPy 差分，以及可选交叉/Linux 容器门禁），缺哪个工具就把那一组记为跳过而不是失败。2026-08-15 修了一处会让证据凭空消失的问题：wheel 原先直接装进当前解释器，而 Homebrew/发行版的 Python 现在按 PEP 668 直接拒绝安装——于是 `install wheel` 失败，依赖它的 `wheel surface`、`python api` 与 UnityPy 差分一并失败，也就是说 Python 那一侧的公开面守卫和 API 套件其实根本没在跑。现在 `python` 组自己建一个 `--clear` 的临时 venv（带 `--system-site-packages`，好让宿主已装的 UnityPy 仍可导入），宿主解释器只作为建 venv 的底座和 maturin 的目标。修好之后第一次跑就抓出一条陈旧断言：`python_api.py` 里还在断言 physics3.json 的紧凑写法，而两次提交前刚把 Cubism 文档改成与托管一致的展开写法——正是「没在跑的测试」会掩盖的那类回归。随后类型桩审计又抓到两项幽灵 API：`.pyi` 允许导入 `AclDecoder`/`OodleDecoder`，运行时模块却没有这两个名字；现在二者是真正的运行时导出，wheel 守卫也改成双向比较。本轮逐项对照 workflow 时又发现本地脚本漏掉了 workspace build、sdist 重建、release CLI/Node 产物和 Python 3.14 安装；这些步骤现已接入并实际通过。交付范围检查也已实际通过，会把 workspace、依赖方向或产物内容的漂移直接变成失败；schema 生成器步骤则在本轮以真实临时 DLL 单独验证，并和托管差分一起通过 `oracle` 组。这不能替代 CI——CI 是在三个平台上跑这套矩阵——但它让拿得到 Linux/Windows 的人能自己产出同样的证据，而不必先从 workflow 文件里把步骤拼出来。另外补了一个 `cross` 组：Linux x86-64 继续编译完整 workspace 与全部测试目标；Windows x86-64 现在由同一门禁用 MinGW 编译 Core/CLI/Python，并在开始前同时检查两套 C 工具链，缺任一个时严格模式都会失败而不是先产出一半证据。Node addon 要链接 `libnode.dll`，仍由真实 Windows runner 验证，不用不完整的交叉环境冒充。这只覆盖「能不能编译」——路径假设、漏掉的 `cfg`、只在某个平台成立的 `Send` 之类——行为层面则由新增的 `linux` 组覆盖：用 CI 钉住的同一个 Rust 1.88 镜像，在容器里跑 core+CLI 的完整常规测试、6 项畸形输入扫描和全部 CLI 套件，并构建、执行和 stage release CLI；Python wheel 也完成 release 构建与两套安装后测试，x86-64 与 arm64 两个架构都已实跑通过（CI 的 wheel 矩阵正是这两个）——这是 LZMA 那次提交之后第一次拿到 Linux 上的真实运行结果，而 Python 那两套正是之前坏了很久没人发现的。Node release addon 也在两种 Linux 架构的干净容器副本里跑通了，且实际生成并检查了 npm tarball（镜像没有 Node，因此按 CI 用的版本拉官方构建），10 组 API 测试全过，整个构建发生在只读源码的临时副本中，容器销毁后不会污染宿主构建。Windows 目前仍只有编译层面的验证。顺带记一笔：workspace 唯一的 C 依赖是 `zstd`（`zstd-sys` 会编 C 源码），交叉编译因此需要目标平台的 C 工具链；`docs/upstream-defects.md` 里原先把「纯 Rust」当成本 crate 已有的性质来论证，那是不准确的，已改成「再加一个原生依赖的代价」；
 2. 扩充真实 corpus，按实际命中率排序缺口（需要真实游戏文件）。为降低这条的门槛，corpus 用例的 `expected` 快照改成可选：不给快照时依然会把每个对象都读一遍、出错即失败，并报出读到了多少文件/对象/可解析载荷，只是没法断言取值对不对。这样「有游戏文件」就够跑，不再同时要求 .NET SDK 与 AssetStudio checkout 来生成快照。另加了一条防自欺断言：没有快照的用例必须至少解析出一个对象——reader 认不出来的输入会被当成资源文件、解析出零个对象，否则那种用例会安静地通过；
-3. 获取样本并实现 Unity 6000.2 MeshLOD/虚拟几何、Tuanjie 虚拟几何 cluster、UnityArchive，而不是猜测布局；
+3. 获取样本并实现 Unity 虚拟几何、Tuanjie 虚拟几何 cluster、UnityArchive，而不是猜测布局
+   （Unity 6000.2 的 MeshLOD 尾部已凭真实 6000.3 TypeTree 实现）；
 4. 是否把 `ruopus` 与 `texture2ddecoder` 的缺陷提到上游（补丁已备好，见 `docs/upstream-defects.md`）。
 
 **可以自主推进，但代价与收益需要先掂量：**
@@ -1491,7 +1496,9 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 - Rust Core 和 Python 主流程不依赖 .NET、GUI 或旧 C ABI；
 - 支持矩阵中的“Implemented”项均有相应单测、边界测试或差分证据；
 - 代表性真实 corpus 在支持的 Unity/Tuanjie/平台矩阵上稳定通过；
-- 未实现格式均有明确、稳定的 Unsupported 行为，不产生静默错误输出；
+- 未实现格式均有明确、稳定的 Unsupported 行为，不产生静默错误输出；高于已验证
+  上限的标准 Unity 版本按默认宽松策略尝试最新已知布局，失败时同样稳定归入
+  `Unsupported` 并注明该次尝试；
 - Rust crate、Python wheel/sdist、可选 Node 包和 CLI 的跨平台发布任务通过；
 - 导出/解包保持有界、拒绝路径穿越和符号链接目标，并采用安全原子发布；
 - C# 只需作为历史参考或可选 oracle，不再承担用户运行时功能。
@@ -1526,6 +1533,10 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 
 **同一条路子又抓到第二个版本门**：Renderer 的"已验证范围"停在 6000.2，于是这份 6000.3 语料上的 scene/FBX/OBJ 导出在开始之前就被拒。实际什么都没变——那份 6000.3.12f1 构建自己的 `MeshRenderer` type tree 列出的字段、顺序，与本项目读的逐一相同，6000.2 的 `m_ForceMeshLod`/`m_MeshLodSelectionBias` 之后再没有新字段。这份语料里没有 `SkinnedMeshRenderer`，它的树取自 UnityPy 的 type-tree 数据库（开发期查阅，不入库），而同一个数据库里的 `MeshRenderer` 与真实构建逐字段相同——这正是它在这里可以当依据的理由。放宽之后立刻露出下一处：一个 bundle 里 152 个 mesh 中有一个是空的，整个场景就失败；本项目拒收的 mesh 所属的 renderer 不贡献任何几何，丢掉它才是对的（`PPtr.TryGet` 对解不开的指针本来就是这么做的），而畸形的 mesh 仍然失败，因为那是关于字节的陈述而不是关于资产的。那个 bundle 现在能导出 152 个材质的 OBJ 与 FBX。
 
+**动画三件套的上限也补齐到 6000.3（2026-08-26）**：AnimationClip、AnimatorController、Avatar 此前仍停在 6000.2——正是 Mesh、Renderer 两次教训里那类"区间没跟上"的遗留项。三个类的分支结构在 6000.2 之后没有任何新字段（AnimatorController 最高的门是 6000.2 的 entity IDs，AnimationClip 最高是 2023.2 的 streamed-curve 拆分，Avatar 最高是 2019.1 的 HumanDescription），托管 reader 同样没有更新的分支；按 sprite-atlas 前例的做法，三个类各带一个 `6000.3.12f1` 差分 fixture 一起放宽，托管 oracle 首轮全对。
+
+**版本上限策略整体转向默认宽松（2026-08-26，维护者裁决）**：Mesh、Renderer 的两次教训说明硬上限的实际效果是"新引擎版本发布 → 真实游戏整体解析失败 → 等一次带 fixture 的放宽"，而 UnityPy/AssetStudio 在同样场景下直接可用。现在**高于已验证上限的标准 Unity 版本默认按最新已知布局解析**；解析不匹配时错误仍归 `Unsupported` 族并注明"高于已验证区间、按最新已知布局尝试未成功"，保留内层诊断（含经由不可信 count 触达的 EOF 与预算诊断——超上限时解出的 count 本就不可信，中途的预算命中按布局错位对待）。`strict_unity_versions` 选项（CLI `--strict-unity-versions`、Python `strict_unity_versions=True`、Node `strictUnityVersions: true`）恢复原有的直接拒绝。**不放宽的部分**：容器格式门（SerializedFile >22、UnityFS v9+）、各类的版本下限（Mesh/Renderer/动画三件套的 2017.3 等）、stripped 版本、Tuanjie 构建（逐 build 布局波动太大）。宽松解析不是验证——文档化的已验证上限仍只随 fixture 移动，机制统一在 `version_gate.rs`，七个类门（Mesh、Renderer、SpriteAtlas、Shader、AnimationClip、AnimatorController、Avatar）共用同一套三态语义与错误映射，各自的拒绝消息逐字节保留。
+
 **两份语料一起过了 corpus 闸门（2026-08-15 晚）**：`real_corpus` 用同一份 manifest 同时跑两个用例——2022.3 播放器目录 23 个文件 / 610,552 个对象 / 190,300 个有解析载荷，6000.3 Addressables 2,778 个文件 / 243,617 个对象 / 104,565 个有解析载荷，release 下 240 秒全过。第一次跑是失败的，而失败的原因值得记一笔：报的是"Texture2D RGBA output is 16777216 bytes, exceeding limit 7953295"，看起来像贴图缺陷，实际是用例声明的预算不够——Live2D 物化的总预算是**整个用例所有包**共用的，交给解码器的上限就是它剩下的余额，于是错误里出现了一个调用方从没选过的数字。已改成明说是哪个预算见底、还剩多少，`corpus/README.md` 也补上"总量是整个用例的、不是每个包的"。
 
 **PNG 那边剩下的分歧是 sprite 紧密网格的边界**：最坏的一张里 1,143,000 个像素差 4 个，而且是双向的——一个 texel 本项目保留、提取那边遮掉，另外三个反过来。这是光栅化的边规则，而本项目的光栅器由托管差分逐字节钉住，所以分歧在提取那一侧。这些情况按"报告"处理而不是"容忍"：把容差放宽到它们能过，同样会盖住真正的遮罩缺陷。
@@ -1539,7 +1550,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | Core/Python 主流程不依赖 .NET、GUI 或旧 C ABI | 满足，且**从 2026-08-15 起有门禁把守而不再只是约定**；2026-08-23 进一步删除了此前仅排除在 workspace 外的旧 C ABI/context crate。`tools/check_delivery_scope.py` 读 `cargo metadata` 的解析结果（不是读清单文本）核对：workspace 恰好四个成员、各自的 target kind 正确、清单都在本仓库内、三个前端都直接依赖 Core，任何一个的普通依赖里都不许出现 GUI/旧 FFI 包名；同时拒绝旧 FFI 源文件或 Rust/Python/Node 公开 `Context`/`context_id` handle 回流。产物侧另有 Core `.crate`、npm tarball、wheel 与 sdist 的内容检查，拒收 `.cs`/`.csproj`/GUI 目录 |
 | 「Implemented」项均有单测、边界测试或差分证据 | 基本满足；纹理/Sprite/Mesh/AnimationClip/Live2D/容器/版本门均有托管差分，TypeTree 另有 UnityPy 第二 oracle，畸形输入另有专门扫描。唯一没有差分的是 5.5+ 序列化 shader，原因是托管侧自身的初始化缺陷；2021+/2022+ 的 shader 已实现（见下），其结构正确性由 46 个真实 shader 与 UnityPy 的逐一比对背书；托管差分覆盖的仍是 5.2/5.3，因为托管侧对 2021+ 根本不产出对象 |
 | 代表性真实 corpus 稳定通过 | **部分满足，且已扩到第二款游戏与第二个引擎世代（2026-08-15）**；(1) 一份完整的 Unity 2022.3.62f2 播放器目录（23 文件 / 610,552 对象 / 190,300 个有解析载荷）；(2) 四个真实 UnityFS v8 bundle；(3) **2,778 个 Unity 6000.3.12f1 的 Addressables bundle（926 MB / 243,617 对象）**，全部零错误通过。仍缺的是 Tuanjie / Switch / 更老版本，以及带托管快照的取值比对 |
-| 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic |
+| 未实现格式有明确稳定的 Unsupported 行为 | 满足；且畸形输入扫描验证了不会 panic。2026-08-26 起高于已验证上限的标准 Unity 版本默认按最新已知布局尝试，失败仍稳定归入 `Unsupported`（见上文策略转向段落） |
 | 跨平台发布任务通过 | **满足（2026-08-24）**；PR run 32659993206 的 16 个主 job 全绿，真实覆盖 Linux/Windows/macOS Rust 运行、三平台 Node、六平台 Python wheel、质量和差分 oracle。workflow_dispatch run 32660298990 进一步 28/28 全绿，额外执行并上传 Linux/Windows/macOS × x86-64/ARM64 的六个 CLI 与六个 Node 制品；CLI staged 二进制、wheel 安装后 API/mypy、Node tarball 临时消费者安装及 JS/TypeScript smoke、许可证/notices 均在对应 runner 验证。专用静态门禁继续防止任何一路或必要产物测试被静默删除 |
 | 导出/解包有界、拒绝穿越与符号链接、原子发布 | **现在才算满足（2026-08-15 修）**；此前这一行写"满足"是**说大了**：主导出与解包路径确实是临时文件加原子发布，但模型同级贴图那条不是——它直接以最终文件名 `create_new` 然后往里写，写到一半失败就留下一张截断的图片，而下一次导出会因为"已存在"跳过它，于是一张坏图会被当成成功的结果永远留在那里。现已改成同目录临时文件、`sync_all`、硬链接 no-clobber 发布，放弃时由 Drop 清掉临时文件。这一行的教训与本文其他几处同源：断言覆盖面时要按路径逐条数，而不是按"这个模块做过这件事"泛化 |
 | C# 仅作历史参考或可选 oracle | 满足 |

@@ -17,14 +17,22 @@ repository. Rust, Python, and Node call the same high-level Core API directly.
 
 The project is currently **Beta**. Its supported paths are extensively bounded,
 tested, and compared with independent readers, but `unity-rs` does not claim to
-understand every Unity, Tuanjie, console, or proprietary codec variant. Unknown
-sample-less layouts are rejected explicitly instead of guessed.
+understand every Unity, Tuanjie, console, or proprietary codec variant. Version
+handling is two-tier: containers, per-class version floors, Tuanjie builds, and
+stripped versions are rejected explicitly instead of guessed, while a standard
+Unity version **above** a class's verified ceiling is parsed with the newest
+known layout by default — a mismatch surfaces as an `Unsupported` error naming
+the attempt, never as silent partial output. Pass `--strict-unity-versions`
+(CLI), `strict_unity_versions=True` (Python), or `strictUnityVersions: true`
+(Node) to refuse above-ceiling versions outright instead.
 
 ## Project status
 
 The headless Rust/Python migration is complete. Compatibility work now proceeds
-from real, independently verifiable samples rather than by extending format
-gates speculatively.
+from real, independently verifiable samples: documented verified ranges move
+only with fixtures, while the default runtime leniently attempts the newest
+known layout above those ranges rather than refusing new engine releases
+outright.
 
 | Surface | Current identifier | Status |
 | --- | --- | --- |
@@ -207,7 +215,9 @@ Node-facing handoff.
 - atomic no-clobber or requested-overwrite export;
 - collection-wide scene, model, FBX, OBJ, and Live2D materialization;
 - the same load options, error families, and resource budgets across Rust,
-  Python, and the corresponding Node surface.
+  Python, and the corresponding Node surface, including the strict-version
+  opt-out (`--strict-unity-versions` / `strict_unity_versions` /
+  `strictUnityVersions`).
 
 For exact Unity version gates, codec exceptions, and differential evidence, use
 the [full status document](REWRITE_STATUS.md) rather than treating this summary
@@ -216,7 +226,10 @@ as a promise for every engine build.
 ## Not tested areas
 
 The following remain **Not tested** until real samples and an independent
-oracle are available:
+oracle are available. Standard Unity versions above a class's verified ceiling
+are also **Not tested**: they are attempted with the newest known layout by
+default, and the stable `Unsupported` contract still holds whenever that layout
+does not fit or strict mode is enabled:
 
 - SerializedFile formats 1-4;
 - UnityArchive payload parsing;
@@ -252,7 +265,9 @@ Important invariants include:
 
 Malformed-input tests verify stable errors instead of panics. **Not tested**
 paths are rejected through the `Unsupported` error family, separately from
-corrupted data and failed I/O.
+corrupted data and failed I/O. The one lenient path — standard Unity versions
+above a class's verified ceiling — reports its failures through the same
+`Unsupported` family, with the inner diagnostic preserved.
 
 ## Workspace layout
 
