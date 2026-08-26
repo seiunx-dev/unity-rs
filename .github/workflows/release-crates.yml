@@ -1,0 +1,95 @@
+name: Release Crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Workspace version to publish
+        required: true
+        default: 0.1.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-crates-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  RELEASE_VERSION: ${{ inputs.version }}
+
+jobs:
+  publish:
+    name: Publish Rust crates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Validate release input and credential
+        shell: bash
+        run: |
+          test -n "${CARGO_REGISTRY_TOKEN}" || {
+            echo "CARGO_REGISTRY_TOKEN is not configured" >&2
+            exit 1
+          }
+          python3 - "${RELEASE_VERSION}" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          expected = sys.argv[1]
+          workspace = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          actual = workspace["workspace"]["package"]["version"]
+          if actual != expected:
+              raise SystemExit(
+                  f"release input {expected!r} does not match workspace version {actual!r}"
+              )
+          PY
+
+      - name: Check whether unity-rs-core is already published
+        id: core
+        shell: bash
+        run: |
+          if cargo info --registry crates-io "unity-rs-core@${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Publish unity-rs-core
+        if: steps.core.outputs.published != 'true'
+        run: cargo publish --locked -p unity-rs-core
+
+      - name: Wait for unity-rs-core index propagation
+        shell: bash
+        run: |
+          for attempt in {1..20}; do
+            if cargo info --registry crates-io "unity-rs-core@${RELEASE_VERSION}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "Waiting for unity-rs-core ${RELEASE_VERSION} to reach the index (${attempt}/20)"
+            sleep 15
+          done
+          echo "unity-rs-core ${RELEASE_VERSION} did not reach the index in time" >&2
+          exit 1
+
+      - name: Check whether unity-rs-cli is already published
+        id: cli
+        shell: bash
+        run: |
+          if cargo info --registry crates-io "unity-rs-cli@${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Publish unity-rs-cli
+        if: steps.cli.outputs.published != 'true'
+        run: cargo publish --locked -p unity-rs-cli
