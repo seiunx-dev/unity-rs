@@ -71,7 +71,7 @@ jobs:
         run: python3 tools/check_core_package.py
       - name: Upload Rust core crate
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unity-rs-core-crate
           path: target/package/unity-rs-core-*.crate
@@ -219,14 +219,14 @@ jobs:
           python -I tests/python_api.py
       - name: Upload Python wheel
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unity-rs-python-${{ matrix.artifact }}
           path: crates/unity-rs-python/dist/*.whl
           if-no-files-found: error
       - name: Upload Python source distribution
         if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && matrix.artifact == 'linux-x64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unity-rs-python-sdist
           path: crates/unity-rs-python/sdist-dist/*.tar.gz
@@ -366,7 +366,7 @@ jobs:
       - name: Smoke-test the staged CLI artifact
         run: ${{ matrix.smoke }}
       - name: Upload native CLI
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unity-rs-cli-${{ matrix.artifact }}
           path: target/release/artifact
@@ -421,8 +421,79 @@ jobs:
       - name: Build platform package
         run: npm pack
       - name: Upload Node package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unity-rs-node-${{ matrix.artifact }}
           path: crates/unity-rs-node/*.tgz
           if-no-files-found: error
+
+  publish-python:
+    name: Publish Python package to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - quality
+      - test
+      - node
+      - python
+      - managed-oracle
+      - audio-oracle
+      - unitypy-oracle
+      - package-cli
+      - package-node
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/unity-rs
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download tested Python distributions
+        uses: actions/download-artifact@v8
+        with:
+          pattern: unity-rs-python-*
+          path: dist
+          merge-multiple: true
+
+      - name: Validate release version and artifact set
+        shell: bash
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          expected = sys.argv[1]
+          workspace = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          actual = workspace["workspace"]["package"]["version"]
+          if actual != expected:
+              raise SystemExit(
+                  f"release tag version {expected!r} does not match workspace version {actual!r}"
+              )
+
+          distributions = pathlib.Path("dist")
+          wheels = sorted(distributions.glob("*.whl"))
+          sdists = sorted(distributions.glob("*.tar.gz"))
+          if len(wheels) != 6 or len(sdists) != 1:
+              raise SystemExit(
+                  f"expected six wheels and one sdist, found {wheels!r} and {sdists!r}"
+              )
+          normalized = expected.replace("-", "_")
+          unexpected = [
+              path.name
+              for path in [*wheels, *sdists]
+              if normalized not in path.name
+          ]
+          if unexpected:
+              raise SystemExit(
+                  f"release artifacts do not match version {expected!r}: {unexpected!r}"
+              )
+          PY
+
+      - name: Publish distributions with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

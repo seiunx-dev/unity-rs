@@ -250,6 +250,31 @@ def validate_workflow(workflow: str) -> None:
     require_fragments(
         node_block, "package-node", ("path: crates/unity-rs-node/*.tgz",)
     )
+    publish_python_block = job_block(workflow, "publish-python")
+    require_fragments(
+        publish_python_block,
+        "publish-python",
+        (
+            "if: startsWith(github.ref, 'refs/tags/v')",
+            "- python",
+            "name: pypi",
+            "id-token: write",
+            "uses: actions/download-artifact@v8",
+            "pattern: unity-rs-python-*",
+            "merge-multiple: true",
+            "uses: pypa/gh-action-pypi-publish@release/v1",
+            "packages-dir: dist/",
+        ),
+    )
+    require_run_commands(
+        publish_python_block,
+        "publish-python",
+        ('python3 - "${GITHUB_REF_NAME#v}"',),
+    )
+    if "uses: actions/upload-artifact@v4" in workflow:
+        raise AuditError("CI workflow still uses the obsolete upload-artifact@v4")
+    if workflow.count("uses: actions/upload-artifact@v7") != 5:
+        raise AuditError("CI workflow must upload all five release artifact groups with v7")
     require_run_commands(
         job_block(workflow, "quality"),
         "quality",
