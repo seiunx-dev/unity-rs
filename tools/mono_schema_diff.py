@@ -57,7 +57,7 @@ def export(
     inputs: Path, output: Path, schema: Path | None, unity_version: str | None
 ) -> tuple[dict[Path, str], str]:
     """Exports every object as type-tree JSON, returning path -> payload kind."""
-    command = ["cargo", "run", "--release", "--quiet", "-p", "assetstudio-cli", "--locked", "--"]
+    command = ["cargo", "run", "--release", "--quiet", "-p", "unity-rs-cli", "--locked", "--"]
     if unity_version:
         command += ["--unity-version", unity_version]
     if schema:
@@ -122,7 +122,7 @@ def main() -> int:
     totals = collections.Counter()
     problems: list[str] = []
 
-    with tempfile.TemporaryDirectory(prefix="assetstudio-schemadiff-") as work:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-schemadiff-") as work:
         root = Path(work).resolve()
         for start in range(0, len(rest), BATCH):
             batch = rest[start : start + BATCH]

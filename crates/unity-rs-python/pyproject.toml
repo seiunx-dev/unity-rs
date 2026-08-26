@@ -1,0 +1,40 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "unity-rs"
+dynamic = ["version"]
+description = "Native Python bindings for unity-rs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["unity", "unity-rs", "assets", "assetbundle"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/seiunx-dev/unity-rs"
+
+[tool.maturin]
+features = ["extension-module"]
+module-name = "unity_rs._native"
+python-source = "python"
+strip = true
+exclude = [
+    "dist/**",
+    "sdist-dist/**",
+    ".ci-venv/**",
+    ".ci-venv-*/**",
+    ".mypy_cache/**",
+]
+
+[tool.mypy]
+mypy_path = "python"
+python_version = "3.9"
+strict = true

@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LEGAL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.txt")
-FORBIDDEN_COMPONENTS = {"assetstudio-ffi", "assetstudio-gui", "assetstudiogui"}
+FORBIDDEN_COMPONENTS = {"unity-rs-ffi", "unity-rs-gui", "unity-rsgui"}
 FORBIDDEN_SUFFIXES = (".cs", ".csproj", ".fsproj", ".sln", ".slnx", ".vbproj")
 
 # Every check here is an `assert`, and `-O` or `PYTHONOPTIMIZE` deletes those
@@ -31,7 +31,7 @@ def forbidden_delivery_path(name: str) -> bool:
 
 
 def main() -> int:
-    archives = sorted((ROOT / "target" / "package").glob("assetstudio-core-*.crate"))
+    archives = sorted((ROOT / "target" / "package").glob("unity-rs-core-*.crate"))
     assert len(archives) == 1, archives
     with tarfile.open(archives[0], "r:gz") as archive:
         forbidden = [member.name for member in archive.getmembers() if forbidden_delivery_path(member.name)]

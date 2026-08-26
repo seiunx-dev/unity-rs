@@ -37,7 +37,7 @@ every version that will consume it.
 Then hand the document to any command that opens a collection:
 
 ```
-assetstudio --mono-schema schema.json export <input> <output>
+unity-rs --mono-schema schema.json export <input> <output>
 ```
 
 `--class 114` narrows an export to `MonoBehaviour` alone, which is usually what
@@ -47,6 +47,45 @@ a schema was generated for.
 object read through a schema is reported as `typetree_json_schema` rather than
 `typetree_json`, because it is a weaker claim: it is only as good as the schema
 it came from.
+
+Schema JSON is parsed directly into the final registry under the document,
+entry, per-entry/total node, per-string, and retained-string-total limits. The
+reader does not first construct a second `serde_json::Value` tree. Entry and
+node limits are checked before descending into the next element; a lexical
+pass measures escaped strings as decoded UTF-8 before `serde_json` allocates
+its one-string unescape scratch. Unknown document fields are consumed without
+materializing their value. The CLI additionally streams each repeatable file
+under one cumulative set of the same budgets.
+
+The final registry does not scan every schema for every object. It indexes the
+portable assembly name (case-insensitive and with an optional `.dll` suffix),
+namespace, class, and exact-or-fallback Unity version under a per-registry
+random hash. Hash candidates are still compared against the complete identity,
+so a collision cannot select the wrong tree. Lookup checks the first exact
+version entry and then the first unversioned fallback, preserving document
+order without copying every identity string into a second table. Registry
+growth and multi-document index rebuilds remain fallible and transactional.
+
+Rust callers that keep schemas as independently reusable registries can build a
+`MonoBehaviourSchemaRegistrySet`. It retains each registry through `Arc` and
+indexes only `(registry, entry)` positions, so neither TypeTrees nor identity
+strings are cloned. Python's `MonoBehaviourSchemas` uses this set: collection
+construction rejects more than 100,000 schemas before converting the first
+Python element. Once those Python objects have been validated and their
+registries retained, construction of the shared random-keyed Core index runs
+outside the GIL. Exact-version and fallback lookup stay indexed while
+preserving the supplied first-match order. This closes the otherwise quadratic
+case where every stripped object scanned every Python-visible schema without
+making a 100,000-entry index build monopolize the interpreter.
+
+Programmatic Rust/Python/Node entries obey the same Unity-version invariant as
+the JSON document: a present version must parse as a Unity version, and a failed
+insert leaves the registry unchanged. Node's Promise APIs must first inspect and
+copy JavaScript-owned values on the event-loop thread, but they defer this
+version validation, random-keyed Core registry construction, asset parsing and
+result materialization to the worker. Their synchronous counterparts keep
+immediate validation errors; asynchronous calls return a Promise and reject it
+from worker execution.
 
 ## The document
 

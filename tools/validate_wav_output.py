@@ -184,7 +184,7 @@ def derived(path: Path) -> list[str]:
 
 def export_and_validate() -> int:
     checked = 0
-    with tempfile.TemporaryDirectory(prefix="assetstudio-wav-") as directory:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-wav-") as directory:
         for name, audio_format, rate, bits, payload in CLIPS:
             channels = audio_format >> 1
             frames = len(payload) // (channels * bits // 8)
@@ -193,7 +193,7 @@ def export_and_validate() -> int:
             assets = work / "clip.assets"
             assets.write_bytes(audio_clip(name, audio_format, rate, payload))
             result = subprocess.run(
-                ["cargo", "run", "--quiet", "-p", "assetstudio-cli", "--locked", "--",
+                ["cargo", "run", "--quiet", "-p", "unity-rs-cli", "--locked", "--",
                  "export", str(assets), str(work / "out")],
                 cwd=ROOT, capture_output=True, text=True,
             )

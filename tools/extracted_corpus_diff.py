@@ -297,7 +297,7 @@ def main() -> int:
     worst_alpha = [0]
     worst_drawn = [0.0]
 
-    with tempfile.TemporaryDirectory(prefix="assetstudio-extracted-") as work:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-extracted-") as work:
         root = Path(work).resolve()
         for index, case in enumerate(cases, start=1):
             bundle = bundles / case.name
@@ -323,7 +323,7 @@ def main() -> int:
                 output = root / f"output{suffix or '_plain'}"
                 command = [
                     "cargo", "run", "--release", "--quiet",
-                    "-p", "assetstudio-cli", "--locked", "--",
+                    "-p", "unity-rs-cli", "--locked", "--",
                 ]
                 if unity_version:
                     command += ["--unity-version", unity_version]

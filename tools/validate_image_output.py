@@ -181,14 +181,14 @@ def export_and_validate() -> int:
     )
 
     checked = 0
-    with tempfile.TemporaryDirectory(prefix="assetstudio-image-") as directory:
+    with tempfile.TemporaryDirectory(prefix="unity-rs-image-") as directory:
         for extension, decode in DECODERS.items():
             work = Path(directory) / extension[1:]
             work.mkdir()
             assets = work / "texture.assets"
             assets.write_bytes(texture_assets(width, height, source))
             result = subprocess.run(
-                ["cargo", "run", "--quiet", "-p", "assetstudio-cli", "--locked", "--",
+                ["cargo", "run", "--quiet", "-p", "unity-rs-cli", "--locked", "--",
                  "export", "--image-format", extension[1:], str(assets), str(work / "out")],
                 cwd=ROOT, capture_output=True, text=True,
             )

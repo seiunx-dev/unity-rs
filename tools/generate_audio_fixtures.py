@@ -20,8 +20,8 @@ internal codecs, and this crate's decoder (`ruopus`) handles them differently:
 One fixture of each keeps both facts under test, so the exact path stays exact
 and the divergent path cannot drift further without a failure.
 
-Usage, from the repository root, with `ffmpeg` (built with libopus) and `lame`
-on PATH:
+Usage, from the repository root, with `ffmpeg` (built with libopus), `lame`, and
+`oggenc` from vorbis-tools/libvorbis 1.3.7 on PATH:
 
     python3 tools/generate_audio_fixtures.py
 """
@@ -29,14 +29,17 @@ on PATH:
 from __future__ import annotations
 
 import subprocess
+import struct
 import sys
 import tempfile
+import wave
+import zlib
 from pathlib import Path
 
 FIXTURES = (
     Path(__file__).resolve().parent.parent
     / "crates"
-    / "assetstudio-core"
+    / "unity-rs-core"
     / "tests"
     / "fixtures"
     / "audio"
@@ -59,10 +62,68 @@ OPUS_VARIANTS = {
 
 MPEG_NAME = "mpeg-layer3-tone.mp3"
 MPEG_TONE = "sine=frequency=440:sample_rate=44100:duration=0.3"
+MPEG_MULTISTREAM_CHANNEL_COUNTS = tuple(range(3, 17))
+MPEG_MULTISTREAM_PERIODS = (
+    94, 106, 118, 130, 142, 154, 166, 178,
+    190, 202, 214, 226, 238, 250, 262, 274,
+)
+MPEG_MULTISTREAM_FRAMES = 13_230
+MPEG_MULTISTREAM_SAMPLE_RATE = 44_100
+OPUS_SURROUND_CHANNEL_COUNTS = (3, 4, 5, 6, 7, 8)
+OPUS_SURROUND_LAYOUTS = {
+    3: "3.0",
+    4: "quad",
+    5: "5.0",
+    6: "5.1",
+    7: "6.1",
+    8: "7.1",
+}
+OPUS_SURROUND_MAPPINGS = {
+    3: (2, 1, bytes((0, 2, 1))),
+    4: (2, 2, bytes((0, 1, 2, 3))),
+    5: (3, 2, bytes((0, 4, 1, 2, 3))),
+    6: (4, 2, bytes((0, 4, 1, 2, 3, 5))),
+    7: (4, 3, bytes((0, 4, 1, 2, 3, 5, 6))),
+    8: (5, 3, bytes((0, 6, 1, 2, 3, 4, 5, 7))),
+}
+OPUS_SURROUND_PERIODS = (138, 150, 164, 178, 194, 210, 226, 242)
+OPUS_SURROUND_FRAMES = 5_760
+OPUS_SURROUND_SAMPLE_RATE = 48_000
+VORBIS_SURROUND_CHANNEL_COUNTS = (3, 4, 5, 6, 7, 8)
+VORBIS_SURROUND_PHASE_STEPS = (83, 97, 109, 127, 149, 167, 181, 199)
+VORBIS_SURROUND_FRAMES = 3_840
+VORBIS_SURROUND_SAMPLE_RATE = 32_000
+VORBIS_SURROUND_SETUP_CRC = 0x6AAD13BC
 
 
 def run(command: list[str]) -> None:
     subprocess.run(command, check=True, capture_output=True)
+
+
+def write_triangle_wave(
+    path: Path,
+    frames: int,
+    sample_rate: int,
+    periods: tuple[int, ...],
+) -> None:
+    """Writes deterministic, distinct integer PCM16 triangle-wave channels."""
+    pcm = bytearray(frames * len(periods) * 2)
+    cursor = 0
+    for frame in range(frames):
+        for period in periods:
+            half_period = period // 2
+            phase = frame % period
+            if phase < half_period:
+                sample = -6_000 + 12_000 * phase // half_period
+            else:
+                sample = 6_000 - 12_000 * (phase - half_period) // half_period
+            struct.pack_into("<h", pcm, cursor, sample)
+            cursor += 2
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(len(periods))
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(pcm)
 
 
 def ogg_packets(path: Path) -> list[bytes]:
@@ -86,6 +147,25 @@ def ogg_packets(path: Path) -> list[bytes]:
                 partial = b""
         offset = body
     return packets
+
+
+def ogg_last_granule(path: Path) -> int:
+    """Returns the final non-sentinel Ogg granule position."""
+    data = path.read_bytes()
+    granule = None
+    offset = 0
+    while offset < len(data):
+        if data[offset : offset + 4] != b"OggS":
+            raise ValueError(f"not an Ogg page at offset {offset}")
+        segment_count = data[offset + 26]
+        segments = data[offset + 27 : offset + 27 + segment_count]
+        page_granule = int.from_bytes(data[offset + 6 : offset + 14], "little")
+        if page_granule != (1 << 64) - 1:
+            granule = page_granule
+        offset += 27 + segment_count + sum(segments)
+    if granule is None:
+        raise ValueError("Ogg stream has no granule position")
+    return granule
 
 
 def generate_opus(name: str, options: list[str], work: Path) -> None:
@@ -137,8 +217,285 @@ def generate_mpeg(work: Path) -> None:
     print(f"wrote {MPEG_NAME}: {(FIXTURES / MPEG_NAME).stat().st_size} bytes")
 
 
+def mpeg_layer3_frames(data: bytes) -> list[bytes]:
+    """Splits a headerless MPEG Layer III stream into complete frames."""
+    mpeg1_layer3_bitrates = (
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+    )
+    mpeg1_rates = (44_100, 48_000, 32_000)
+    frames: list[bytes] = []
+    offset = 0
+    while offset < len(data):
+        if offset + 4 > len(data):
+            raise ValueError("MPEG fixture ends inside a frame header")
+        word = int.from_bytes(data[offset : offset + 4], "big")
+        if word >> 21 != 0x7FF or (word >> 19) & 0x03 != 3:
+            raise ValueError(f"MPEG fixture has a non-MPEG-1 sync at {offset}")
+        if (word >> 17) & 0x03 != 1:
+            raise ValueError(f"MPEG fixture has a non-Layer-III frame at {offset}")
+        bitrate = mpeg1_layer3_bitrates[(word >> 12) & 0x0F]
+        rate_index = (word >> 10) & 0x03
+        if bitrate == 0 or rate_index >= len(mpeg1_rates):
+            raise ValueError(f"MPEG fixture has a reserved header at {offset}")
+        sample_rate = mpeg1_rates[rate_index]
+        padding = (word >> 9) & 1
+        length = 144 * bitrate * 1000 // sample_rate + padding
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"MPEG fixture frame at {offset} is truncated")
+        frames.append(data[offset:end])
+        offset = end
+    return frames
+
+
+def generate_multistream_mpeg(work: Path) -> None:
+    """Builds 3-16 channel FSB5 files from independent mono/stereo streams."""
+    stereo_streams: list[list[bytes]] = []
+    for index in range(8):
+        raw = work / f"mpeg-pair-{index}.wav"
+        encoded = work / f"mpeg-pair-{index}.mp3"
+        write_triangle_wave(
+            raw,
+            MPEG_MULTISTREAM_FRAMES,
+            MPEG_MULTISTREAM_SAMPLE_RATE,
+            MPEG_MULTISTREAM_PERIODS[index * 2 : index * 2 + 2],
+        )
+        run(
+            [
+                "lame", "--quiet", "-b", "128", "--cbr", "-m", "s",
+                "--nores", "-t", str(raw), str(encoded),
+            ]
+        )
+        stereo_streams.append(mpeg_layer3_frames(encoded.read_bytes()))
+
+    mono_streams: dict[int, list[bytes]] = {}
+    for channel in range(2, 16, 2):
+        raw = work / f"mpeg-mono-{channel}.wav"
+        encoded = work / f"mpeg-mono-{channel}.mp3"
+        write_triangle_wave(
+            raw,
+            MPEG_MULTISTREAM_FRAMES,
+            MPEG_MULTISTREAM_SAMPLE_RATE,
+            (MPEG_MULTISTREAM_PERIODS[channel],),
+        )
+        run(
+            [
+                "lame", "--quiet", "-b", "128", "--cbr", "-m", "m",
+                "--nores", "-t", str(raw), str(encoded),
+            ]
+        )
+        mono_streams[channel] = mpeg_layer3_frames(encoded.read_bytes())
+
+    for channels in MPEG_MULTISTREAM_CHANNEL_COUNTS:
+        streams = list(stereo_streams[: channels // 2])
+        if channels % 2:
+            streams.append(mono_streams[channels - 1])
+        frame_count = len(streams[0])
+        if frame_count == 0 or any(len(stream) != frame_count for stream in streams):
+            raise ValueError(
+                f"{channels}-channel MPEG encoders produced different frame counts"
+            )
+        data = bytearray()
+        for frames in zip(*streams):
+            interleave = (len(frames[0]) + 15) & ~15
+            for frame in frames:
+                if (len(frame) + 15) & ~15 != interleave:
+                    raise ValueError(
+                        f"{channels}-channel MPEG frames have different padded spans"
+                    )
+                data.extend(frame)
+                data.extend(b"\0" * (interleave - len(frame)))
+
+        channel_code = {6: 2, 8: 3}.get(channels, 0)
+        has_channel_metadata = channels not in (1, 2, 6, 8)
+        sample_mode = (
+            (frame_count * 1152 << 34)
+            | (channel_code << 5)
+            | (8 << 1)
+            | int(has_channel_metadata)
+        )
+        metadata = bytearray()
+        if has_channel_metadata:
+            channel_header = (1 << 25) | (1 << 1)
+            metadata.extend(channel_header.to_bytes(4, "little"))
+            metadata.append(channels)
+        sample_headers = sample_mode.to_bytes(8, "little") + metadata
+        header = bytearray(0x3C)
+        header[:4] = b"FSB5"
+        header[4:8] = (1).to_bytes(4, "little")
+        header[8:12] = (1).to_bytes(4, "little")
+        header[12:16] = len(sample_headers).to_bytes(4, "little")
+        header[20:24] = len(data).to_bytes(4, "little")
+        header[24:28] = (11).to_bytes(4, "little")
+        name = f"fsb5-mpeg-layer3-{channels}ch.fsb"
+        output = header + sample_headers + data
+        (FIXTURES / name).write_bytes(output)
+        print(
+            f"wrote {name}: {frame_count} frames per stream, {len(output)} bytes"
+        )
+
+
+def generate_surround_opus(work: Path) -> None:
+    """Builds 3-8 channel FSB5 files from standard family-1 Opus streams."""
+    for channels in OPUS_SURROUND_CHANNEL_COUNTS:
+        fsb_name = f"fsb5-opus-celt-{channels}ch.fsb"
+        ogg_name = f"opus-celt-{channels}ch.ogg"
+        wave_path = work / f"opus-celt-{channels}ch.wav"
+        ogg = work / ogg_name
+        write_triangle_wave(
+            wave_path,
+            OPUS_SURROUND_FRAMES,
+            OPUS_SURROUND_SAMPLE_RATE,
+            OPUS_SURROUND_PERIODS[:channels],
+        )
+        run(
+            [
+                "ffmpeg", "-v", "error", "-y",
+                "-channel_layout", OPUS_SURROUND_LAYOUTS[channels],
+                "-i", str(wave_path),
+                "-c:a", "libopus", "-mapping_family", "1",
+                "-application", "audio", "-b:a", f"{channels * 64}k",
+                "-vbr", "off", "-frame_duration", "20",
+                "-fflags", "+bitexact", "-map_metadata", "-1", str(ogg),
+            ]
+        )
+        packets = ogg_packets(ogg)
+        head, audio = packets[0], packets[2:]
+        stream_count, coupled_count, mapping = OPUS_SURROUND_MAPPINGS[channels]
+        if (
+            not head.startswith(b"OpusHead")
+            or len(head) != 21 + channels
+            or head[9] != channels
+            or head[18] != 1
+            or head[19] != stream_count
+            or head[20] != coupled_count
+            or head[21:] != mapping
+        ):
+            raise ValueError(
+                f"unexpected {channels}-channel Opus mapping-family-1 header"
+            )
+        pre_skip = int.from_bytes(head[10:12], "little")
+        if pre_skip != 312:
+            raise ValueError(
+                f"{channels}-channel Opus pre-skip is {pre_skip}, expected 312"
+            )
+        frame_count = ogg_last_granule(ogg) - pre_skip
+        if frame_count != OPUS_SURROUND_FRAMES:
+            raise ValueError(
+                f"{channels}-channel Opus stream has {frame_count} post-skip "
+                f"frames, expected {OPUS_SURROUND_FRAMES}"
+            )
+
+        data = b"".join(
+            len(packet).to_bytes(2, "little") + packet for packet in audio
+        ) + b"\0\0"
+        channel_code = {6: 2, 8: 3}.get(channels, 0)
+        has_channel_metadata = channels not in (1, 2, 6, 8)
+        sample_mode = (
+            (frame_count << 34)
+            | (channel_code << 5)
+            | (9 << 1)
+            | int(has_channel_metadata)
+        )
+        metadata = bytearray()
+        if has_channel_metadata:
+            channel_header = (1 << 25) | (1 << 1)
+            metadata.extend(channel_header.to_bytes(4, "little"))
+            metadata.append(channels)
+        sample_headers = sample_mode.to_bytes(8, "little") + metadata
+        header = bytearray(0x3C)
+        header[:4] = b"FSB5"
+        header[4:8] = (1).to_bytes(4, "little")
+        header[8:12] = (1).to_bytes(4, "little")
+        header[12:16] = len(sample_headers).to_bytes(4, "little")
+        header[20:24] = len(data).to_bytes(4, "little")
+        header[24:28] = (17).to_bytes(4, "little")
+        (FIXTURES / fsb_name).write_bytes(header + sample_headers + data)
+        (FIXTURES / ogg_name).write_bytes(ogg.read_bytes())
+        print(
+            f"wrote {fsb_name} and {ogg_name}: {len(audio)} packets, "
+            f"{frame_count} frames"
+        )
+
+
+def generate_surround_vorbis(work: Path) -> None:
+    """Builds 3-8 channel FSB5 files from standard libvorbis streams."""
+    for channels in VORBIS_SURROUND_CHANNEL_COUNTS:
+        fsb_name = f"fsb5-vorbis-{channels}ch.fsb"
+        ogg_name = f"vorbis-{channels}ch.ogg"
+        wave_path = work / f"vorbis-{channels}ch.wav"
+        ogg = work / ogg_name
+        pcm = bytearray(VORBIS_SURROUND_FRAMES * channels * 2)
+        cursor = 0
+        for frame in range(VORBIS_SURROUND_FRAMES):
+            for phase_step in VORBIS_SURROUND_PHASE_STEPS[:channels]:
+                sample = (frame * phase_step) % 8_001 - 4_000
+                struct.pack_into("<h", pcm, cursor, sample)
+                cursor += 2
+        with wave.open(str(wave_path), "wb") as output:
+            output.setnchannels(channels)
+            output.setsampwidth(2)
+            output.setframerate(VORBIS_SURROUND_SAMPLE_RATE)
+            output.writeframes(pcm)
+        run(
+            [
+                "oggenc", "--quiet", "--serial", "1", "--discard-comments",
+                "--quality", "4", "--output", str(ogg), str(wave_path),
+            ]
+        )
+        packets = ogg_packets(ogg)
+        identification, setup, audio = packets[0], packets[2], packets[3:]
+        if (
+            not identification.startswith(b"\x01vorbis")
+            or len(identification) != 30
+            or identification[11] != channels
+            or int.from_bytes(identification[12:16], "little")
+            != VORBIS_SURROUND_SAMPLE_RATE
+        ):
+            raise ValueError(
+                f"unexpected {channels}-channel Vorbis identification header"
+            )
+        setup_crc = zlib.crc32(setup) & 0xFFFF_FFFF
+        if setup_crc != VORBIS_SURROUND_SETUP_CRC:
+            raise ValueError(
+                f"{channels}-channel Vorbis setup CRC is {setup_crc:08x}, "
+                f"expected {VORBIS_SURROUND_SETUP_CRC:08x}"
+            )
+        frame_count = ogg_last_granule(ogg)
+        if frame_count <= 0:
+            raise ValueError(f"{channels}-channel Vorbis stream has no sample frames")
+        data = b"".join(
+            len(packet).to_bytes(2, "little") + packet for packet in audio
+        ) + b"\0\0"
+        channel_code = {6: 2, 8: 3}.get(channels, 0)
+        sample_mode = (frame_count << 34) | (channel_code << 5) | (7 << 1) | 1
+        metadata = bytearray()
+        if channels not in (1, 2, 6, 8):
+            channel_header = (1 << 25) | (1 << 1) | 1
+            metadata.extend(channel_header.to_bytes(4, "little"))
+            metadata.append(channels)
+        vorbis_header = (11 << 25) | (8 << 1)
+        metadata.extend(vorbis_header.to_bytes(4, "little"))
+        metadata.extend(setup_crc.to_bytes(4, "little"))
+        metadata.extend(b"\0\0\0\0")
+        sample_headers = sample_mode.to_bytes(8, "little") + metadata
+        header = bytearray(0x3C)
+        header[:4] = b"FSB5"
+        header[4:8] = (1).to_bytes(4, "little")
+        header[8:12] = (1).to_bytes(4, "little")
+        header[12:16] = len(sample_headers).to_bytes(4, "little")
+        header[20:24] = len(data).to_bytes(4, "little")
+        header[24:28] = (15).to_bytes(4, "little")
+        (FIXTURES / fsb_name).write_bytes(header + sample_headers + data)
+        (FIXTURES / ogg_name).write_bytes(ogg.read_bytes())
+        print(
+            f"wrote {fsb_name} and {ogg_name}: {len(audio)} packets, "
+            f"{frame_count} frames"
+        )
+
+
 def main() -> None:
-    for tool in ("ffmpeg", "lame"):
+    for tool in ("ffmpeg", "lame", "oggenc"):
         if subprocess.run(["which", tool], capture_output=True).returncode != 0:
             sys.exit(f"{tool} is required to regenerate the audio fixtures")
     with tempfile.TemporaryDirectory() as directory:
@@ -146,6 +503,9 @@ def main() -> None:
         for name, options in OPUS_VARIANTS.items():
             generate_opus(name, options, work)
         generate_mpeg(work)
+        generate_multistream_mpeg(work)
+        generate_surround_opus(work)
+        generate_surround_vorbis(work)
 
 
 if __name__ == "__main__":

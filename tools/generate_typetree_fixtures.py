@@ -39,7 +39,7 @@ TEXT_ASSET_CLASS_ID = 49
 OUTPUT = (
     Path(__file__).resolve().parent.parent
     / "crates"
-    / "assetstudio-core"
+    / "unity-rs-core"
     / "tests"
     / "fixtures"
     / "typetree"

@@ -36,7 +36,7 @@ except ImportError:
 FIXTURES = (
     Path(__file__).resolve().parent.parent
     / "crates"
-    / "assetstudio-core"
+    / "unity-rs-core"
     / "tests"
     / "fixtures"
     / "astc"

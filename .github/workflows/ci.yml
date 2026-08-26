@@ -33,8 +33,26 @@ jobs:
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
           rustup override set 1.88.0
+      - name: Install locked RustSec auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+      - name: Audit locked Rust dependencies
+        run: cargo audit --file Cargo.lock --deny unsound --deny yanked
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Test the local CI completion policy
+        run: python3 tools/test_local_ci.py
+      - name: Verify Python API surface coverage
+        run: python3 tools/check_python_api_surface.py
+      - name: Test the Python API surface audit
+        run: python3 tools/test_python_api_surface.py
+      - name: Verify Node API surface coverage
+        run: python3 tools/check_node_api_surface.py
+      - name: Test the Node API surface audit
+        run: python3 tools/test_node_api_surface.py
+      - name: Verify six-platform release matrices
+        run: python3 tools/check_ci_matrix.py
+      - name: Test the release-matrix audit
+        run: python3 tools/test_ci_matrix.py
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build warning-free Rust API documentation
@@ -42,19 +60,21 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
       - name: Verify publishable Rust core crate
-        run: cargo package --locked -p assetstudio-core
+        run: cargo package --locked -p unity-rs-core
       - name: Verify locked third-party license bundle
         run: python3 tools/generate_dependency_licenses.py --check
       - name: Verify headless delivery scope
         run: python3 tools/check_delivery_scope.py
+      - name: Test the headless delivery-scope audit
+        run: python3 tools/test_delivery_scope.py
       - name: Verify Core crate legal files
         run: python3 tools/check_core_package.py
       - name: Upload Rust core crate
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: assetstudio-core-crate
-          path: target/package/assetstudio-core-*.crate
+          name: unity-rs-core-crate
+          path: target/package/unity-rs-core-*.crate
           if-no-files-found: error
 
   test:
@@ -94,7 +114,7 @@ jobs:
           - macos-latest
     defaults:
       run:
-        working-directory: crates/assetstudio-node
+        working-directory: crates/unity-rs-node
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -105,7 +125,7 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: crates/assetstudio-node/package-lock.json
+          cache-dependency-path: crates/unity-rs-node/package-lock.json
       - name: Install locked Node build tooling
         run: npm ci
       - name: Build the native Node-API addon and TypeScript declarations
@@ -142,7 +162,7 @@ jobs:
             build_python: "3.9"
     defaults:
       run:
-        working-directory: crates/assetstudio-python
+        working-directory: crates/unity-rs-python
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -201,22 +221,22 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: assetstudio-python-${{ matrix.artifact }}
-          path: crates/assetstudio-python/dist/*.whl
+          name: unity-rs-python-${{ matrix.artifact }}
+          path: crates/unity-rs-python/dist/*.whl
           if-no-files-found: error
       - name: Upload Python source distribution
         if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && matrix.artifact == 'linux-x64'
         uses: actions/upload-artifact@v4
         with:
-          name: assetstudio-python-sdist
-          path: crates/assetstudio-python/sdist-dist/*.tar.gz
+          name: unity-rs-python-sdist
+          path: crates/unity-rs-python/sdist-dist/*.tar.gz
           if-no-files-found: error
 
   managed-oracle:
     name: Managed-to-Rust differential oracle
     runs-on: ubuntu-latest
     env:
-      ASSETSTUDIO_REPO: ${{ github.workspace }}/managed-oracle-source
+      UNITY_RS_ORACLE_REPO: ${{ github.workspace }}/managed-oracle-source
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -237,9 +257,9 @@ jobs:
         with:
           dotnet-version: "10.0.x"
       - name: Restore managed oracle offline-ready graph
-        run: dotnet restore oracle/AssetStudioOracle.csproj --ignore-failed-sources -p:NuGetAudit=false -p:AssetStudioRepo="$ASSETSTUDIO_REPO"
+        run: dotnet restore oracle/AssetStudioOracle.csproj --ignore-failed-sources -p:NuGetAudit=false -p:AssetStudioRepo="$UNITY_RS_ORACLE_REPO"
       - name: Compare managed and Rust manifests
-        run: cargo +1.88.0 test -p assetstudio-core --test dotnet_oracle --locked -- --ignored --nocapture
+        run: cargo +1.88.0 test -p unity-rs-core --test dotnet_oracle --locked -- --ignored --nocapture
       - name: Verify version-scoped MonoBehaviour schema generation
         run: python3 tools/test_monoschema.py
 
@@ -258,20 +278,24 @@ jobs:
         run: |
           curl -fsSL -o vgmstream.zip \
             https://github.com/vgmstream/vgmstream/releases/download/${{ env.VGMSTREAM_VERSION }}/vgmstream-linux.zip
+          mkdir -p "$HOME/.local/bin"
           unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/vgmstream-cli"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Verify the oracle runs
-        run: vgmstream-cli -h > /dev/null
+        # vgmstream uses exit 1 for both of its successful information modes.
+        # Parse the pinned version output instead of treating that documented
+        # status as an execution failure or hiding arbitrary errors with `|| true`.
+        run: python3 -c "import json, os, subprocess; result = subprocess.run(['vgmstream-cli', '-V'], check=False, capture_output=True, text=True); assert result.returncode == 1, result; assert json.loads(result.stdout)['version'] == os.environ['VGMSTREAM_VERSION']"
       - name: Compare decoded PCM against vgmstream
-        run: cargo +1.88.0 test -p assetstudio-core --lib --locked -- --ignored
+        run: cargo +1.88.0 test -p unity-rs-core --lib --locked -- --ignored
 
   unitypy-oracle:
     name: UnityPy differential oracle
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/assetstudio-python
+        working-directory: crates/unity-rs-python
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -304,28 +328,28 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: linux-x64
-            binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            binary: target/release/unity-rs
+            smoke: ./target/release/artifact/unity-rs --help
           - os: ubuntu-24.04-arm
             artifact: linux-arm64
-            binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            binary: target/release/unity-rs
+            smoke: ./target/release/artifact/unity-rs --help
           - os: windows-latest
             artifact: windows-x64
-            binary: target/release/assetstudio.exe
-            smoke: .\target\release\assetstudio.exe --help
+            binary: target/release/unity-rs.exe
+            smoke: .\target\release\artifact\unity-rs.exe --help
           - os: windows-11-arm
             artifact: windows-arm64
-            binary: target/release/assetstudio.exe
-            smoke: .\target\release\assetstudio.exe --help
+            binary: target/release/unity-rs.exe
+            smoke: .\target\release\artifact\unity-rs.exe --help
           - os: macos-15-intel
             artifact: macos-x64
-            binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            binary: target/release/unity-rs
+            smoke: ./target/release/artifact/unity-rs --help
           - os: macos-latest
             artifact: macos-arm64
-            binary: target/release/assetstudio
-            smoke: ./target/release/assetstudio --help
+            binary: target/release/unity-rs
+            smoke: ./target/release/artifact/unity-rs --help
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -336,15 +360,15 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build release CLI
-        run: cargo +1.88.0 build --release --locked -p assetstudio-cli
-      - name: Smoke-test the exact CLI artifact
-        run: ${{ matrix.smoke }}
+        run: cargo +1.88.0 build --release --locked -p unity-rs-cli
       - name: Stage binary with license and notices
         run: python tools/stage_cli_artifact.py "${{ matrix.binary }}" target/release/artifact
+      - name: Smoke-test the staged CLI artifact
+        run: ${{ matrix.smoke }}
       - name: Upload native CLI
         uses: actions/upload-artifact@v4
         with:
-          name: assetstudio-cli-${{ matrix.artifact }}
+          name: unity-rs-cli-${{ matrix.artifact }}
           path: target/release/artifact
           if-no-files-found: error
 
@@ -374,7 +398,7 @@ jobs:
             artifact: macos-arm64
     defaults:
       run:
-        working-directory: crates/assetstudio-node
+        working-directory: crates/unity-rs-node
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -385,7 +409,7 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: crates/assetstudio-node/package-lock.json
+          cache-dependency-path: crates/unity-rs-node/package-lock.json
       - name: Install locked Node build tooling
         run: npm ci
       - name: Build release Node-API addon
@@ -399,6 +423,6 @@ jobs:
       - name: Upload Node package
         uses: actions/upload-artifact@v4
         with:
-          name: assetstudio-node-${{ matrix.artifact }}
-          path: crates/assetstudio-node/*.tgz
+          name: unity-rs-node-${{ matrix.artifact }}
+          path: crates/unity-rs-node/*.tgz
           if-no-files-found: error

@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """Runs every step the CI workflow runs, on this machine.
 
-CI has not run since the LZMA commit, and the gap was not harmless: the Python
-suite had been failing the whole time and nothing surfaced it until the wheel
-was built by hand. This exists so that "run what CI runs" is one command on any
-platform rather than a sequence someone has to reconstruct from the workflow
-file.
+CI has not executed repository steps since the LZMA commit, and the gap was not
+harmless: the Python suite had been failing the whole time and nothing surfaced
+it until the wheel was built by hand. This exists so that "run what CI runs" is
+one command on any platform rather than a sequence someone has to reconstruct
+from the workflow file.
 
 It is not a replacement for CI. CI runs this matrix on Linux, Windows and
 macOS; this runs it wherever you are. The value is that a contributor on a
 platform the maintainer cannot reach can produce the same evidence.
 
-Two groups reach past this machine. `cross` compiles the workspace and its
-tests for another target without running them, which catches what fails to
-build elsewhere -- a path assumption, a missing `cfg`, a type that is only
-`Send` on one platform -- but says nothing about behaviour; it needs a cross C
-toolchain because zstd builds from C sources. `linux` goes further and runs the
-suite and the Python wheel inside a container on the toolchain CI pins, which
-is behaviour rather than compilation. Neither covers Windows or macOS at once,
-so CI still has work to do.
+Two groups reach past this machine. `cross` compiles the full workspace and
+tests for Linux x86-64, then Core/CLI/Python for Windows x86-64 without running
+them, which catches what fails to build elsewhere -- a path assumption, a
+missing `cfg`, a type that is only `Send` on one platform -- but says nothing
+about behaviour; it needs both cross C toolchains because zstd builds from C
+sources. The Node addon is left to a real Windows runner because a Unix cross
+environment has no `libnode.dll`. `linux` goes further and runs the
+Core/CLI suite, release CLI, Python wheel and release Node package for amd64 and
+arm64 inside containers on the toolchain CI pins, which is behaviour and
+artifact validation rather than compilation. Neither covers Windows or macOS
+at once, so CI still has work to do.
 
 The `outputs` group is a second implementation rather than a second run: the
 crate's binary FBX reader and writer were built together, so their agreement
@@ -43,11 +46,15 @@ its own pixels is caught rather than silently read correctly.
 
 Steps are grouped, and a group that cannot run because a tool is missing is
 reported as skipped rather than failed -- the .NET oracle, `vgmstream-cli` and
-UnityPy are all optional. Anything that runs and fails is a failure.
+UnityPy are all optional. `security` similarly needs the exact `cargo-audit`
+version pinned in the workflow. Anything that runs and fails is a failure. Use
+`--fail-on-skip` for release or close-out evidence, where a missing tool must
+make the command fail instead of weakening the result.
 
     python3 tools/local_ci.py             # everything available
     python3 tools/local_ci.py --list      # what would run
     python3 tools/local_ci.py rust python # only these groups
+    python3 tools/local_ci.py --fail-on-skip quality rust security python
 """
 
 from __future__ import annotations
@@ -62,8 +69,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-NODE = ROOT / "crates" / "assetstudio-node"
-PYTHON = ROOT / "crates" / "assetstudio-python"
+NODE = ROOT / "crates" / "unity-rs-node"
+PYTHON = ROOT / "crates" / "unity-rs-python"
 # The wheel is installed here rather than into whatever interpreter happens to
 # be on PATH. A Homebrew or distribution Python refuses `pip install` outright
 # under PEP 668, and one that does not would be left carrying a build of this
@@ -73,7 +80,7 @@ VENV = PYTHON / ".ci-venv"
 VENV_314 = PYTHON / ".ci-venv-314"
 MYPY_VERSION = "1.18.2"
 CLI_BINARY = ROOT / "target" / "release" / (
-    "assetstudio.exe" if os.name == "nt" else "assetstudio"
+    "unity-rs.exe" if os.name == "nt" else "unity-rs"
 )
 
 # Several steps below verify with `assert` -- the inline `-c` snippets here and
@@ -103,6 +110,14 @@ class Group:
     # A tool that must exist for the group to mean anything. None means the
     # group only needs cargo, which the runner requires up front.
     requires: str | None = None
+    # Further tools needed by a compound group. Checking them before the first
+    # step avoids spending time on one platform and then failing halfway only
+    # because the next platform's C compiler was absent.
+    additional_requires: tuple[str, ...] = ()
+    # Exact stdout from ``<requires> --version`` when reproducible evidence
+    # depends on a pinned tool release. A different installed version is a
+    # missing prerequisite, not permission to silently produce weaker proof.
+    required_version_output: str | None = None
     # Optional semantic prerequisite, such as an import inside a virtualenv.
     # A failed probe skips the group just like a missing executable does.
     probe: list[str] | None = None
@@ -130,6 +145,34 @@ def groups(interpreter: str) -> list[Group]:
             [
                 Step("format", ["cargo", "fmt", "--all", "--", "--check"]),
                 Step(
+                    "local CI runner tests",
+                    [sys.executable, "tools/test_local_ci.py"],
+                ),
+                Step(
+                    "Python API surface audit",
+                    [sys.executable, "tools/check_python_api_surface.py"],
+                ),
+                Step(
+                    "Python API surface audit tests",
+                    [sys.executable, "tools/test_python_api_surface.py"],
+                ),
+                Step(
+                    "Node API surface audit",
+                    [sys.executable, "tools/check_node_api_surface.py"],
+                ),
+                Step(
+                    "Node API surface audit tests",
+                    [sys.executable, "tools/test_node_api_surface.py"],
+                ),
+                Step(
+                    "CI release matrix audit",
+                    [sys.executable, "tools/check_ci_matrix.py"],
+                ),
+                Step(
+                    "CI release matrix audit tests",
+                    [sys.executable, "tools/test_ci_matrix.py"],
+                ),
+                Step(
                     "clippy",
                     [
                         "cargo", "clippy", "--workspace", "--all-targets",
@@ -145,7 +188,7 @@ def groups(interpreter: str) -> list[Group]:
                     "package the core crate",
                     [
                         "cargo", "package", "--allow-dirty", "--locked",
-                        "-p", "assetstudio-core",
+                        "-p", "unity-rs-core",
                     ],
                 ),
                 Step(
@@ -158,6 +201,10 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "headless delivery scope",
                     ["python3", "tools/check_delivery_scope.py"],
+                ),
+                Step(
+                    "headless delivery scope tests",
+                    ["python3", "tools/test_delivery_scope.py"],
                 ),
                 Step(
                     "Core crate legal files",
@@ -173,18 +220,33 @@ def groups(interpreter: str) -> list[Group]:
             ],
         ),
         Group(
+            "security",
+            [
+                Step(
+                    "RustSec dependency audit",
+                    [
+                        "cargo-audit", "audit", "--file", "Cargo.lock",
+                        "--deny", "unsound", "--deny", "yanked",
+                    ],
+                ),
+            ],
+            requires="cargo-audit",
+            required_version_output="cargo-audit 0.22.2",
+            reason="needs cargo-audit 0.22.2",
+        ),
+        Group(
             "cli-package",
             [
                 Step(
                     "build release CLI",
                     [
                         "cargo", "build", "--release", "--locked",
-                        "-p", "assetstudio-cli",
+                        "-p", "unity-rs-cli",
                     ],
                 ),
                 Step("smoke exact release CLI", [str(CLI_BINARY), "--help"]),
                 Step(
-                    "stage release CLI",
+                    "stage and smoke release CLI artifact",
                     [sys.executable, "-c", STAGE_CLI_ARTIFACT, str(CLI_BINARY)],
                 ),
             ],
@@ -195,7 +257,7 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "managed differential",
                     [
-                        "cargo", "test", "-p", "assetstudio-core", "--test",
+                        "cargo", "test", "-p", "unity-rs-core", "--test",
                         "dotnet_oracle", "--locked", "--", "--ignored",
                     ],
                 ),
@@ -213,7 +275,7 @@ def groups(interpreter: str) -> list[Group]:
                 Step(
                     "audio differential",
                     [
-                        "cargo", "test", "-p", "assetstudio-core", "--lib",
+                        "cargo", "test", "-p", "unity-rs-core", "--lib",
                         "--locked", "--", "--ignored",
                     ],
                 )
@@ -224,6 +286,10 @@ def groups(interpreter: str) -> list[Group]:
         Group(
             "outputs",
             [
+                Step(
+                    "binary FBX verifier regressions",
+                    ["python3", "tools/test_validate_fbx_binary.py"],
+                ),
                 Step(
                     "binary FBX validity",
                     ["python3", "tools/validate_fbx_binary.py", "--cli"],
@@ -261,10 +327,29 @@ def groups(interpreter: str) -> list[Group]:
                             "x86_64-unknown-linux-gnu-gcc"
                         ),
                     },
-                )
+                ),
+                Step(
+                    "compile Core/CLI/Python for Windows x86-64",
+                    [
+                        "cargo", "check", "-p", "unity-rs-core",
+                        "-p", "unity-rs-cli", "-p", "unity-rs-python",
+                        "--all-targets", "--locked", "--target",
+                        "x86_64-pc-windows-gnu",
+                    ],
+                    env={
+                        "CC_x86_64_pc_windows_gnu": "x86_64-w64-mingw32-gcc",
+                        "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER": (
+                            "x86_64-w64-mingw32-gcc"
+                        ),
+                    },
+                ),
             ],
             requires="x86_64-unknown-linux-gnu-gcc",
-            reason="cross-compiling needs a Linux C toolchain for zstd's C sources",
+            additional_requires=("x86_64-w64-mingw32-gcc",),
+            reason=(
+                "cross-compiling needs Linux and Windows C toolchains for "
+                "zstd's C sources"
+            ),
         ),
         Group(
             "linux",
@@ -291,7 +376,7 @@ def groups(interpreter: str) -> list[Group]:
                         [
                             "docker", "run", "--rm",
                             "--platform", f"linux/{architecture}",
-                            "-v", f"{ROOT}:/src", "-w", "/src/crates/assetstudio-python",
+                            "-v", f"{ROOT}:/src", "-w", "/src/crates/unity-rs-python",
                             "-e", f"CARGO_TARGET_DIR=/tmp/target-python-{architecture}",
                             LINUX_IMAGE,
                             "sh", "-c", LINUX_WHEEL,
@@ -450,7 +535,7 @@ def groups(interpreter: str) -> list[Group]:
                     cwd=PYTHON,
                 )
             ],
-            probe=[venv_interpreter(), "-c", "import assetstudio, UnityPy"],
+            probe=[venv_interpreter(), "-c", "import unity_rs, UnityPy"],
             reason="needs the built wheel and UnityPy in the same interpreter",
         ),
     ]
@@ -466,12 +551,13 @@ LINUX_SETUP = "apt-get update -qq >/dev/null && apt-get install -y -qq gcc >/dev
 # does not carry.
 LINUX_TESTS = (
     f"{LINUX_SETUP} && apt-get install -y -qq python3 >/dev/null"
-    " && cargo test -p assetstudio-core -p assetstudio-cli --locked"
-    " && cargo build --release --locked -p assetstudio-cli"
-    ' && "$CARGO_TARGET_DIR/release/assetstudio" --help >/dev/null'
+    " && cargo test -p unity-rs-core -p unity-rs-cli --locked"
+    " && cargo build --release --locked -p unity-rs-cli"
+    ' && "$CARGO_TARGET_DIR/release/unity-rs" --help >/dev/null'
     " && python3 tools/stage_cli_artifact.py"
-    ' "$CARGO_TARGET_DIR/release/assetstudio" /tmp/cli-artifact'
+    ' "$CARGO_TARGET_DIR/release/unity-rs" /tmp/cli-artifact'
     ' && test "$(find /tmp/cli-artifact -maxdepth 1 -type f | wc -l)" -eq 4'
+    " && /tmp/cli-artifact/unity-rs --help >/dev/null"
 )
 
 LINUX_WHEEL = (
@@ -503,9 +589,9 @@ def linux_node_command(node_architecture: str, addon_architecture: str) -> str:
         " && mkdir /tmp/repository"
         " && tar --exclude=.git --exclude=target --exclude=node_modules"
         " --exclude='*.node' -C /src -cf - . | tar -C /tmp/repository -xf -"
-        " && cd /tmp/repository/crates/assetstudio-node"
+        " && cd /tmp/repository/crates/unity-rs-node"
         " && npm ci --silent && npm run build"
-        f" && test -f assetstudio-node.linux-{addon_architecture}-gnu.node"
+        f" && test -f unity-rs-node.linux-{addon_architecture}-gnu.node"
         " && npm test && npm run test:package"
         " && mkdir /tmp/node-pack"
         " && npm pack --silent --pack-destination /tmp/node-pack >/dev/null"
@@ -538,6 +624,7 @@ STAGE_CLI_ARTIFACT = (
     "'THIRD_PARTY_LICENSES.txt', pathlib.Path(sys.argv[1]).name}; "
     "actual = {path.name for path in output.iterdir()}; "
     "assert actual == expected, (actual, expected); "
+    "subprocess.check_call([str(output / pathlib.Path(sys.argv[1]).name), '--help']); "
     "temporary.cleanup()"
 )
 
@@ -567,10 +654,31 @@ def run(step: Step) -> tuple[bool, str]:
     return False, "\n".join(tail[-25:])
 
 
+def executable_version(executable: str) -> str | None:
+    """Return a tool's normalized ``--version`` output, or None on failure."""
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("groups", nargs="*", help="only run these groups")
     parser.add_argument("--list", action="store_true", help="list groups and exit")
+    parser.add_argument(
+        "--fail-on-skip",
+        action="store_true",
+        help="return failure if a requested group cannot run",
+    )
     parser.add_argument(
         "--interpreter",
         default=sys.executable,
@@ -590,8 +698,14 @@ def main() -> int:
 
     if arguments.list:
         for group in available:
-            if group.requires:
-                note = f"  (needs {group.requires})"
+            if group.requires or group.additional_requires:
+                requirement = group.required_version_output or group.requires
+                requirements = tuple(
+                    value
+                    for value in (requirement, *group.additional_requires)
+                    if value is not None
+                )
+                note = f"  (needs {', '.join(requirements)})"
             elif group.probe:
                 note = f"  (optional: {group.reason})"
             else:
@@ -608,9 +722,33 @@ def main() -> int:
     failures: list[str] = []
     skipped: list[str] = []
     for group in available:
-        if group.requires and shutil.which(group.requires) is None:
+        if group.requires:
+            executable = shutil.which(group.requires)
+            if executable is None:
+                skipped.append(f"{group.name}: {group.reason}")
+                print(f"skip {group.name}: {group.requires} not found")
+                continue
+            if group.required_version_output is not None:
+                actual_version = executable_version(executable)
+                if actual_version != group.required_version_output:
+                    actual = actual_version or "unavailable"
+                    skipped.append(f"{group.name}: {group.reason}; found {actual}")
+                    print(
+                        f"skip {group.name}: expected {group.required_version_output}, "
+                        f"found {actual}"
+                    )
+                    continue
+        missing_additional = next(
+            (
+                requirement
+                for requirement in group.additional_requires
+                if shutil.which(requirement) is None
+            ),
+            None,
+        )
+        if missing_additional is not None:
             skipped.append(f"{group.name}: {group.reason}")
-            print(f"skip {group.name}: {group.requires} not found")
+            print(f"skip {group.name}: {missing_additional} not found")
             continue
         if group.probe:
             try:
@@ -641,6 +779,9 @@ def main() -> int:
         print(f"skipped {note}")
     if failures:
         print(f"\n{len(failures)} step(s) failed: {', '.join(failures)}")
+        return 1
+    if skipped and arguments.fail_on_skip:
+        print(f"\n{len(skipped)} group(s) skipped under --fail-on-skip")
         return 1
     print(f"all steps passed ({len(skipped)} group(s) skipped)")
     return 0
