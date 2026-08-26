@@ -976,6 +976,7 @@ fn load_options(
         } else {
             LoadFailurePolicy::Abort
         },
+        strict_unity_versions: false,
     })
 }
 

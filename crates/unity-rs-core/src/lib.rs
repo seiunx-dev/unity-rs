@@ -67,6 +67,7 @@ pub mod unity_cn;
 pub mod unity_version;
 /// Vendored third-party decoders; see the module documentation for why.
 mod vendor;
+mod version_gate;
 pub mod web_file;
 
 pub use error::{Error, Result};

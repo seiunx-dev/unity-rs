@@ -10,6 +10,7 @@ use std::mem::{replace, size_of};
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::serialized::{ObjectReference, SerializedFile};
 use crate::source::{Region, RegionCursor};
+use crate::version_gate::{VersionGateOutcome, finish_lenient};
 use crate::{Error, Result};
 
 pub const ANIMATION_CLIP_CLASS_ID: i32 = 74;
@@ -598,32 +599,44 @@ pub fn read_animation_clip(
     object_index: usize,
     limits: AnimationClipReadLimits,
 ) -> Result<AnimationClip> {
-    validate_supported_version(file)?;
-    AnimationClipReader::new(file, object_index, limits)?.read()
+    let outcome = validate_supported_version(file)?;
+    finish_lenient(
+        outcome,
+        "AnimationClip",
+        &file.unity_version,
+        AnimationClipReader::new(file, object_index, limits).and_then(AnimationClipReader::read),
+    )
 }
 
-fn validate_supported_version(file: &SerializedFile) -> Result<()> {
+fn validate_supported_version(file: &SerializedFile) -> Result<VersionGateOutcome> {
     if file.unity_version.is_stripped() {
         return Err(Error::unsupported(
             "AnimationClip requires a Unity version because every curve layout is version-dependent",
         ));
     }
     let version = file.unity_version.components();
-    let supported = if file.unity_version.is_tuanjie() {
-        version.0 == 2022 && version.1 == 3 && version.2 >= 2
+    if file.unity_version.is_tuanjie() {
+        if version.0 == 2022 && version.1 == 3 && version.2 >= 2 {
+            return Ok(VersionGateOutcome::Verified);
+        }
     } else {
         // 6000.3 checked rather than assumed: the managed reader carries no
         // AnimationClip branch newer than 2023.2's streamed-curve split, and
         // the 6000.3.12f1 differential fixture locks that shared layout.
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
-    };
-    if !supported {
-        return Err(Error::unsupported(format!(
-            "AnimationClip Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.3, and Tuanjie 2022.3.x ranges",
-            file.unity_version
-        )));
+        if ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
+        {
+            return Ok(VersionGateOutcome::Verified);
+        }
+        // Leniency applies only above the verified standard-Unity range;
+        // versions below the floor keep the historical rejection.
+        if version >= (2024, 0, 0) && !file.strict_unity_versions {
+            return Ok(VersionGateOutcome::AboveVerifiedRange);
+        }
     }
-    Ok(())
+    Err(Error::unsupported(format!(
+        "AnimationClip Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.3, and Tuanjie 2022.3.x ranges",
+        file.unity_version
+    )))
 }
 
 fn uses_split_streamed_curve_counts(version: (u32, u32, u32)) -> bool {
@@ -2173,13 +2186,34 @@ mod tests {
 
         let old = parse_asset(22, Endian::Little, 13, "2017.2.9f1", &payload);
         assert!(read_animation_clip(&old, 0, AnimationClipReadLimits::default()).is_err());
-        // The upper bound moved to 6000.3 on the evidence in
-        // `validate_supported_version`, so the refusal case moves with it.
+        // Above the verified ceiling (6000.3) the default is lenient: the
+        // newest known layout is attempted, a layout mismatch is reported as
+        // `Unsupported`, and only `strict_unity_versions` restores the
+        // historical rejection.
         for version in ["2024.1.0f1", "6000.4.0f1"] {
-            let unverified = parse_asset(22, Endian::Little, 13, version, &payload);
+            let newest = standard_payload((6000, 3, 0), 22, Endian::Little, false, false);
+            let lenient = parse_asset(22, Endian::Little, 13, version, &newest);
+            read_animation_clip(&lenient, 0, AnimationClipReadLimits::default())
+                .unwrap_or_else(|error| panic!("{version}: {error}"));
+
+            let short = parse_asset(22, Endian::Little, 13, version, &newest[..newest.len() - 8]);
+            let error =
+                read_animation_clip(&short, 0, AnimationClipReadLimits::default()).unwrap_err();
+            let crate::Error::Unsupported(message) = &error else {
+                panic!("{version}: expected Unsupported, got {error:?}");
+            };
             assert!(
-                read_animation_clip(&unverified, 0, AnimationClipReadLimits::default()).is_err(),
-                "{version}"
+                message.contains("above the verified range"),
+                "{version}: {message}"
+            );
+
+            let mut strict = parse_asset(22, Endian::Little, 13, version, &newest);
+            strict.strict_unity_versions = true;
+            let error =
+                read_animation_clip(&strict, 0, AnimationClipReadLimits::default()).unwrap_err();
+            assert!(
+                error.to_string().contains("outside the verified"),
+                "{version}: {error}"
             );
         }
 

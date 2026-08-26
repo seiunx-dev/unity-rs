@@ -2433,6 +2433,7 @@ impl PyUnityRs {
             oodle_decoder,
             unity_cn_key: parse_unity_cn_key(py, unity_cn_key)?,
             failure_policy: failure_policy(skip_unreadable_inputs),
+            strict_unity_versions: false,
         };
         py.detach(move || Studio::open_with_options(path, options))
             .map(|studio| Self { studio })
@@ -2543,6 +2544,7 @@ impl PyUnityRs {
             oodle_decoder: python_oodle_decoder(py, oodle_decoder)?,
             unity_cn_key: parse_unity_cn_key(py, unity_cn_key)?,
             failure_policy: failure_policy(skip_unreadable_inputs),
+            strict_unity_versions: false,
         };
         py.detach(move || Studio::open_regions_with_options(inputs, options))
             .map(|studio| Self { studio })

@@ -11,6 +11,7 @@ use crate::animation_clip::{ByteRegion, F32Array, I32Array, U32Array};
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::serialized::{ObjectReference, SerializedFile};
 use crate::source::{Region, RegionCursor};
+use crate::version_gate::{VersionGateOutcome, finish_lenient};
 use crate::{Error, Result};
 
 pub const ANIMATOR_CONTROLLER_CLASS_ID: i32 = 91;
@@ -319,31 +320,34 @@ pub fn read_animator_controller(
     object_index: usize,
     limits: AnimatorControllerReadLimits,
 ) -> Result<AnimatorController> {
-    validate_supported_version(file)?;
-    let mut reader = ControllerReader::new(file, object_index, limits)?;
-    let name = reader.read_named_object()?;
-    let controller_size = reader.reader.read_u32()?;
-    let controller = reader.read_controller_constant()?;
-    let tos = reader.read_tos()?;
-    let animation_clips = reader.read_animation_clips()?;
-    reader.read_state_machine_behaviour_tail()?;
+    let outcome = validate_supported_version(file)?;
+    let result = (|| -> Result<AnimatorController> {
+        let mut reader = ControllerReader::new(file, object_index, limits)?;
+        let name = reader.read_named_object()?;
+        let controller_size = reader.reader.read_u32()?;
+        let controller = reader.read_controller_constant()?;
+        let tos = reader.read_tos()?;
+        let animation_clips = reader.read_animation_clips()?;
+        reader.read_state_machine_behaviour_tail()?;
 
-    // Now this means something: everything the object carries has been
-    // accounted for, either read or checked and found empty.
-    let trailing = reader.reader.remaining()?;
-    if trailing != 0 {
-        return Err(Error::invalid_data(format!(
-            "AnimatorController object contains {trailing} unparsed trailing bytes"
-        )));
-    }
-    Ok(AnimatorController {
-        path_id: reader.path_id,
-        name,
-        controller_size,
-        controller,
-        tos,
-        animation_clips,
-    })
+        // Now this means something: everything the object carries has been
+        // accounted for, either read or checked and found empty.
+        let trailing = reader.reader.remaining()?;
+        if trailing != 0 {
+            return Err(Error::invalid_data(format!(
+                "AnimatorController object contains {trailing} unparsed trailing bytes"
+            )));
+        }
+        Ok(AnimatorController {
+            path_id: reader.path_id,
+            name,
+            controller_size,
+            controller,
+            tos,
+            animation_clips,
+        })
+    })();
+    finish_lenient(outcome, "AnimatorController", &file.unity_version, result)
 }
 
 #[derive(Debug, Default)]
@@ -1034,29 +1038,36 @@ impl ControllerReader {
     }
 }
 
-fn validate_supported_version(file: &SerializedFile) -> Result<()> {
+fn validate_supported_version(file: &SerializedFile) -> Result<VersionGateOutcome> {
     if file.unity_version.is_stripped() {
         return Err(Error::unsupported(
             "AnimatorController requires a Unity version for its nested layout",
         ));
     }
     let version = file.unity_version.components();
-    let supported = if file.unity_version.is_tuanjie() {
-        version.0 == 2022 && version.1 == 3 && version.2 >= 2
+    if file.unity_version.is_tuanjie() {
+        if version.0 == 2022 && version.1 == 3 && version.2 >= 2 {
+            return Ok(VersionGateOutcome::Verified);
+        }
     } else {
         // 6000.3 checked rather than assumed: the managed reader adds nothing
         // to AnimatorController after 6000.2's default entity IDs, and the
         // 6000.3.12f1 differential fixture locks that shared layout.
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version)
+        if ((2017, 3, 0)..(2024, 0, 0)).contains(&version)
             || (file.unity_version.major == 6000 && file.unity_version.minor <= 3)
-    };
-    if !supported {
-        return Err(Error::unsupported(format!(
-            "AnimatorController Unity version {} is outside the verified 2017.3-2023.x, 6000.0-6000.3, and Tuanjie 2022.3.x ranges",
-            file.unity_version
-        )));
+        {
+            return Ok(VersionGateOutcome::Verified);
+        }
+        // Leniency applies only above the verified standard-Unity range;
+        // versions below the floor keep the historical rejection.
+        if version >= (2024, 0, 0) && !file.strict_unity_versions {
+            return Ok(VersionGateOutcome::AboveVerifiedRange);
+        }
     }
-    Ok(())
+    Err(Error::unsupported(format!(
+        "AnimatorController Unity version {} is outside the verified 2017.3-2023.x, 6000.0-6000.3, and Tuanjie 2022.3.x ranges",
+        file.unity_version
+    )))
 }
 
 #[cfg(test)]
@@ -1198,14 +1209,42 @@ mod tests {
     fn rejects_versions_truncation_negative_counts_trailing_bytes_and_budgets() {
         let endian = TestEndian::Little;
         let object = minimal_controller_object(endian, false, "limits", 91, None);
-        // The upper bound moved to 6000.3 on the evidence in
-        // `validate_supported_version`, so the refusal case moves with it.
-        for version in ["2017.2.9f1", "2024.1.0f1", "6000.4.0f1", "2023.1.0t1"] {
+        for version in ["2017.2.9f1", "2023.1.0t1"] {
             let file = parse_asset(22, endian, 13, version, &object);
             assert!(
                 read_animator_controller(&file, 0, AnimatorControllerReadLimits::default())
                     .is_err(),
                 "{version} should be unsupported"
+            );
+        }
+
+        // Above the verified ceiling (6000.3) the default is lenient: the
+        // newest known layout is attempted, a layout mismatch is reported as
+        // `Unsupported`, and only `strict_unity_versions` restores the
+        // historical rejection.
+        let entity_object = minimal_controller_object(endian, false, "limits", 91, Some(&[3]));
+        let lenient = parse_asset(22, endian, 13, "6000.4.0f1", &entity_object);
+        read_animator_controller(&lenient, 0, AnimatorControllerReadLimits::default())
+            .unwrap_or_else(|error| panic!("6000.4.0f1: {error}"));
+
+        let mismatched = parse_asset(22, endian, 13, "6000.4.0f1", &object);
+        let error =
+            read_animator_controller(&mismatched, 0, AnimatorControllerReadLimits::default())
+                .unwrap_err();
+        let crate::Error::Unsupported(message) = &error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("above the verified range"), "{message}");
+
+        for version in ["2024.1.0f1", "6000.4.0f1"] {
+            let mut strict = parse_asset(22, endian, 13, version, &entity_object);
+            strict.strict_unity_versions = true;
+            let error =
+                read_animator_controller(&strict, 0, AnimatorControllerReadLimits::default())
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("outside the verified"),
+                "{version}: {error}"
             );
         }
 

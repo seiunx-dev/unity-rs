@@ -69,6 +69,10 @@ pub struct SerializedOpenOptions {
     /// one. Unlike the override, this is only consulted when the file cannot
     /// speak for itself: see [`SerializedFile::open_with_options`].
     pub bundle_version_hint: Option<UnityVersion>,
+    /// Reject classes whose standard-Unity version is above the verified
+    /// ceiling instead of attempting the newest known layout. The default is
+    /// lenient; see `version_gate` for the exact error contract.
+    pub strict_unity_versions: bool,
 }
 
 impl Default for SerializedParseLimits {
@@ -230,6 +234,9 @@ pub struct SerializedFile {
     pub externals: Vec<ExternalFile>,
     pub reference_types: Vec<SerializedType>,
     pub user_information: String,
+    /// Carried from [`SerializedOpenOptions::strict_unity_versions`] so every
+    /// per-class version gate sees the caller's choice.
+    pub strict_unity_versions: bool,
 }
 
 #[derive(Debug, Default)]
@@ -250,8 +257,7 @@ impl SerializedFile {
             region,
             SerializedOpenOptions {
                 limits,
-                unity_version_override: None,
-                bundle_version_hint: None,
+                ..SerializedOpenOptions::default()
             },
         )
     }
@@ -279,6 +285,7 @@ impl SerializedFile {
             limits,
             unity_version_override,
             bundle_version_hint,
+            strict_unity_versions,
         } = options;
         let mut root_reader = EndianReader::new(region.cursor(), Endian::Big);
         let header = SerializedFileHeader::read(&mut root_reader)?;
@@ -588,6 +595,7 @@ impl SerializedFile {
             externals,
             reference_types,
             user_information,
+            strict_unity_versions,
         })
     }
 

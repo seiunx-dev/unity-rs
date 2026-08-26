@@ -11,6 +11,7 @@ use std::io::Read;
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::serialized::{ObjectReference, SerializedFile};
 use crate::source::RegionCursor;
+use crate::version_gate::{VersionGateOutcome, finish_lenient};
 use crate::{Error, Result};
 
 pub const SPRITE_ATLAS_CLASS_ID: i32 = 687_078_895;
@@ -189,18 +190,10 @@ pub fn read_sprite_atlas(
     object_index: usize,
     limits: SpriteAtlasReadLimits,
 ) -> Result<SpriteAtlas> {
-    if file.unity_version.is_stripped() {
-        return Err(Error::unsupported(
-            "SpriteAtlas requires a Unity version because its layout is version-dependent",
-        ));
-    }
-    let version = file.unity_version.components();
-    if !is_verified_sprite_atlas_version(version) {
-        return Err(Error::unsupported(format!(
-            "SpriteAtlas layout is verified for Unity 2017.1 through 2023.x and Unity 6000.0 through 6000.3, got {}",
-            file.unity_version
-        )));
-    }
+    let outcome = validate_sprite_atlas_version(file)?;
+    // The object lookup and class-ID check depend only on metadata, so they
+    // run before the lenient wrapper and keep their error families even above
+    // the verified range.
     let object = file.objects.get(object_index).ok_or_else(|| {
         Error::invalid_data(format!(
             "serialized object index {object_index} is out of range"
@@ -213,25 +206,53 @@ pub fn read_sprite_atlas(
         )));
     }
 
-    let region = file.object_region(object_index)?;
-    let endian = if file.header.endianness == 0 {
-        Endian::Little
-    } else {
-        Endian::Big
-    };
-    let mut reader = SpriteAtlasObjectReader {
-        reader: EndianReader::new(region.cursor(), endian),
-        absolute_start: object.byte_start,
-        target_platform: file.target_platform,
-        format_version: file.header.version.0,
-        version,
-        limits,
-        total_string_bytes: 0,
-        total_secondary_textures: 0,
-    };
-    let atlas = reader.read_atlas(object.path_id)?;
-    reader.finish_known_layout()?;
-    Ok(atlas)
+    let result = (|| -> Result<SpriteAtlas> {
+        let region = file.object_region(object_index)?;
+        let endian = if file.header.endianness == 0 {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+        let mut reader = SpriteAtlasObjectReader {
+            reader: EndianReader::new(region.cursor(), endian),
+            absolute_start: object.byte_start,
+            target_platform: file.target_platform,
+            format_version: file.header.version.0,
+            version: file.unity_version.components(),
+            limits,
+            total_string_bytes: 0,
+            total_secondary_textures: 0,
+        };
+        let atlas = reader.read_atlas(object.path_id)?;
+        reader.finish_known_layout()?;
+        Ok(atlas)
+    })();
+    finish_lenient(outcome, "SpriteAtlas", &file.unity_version, result)
+}
+
+fn validate_sprite_atlas_version(file: &SerializedFile) -> Result<VersionGateOutcome> {
+    if file.unity_version.is_stripped() {
+        return Err(Error::unsupported(
+            "SpriteAtlas requires a Unity version because its layout is version-dependent",
+        ));
+    }
+    let version = file.unity_version.components();
+    if is_verified_sprite_atlas_version(version) {
+        return Ok(VersionGateOutcome::Verified);
+    }
+    // Leniency applies only above the verified standard-Unity range (Tuanjie
+    // atlases carry standard 2022.3/2023 numbers and stay inside it);
+    // versions below the floor keep the historical rejection.
+    if !file.unity_version.is_tuanjie()
+        && version >= (LAST_VERIFIED_UNITY_MAJOR + 1, 0, 0)
+        && !file.strict_unity_versions
+    {
+        return Ok(VersionGateOutcome::AboveVerifiedRange);
+    }
+    Err(Error::unsupported(format!(
+        "SpriteAtlas layout is verified for Unity 2017.1 through 2023.x and Unity 6000.0 through 6000.3, got {}",
+        file.unity_version
+    )))
 }
 
 const fn is_verified_sprite_atlas_version(version: (u32, u32, u32)) -> bool {
@@ -846,9 +867,7 @@ mod tests {
 
     #[test]
     fn rejects_unverified_versions_and_wrong_class() {
-        // The upper bound moved to 6000.3 on the evidence in the constant's
-        // comment, so the refusal case moves with it.
-        for version in ["2017.0.4f1", "2024.1.0f1", "6000.4.0f1", ""] {
+        for version in ["2017.0.4f1", ""] {
             let object = atlas_object((2022, 3, 62), Endian::Little, 13, &[FIRST_KEY]);
             let file = parse_asset(
                 version,
@@ -860,6 +879,56 @@ mod tests {
             assert!(
                 matches!(error, Error::Unsupported(_)),
                 "version {version:?}"
+            );
+        }
+
+        // Above the verified ceiling (6000.3) the default is lenient: the
+        // newest known layout is attempted, a layout mismatch is reported as
+        // `Unsupported`, and only `strict_unity_versions` restores the
+        // historical rejection.
+        for version in ["2024.1.0f1", "6000.4.0f1"] {
+            let object = atlas_object((2022, 3, 62), Endian::Little, 13, &[FIRST_KEY]);
+            let file = parse_asset(
+                version,
+                Endian::Little,
+                13,
+                &[(SPRITE_ATLAS_CLASS_ID, 1, object.clone())],
+            );
+            let atlas = read_sprite_atlas(&file, 0, SpriteAtlasReadLimits::default())
+                .unwrap_or_else(|error| panic!("{version}: {error}"));
+            assert_eq!(atlas.name, "atlas", "{version}");
+
+            let short = parse_asset(
+                version,
+                Endian::Little,
+                13,
+                &[(
+                    SPRITE_ATLAS_CLASS_ID,
+                    1,
+                    object[..object.len() - 8].to_vec(),
+                )],
+            );
+            let error = read_sprite_atlas(&short, 0, SpriteAtlasReadLimits::default()).unwrap_err();
+            let Error::Unsupported(message) = &error else {
+                panic!("{version}: expected Unsupported, got {error:?}");
+            };
+            assert!(
+                message.contains("above the verified range"),
+                "{version}: {message}"
+            );
+
+            let mut strict = parse_asset(
+                version,
+                Endian::Little,
+                13,
+                &[(SPRITE_ATLAS_CLASS_ID, 1, object)],
+            );
+            strict.strict_unity_versions = true;
+            let error =
+                read_sprite_atlas(&strict, 0, SpriteAtlasReadLimits::default()).unwrap_err();
+            assert!(
+                error.to_string().contains("verified for"),
+                "{version}: {error}"
             );
         }
 

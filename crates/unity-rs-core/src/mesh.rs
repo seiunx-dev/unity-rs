@@ -7,6 +7,7 @@ use crate::managed_number::ManagedNumber;
 use crate::packed_bits::{PackedFloatVector, PackedIntVector};
 use crate::serialized::{ObjectInfo, SerializedFile};
 use crate::source::{Region, RegionCursor};
+use crate::version_gate::{VersionGateOutcome, finish_lenient};
 use crate::{Error, Result};
 
 pub const MESH_CLASS_ID: i32 = 43;
@@ -431,37 +432,16 @@ fn triangulate(
     Ok(indices)
 }
 
-#[allow(clippy::too_many_lines)]
 fn read_mesh_inner(
     collection: Option<&AssetCollection>,
     file: &SerializedFile,
     object_index: usize,
     limits: MeshReadLimits,
 ) -> Result<Mesh> {
-    if file.unity_version.is_stripped() {
-        return Err(Error::unsupported(
-            "Mesh requires a Unity version because its layout is version-dependent",
-        ));
-    }
-    let version = file.unity_version.components();
-    let is_tuanjie = file.unity_version.build_type.as_deref() == Some("t");
-    let supported = if is_tuanjie {
-        version.0 == 2022 && version.1 == 3 && version.2 >= 2
-    } else {
-        // 6000.2 appends a `MeshLodInfo` tail; everything before it is
-        // unchanged, and the tail's shape comes from the type tree a 6000.3
-        // build writes rather than from a guess. 6000.4 and later are refused
-        // for the same reason 6000.2 was before that tree was read: nothing
-        // here has seen one.
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
-    };
-    if !supported {
-        return Err(Error::unsupported(format!(
-            "resident Mesh layout for Unity {}; implemented ranges are standard Unity 2017.3-2023 and 6000.0-6000.3 plus Tuanjie 2022.3.x",
-            file.unity_version
-        )));
-    }
-
+    let outcome = validate_mesh_version(file)?;
+    // The object lookup and the declared-byte-size budget depend only on
+    // metadata, so they run before the lenient wrapper and keep their error
+    // families even above the verified range.
     let object = require_mesh(file, object_index)?;
     if object.byte_size > limits.maximum_object_bytes {
         return Err(Error::invalid_data(format!(
@@ -469,6 +449,56 @@ fn read_mesh_inner(
             object.byte_size, limits.maximum_object_bytes
         )));
     }
+    finish_lenient(
+        outcome,
+        "Mesh",
+        &file.unity_version,
+        read_mesh_body(collection, file, object_index, limits),
+    )
+}
+
+fn validate_mesh_version(file: &SerializedFile) -> Result<VersionGateOutcome> {
+    if file.unity_version.is_stripped() {
+        return Err(Error::unsupported(
+            "Mesh requires a Unity version because its layout is version-dependent",
+        ));
+    }
+    let version = file.unity_version.components();
+    let is_tuanjie = file.unity_version.build_type.as_deref() == Some("t");
+    if is_tuanjie {
+        if version.0 == 2022 && version.1 == 3 && version.2 >= 2 {
+            return Ok(VersionGateOutcome::Verified);
+        }
+    } else {
+        // 6000.2 appends a `MeshLodInfo` tail; everything before it is
+        // unchanged, and the tail's shape comes from the type tree a 6000.3
+        // build writes rather than from a guess.
+        if ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
+        {
+            return Ok(VersionGateOutcome::Verified);
+        }
+        // Leniency applies only above the verified standard-Unity range;
+        // versions below the floor keep the historical rejection.
+        if version >= (2024, 0, 0) && !file.strict_unity_versions {
+            return Ok(VersionGateOutcome::AboveVerifiedRange);
+        }
+    }
+    Err(Error::unsupported(format!(
+        "resident Mesh layout for Unity {}; implemented ranges are standard Unity 2017.3-2023 and 6000.0-6000.3 plus Tuanjie 2022.3.x",
+        file.unity_version
+    )))
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_mesh_body(
+    collection: Option<&AssetCollection>,
+    file: &SerializedFile,
+    object_index: usize,
+    limits: MeshReadLimits,
+) -> Result<Mesh> {
+    let version = file.unity_version.components();
+    let is_tuanjie = file.unity_version.build_type.as_deref() == Some("t");
+    let object = require_mesh(file, object_index)?;
     let mut reader = MeshObjectReader::new(file, object_index, limits)?;
     let name = reader.read_named_object()?;
 
@@ -2607,19 +2637,48 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("Unity 2017.3-2023"));
 
-        for version in [
-            "2022.3.1t1",
-            "2023.1.0t1",
-            "2024.1.0f1",
-            "6000.2.0f1",
-            "6000.3.0f1",
-        ] {
+        for version in ["2022.3.1t1", "2023.1.0t1", "6000.2.0f1", "6000.3.0f1"] {
             let file = parse_v22_mesh_version(&unsupported, version);
             assert!(
                 read_mesh(&file, 0, MeshReadLimits::default()).is_err(),
                 "{version}"
             );
         }
+
+        // Above the verified ceiling (6000.3) the default is lenient: the
+        // newest known layout -- including the 6000.2 mesh-LOD tail -- is
+        // attempted, a mismatch is reported as `Unsupported`, and only
+        // `strict_unity_versions` restores the historical rejection.
+        let mut newest = resident_mesh_fixture(MeshFixtureOptions {
+            layout_version: (6000, 1, 0),
+            ..MeshFixtureOptions::default()
+        });
+        // The empty `MeshLodInfo` tail: selection slope, selection bias, a
+        // level count, and zero per-submesh index ranges.
+        newest.extend_from_slice(&[0; 16]);
+        let mesh = read_mesh(
+            &parse_v22_mesh_version(&newest, "6000.4.0f1"),
+            0,
+            MeshReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(mesh.sub_meshes[0].indices, [0, 1, 2]);
+
+        let error = read_mesh(
+            &parse_v22_mesh_version(&unsupported, "2024.1.0f1"),
+            0,
+            MeshReadLimits::default(),
+        )
+        .unwrap_err();
+        let crate::Error::Unsupported(message) = &error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("above the verified range"), "{message}");
+
+        let mut strict = parse_v22_mesh_version(&newest, "6000.4.0f1");
+        strict.strict_unity_versions = true;
+        let error = read_mesh(&strict, 0, MeshReadLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("Unity 2017.3-2023"), "{error}");
 
         let truncated = resident_mesh_fixture(MeshFixtureOptions {
             truncate_vertex_data: true,

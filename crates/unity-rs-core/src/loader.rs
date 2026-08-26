@@ -139,6 +139,7 @@ struct RootLoadSettings<'a> {
     oodle_decoder: Option<&'a Arc<dyn OodleDecoder>>,
     unity_cn_key: Option<UnityCnKey>,
     failure_policy: LoadFailurePolicy,
+    strict_unity_versions: bool,
 }
 
 #[derive(Clone, Default)]
@@ -149,6 +150,9 @@ pub struct AssetLoadOptions {
     /// Key for UnityCN-encrypted bundles. Without one they stay refused.
     pub unity_cn_key: Option<UnityCnKey>,
     pub failure_policy: LoadFailurePolicy,
+    /// Reject classes whose standard-Unity version is above the verified
+    /// ceiling instead of attempting the newest known layout (the default).
+    pub strict_unity_versions: bool,
 }
 
 impl fmt::Debug for AssetLoadOptions {
@@ -163,6 +167,7 @@ impl fmt::Debug for AssetLoadOptions {
             )
             .field("unity_cn_key", &self.unity_cn_key)
             .field("failure_policy", &self.failure_policy)
+            .field("strict_unity_versions", &self.strict_unity_versions)
             .finish()
     }
 }
@@ -368,6 +373,7 @@ impl AssetCollection {
             oodle_decoder,
             unity_cn_key,
             failure_policy,
+            strict_unity_versions,
         } = options;
         let mut collection = Self::default();
         let mut budget = AssetLoadBudget::default();
@@ -381,6 +387,7 @@ impl AssetCollection {
                 oodle_decoder: oodle_decoder.as_ref(),
                 unity_cn_key,
                 failure_policy,
+                strict_unity_versions,
             },
             &mut budget,
         )?;
@@ -401,6 +408,7 @@ impl AssetCollection {
             oodle_decoder,
             unity_cn_key,
             failure_policy,
+            strict_unity_versions,
         } = options;
         let settings = RootLoadSettings {
             limits: &limits,
@@ -408,6 +416,7 @@ impl AssetCollection {
             oodle_decoder: oodle_decoder.as_ref(),
             unity_cn_key,
             failure_policy,
+            strict_unity_versions,
         };
         let mut collection = Self::default();
         let mut budget = AssetLoadBudget::default();
@@ -457,6 +466,7 @@ impl AssetCollection {
             oodle_decoder,
             unity_cn_key,
             failure_policy,
+            strict_unity_versions,
         } = options;
         let path = path.as_ref();
         let metadata = fs::metadata(path)?;
@@ -479,6 +489,7 @@ impl AssetCollection {
             oodle_decoder: oodle_decoder.as_ref(),
             unity_cn_key,
             failure_policy,
+            strict_unity_versions,
         };
         let mut collection = Self::default();
         for (label, region) in inputs {
@@ -501,6 +512,7 @@ impl AssetCollection {
             unity_version_override,
             oodle_decoder,
             unity_cn_key,
+            strict_unity_versions,
             ..
         } = *settings;
         let mut pending = VecDeque::new();
@@ -533,6 +545,7 @@ impl AssetCollection {
                         SerializedOpenOptions {
                             unity_version_override: unity_version_override.cloned(),
                             bundle_version_hint: input.unity_version_hint,
+                            strict_unity_versions,
                             ..SerializedOpenOptions::default()
                         },
                     )?;
@@ -3937,6 +3950,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overridden.serialized_files[0].file.unity_version, explicit);
+    }
+
+    #[test]
+    fn strict_unity_versions_option_reaches_every_loaded_serialized_file() {
+        let declared = empty_v22_serialized_file_with_version("2019.4.40f1");
+
+        let default_loaded =
+            AssetCollection::load("strictness.assets", Region::from_bytes(declared.clone()))
+                .unwrap();
+        assert!(
+            !default_loaded.serialized_files[0]
+                .file
+                .strict_unity_versions
+        );
+
+        let strict_loaded = AssetCollection::load_with_options(
+            "strictness.assets",
+            Region::from_bytes(declared),
+            AssetLoadOptions {
+                strict_unity_versions: true,
+                ..AssetLoadOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(strict_loaded.serialized_files[0].file.strict_unity_versions);
     }
 
     #[test]

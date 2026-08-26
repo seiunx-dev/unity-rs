@@ -6,6 +6,7 @@ use crate::endian::{Endian, EndianReader, checked_length};
 use crate::serialized::SerializedFile;
 use crate::source::{Region, RegionCursor};
 use crate::unity_version::UnityVersion;
+use crate::version_gate::{VersionGateOutcome, finish_lenient};
 use crate::{Error, Result};
 
 pub const SHADER_CLASS_ID: i32 = 48;
@@ -133,30 +134,33 @@ pub fn read_shader(
             "Shader requires a Unity version because its layout is version-dependent",
         ));
     }
-    validate_unity_shader_version(&file.unity_version)?;
+    let outcome = validate_unity_shader_version(&file.unity_version, file.strict_unity_versions)?;
 
-    let region = file.object_region(object_index)?;
-    let endian = if file.header.endianness == 0 {
-        Endian::Little
-    } else {
-        Endian::Big
-    };
-    let mut reader = ShaderObjectReader {
-        reader: EndianReader::new(region.cursor(), endian),
-        region,
-        absolute_start: object.byte_start,
-        target_platform: file.target_platform,
-        format_version: file.header.version.0,
-        version: file.unity_version.clone(),
-        limits,
-        budget: ParseBudget::default(),
-    };
+    let result = (|| -> Result<ShaderTextAsset> {
+        let region = file.object_region(object_index)?;
+        let endian = if file.header.endianness == 0 {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+        let mut reader = ShaderObjectReader {
+            reader: EndianReader::new(region.cursor(), endian),
+            region,
+            absolute_start: object.byte_start,
+            target_platform: file.target_platform,
+            format_version: file.header.version.0,
+            version: file.unity_version.clone(),
+            limits,
+            budget: ParseBudget::default(),
+        };
 
-    let name = reader.read_named_object()?;
-    if file.unity_version.components() >= (5, 5, 0) {
-        return read_modern_shader(&mut reader, object.path_id, name);
-    }
-    read_legacy_shader(&mut reader, object.path_id, name)
+        let name = reader.read_named_object()?;
+        if file.unity_version.components() >= (5, 5, 0) {
+            return read_modern_shader(&mut reader, object.path_id, name);
+        }
+        read_legacy_shader(&mut reader, object.path_id, name)
+    })();
+    finish_lenient(outcome, "Shader", &file.unity_version, result)
 }
 
 fn read_modern_shader(
@@ -276,14 +280,21 @@ fn header_length() -> Result<u64> {
 /// Those two fields are implemented here, taken from the serialized layout
 /// rather than from the managed source, so this reads what the managed one
 /// declines. Every shader in a real Unity 2022.3 game parses and converts.
-fn validate_unity_shader_version(version: &UnityVersion) -> Result<()> {
+fn validate_unity_shader_version(
+    version: &UnityVersion,
+    strict: bool,
+) -> Result<VersionGateOutcome> {
     if version.major <= 5 || (2017..=2023).contains(&version.major) || version.major == 6000 {
-        Ok(())
-    } else {
-        Err(Error::unsupported(format!(
-            "Unity {version} Shader serialization version"
-        )))
+        return Ok(VersionGateOutcome::Verified);
     }
+    // Leniency applies only above the verified majors (2024+, 6001+, ...);
+    // Tuanjie shaders carry standard 2022.3 numbers and stay verified.
+    if version.major >= 2024 && !version.is_tuanjie() && !strict {
+        return Ok(VersionGateOutcome::AboveVerifiedRange);
+    }
+    Err(Error::unsupported(format!(
+        "Unity {version} Shader serialization version"
+    )))
 }
 
 #[derive(Debug, Default)]
@@ -3136,9 +3147,24 @@ mod tests {
 
     #[test]
     fn rejects_unknown_unity_and_gpu_record_versions() {
+        // Above the verified majors the default is lenient: the newest known
+        // layout is attempted, and this empty payload cannot satisfy it, so
+        // the failure is reported as `Unsupported` with the attempt recorded.
         let future = parse_asset("7000.0.0f1", 13, &[], Endian::Little);
         let error = read_shader(&future, 0, ShaderReadLimits::default()).unwrap_err();
-        assert!(matches!(error, Error::Unsupported(message) if message.contains("7000")));
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message.contains("7000")
+                && message.contains("above the verified range")),
+            "{error}"
+        );
+
+        let mut strict = parse_asset("7000.0.0f1", 13, &[], Endian::Little);
+        strict.strict_unity_versions = true;
+        let error = read_shader(&strict, 0, ShaderReadLimits::default()).unwrap_err();
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message.contains("Shader serialization version")),
+            "{error}"
+        );
 
         let record = shader_sub_program_record(123_456_789, 1, &[], &[], b"bad");
         let first = shader_program_segment(&[(0, record.len(), 1)], &[], true);

@@ -16,6 +16,7 @@ use crate::endian::{Endian, EndianReader, checked_length};
 use crate::scene::{ComponentHeader, EditorExtensionHeader};
 use crate::serialized::{ObjectReference, SerializedFile};
 use crate::source::{Region, RegionCursor};
+use crate::version_gate::{VersionGateOutcome, finish_lenient};
 use crate::{Error, Result};
 
 pub const MESH_RENDERER_CLASS_ID: i32 = 23;
@@ -99,21 +100,24 @@ pub fn read_mesh_renderer(
     object_index: usize,
     limits: RendererReadLimits,
 ) -> Result<MeshRenderer> {
-    validate_renderer_version(file)?;
-    let mut reader = RendererObjectReader::new(
-        file,
-        object_index,
-        MESH_RENDERER_CLASS_ID,
-        "MeshRenderer",
-        limits,
-    )?;
-    let renderer = reader.read_renderer()?;
-    let trailing_bytes = reader.reader.remaining()?;
-    Ok(MeshRenderer {
-        path_id: reader.path_id,
-        renderer,
-        trailing_bytes,
-    })
+    let outcome = validate_renderer_version(file)?;
+    let result = (|| -> Result<MeshRenderer> {
+        let mut reader = RendererObjectReader::new(
+            file,
+            object_index,
+            MESH_RENDERER_CLASS_ID,
+            "MeshRenderer",
+            limits,
+        )?;
+        let renderer = reader.read_renderer()?;
+        let trailing_bytes = reader.reader.remaining()?;
+        Ok(MeshRenderer {
+            path_id: reader.path_id,
+            renderer,
+            trailing_bytes,
+        })
+    })();
+    finish_lenient(outcome, "MeshRenderer", &file.unity_version, result)
 }
 
 pub fn read_skinned_mesh_renderer(
@@ -121,55 +125,58 @@ pub fn read_skinned_mesh_renderer(
     object_index: usize,
     limits: RendererReadLimits,
 ) -> Result<SkinnedMeshRenderer> {
-    validate_renderer_version(file)?;
-    let mut reader = RendererObjectReader::new(
-        file,
-        object_index,
-        SKINNED_MESH_RENDERER_CLASS_ID,
-        "SkinnedMeshRenderer",
-        limits,
-    )?;
-    let renderer = reader.read_renderer()?;
-    let quality = reader.reader.read_i32()?;
-    let update_when_offscreen = reader.reader.read_bool()?;
-    let skin_normals = reader.reader.read_bool()?;
-    reader.align(4)?;
-    let mesh = reader.read_pptr("SkinnedMeshRenderer mesh")?;
-    let bone_count = reader.read_count(
-        "SkinnedMeshRenderer bone",
-        limits.maximum_bones,
-        reader.pptr_size(),
-    )?;
-    reader.check_reference_budget(bone_count, "SkinnedMeshRenderer bone")?;
-    let mut bones = reserve_vec(bone_count, "SkinnedMeshRenderer bones")?;
-    for _ in 0..bone_count {
-        bones.push(reader.read_pptr("SkinnedMeshRenderer bone")?);
-    }
-    let weight_count = reader.read_count(
-        "SkinnedMeshRenderer blend-shape weight",
-        limits.maximum_blend_shape_weights,
-        4,
-    )?;
-    let mut blend_shape_weights =
-        reserve_vec(weight_count, "SkinnedMeshRenderer blend-shape weights")?;
-    for _ in 0..weight_count {
-        blend_shape_weights.push(reader.reader.read_f32()?);
-    }
-    let trailing_bytes = reader.reader.remaining()?;
-    Ok(SkinnedMeshRenderer {
-        path_id: reader.path_id,
-        renderer,
-        quality,
-        update_when_offscreen,
-        skin_normals,
-        mesh,
-        bones,
-        blend_shape_weights,
-        trailing_bytes,
-    })
+    let outcome = validate_renderer_version(file)?;
+    let result = (|| -> Result<SkinnedMeshRenderer> {
+        let mut reader = RendererObjectReader::new(
+            file,
+            object_index,
+            SKINNED_MESH_RENDERER_CLASS_ID,
+            "SkinnedMeshRenderer",
+            limits,
+        )?;
+        let renderer = reader.read_renderer()?;
+        let quality = reader.reader.read_i32()?;
+        let update_when_offscreen = reader.reader.read_bool()?;
+        let skin_normals = reader.reader.read_bool()?;
+        reader.align(4)?;
+        let mesh = reader.read_pptr("SkinnedMeshRenderer mesh")?;
+        let bone_count = reader.read_count(
+            "SkinnedMeshRenderer bone",
+            limits.maximum_bones,
+            reader.pptr_size(),
+        )?;
+        reader.check_reference_budget(bone_count, "SkinnedMeshRenderer bone")?;
+        let mut bones = reserve_vec(bone_count, "SkinnedMeshRenderer bones")?;
+        for _ in 0..bone_count {
+            bones.push(reader.read_pptr("SkinnedMeshRenderer bone")?);
+        }
+        let weight_count = reader.read_count(
+            "SkinnedMeshRenderer blend-shape weight",
+            limits.maximum_blend_shape_weights,
+            4,
+        )?;
+        let mut blend_shape_weights =
+            reserve_vec(weight_count, "SkinnedMeshRenderer blend-shape weights")?;
+        for _ in 0..weight_count {
+            blend_shape_weights.push(reader.reader.read_f32()?);
+        }
+        let trailing_bytes = reader.reader.remaining()?;
+        Ok(SkinnedMeshRenderer {
+            path_id: reader.path_id,
+            renderer,
+            quality,
+            update_when_offscreen,
+            skin_normals,
+            mesh,
+            bones,
+            blend_shape_weights,
+            trailing_bytes,
+        })
+    })();
+    finish_lenient(outcome, "SkinnedMeshRenderer", &file.unity_version, result)
 }
 
-fn validate_renderer_version(file: &SerializedFile) -> Result<()> {
+fn validate_renderer_version(file: &SerializedFile) -> Result<VersionGateOutcome> {
     if file.unity_version.is_stripped() {
         return Err(Error::unsupported(
             "Renderer requires a Unity version because its layout is version-dependent",
@@ -177,18 +184,25 @@ fn validate_renderer_version(file: &SerializedFile) -> Result<()> {
     }
     let version = file.unity_version.components();
     let is_tuanjie = file.unity_version.build_type.as_deref() == Some("t");
-    let supported = if is_tuanjie {
-        version.0 == 2022 && version.1 == 3 && version.2 >= 2
+    if is_tuanjie {
+        if version.0 == 2022 && version.1 == 3 && version.2 >= 2 {
+            return Ok(VersionGateOutcome::Verified);
+        }
     } else {
-        (MINIMUM_RENDERER_VERSION..=MAXIMUM_RENDERER_VERSION).contains(&version)
-    };
-    if !supported {
-        return Err(Error::unsupported(format!(
-            "Renderer is verified for standard Unity 2017.3 through 6000.3 and Tuanjie 2022.3.x, got {}",
-            file.unity_version
-        )));
+        if (MINIMUM_RENDERER_VERSION..=MAXIMUM_RENDERER_VERSION).contains(&version) {
+            return Ok(VersionGateOutcome::Verified);
+        }
+        // Leniency applies only above the verified standard-Unity range
+        // (2024+ and past-6000.3 releases alike); versions below the floor
+        // keep the historical rejection.
+        if version >= (2024, 0, 0) && !file.strict_unity_versions {
+            return Ok(VersionGateOutcome::AboveVerifiedRange);
+        }
     }
-    Ok(())
+    Err(Error::unsupported(format!(
+        "Renderer is verified for standard Unity 2017.3 through 6000.3 and Tuanjie 2022.3.x, got {}",
+        file.unity_version
+    )))
 }
 
 struct RendererObjectReader {
@@ -585,10 +599,30 @@ mod tests {
         );
         let early_tuanjie = parse_asset(MESH_RENDERER_CLASS_ID, "2022.3.1t1", &object);
         assert!(read_mesh_renderer(&early_tuanjie, 0, RendererReadLimits::default()).is_err());
-        // The upper bound moved to 6000.3 on the evidence in the module doc,
-        // so the refusal case moves with it.
-        let future = parse_asset(MESH_RENDERER_CLASS_ID, "6000.4.0f1", &object);
-        assert!(read_mesh_renderer(&future, 0, RendererReadLimits::default()).is_err());
+        // Above the verified ceiling (6000.3) the default is lenient: the
+        // newest known layout is attempted, a layout mismatch is reported as
+        // `Unsupported`, and only `strict_unity_versions` restores the
+        // historical rejection.
+        let newest = renderer_prefix("6000.2.0f1");
+        let lenient = parse_asset(MESH_RENDERER_CLASS_ID, "6000.4.0f1", &newest);
+        let renderer = read_mesh_renderer(&lenient, 0, RendererReadLimits::default()).unwrap();
+        assert_eq!(renderer.renderer.materials[0].path_id, 21);
+
+        let short = parse_asset(
+            MESH_RENDERER_CLASS_ID,
+            "6000.4.0f1",
+            &newest[..newest.len() - 40],
+        );
+        let error = read_mesh_renderer(&short, 0, RendererReadLimits::default()).unwrap_err();
+        let crate::Error::Unsupported(message) = &error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("above the verified range"), "{message}");
+
+        let mut strict = parse_asset(MESH_RENDERER_CLASS_ID, "6000.4.0f1", &newest);
+        strict.strict_unity_versions = true;
+        let error = read_mesh_renderer(&strict, 0, RendererReadLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("verified for"), "{error}");
     }
 
     #[test]

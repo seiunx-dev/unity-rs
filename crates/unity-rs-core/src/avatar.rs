@@ -12,6 +12,7 @@ use std::mem::size_of;
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::serialized::{ObjectReference, SerializedFile};
 use crate::source::{Region, RegionCursor};
+use crate::version_gate::{VersionGateOutcome, finish_lenient};
 use crate::{Error, Result};
 
 pub const AVATAR_CLASS_ID: i32 = 90;
@@ -305,31 +306,34 @@ pub fn read_avatar(
     object_index: usize,
     limits: AvatarReadLimits,
 ) -> Result<Avatar> {
-    validate_supported_version(file)?;
-    let mut reader = AvatarReader::new(file, object_index, limits)?;
-    let name = reader.read_named_object()?;
-    let declared_avatar_size = reader.reader.read_u32()?;
-    let constant = reader.read_avatar_constant()?;
-    let paths = reader.read_paths()?;
-    let human_description = if has_human_description(file) {
-        Some(reader.read_human_description()?)
-    } else {
-        None
-    };
-    let trailing = reader.reader.remaining()?;
-    if trailing != 0 {
-        return Err(Error::invalid_data(format!(
-            "Avatar object contains {trailing} trailing bytes after its verified layout"
-        )));
-    }
-    Ok(Avatar {
-        path_id: reader.path_id,
-        name,
-        declared_avatar_size,
-        constant,
-        paths,
-        human_description,
-    })
+    let outcome = validate_supported_version(file)?;
+    let result = (|| -> Result<Avatar> {
+        let mut reader = AvatarReader::new(file, object_index, limits)?;
+        let name = reader.read_named_object()?;
+        let declared_avatar_size = reader.reader.read_u32()?;
+        let constant = reader.read_avatar_constant()?;
+        let paths = reader.read_paths()?;
+        let human_description = if has_human_description(file) {
+            Some(reader.read_human_description()?)
+        } else {
+            None
+        };
+        let trailing = reader.reader.remaining()?;
+        if trailing != 0 {
+            return Err(Error::invalid_data(format!(
+                "Avatar object contains {trailing} trailing bytes after its verified layout"
+            )));
+        }
+        Ok(Avatar {
+            path_id: reader.path_id,
+            name,
+            declared_avatar_size,
+            constant,
+            paths,
+            human_description,
+        })
+    })();
+    finish_lenient(outcome, "Avatar", &file.unity_version, result)
 }
 
 fn has_human_description(file: &SerializedFile) -> bool {
@@ -340,28 +344,35 @@ fn has_human_description(file: &SerializedFile) -> bool {
             && (!version.is_beta() || version.build >= 1))
 }
 
-fn validate_supported_version(file: &SerializedFile) -> Result<()> {
+fn validate_supported_version(file: &SerializedFile) -> Result<VersionGateOutcome> {
     if file.unity_version.is_stripped() {
         return Err(Error::unsupported(
             "Avatar requires a Unity version because its Human layout is version-dependent",
         ));
     }
     let version = file.unity_version.components();
-    let supported = if file.unity_version.is_tuanjie() {
-        version.0 == 2022 && version.1 == 3 && version.2 >= 2
+    if file.unity_version.is_tuanjie() {
+        if version.0 == 2022 && version.1 == 3 && version.2 >= 2 {
+            return Ok(VersionGateOutcome::Verified);
+        }
     } else {
         // 6000.3 checked rather than assumed: the managed reader carries no
         // Avatar branch newer than 2019.1's human description, and the
         // 6000.3.12f1 differential fixture locks that shared layout.
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
-    };
-    if !supported {
-        return Err(Error::unsupported(format!(
-            "Avatar Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.3, and Tuanjie 2022.3.x ranges",
-            file.unity_version
-        )));
+        if ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
+        {
+            return Ok(VersionGateOutcome::Verified);
+        }
+        // Leniency applies only above the verified standard-Unity range;
+        // versions below the floor keep the historical rejection.
+        if version >= (2024, 0, 0) && !file.strict_unity_versions {
+            return Ok(VersionGateOutcome::AboveVerifiedRange);
+        }
     }
-    Ok(())
+    Err(Error::unsupported(format!(
+        "Avatar Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.3, and Tuanjie 2022.3.x ranges",
+        file.unity_version
+    )))
 }
 
 #[derive(Debug, Default)]
@@ -1194,15 +1205,7 @@ mod tests {
     fn rejects_wrong_class_stripped_and_out_of_range_versions() {
         let endian = TestEndian::Little;
         let object = modern_avatar_object(endian);
-        // The upper bound moved to 6000.3 on the evidence in
-        // `validate_supported_version`, so the refusal case moves with it.
-        for version in [
-            "0.0.0",
-            "2017.2.5f1",
-            "2024.1.0f1",
-            "6000.4.0f1",
-            "2023.1.0t1",
-        ] {
+        for version in ["0.0.0", "2017.2.5f1", "2023.1.0t1"] {
             let file = parse_asset(22, endian, 13, version, &object, AVATAR_CLASS_ID);
             assert!(
                 read_avatar(&file, 0, AvatarReadLimits::default()).is_err(),
@@ -1211,6 +1214,41 @@ mod tests {
         }
         let wrong_class = parse_asset(22, endian, 13, "2022.3.62f1", &object, 91);
         assert!(read_avatar(&wrong_class, 0, AvatarReadLimits::default()).is_err());
+
+        // Above the verified ceiling (6000.3) the default is lenient: the
+        // newest known layout is attempted, a layout mismatch is reported as
+        // `Unsupported`, and only `strict_unity_versions` restores the
+        // historical rejection.
+        for version in ["2024.1.0f1", "6000.4.0f1"] {
+            let lenient = parse_asset(22, endian, 13, version, &object, AVATAR_CLASS_ID);
+            read_avatar(&lenient, 0, AvatarReadLimits::default())
+                .unwrap_or_else(|error| panic!("{version}: {error}"));
+
+            let short = parse_asset(
+                22,
+                endian,
+                13,
+                version,
+                &object[..object.len() - 8],
+                AVATAR_CLASS_ID,
+            );
+            let error = read_avatar(&short, 0, AvatarReadLimits::default()).unwrap_err();
+            let crate::Error::Unsupported(message) = &error else {
+                panic!("{version}: expected Unsupported, got {error:?}");
+            };
+            assert!(
+                message.contains("above the verified range"),
+                "{version}: {message}"
+            );
+
+            let mut strict = parse_asset(22, endian, 13, version, &object, AVATAR_CLASS_ID);
+            strict.strict_unity_versions = true;
+            let error = read_avatar(&strict, 0, AvatarReadLimits::default()).unwrap_err();
+            assert!(
+                error.to_string().contains("outside the verified"),
+                "{version}: {error}"
+            );
+        }
     }
 
     fn legacy_avatar_object(endian: TestEndian, no_target: bool, format_version: u32) -> Vec<u8> {
