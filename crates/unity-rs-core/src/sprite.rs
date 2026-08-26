@@ -363,6 +363,7 @@ struct SelectedSpriteAtlas<'a> {
     file_index: Option<usize>,
     object_index: usize,
     is_variant: Option<bool>,
+    from_backfill: bool,
 }
 
 /// Reproduces `AssetsManager.ProcessAssets`: every successfully parsed atlas
@@ -396,6 +397,7 @@ fn effective_sprite_atlas<'a>(
             is_variant: read_sprite_atlas(file, object_index, atlas_read_limits(limits))
                 .ok()
                 .map(|atlas| atlas.is_variant),
+            from_backfill: false,
         })
     };
 
@@ -435,6 +437,7 @@ fn effective_sprite_atlas<'a>(
                     file_index: Some(file_index),
                     object_index,
                     is_variant: Some(atlas.is_variant),
+                    from_backfill: true,
                 });
             }
         }
@@ -476,6 +479,7 @@ fn effective_sprite_atlas_by_file_index<'a>(
             is_variant: collection
                 .indexed_sprite_atlas(resolved.file_index, resolved.object_index)
                 .map(|atlas| atlas.is_variant),
+            from_backfill: false,
         })
     };
 
@@ -494,6 +498,7 @@ fn effective_sprite_atlas_by_file_index<'a>(
                 file_index: Some(atlas.file_index),
                 object_index: atlas.object_index,
                 is_variant: Some(atlas.is_variant),
+                from_backfill: true,
             });
         }
     }
@@ -609,7 +614,11 @@ fn decode_sprite_from_atlas(
     })?;
     let data = match atlas.render_data_for_sprite_key(&guid_bytes, value) {
         Some(data) => data,
-        None if atlas.render_data_entries.is_empty() => {
+        None if selected_atlas.from_backfill || atlas.render_data_entries.is_empty() => {
+            // Some shipped atlases list a Sprite in packedSprites but omit its render-data
+            // key. The Sprite can still carry complete resident render data, so preserve the
+            // empty-atlas fallback instead of making that stale backfill index prevent an
+            // otherwise valid export. Explicit non-empty atlases remain authoritative.
             return decode_sprite_from_resident_data(
                 collection,
                 sprite_source.file,
@@ -3188,6 +3197,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(image.pixels, [30, 0, 0, 255]);
+    }
+
+    #[test]
+    fn falls_back_to_resident_data_when_backfilled_atlas_lacks_sprite_key() {
+        let sprite_object = modern_sprite_object(
+            2,
+            0,
+            [0.0, 0.0, 1.0, 1.0],
+            2,
+            ObjectReferenceFields {
+                render_key_value: 21_300_000,
+                ..ObjectReferenceFields::default()
+            },
+        );
+        let atlas = sprite_atlas_object(AtlasFixtureFields {
+            texture_path: 3,
+            ..AtlasFixtureFields::default()
+        });
+        let file = parse_asset(
+            "2022.3.62f1",
+            &[
+                (SPRITE_CLASS_ID, 1, sprite_object),
+                (28, 2, texture_object(1, 1, &[1, 2, 3, 255])),
+                (28, 3, texture_object(1, 1, &[30, 0, 0, 255])),
+                (SPRITE_ATLAS_CLASS_ID, 9, atlas),
+            ],
+        );
+        let collection = collection_with(file.clone());
+        let sprite = read_sprite(&file, 0, SpriteReadLimits::default()).unwrap();
+
+        let image = decode_sprite_rgba8(
+            &collection,
+            &file,
+            &sprite,
+            SpriteReadLimits::default(),
+            TextureReadLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(image.pixels, [1, 2, 3, 255]);
     }
 
     #[test]
