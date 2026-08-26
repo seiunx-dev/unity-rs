@@ -235,6 +235,32 @@ class CiMatrixAuditTests(unittest.TestCase):
         with self.assertRaises(check_ci_matrix.AuditError):
             check_ci_matrix.validate_node_package(altered)
 
+    def test_missing_pypi_trusted_publisher_is_rejected(self) -> None:
+        altered = self.workflow.replace(
+            "        uses: pypa/gh-action-pypi-publish@release/v1\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
+    def test_missing_pypi_oidc_permission_is_rejected(self) -> None:
+        altered = self.workflow.replace("      id-token: write\n", "", 1)
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
+    def test_python_publish_must_validate_the_tag_version(self) -> None:
+        altered = self.workflow.replace(
+            '          python3 - "${GITHUB_REF_NAME#v}" <<\'PY\'\n',
+            "",
+            1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
 
 if __name__ == "__main__":
     unittest.main()
