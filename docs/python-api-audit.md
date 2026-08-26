@@ -146,6 +146,6 @@ methods:
   callback, so an asset cannot ask Python to allocate output that is already
   known to exceed the caller's limits.
 
-Remaining unsupported Unity/Tuanjie layouts are Core compatibility gaps, not
-Python-binding gaps.  They stay explicit `NotImplementedError` translations
-until sample-backed Core support exists.
+Remaining Unity/Tuanjie layouts are marked **Not tested**; they are Core
+compatibility gaps, not Python-binding gaps. If encountered, they stay explicit
+`NotImplementedError` translations until sample-backed Core support exists.

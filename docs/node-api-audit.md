@@ -102,7 +102,7 @@ The complete host gate and the native Linux amd64/arm64 addon-and-tarball gates
 were rerun after this installed-surface check was added; every requested step
 passed with zero skipped groups.
 
-Remaining unsupported Unity/Tuanjie layouts are Core compatibility gaps, not
-Node-binding gaps. They remain explicit napi errors until sample-backed Core
-support exists. Node stays an optional delivery surface; Rust and Python remain
-the formal primary targets.
+Remaining Unity/Tuanjie layouts are marked **Not tested**; they are Core
+compatibility gaps, not Node-binding gaps. If encountered, they remain explicit
+napi errors until sample-backed Core support exists. Node stays an optional
+delivery surface; Rust and Python remain the formal primary targets.

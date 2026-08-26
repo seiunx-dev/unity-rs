@@ -213,10 +213,10 @@ For exact Unity version gates, codec exceptions, and differential evidence, use
 the [full status document](REWRITE_STATUS.md) rather than treating this summary
 as a promise for every engine build.
 
-## Deliberate gaps
+## Not tested areas
 
-The following remain explicit `Unsupported` paths until real samples and an
-independent oracle are available:
+The following remain **Not tested** until real samples and an independent
+oracle are available:
 
 - SerializedFile formats 1-4;
 - UnityArchive payload parsing;
@@ -250,8 +250,9 @@ Important invariants include:
 - Python releases the GIL around scalable Rust work, and Node worker tasks keep
   scalable projection off the event loop.
 
-Malformed-input tests verify stable errors instead of panics. Unsupported
-formats are reported separately from corrupted data and failed I/O.
+Malformed-input tests verify stable errors instead of panics. **Not tested**
+paths are rejected through the `Unsupported` error family, separately from
+corrupted data and failed I/O.
 
 ## Workspace layout
 
@@ -265,11 +266,11 @@ oracle/                    Checked managed differential harness
 tools/                     Quality, packaging, corpus, and API audits
 ```
 
-The compatibility directory names are retained because they are also Cargo and
-package identifiers. Delivery-scope tests enforce that the workspace contains
-only the four headless members above and that each frontend depends directly on
-Core. GUI, managed runtime, old FFI source, and public context handles are
-rejected from shipped artifacts.
+The workspace directory names match their Cargo and package identifiers.
+Delivery-scope tests enforce that the workspace contains only the four headless
+members above and that each frontend depends directly on Core. GUI, managed
+runtime, old FFI source, and public context handles are rejected from shipped
+artifacts.
 
 ## Build and verification
 

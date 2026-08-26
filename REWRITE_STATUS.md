@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-08-25（Asia/Shanghai）
+最后更新：2026-08-26（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -19,8 +19,9 @@
 - 旧版自定义 C ABI 的兼容、发布或语义复刻。
 
 暂时拿不到真实样本或独立 oracle 的 Unity/Tuanjie 版本与平台格式保留在
-`corpus/` 验收工程和兼容矩阵中，继续稳定返回 `Unsupported`，不猜布局。它们仍是未来
-兼容性 1.0 的证据缺口，但按本次迁移约定不阻塞无头 Rust/Python 运行时重写的完成。
+`corpus/` 验收工程，并在兼容矩阵中标记为 **Not tested**；实际命中时继续稳定返回
+`Unsupported`，不猜布局。它们仍是未来兼容性 1.0 的证据缺口，但按本次迁移约定不阻塞
+无头 Rust/Python 运行时重写的完成。
 
 托管 C# 实现位于独立仓库 [`Team-Haruki/AssetStudio`](https://github.com/Team-Haruki/AssetStudio)，仅作差分测试 oracle，不是 Rust、Python、Node 或 CLI 的运行时依赖；差分门通过 `UNITY_RS_ORACLE_REPO` 或同级目录定位它。旧 `unity-rs-ffi`/context handle 源码已从仓库删除，不再只是排除在 Cargo workspace 之外。
 
@@ -49,12 +50,13 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 
 1. **可自主完成的发布收口已完成（2026-08-25）**：已声明支持路径的 hostile input、
    累计内存/输出和 worker/GIL 边界完成第四十九项治理；零跳过本地门禁与最终 HEAD 的
-   公开多平台矩阵再次全绿。正式发布版本号、合并和 registry 发布仍由维护者决定，不是
-   解析或绑定实现缺口。
+   公开多平台矩阵再次全绿。项目迁至 `seiunx-dev/unity-rs` 与首次正式发布现已完成；
+   后续版本号、registry 发布和 GitHub Release 仍由维护者决定，不属于解析或绑定实现缺口。
 2. **需要真实样本的验收**：补 Tuanjie 2022.3.x、Nintendo Switch、Unity 4/5/2017 和
    带完整托管快照的代表性 corpus。只对样本实际命中的长尾补实现；UnityArchive、虚拟几何
-   cluster、Switch stripped/低 mip 及平台 codec 在没有可验证布局或独立 oracle 时继续稳定
-   返回 `Unsupported`，不猜字段，也不作为已经支持的能力宣传。
+   cluster、Switch stripped/低 mip 及平台 codec 在没有可验证布局或独立 oracle 时在兼容
+   矩阵中标记为 **Not tested**；实际命中时继续稳定返回 `Unsupported`，不猜字段，也不作为
+   已经支持的能力宣传。
 3. **退役证据**：用上述 corpus 生成版本化 manifest，覆盖对象顺序、PathID/class、名称和
    container、原始载荷 hash、主要解码结果或稳定错误族。C# 只保留为可选历史 oracle；默认
    构建、安装和用户工作流必须继续完全不需要 .NET。
@@ -1421,7 +1423,7 @@ Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 prof
 | 0 | **收口当前工作树**：逐模块审查现有 Core、Python、Node、CI、许可证和文档改动，确认所有新增文件都属于交付范围，再整理为可审查提交 | **已完成并同步远端（2026-08-24）**：`37e6ee0`、`ca0ea56`、`2c24e2f` 分别收口 Core/绑定、CI/交付范围和文档，均在独立 worktree 中验证可单独构建或通过对应严格门禁；分支 `codex/headless-rewrite-closure` 已推送并创建 PR #1。完整 `outputs quality rust python node typing security cross`、其余 `cli-package oracle audio python314 unitypy` 组，以及 Linux amd64/arm64 原生 Core/CLI、release CLI、Python wheel、Node addon/npm 均通过且零跳过；`git diff --check` 通过。CodeRabbit 指出的两处 CI 证据绕过已在 2026-08-24 修复：命令只从实际 `run` step 计数，CLI staging 顺序不再受注释文本影响；其日期提醒按当前上海日期无需改动 |
 | 1 | **跑通正式六平台发布矩阵**：在 GitHub Actions 上执行 Linux、Windows、macOS × x86-64/ARM64 的 CLI、Python wheel 和可选 Node 包任务 | **已完成（2026-08-24）**：PR run 32659993206 的 16 个主 job 全绿；workflow_dispatch run 32660298990 为 28/28，全量包含六个 CLI artifact、六个 Node artifact 和六个 Python wheel。CLI staged 产物运行 `--help`，wheel 安装后通过公开 API/mypy，Node tarball 从临时消费者安装并核对 JS/TypeScript 运行时表面；法律文件随所有产物校验 |
 | 2 | **扩充代表性真实 corpus**：在现有 Unity 2022.3 与 6000.3 之外，优先加入 Tuanjie 2022.3.x、Nintendo Switch、旧 Unity 4/5/2017 和带完整托管快照的样本 | 私有 manifest 在 release 模式稳定通过；每类至少有对象顺序、PathID/class、名称/container、原始载荷 hash、主要解码结果或明确错误族的版本化快照；专有样本不提交到仓库 |
-| 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
+| 3 | **按 corpus 命中补格式长尾**：只处理真实样本实际触发的 UnityArchive、Unity/Tuanjie 虚拟几何 cluster、Switch 低 mip/stripped mip 和平台纹理/音频 codec | 每项都有最小 fixture、边界/畸形输入测试和独立 oracle；没有可靠布局或 oracle 的格式在兼容矩阵中标记为 **Not tested**，实际命中时继续稳定返回 `Unsupported`，不猜字段、不静默产出 |
 | 3A | **继续不依赖外部样本的 hostile-input 资源审计**：优先检查“只需一个字段却物化整棵对象”、跨对象重复遍历、累计输出/临时分配、不可失败集合增长和目录工作量放大；本轮已完成 `CubismModel._moc` 的完整校验式根字段投影、`SerializeReference` registry 的类型查找/校验二次方放大治理、模型动画 path/suffix 的 `tracks × nodes`、Avatar fallback 的 `tracks × avatar_paths`、Live2D 散件回退的 `models × roles`、clip fallback 的 `models × animators`、SceneHierarchy 两张百万级索引、AnimationGraph controller/clip/queued 三张百万级构建索引、ModelIr GameObject/Mesh/Material/Avatar 四类构建与最终索引、Loader collection-wide 对象名称/container/MonoScript class 元数据索引、递归 PendingInput/final collection 表、ASCII FBX 材质/贴图二次规划、Cubism clip motion 目标去重/后缀哈希、FadeMotion 曲线目标分类共享索引、ModelIr 目标资产对全局对象表重复线扫、TypeTree 子树边界的 `schema nodes × runtime values`、SpriteAtlas 回填的 `sprites × atlases × packedSprites`、legacy streamed AudioClip 的 `clips × serialized files`、FBX blend-shape 动画的 `tracks × morph channels`、Live2D 隐藏 lowercase 名称/显示信息索引、模型贴图共享名称索引的累计驻留预算，以及外部 MonoBehaviour schema 的 `objects × entries` 版本查找放大 | 每个确认问题必须有能在旧实现触发预算失败、超线性工作或不可恢复分配失败的合成回归；修复后仍完整消费/校验输入，并通过零跳过的 Rust/Python/Node/oracle 本地门禁和公开常规矩阵。`45e1194` 的低物化预算、截断尾部及 registry/reference-type 投影回归是第一项完成证据；`3f24ff0` 的 16,384 类型规模、重复首声明和两类预分配预算回归是第二项；`df42c67` 的 8,192 同名叶子、任意中段后缀、旧线性 oracle 等价和精确索引预算是第三项；`dac020e` 的 16,384 次 Avatar hash 重复查询、重复首声明、只索引所选 Avatar 及共享 count/byte 预算是第四项；`ee6f668` 的 16,384 条松散角色逆序/重复查询、发现顺序/首项语义和统一字节预算低一字节拒绝是第五项；`b8d0766` 的 16,384 条逆序 Animator、重复首项、重复二分查询和精确索引预算是第六项；`b77192a` 的 16,384 条逆序 GameObject 二分查询、重复身份拒绝、最终索引低一字节拒绝和 Transform-owner 预算前拒绝是第七项；`21ede89` 的 controller/clip 各 16,384 条逆序二分查询、重复身份拒绝、合计索引低一字节拒绝及正式 build 零预算路径是第八项；`01594a2` 的 16,384 条逆序 ModelIr 节点二分查询、重复身份拒绝、合计索引低一字节拒绝及真实共享资产唯一计费是第九项；`e53210a` 的 16,384 条逆序 Loader 元数据二分查询、entry/共享字节预算、公开命名对象拒绝路径及 metadata/MonoScript class last-wins 是第十项；`e5ee1a4` 的 16,384-entry WebData 精确/低一项 discovered-file 上限、队列拒绝前后 capacity 与最终资源表完整性是第十一项；`122a946` 的 16,384 条重复材质贴图绑定、唯一 Texture/Video plan 和首项 UV transform 语义是第十二项；`ca3171d` 的 16,384 个逆序唯一 Cubism 目标、重复首项、Parameter/Part 同名区分、嵌套 suffix 语义及六类目标索引预算是第十三项；`42fe0b2` 的 16,384 个逆序目标、16,384 次索引查询、4,096 条公开 writer 最坏位置曲线、Parameter/Part 同名优先级及四类目标索引预算是第十四项；`a646d15` 的 16,384 个逆序 Mesh 对象、逐一 pathID 查询、比较次数低于 `N × 20` 及现有 stale-index/重复首项语义是第十五项；`d9cff60` 的两棵 32,768 节点深/宽树、逐节点边界查询、构建 probe 不超过 `2 × N`、reference-type 按需缓存和分配前预算拒绝是第十六项；`2c9fb42` 的 16,384 条 assignment 逆序全查询、probe 低于 `N × 40`、master/variant 等价与 4/3-entry 分配前预算边界是第十七项；`9daca17` 的 16,384-file table、indexed 零 probe、兼容入口 16,384 probe、相同 payload 与越界拒绝是第十八项；`90f572d` 的 16,384 个逆序 morph channel、全量二分 probe 低于 `N × 20`、重复首 channel、精确/少一字节索引预算及公共 writer 拒绝路径是第十九项完成证据 |
 | 3A-20 | **已完成 AnimationGraph 的 `Animators × bound clips` 派生复制治理**：共享 controller 的 clip 列表现在先累计计入 graph edge 预算，再逐 Animator 可失败分配，避免通过原始引用上限后再发生未计费的乘法驻留增长 | `5482d07`：16,384×16,384 预检在首个副本分配前拒绝，4×3 精确预算保序，公共 fixture 以 10/11 edge 边界证明生产 builder 已接线；零跳过本地总门禁及公开常规矩阵 32755098612 全绿。这是 hostile-input 审计的第二十项完成证据 |
 | 3A-21 | **已完成模型动画同名 clip 的唯一名称放大治理**：唯一名称表现在把“下一个尚未检查的后缀”保存在既有名称键旁；每个 base 已经跨过的后缀不会在后续 clip 上从零重扫，也不为索引保留第三份输入字符串 | `98a722b`：`Walk`/`Walk_1`/空名交叉碰撞仍按首个空闲后缀命名，最终名称和索引副本继续精确计入累计字符串预算且少一字节拒绝；16,384 个同名 clip 的候选探测不超过 `2 × N`。完整 Core 611 项、畸形输入 6/6、Rust/Python/Node/oracle 零跳过本地门禁及公开常规矩阵 32758905875 全绿。这是 hostile-input 审计的第二十一项完成证据 |
