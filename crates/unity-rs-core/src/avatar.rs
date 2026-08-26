@@ -1,7 +1,7 @@
 //! Complete, source-bound parsing for Unity and Tuanjie `Avatar` objects.
 //!
 //! The engine layout is verified for Unity 2017.3 through 2023.x, Unity 6000.0
-//! through 6000.2, and Tuanjie 2022.3.x.
+//! through 6000.3, and Tuanjie 2022.3.x.
 //! Unity 2018.2 removes the legacy handle/collider arrays, while Unity
 //! 2019.1.0b1 adds the serialized `HumanDescription` tail. Unlike the managed
 //! reader, this module consumes that tail and rejects any bytes left inside the
@@ -350,11 +350,14 @@ fn validate_supported_version(file: &SerializedFile) -> Result<()> {
     let supported = if file.unity_version.is_tuanjie() {
         version.0 == 2022 && version.1 == 3 && version.2 >= 2
     } else {
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 2)
+        // 6000.3 checked rather than assumed: the managed reader carries no
+        // Avatar branch newer than 2019.1's human description, and the
+        // 6000.3.12f1 differential fixture locks that shared layout.
+        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
     };
     if !supported {
         return Err(Error::unsupported(format!(
-            "Avatar Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.2, and Tuanjie 2022.3.x ranges",
+            "Avatar Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.3, and Tuanjie 2022.3.x ranges",
             file.unity_version
         )));
     }
@@ -1003,7 +1006,13 @@ mod tests {
     fn reads_2023_and_unity_6000_complete_human_description_layouts() {
         let endian = TestEndian::Little;
         let object = modern_avatar_object(endian);
-        for version in ["2023.3.0f1", "6000.0.0f1", "6000.1.0f1", "6000.2.0f1"] {
+        for version in [
+            "2023.3.0f1",
+            "6000.0.0f1",
+            "6000.1.0f1",
+            "6000.2.0f1",
+            "6000.3.0f1",
+        ] {
             let file = parse_asset(22, endian, 13, version, &object, AVATAR_CLASS_ID);
             let avatar = read_avatar(&file, 0, AvatarReadLimits::default()).unwrap();
             let description = avatar.human_description.unwrap();
@@ -1185,11 +1194,13 @@ mod tests {
     fn rejects_wrong_class_stripped_and_out_of_range_versions() {
         let endian = TestEndian::Little;
         let object = modern_avatar_object(endian);
+        // The upper bound moved to 6000.3 on the evidence in
+        // `validate_supported_version`, so the refusal case moves with it.
         for version in [
             "0.0.0",
             "2017.2.5f1",
             "2024.1.0f1",
-            "6000.3.0f1",
+            "6000.4.0f1",
             "2023.1.0t1",
         ] {
             let file = parse_asset(22, endian, 13, version, &object, AVATAR_CLASS_ID);

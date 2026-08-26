@@ -216,31 +216,6 @@ fn object_fixtures() -> Vec<TemporaryFixture> {
             &synthetic_single_v22(48, 48, "5.3.8f2", &subprogram_shader()),
         )
         .unwrap(),
-        TemporaryFixture::new(
-            "oracle-controller-6000.2.assets",
-            &synthetic_single_v22(91, 91, "6000.2.0f1", &animator_controller()),
-        )
-        .unwrap(),
-        TemporaryFixture::new(
-            "oracle-controller-tuanjie.assets",
-            &synthetic_single_v22(91, 91, "2022.3.55t4", &tuanjie_animator_controller()),
-        )
-        .unwrap(),
-        TemporaryFixture::new(
-            "oracle-avatar-6000.2.assets",
-            &synthetic_single_v22(90, 90, "6000.2.0f1", &avatar()),
-        )
-        .unwrap(),
-        TemporaryFixture::new(
-            "oracle-avatar-tuanjie.assets",
-            &synthetic_single_v22(90, 90, "2022.3.55t4", &avatar()),
-        )
-        .unwrap(),
-        TemporaryFixture::new(
-            "oracle-animation-6000.2.assets",
-            &synthetic_single_v22(74, 74, "6000.2.0f1", &animation_clip()),
-        )
-        .unwrap(),
         TemporaryFixture::with_resource(
             "oracle-v22.assets",
             &synthetic_v22(),
@@ -407,7 +382,8 @@ fn sprite_atlas_fixtures() -> Vec<TemporaryFixture> {
     .collect()
 }
 
-/// The `AnimationClip` fixtures, including one carrying real keyframes.
+/// The animation-stack fixtures: `AnimationClip` (including one carrying real
+/// keyframes), `AnimatorController`, and `Avatar`.
 fn animation_fixtures() -> Vec<TemporaryFixture> {
     vec![
         TemporaryFixture::new(
@@ -423,6 +399,52 @@ fn animation_fixtures() -> Vec<TemporaryFixture> {
         TemporaryFixture::new(
             "oracle-animation-tuanjie-1.5.assets",
             &synthetic_single_v22(74, 74, "2022.3.55t4", &tuanjie_embedded_animation_clip()),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
+            "oracle-animation-6000.2.assets",
+            &synthetic_single_v22(74, 74, "6000.2.0f1", &animation_clip()),
+        )
+        .unwrap(),
+        // The top of the verified range, so widening it further has to bring
+        // a fixture with it.
+        TemporaryFixture::new(
+            "oracle-animation-6000.3.assets",
+            &synthetic_single_v22(74, 74, "6000.3.12f1", &animation_clip()),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
+            "oracle-controller-6000.2.assets",
+            &synthetic_single_v22(91, 91, "6000.2.0f1", &animator_controller()),
+        )
+        .unwrap(),
+        // The top of the verified range, so widening it further has to bring
+        // a fixture with it.
+        TemporaryFixture::new(
+            "oracle-controller-6000.3.assets",
+            &synthetic_single_v22(91, 91, "6000.3.12f1", &animator_controller()),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
+            "oracle-controller-tuanjie.assets",
+            &synthetic_single_v22(91, 91, "2022.3.55t4", &tuanjie_animator_controller()),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
+            "oracle-avatar-6000.2.assets",
+            &synthetic_single_v22(90, 90, "6000.2.0f1", &avatar()),
+        )
+        .unwrap(),
+        // The top of the verified range, so widening it further has to bring
+        // a fixture with it.
+        TemporaryFixture::new(
+            "oracle-avatar-6000.3.assets",
+            &synthetic_single_v22(90, 90, "6000.3.12f1", &avatar()),
+        )
+        .unwrap(),
+        TemporaryFixture::new(
+            "oracle-avatar-tuanjie.assets",
+            &synthetic_single_v22(90, 90, "2022.3.55t4", &avatar()),
         )
         .unwrap(),
     ]

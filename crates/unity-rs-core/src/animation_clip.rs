@@ -1,7 +1,7 @@
 //! Bounded, source-bound parsing for Unity and Tuanjie `AnimationClip` objects.
 //!
 //! The implemented layout covers non-Tuanjie Unity 2017.3 through 2023.x and
-//! Unity 6000.0 through 6000.2, plus the Tuanjie 2022.3.x layout. Tuanjie's
+//! Unity 6000.0 through 6000.3, plus the Tuanjie 2022.3.x layout. Tuanjie's
 //! embedded animation-data, relocated curve, streaming-info, and ACL version
 //! gates are parsed explicitly.
 
@@ -612,11 +612,14 @@ fn validate_supported_version(file: &SerializedFile) -> Result<()> {
     let supported = if file.unity_version.is_tuanjie() {
         version.0 == 2022 && version.1 == 3 && version.2 >= 2
     } else {
-        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 2)
+        // 6000.3 checked rather than assumed: the managed reader carries no
+        // AnimationClip branch newer than 2023.2's streamed-curve split, and
+        // the 6000.3.12f1 differential fixture locks that shared layout.
+        ((2017, 3, 0)..(2024, 0, 0)).contains(&version) || (version.0 == 6000 && version.1 <= 3)
     };
     if !supported {
         return Err(Error::unsupported(format!(
-            "AnimationClip Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.2, and Tuanjie 2022.3.x ranges",
+            "AnimationClip Unity version {} is outside the verified 2017.3 through 2023.x, 6000.0 through 6000.3, and Tuanjie 2022.3.x ranges",
             file.unity_version
         )));
     }
@@ -2023,6 +2026,7 @@ mod tests {
             ((6000, 0, 0), "6000.0.0f1", true),
             ((6000, 1, 0), "6000.1.0f1", true),
             ((6000, 2, 0), "6000.2.0f1", true),
+            ((6000, 3, 0), "6000.3.0f1", true),
         ] {
             let payload = standard_payload(version, 22, Endian::Little, false, false);
             let file = parse_asset(22, Endian::Little, 13, text, &payload);
@@ -2169,7 +2173,9 @@ mod tests {
 
         let old = parse_asset(22, Endian::Little, 13, "2017.2.9f1", &payload);
         assert!(read_animation_clip(&old, 0, AnimationClipReadLimits::default()).is_err());
-        for version in ["2024.1.0f1", "6000.3.0f1"] {
+        // The upper bound moved to 6000.3 on the evidence in
+        // `validate_supported_version`, so the refusal case moves with it.
+        for version in ["2024.1.0f1", "6000.4.0f1"] {
             let unverified = parse_asset(22, Endian::Little, 13, version, &payload);
             assert!(
                 read_animation_clip(&unverified, 0, AnimationClipReadLimits::default()).is_err(),

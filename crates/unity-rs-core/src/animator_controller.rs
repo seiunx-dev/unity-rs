@@ -1,6 +1,6 @@
 //! Bounded parsing for Unity and Tuanjie `AnimatorController` objects.
 //!
-//! The verified layout covers Unity 2017.3 through 2023.x, Unity 6000.0-6000.2,
+//! The verified layout covers Unity 2017.3 through 2023.x, Unity 6000.0-6000.3,
 //! and Tuanjie 2022.3.x. Large numeric arrays stay source-bound and are
 //! materialized only through the bounded array helpers shared with
 //! `AnimationClip`.
@@ -1044,12 +1044,15 @@ fn validate_supported_version(file: &SerializedFile) -> Result<()> {
     let supported = if file.unity_version.is_tuanjie() {
         version.0 == 2022 && version.1 == 3 && version.2 >= 2
     } else {
+        // 6000.3 checked rather than assumed: the managed reader adds nothing
+        // to AnimatorController after 6000.2's default entity IDs, and the
+        // 6000.3.12f1 differential fixture locks that shared layout.
         ((2017, 3, 0)..(2024, 0, 0)).contains(&version)
-            || (file.unity_version.major == 6000 && file.unity_version.minor <= 2)
+            || (file.unity_version.major == 6000 && file.unity_version.minor <= 3)
     };
     if !supported {
         return Err(Error::unsupported(format!(
-            "AnimatorController Unity version {} is outside the verified 2017.3-2023.x, 6000.0-6000.2, and Tuanjie 2022.3.x ranges",
+            "AnimatorController Unity version {} is outside the verified 2017.3-2023.x, 6000.0-6000.3, and Tuanjie 2022.3.x ranges",
             file.unity_version
         )));
     }
@@ -1164,22 +1167,25 @@ mod tests {
             assert_eq!(value.animation_clips[0].path_id, 91);
         }
 
-        let object = minimal_controller_object(endian, false, "entity", 92, Some(&[17, -9]));
-        let file = parse_asset(22, endian, 13, "6000.2.0f1", &object);
-        let value =
-            read_animator_controller(&file, 0, AnimatorControllerReadLimits::default()).unwrap();
-        assert_eq!(
-            value
-                .controller
-                .default_values
-                .entity_ids
-                .as_ref()
-                .unwrap()
-                .read_values(2)
-                .unwrap(),
-            [17, -9]
-        );
-        assert_eq!(value.animation_clips[0].path_id, 92);
+        for version in ["6000.2.0f1", "6000.3.0f1"] {
+            let object = minimal_controller_object(endian, false, "entity", 92, Some(&[17, -9]));
+            let file = parse_asset(22, endian, 13, version, &object);
+            let value = read_animator_controller(&file, 0, AnimatorControllerReadLimits::default())
+                .unwrap();
+            assert_eq!(
+                value
+                    .controller
+                    .default_values
+                    .entity_ids
+                    .as_ref()
+                    .unwrap()
+                    .read_values(2)
+                    .unwrap(),
+                [17, -9],
+                "{version}"
+            );
+            assert_eq!(value.animation_clips[0].path_id, 92, "{version}");
+        }
 
         let missing = minimal_controller_object(endian, false, "missing", 93, None);
         let missing = parse_asset(22, endian, 13, "6000.2.0f1", &missing);
@@ -1192,7 +1198,9 @@ mod tests {
     fn rejects_versions_truncation_negative_counts_trailing_bytes_and_budgets() {
         let endian = TestEndian::Little;
         let object = minimal_controller_object(endian, false, "limits", 91, None);
-        for version in ["2017.2.9f1", "2024.1.0f1", "6000.3.0f1", "2023.1.0t1"] {
+        // The upper bound moved to 6000.3 on the evidence in
+        // `validate_supported_version`, so the refusal case moves with it.
+        for version in ["2017.2.9f1", "2024.1.0f1", "6000.4.0f1", "2023.1.0t1"] {
             let file = parse_asset(22, endian, 13, version, &object);
             assert!(
                 read_animator_controller(&file, 0, AnimatorControllerReadLimits::default())
