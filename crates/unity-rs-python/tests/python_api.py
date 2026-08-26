@@ -113,7 +113,7 @@ def synthetic_text_asset() -> bytes:
     return finish_v22_asset(49, payload)
 
 
-def synthetic_unity6_shader() -> bytes:
+def synthetic_unity6_shader(unity_version: str = "6000.2.0f1") -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "Unity6Object")
     push_i32(payload, 0)  # properties
@@ -141,7 +141,7 @@ def synthetic_unity6_shader() -> bytes:
     payload.append(0)  # baked
     align(payload, 4)
     payload.extend(b"\x00" * 16)  # asset GUID
-    return finish_v22_asset(48, payload, "6000.2.0f1")
+    return finish_v22_asset(48, payload, unity_version)
 
 
 def synthetic_mesh(*, external: bool = False, tuanjie: bool = False) -> bytes:
@@ -2529,6 +2529,38 @@ def main() -> None:
             pass
         else:
             raise AssertionError("Shader output limit should be enforced")
+
+        # Above the verified Unity majors the default is lenient: the newest
+        # known layout is attempted. This 6000.2-layout shader relabeled 7000
+        # misses the 6000.3 asset-identifier field, so the attempt does not
+        # fit and the failure stays in the NotImplementedError family with the
+        # attempt recorded. strict_unity_versions restores the version-gate
+        # rejection without touching the payload.
+        future_path = Path(directory) / "unity7-shader.assets"
+        future_path.write_bytes(synthetic_unity6_shader(unity_version="7000.0.0f1"))
+        try:
+            UnityRs(future_path).read_shader(0, 7)
+        except NotImplementedError as error:
+            assert "above the verified range" in str(error), error
+        else:
+            raise AssertionError("the lenient 7000 shader attempt should not fit")
+        try:
+            UnityRs(future_path, strict_unity_versions=True).read_shader(0, 7)
+        except NotImplementedError as error:
+            assert "Shader serialization version" in str(error), error
+        else:
+            raise AssertionError("strict mode should refuse the 7000 shader outright")
+
+        # The keyword is accepted by the in-memory constructors as well, and
+        # in-range files are unaffected by strict mode.
+        strict_bytes = UnityRs.from_bytes(
+            synthetic_text_asset(), strict_unity_versions=True
+        )
+        assert strict_bytes.object_count == 1
+        strict_memory = UnityRs.from_memory_files(
+            [("text.assets", synthetic_text_asset())], strict_unity_versions=True
+        )
+        assert strict_memory.object_count == 1
 
         mesh_path = Path(directory) / "mesh.assets"
         mesh_path.write_bytes(synthetic_mesh())

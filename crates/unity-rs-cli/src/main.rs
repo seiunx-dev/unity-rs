@@ -269,6 +269,9 @@ struct LoadOptions {
     mono_schemas: Vec<PathBuf>,
     /// Read through the schemas even where the file carries its own type tree.
     mono_schema_override: bool,
+    /// Reject classes whose standard-Unity version is above the verified
+    /// ceiling instead of attempting the newest known layout.
+    strict_unity_versions: bool,
 }
 
 impl LoadOptions {
@@ -442,6 +445,10 @@ enum LoadFlag {
 /// A load option that is on or off rather than carrying a value.
 const MONO_SCHEMA_OVERRIDE_FLAG: &str = "--mono-schema-override";
 
+/// On/off: refuse classes above their verified Unity version ceiling instead
+/// of attempting the newest known layout.
+const STRICT_UNITY_VERSIONS_FLAG: &str = "--strict-unity-versions";
+
 impl LoadFlag {
     const fn name(self) -> &'static str {
         match self {
@@ -530,6 +537,9 @@ fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadO
             (LoadFlag::MonoSchema, Some(OsStr::new(value)))
         } else if text == Some(MONO_SCHEMA_OVERRIDE_FLAG) {
             load.mono_schema_override = true;
+            continue;
+        } else if text == Some(STRICT_UNITY_VERSIONS_FLAG) {
+            load.strict_unity_versions = true;
             continue;
         } else {
             remaining.push(copy_cli_argument(
@@ -936,7 +946,9 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          first document holding a class wins. See docs/mono-schema.md.\n  \
          --mono-schema-override      Read through the schemas even where the file carries\n  \
          its own type tree. For checking a generated schema against a build\n  \
-         that still ships trees; extraction should not use it.\n\n\
+         that still ships trees; extraction should not use it.\n  \
+         --strict-unity-versions     Refuse classes whose Unity version is above the\n  \
+         verified range instead of attempting the newest known layout.\n\n\
          FBX export:\n  Writes deterministic ASCII FBX 7.4 for transform hierarchies, resident\n  \
          triangle meshes, submeshes, material slots, normals, UV0, local TRS, direct/hash bones,\n  \
          skinning, static blend shapes, explicit/packed legacy curves, and streamed/dense/constant\n  \
@@ -3443,6 +3455,7 @@ fn load_asset_collection(
         AssetLoadOptions {
             unity_version_override: load.unity_version.clone(),
             failure_policy: LoadFailurePolicy::SkipInput,
+            strict_unity_versions: load.strict_unity_versions,
             ..AssetLoadOptions::default()
         },
     )?;
@@ -4902,6 +4915,20 @@ mod tests {
         assert!(
             load.mono_schema_registry().is_err(),
             "first.json does not exist"
+        );
+    }
+
+    #[test]
+    fn strict_unity_versions_flag_is_split_out_and_defaults_off() {
+        let (remaining, load) =
+            split_load_options(&arguments(&["--strict-unity-versions", "info"])).unwrap();
+        assert_eq!(remaining, arguments(&["info"]));
+        assert!(load.strict_unity_versions);
+        assert!(
+            !split_load_options(&arguments(&["info"]))
+                .unwrap()
+                .1
+                .strict_unity_versions
         );
     }
 

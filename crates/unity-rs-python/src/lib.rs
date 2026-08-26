@@ -2398,7 +2398,8 @@ impl PyUnityRs {
         maximum_diagnostic_bytes=268_435_456,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
-        unity_cn_key=None
+        unity_cn_key=None,
+        strict_unity_versions=false
     ))]
     // PyO3 keyword arguments are the Python signature, so they cannot be
     // grouped into a struct without changing the public API.
@@ -2416,6 +2417,7 @@ impl PyUnityRs {
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
         unity_cn_key: Option<Py<PyAny>>,
+        strict_unity_versions: bool,
     ) -> PyResult<Self> {
         let unity_version_override = parse_unity_version_override(unity_version)?;
         let oodle_decoder = python_oodle_decoder(py, oodle_decoder)?;
@@ -2433,7 +2435,7 @@ impl PyUnityRs {
             oodle_decoder,
             unity_cn_key: parse_unity_cn_key(py, unity_cn_key)?,
             failure_policy: failure_policy(skip_unreadable_inputs),
-            strict_unity_versions: false,
+            strict_unity_versions,
         };
         py.detach(move || Studio::open_with_options(path, options))
             .map(|studio| Self { studio })
@@ -2450,7 +2452,8 @@ impl PyUnityRs {
         maximum_bytes=4_294_967_296,
         maximum_path_bytes=1_048_576,
         maximum_total_path_bytes=67_108_864,
-        oodle_decoder=None
+        oodle_decoder=None,
+        strict_unity_versions=false
     ))]
     // PyO3 keyword arguments are the Python signature, so they cannot be
     // grouped into a struct without changing the public API.
@@ -2464,6 +2467,7 @@ impl PyUnityRs {
         maximum_path_bytes: usize,
         maximum_total_path_bytes: usize,
         oodle_decoder: Option<Py<PyAny>>,
+        strict_unity_versions: bool,
     ) -> PyResult<Self> {
         let bytes = copy_python_input(data.as_bytes(), maximum_bytes)?;
         let name = copy_python_input_name(
@@ -2480,6 +2484,7 @@ impl PyUnityRs {
             },
             unity_version_override: parse_unity_version_override(unity_version)?,
             oodle_decoder: python_oodle_decoder(py, oodle_decoder)?,
+            strict_unity_versions,
             ..AssetLoadOptions::default()
         };
         py.detach(move || {
@@ -2503,7 +2508,8 @@ impl PyUnityRs {
         maximum_diagnostic_bytes=268_435_456,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
-        unity_cn_key=None
+        unity_cn_key=None,
+        strict_unity_versions=false
     ))]
     // PyO3 keyword arguments are the Python signature, so they cannot be
     // grouped into a struct without changing the public API.
@@ -2521,6 +2527,7 @@ impl PyUnityRs {
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
         unity_cn_key: Option<Py<PyAny>>,
+        strict_unity_versions: bool,
     ) -> PyResult<Self> {
         let inputs = copy_python_files(
             files,
@@ -2544,7 +2551,7 @@ impl PyUnityRs {
             oodle_decoder: python_oodle_decoder(py, oodle_decoder)?,
             unity_cn_key: parse_unity_cn_key(py, unity_cn_key)?,
             failure_policy: failure_policy(skip_unreadable_inputs),
-            strict_unity_versions: false,
+            strict_unity_versions,
         };
         py.detach(move || Studio::open_regions_with_options(inputs, options))
             .map(|studio| Self { studio })

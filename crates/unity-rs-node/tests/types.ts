@@ -38,6 +38,7 @@ const openOptions: OpenOptions = {
   maximumPathBytes: 1024 * 1024,
   maximumTotalPathBytes: 64 * 1024 * 1024,
   maximumDiagnosticBytes: 256 * 1024 * 1024,
+  strictUnityVersions: true,
 };
 const openedWithPathLimits: UnityRs = UnityRs.openWith(
   "fixture.assets",

@@ -2175,6 +2175,13 @@ console.log('node api: settings and version override ok')
     /files.*exceeding limit/i,
   )
   assert.equal(inputElementRead, false)
+
+  // The strict-unity-versions opt-out is accepted and does not disturb loads
+  // that stay inside the verified ranges.
+  const strict = addon.UnityRs.fromBuffers(inputs, undefined, {
+    strictUnityVersions: true,
+  })
+  assert.equal(strict.fileCount, 2)
 }
 
 // Scene assembly across the loaded files.

@@ -962,6 +962,7 @@ class UnityRs:
         oodle_decoder: Optional[OodleDecoder] = None,
         skip_unreadable_inputs: bool = False,
         unity_cn_key: Union[bytes, str, None] = None,
+        strict_unity_versions: bool = False,
     ) -> UnityRs: ...
     @staticmethod
     def from_bytes(
@@ -973,6 +974,7 @@ class UnityRs:
         maximum_path_bytes: int = 1_048_576,
         maximum_total_path_bytes: int = 67_108_864,
         oodle_decoder: Optional[OodleDecoder] = None,
+        strict_unity_versions: bool = False,
     ) -> UnityRs: ...
     @staticmethod
     def from_memory_files(
@@ -988,6 +990,7 @@ class UnityRs:
         oodle_decoder: Optional[OodleDecoder] = None,
         skip_unreadable_inputs: bool = False,
         unity_cn_key: Union[bytes, str, None] = None,
+        strict_unity_versions: bool = False,
     ) -> UnityRs: ...
     @property
     def file_count(self) -> int: ...

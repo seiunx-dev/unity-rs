@@ -836,6 +836,9 @@ pub struct OpenOptions {
     /// that did not. A game directory routinely mixes readable assets with
     /// encrypted or not-yet-supported containers.
     pub skip_unreadable_inputs: Option<bool>,
+    /// Reject classes whose standard-Unity version is above the verified
+    /// ceiling instead of attempting the newest known layout (the default).
+    pub strict_unity_versions: Option<bool>,
     pub maximum_input_files: Option<u32>,
     pub maximum_input_directories: Option<u32>,
     pub maximum_directory_entries: Option<u32>,
@@ -976,7 +979,7 @@ fn load_options(
         } else {
             LoadFailurePolicy::Abort
         },
-        strict_unity_versions: false,
+        strict_unity_versions: options.strict_unity_versions.unwrap_or(false),
     })
 }
 
@@ -5407,6 +5410,7 @@ mod tests {
                 unity_version: None,
                 unity_cn_key: None,
                 skip_unreadable_inputs: Some(true),
+                strict_unity_versions: Some(true),
                 maximum_input_files: None,
                 maximum_input_directories: None,
                 maximum_directory_entries: None,
@@ -5419,6 +5423,8 @@ mod tests {
         .unwrap();
         assert_eq!(configured.limits.maximum_diagnostic_bytes, 0);
         assert_eq!(configured.failure_policy, LoadFailurePolicy::SkipInput);
+        assert!(configured.strict_unity_versions);
+        assert!(!defaults.strict_unity_versions);
     }
 
     fn assert_bounded_option_error(error: &napi::Error, field: &str, oversized: &str) {

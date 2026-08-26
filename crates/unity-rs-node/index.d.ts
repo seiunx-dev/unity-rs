@@ -928,6 +928,11 @@ export interface OpenOptions {
    * encrypted or not-yet-supported containers.
    */
   skipUnreadableInputs?: boolean
+  /**
+   * Reject classes whose standard-Unity version is above the verified
+   * ceiling instead of attempting the newest known layout (the default).
+   */
+  strictUnityVersions?: boolean
   maximumInputFiles?: number
   maximumInputDirectories?: number
   maximumDirectoryEntries?: number
