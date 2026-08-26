@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/Team-Haruki/unity-rs"
+repository = "https://github.com/seiunx-dev/unity-rs"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
