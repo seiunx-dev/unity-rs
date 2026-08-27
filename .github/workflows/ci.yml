@@ -30,7 +30,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -40,7 +40,7 @@ jobs:
           restore-keys: cargo-registry-${{ runner.os }}-
       # Lint, doc and package builds on the fixed Ubuntu runner.
       - name: Cache build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/
           key: cargo-target-quality-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
@@ -50,7 +50,7 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
           rustup override set 1.88.0
       - name: Cache the locked RustSec auditor
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-0.22.2-${{ runner.os }}
@@ -112,7 +112,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -122,7 +122,7 @@ jobs:
           restore-keys: cargo-registry-${{ runner.os }}-
       # Workspace debug test builds per OS.
       - name: Cache build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/
           key: cargo-target-test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
@@ -156,7 +156,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -166,7 +166,7 @@ jobs:
           restore-keys: cargo-registry-${{ runner.os }}-
       # Node-API debug builds per OS.
       - name: Cache build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/
           key: cargo-target-node-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
@@ -236,7 +236,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -322,7 +322,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -332,7 +332,7 @@ jobs:
           restore-keys: cargo-registry-${{ runner.os }}-
       # Shared with the other oracle jobs; see above.
       - name: Cache build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/
           key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
@@ -367,7 +367,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -377,7 +377,7 @@ jobs:
           restore-keys: cargo-registry-${{ runner.os }}-
       # Shared with the other oracle jobs; see above.
       - name: Cache build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/
           key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
@@ -413,7 +413,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -423,7 +423,7 @@ jobs:
           restore-keys: cargo-registry-${{ runner.os }}-
       # The three oracle jobs share one artifact cache: they compile near-identical core test builds, and only the first finisher saves.
       - name: Cache build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/
           key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
@@ -483,7 +483,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -541,7 +541,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
