@@ -778,6 +778,25 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   87 方法计数全部同步。
   `cargo fmt/check/clippy -D warnings/test`、两个 API surface 审计与
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 零跳过通过；
+- **图像管线三项性能收口已于 2026-08-27 落地（研究 workflow 的路线图第 1/2/4 项）**：
+  (1) 批量导出接通编码旋钮——`ExportOptions` 新增 `png_compression`/`png_filter`，图像 payload
+  改走 `write_rgba_image_with_options`，默认值逐字节复现历史输出；CLI 增
+  `--png-compression <fast|default|best|0-9>` 与 `--png-filter <auto|none|adaptive>`，Python
+  `export(compression=, png_filter=)`、Node `exportWithOptions({compression, pngFilter})` 同形。
+  此前批量导出被钉死在 flate2 level 6 + 无 filter（~316 ms/2048²），fast/fdeflate 路径
+  （~27 ms）只有逐对象 API 可达；四端回归断言 fast 产出不同且有效的 PNG 流、默认流不变、
+  非法值拒绝。(2) `decode_linear_pixels` 的格式 `match` 从逐像素循环体提为每格式专用闭包
+  循环（RGBA32 退化为整块拷贝），形状可自动向量化；既有逐格式像素钉字节测试保证不变。
+  (3) ASTC 解码器从 vendor 最小-delta 合同下 fork 为一等公民 `src/astc.rs`（vendored
+  `astc.rs` 删除，`f16` 留给 BC6H 共用）：整块载入 `u128` 后所有位读成为带界移位——原
+  slice 算术位读对敌意块 panic（实测 ~44% 随机块触发，靠 `catch_unwind` 兜底）现不可达，
+  敌意权重数改为显式 `Err`（同样落 `InvalidData` 族）；双线性 infill 系数
+  （profiling 占 42%）按权重网格几何懒建 121 槽缓存（块内容无关，每图至多 121×1.4 KiB 有界
+  分配）；`BlockData`/序列缓冲跨块复用；`applicate_color` 切片化并特化占主导的
+  LDR 单 partition 形状（端点扩展提为循环常量）。真实 astcenc fixture 平铺 2048² 实测：
+  LDR 4×4 57.4→37.6 ms/帧（1.53×）、6×6 36.1→24.1、12×12 25.8→19.1；HDR 4×4
+  79.5→55.6（1.43×）。算术逐字节不变由 LDR/HDR 双 fixture 套件与 managed oracle 差分钉住
+  （fork 后 oracle 实跑两轮全过），malformed-input 套件确认敌意行为契约保持错误族不变；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

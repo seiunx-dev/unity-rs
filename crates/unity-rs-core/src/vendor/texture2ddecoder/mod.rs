@@ -36,16 +36,15 @@
 //! copyright notice sit beside this file, and `THIRD_PARTY_NOTICES.md` records
 //! the arrangement.
 
-mod astc;
 mod atc;
 mod bc3_alpha;
 mod bc6;
 mod bitreader;
 mod color;
 mod consts;
-mod f16;
-
-pub(crate) use astc::decode_astc;
+// The first-party ASTC decoder in `crate::astc` (forked from the vendored
+// copy for performance) shares this half-float conversion with BC6H.
+pub(crate) mod f16;
 pub(crate) use atc::{decode_atc_rgb4, decode_atc_rgba8};
 
 /// Decodes a whole BC6H (unsigned) image.

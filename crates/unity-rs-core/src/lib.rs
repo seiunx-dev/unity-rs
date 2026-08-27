@@ -8,6 +8,7 @@ pub mod animation_clip;
 pub mod animation_component;
 pub mod animation_graph;
 pub mod animator_controller;
+mod astc;
 pub mod audio;
 pub mod avatar;
 pub mod bundle;

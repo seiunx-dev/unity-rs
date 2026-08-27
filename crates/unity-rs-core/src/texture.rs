@@ -2442,32 +2442,32 @@ fn decode_external_compressed_pixels(
         TextureFormat::ASTC_RGB_4X4
         | TextureFormat::ASTC_RGBA_4X4
         | TextureFormat::ASTC_HDR_4X4 => {
-            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 4, 4, &mut decoded)
+            crate::astc::decode_astc(input, width, height, 4, 4, &mut decoded)
         }
         TextureFormat::ASTC_RGB_5X5
         | TextureFormat::ASTC_RGBA_5X5
         | TextureFormat::ASTC_HDR_5X5 => {
-            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 5, 5, &mut decoded)
+            crate::astc::decode_astc(input, width, height, 5, 5, &mut decoded)
         }
         TextureFormat::ASTC_RGB_6X6
         | TextureFormat::ASTC_RGBA_6X6
         | TextureFormat::ASTC_HDR_6X6 => {
-            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 6, 6, &mut decoded)
+            crate::astc::decode_astc(input, width, height, 6, 6, &mut decoded)
         }
         TextureFormat::ASTC_RGB_8X8
         | TextureFormat::ASTC_RGBA_8X8
         | TextureFormat::ASTC_HDR_8X8 => {
-            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 8, 8, &mut decoded)
+            crate::astc::decode_astc(input, width, height, 8, 8, &mut decoded)
         }
         TextureFormat::ASTC_RGB_10X10
         | TextureFormat::ASTC_RGBA_10X10
         | TextureFormat::ASTC_HDR_10X10 => {
-            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 10, 10, &mut decoded)
+            crate::astc::decode_astc(input, width, height, 10, 10, &mut decoded)
         }
         TextureFormat::ASTC_RGB_12X12
         | TextureFormat::ASTC_RGBA_12X12
         | TextureFormat::ASTC_HDR_12X12 => {
-            crate::vendor::texture2ddecoder::decode_astc(input, width, height, 12, 12, &mut decoded)
+            crate::astc::decode_astc(input, width, height, 12, 12, &mut decoded)
         }
         _ => Err("unsupported external texture decoder format"),
     }))
@@ -2598,90 +2598,115 @@ fn clamp_u8(value: i32) -> u8 {
     u8::try_from(value.clamp(0, 255)).expect("clamped color channel fits in u8")
 }
 
+/// Runs one per-pixel conversion over every complete source/destination
+/// pixel pair. Each caller passes a distinct closure, so the format `match`
+/// is evaluated once per image and the conversion body inlines into a tight,
+/// auto-vectorizable loop instead of re-dispatching per pixel.
+fn for_each_linear_pixel(
+    input: &[u8],
+    output: &mut [u8],
+    bytes_per_pixel: usize,
+    mut decode: impl FnMut(&[u8], &mut [u8]),
+) {
+    for (source, destination) in input
+        .chunks_exact(bytes_per_pixel)
+        .zip(output.chunks_exact_mut(4))
+    {
+        decode(source, destination);
+    }
+}
+
 fn decode_linear_pixels(
     format: TextureFormat,
     input: &[u8],
     output: &mut [u8],
     bytes_per_pixel: usize,
 ) {
-    for (source, destination) in input
-        .chunks_exact(bytes_per_pixel)
-        .zip(output.chunks_exact_mut(4))
-    {
-        match format {
-            TextureFormat::ALPHA8 => destination.copy_from_slice(&[255, 255, 255, source[0]]),
-            TextureFormat::RGB24 => {
-                destination.copy_from_slice(&[source[0], source[1], source[2], 255]);
-            }
-            TextureFormat::BGR24 => {
-                destination.copy_from_slice(&[source[2], source[1], source[0], 255]);
-            }
-            TextureFormat::RGBA32 => destination.copy_from_slice(source),
-            TextureFormat::ARGB32 => {
-                destination.copy_from_slice(&[source[1], source[2], source[3], source[0]]);
-            }
-            TextureFormat::ARGB4444 => {
-                let packed = u16::from_le_bytes([source[0], source[1]]);
-                destination.copy_from_slice(&[
-                    expand_nibble(packed >> 8),
-                    expand_nibble(packed >> 4),
-                    expand_nibble(packed),
-                    expand_nibble(packed >> 12),
-                ]);
-            }
-            TextureFormat::RGB565 => {
-                let [red, green, blue] = rgb565(u16::from_le_bytes([source[0], source[1]]));
-                destination.copy_from_slice(&[red, green, blue, 255]);
-            }
-            TextureFormat::R16 => {
-                destination.copy_from_slice(&[downscale_u16(source[0], source[1]), 0, 0, 255]);
-            }
-            TextureFormat::RGBA4444 => {
-                let packed = u16::from_le_bytes([source[0], source[1]]);
-                destination.copy_from_slice(&[
-                    expand_nibble(packed >> 12),
-                    expand_nibble(packed >> 8),
-                    expand_nibble(packed >> 4),
-                    expand_nibble(packed),
-                ]);
-            }
-            TextureFormat::BGRA32 => {
-                destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
-            }
-            TextureFormat::R_HALF
-            | TextureFormat::RG_HALF
-            | TextureFormat::RGBA_HALF
-            | TextureFormat::R_FLOAT
-            | TextureFormat::RG_FLOAT
-            | TextureFormat::RGBA_FLOAT
-            | TextureFormat::RGB9E5_FLOAT => {
-                decode_floating_point_pixel(format, source, destination);
-            }
-            TextureFormat::YUY2 => unreachable!("YUY2 is decoded in shared chroma pairs"),
-            TextureFormat::R8 => destination.copy_from_slice(&[source[0], 0, 0, 255]),
-            TextureFormat::RG16 => destination.copy_from_slice(&[source[0], source[1], 0, 255]),
-            TextureFormat::RG32 => destination.copy_from_slice(&[
-                downscale_u16(source[0], source[1]),
-                downscale_u16(source[2], source[3]),
-                0,
-                255,
-            ]),
-            TextureFormat::RGB48 => destination.copy_from_slice(&[
-                downscale_u16(source[0], source[1]),
-                downscale_u16(source[2], source[3]),
-                downscale_u16(source[4], source[5]),
-                255,
-            ]),
-            TextureFormat::RGBA64 => {
-                destination.copy_from_slice(&[
-                    downscale_u16(source[0], source[1]),
-                    downscale_u16(source[2], source[3]),
-                    downscale_u16(source[4], source[5]),
-                    downscale_u16(source[6], source[7]),
-                ]);
-            }
-            _ => unreachable!("unsupported formats are rejected before decoding"),
+    match format {
+        TextureFormat::ALPHA8 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[255, 255, 255, s[0]]);
+        }),
+        TextureFormat::RGB24 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[s[0], s[1], s[2], 255]);
+        }),
+        TextureFormat::BGR24 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[s[2], s[1], s[0], 255]);
+        }),
+        TextureFormat::RGBA32 => {
+            // Source and destination strides agree, so the whole surface is
+            // one bulk copy over the complete pixels both sides can hold.
+            let length = (input.len() / 4).min(output.len() / 4) * 4;
+            output[..length].copy_from_slice(&input[..length]);
         }
+        TextureFormat::ARGB32 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[s[1], s[2], s[3], s[0]]);
+        }),
+        TextureFormat::ARGB4444 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            let packed = u16::from_le_bytes([s[0], s[1]]);
+            d.copy_from_slice(&[
+                expand_nibble(packed >> 8),
+                expand_nibble(packed >> 4),
+                expand_nibble(packed),
+                expand_nibble(packed >> 12),
+            ]);
+        }),
+        TextureFormat::RGB565 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            let [red, green, blue] = rgb565(u16::from_le_bytes([s[0], s[1]]));
+            d.copy_from_slice(&[red, green, blue, 255]);
+        }),
+        TextureFormat::R16 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[downscale_u16(s[0], s[1]), 0, 0, 255]);
+        }),
+        TextureFormat::RGBA4444 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            let packed = u16::from_le_bytes([s[0], s[1]]);
+            d.copy_from_slice(&[
+                expand_nibble(packed >> 12),
+                expand_nibble(packed >> 8),
+                expand_nibble(packed >> 4),
+                expand_nibble(packed),
+            ]);
+        }),
+        TextureFormat::BGRA32 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        }),
+        TextureFormat::R_HALF
+        | TextureFormat::RG_HALF
+        | TextureFormat::RGBA_HALF
+        | TextureFormat::R_FLOAT
+        | TextureFormat::RG_FLOAT
+        | TextureFormat::RGBA_FLOAT
+        | TextureFormat::RGB9E5_FLOAT => {
+            for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+                decode_floating_point_pixel(format, s, d);
+            });
+        }
+        TextureFormat::YUY2 => unreachable!("YUY2 is decoded in shared chroma pairs"),
+        TextureFormat::R8 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[s[0], 0, 0, 255]);
+        }),
+        TextureFormat::RG16 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[s[0], s[1], 0, 255]);
+        }),
+        TextureFormat::RG32 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[downscale_u16(s[0], s[1]), downscale_u16(s[2], s[3]), 0, 255]);
+        }),
+        TextureFormat::RGB48 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[
+                downscale_u16(s[0], s[1]),
+                downscale_u16(s[2], s[3]),
+                downscale_u16(s[4], s[5]),
+                255,
+            ]);
+        }),
+        TextureFormat::RGBA64 => for_each_linear_pixel(input, output, bytes_per_pixel, |s, d| {
+            d.copy_from_slice(&[
+                downscale_u16(s[0], s[1]),
+                downscale_u16(s[2], s[3]),
+                downscale_u16(s[4], s[5]),
+                downscale_u16(s[6], s[7]),
+            ]);
+        }),
+        _ => unreachable!("unsupported formats are rejected before decoding"),
     }
 }
 
