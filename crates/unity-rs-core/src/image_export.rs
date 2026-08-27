@@ -136,8 +136,15 @@ impl PngCompression {
 /// compression ratio the filtered scanlines allow.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PngFilter {
-    /// Filter type zero on every scanline — the historical output.
+    /// Follows the compression choice: [`Self::Adaptive`] under
+    /// [`PngCompression::Fast`], whose simple fdeflate Huffman model barely
+    /// compresses unfiltered scanlines, and [`Self::None`] under the flate2
+    /// levels, where measurement showed filtering costs CPU without buying
+    /// size on decoded-texture content. This keeps every compression choice
+    /// usable on its own.
     #[default]
+    Auto,
+    /// Filter type zero on every scanline — the historical output.
     None,
     /// Chooses among the five standard filters per scanline with the
     /// minimum-sum-of-absolute-differences heuristic used by libpng and
@@ -208,7 +215,7 @@ impl Default for ImageEncodeOptions {
             jpeg_optimized_huffman: false,
             jpeg_background: None,
             png_compression: PngCompression::Default,
-            png_filter: PngFilter::None,
+            png_filter: PngFilter::Auto,
             maximum_output_bytes: 512 * 1024 * 1024,
         }
     }
@@ -504,40 +511,74 @@ fn write_png<W: Write>(
     ihdr[9] = 6;
     write_png_chunk(output, *b"IHDR", &ihdr)?;
 
+    // `Auto` follows the compression choice: the fdeflate fast path barely
+    // compresses unfiltered scanlines, while measurement shows filtering
+    // buys the flate2 levels nothing on this content class.
+    let adaptive = match options.png_filter {
+        PngFilter::Adaptive => true,
+        PngFilter::None => false,
+        PngFilter::Auto => matches!(options.png_compression, PngCompression::Fast),
+    };
     let idat = IdatWriter::new(output)?;
     let mut encoder = PngDeflater::new(idat, zlib_level)?;
-    match options.png_filter {
-        PngFilter::None => {
-            for output_row in 0..dimensions.height_usize {
-                encoder.write_all(&[0])?;
-                encoder.write_all(display_row(image, dimensions, row_order, output_row)?)?;
-            }
-        }
-        PngFilter::Adaptive => {
-            // One reusable scanline buffer holds the filtered candidate; the
-            // prior row is borrowed straight from the pixel buffer, so the
-            // working memory stays a single stride regardless of image size.
-            let mut filtered = Vec::new();
-            filtered
+    if adaptive {
+        // Working memory is five scanline strides regardless of image
+        // size: a zero row standing in for the missing prior of row 0,
+        // and one candidate buffer per non-trivial filter. Each byte is
+        // touched once per filter by a specialized branch-free loop that
+        // accumulates the selection heuristic as it fills, and the
+        // chosen candidate is written out as-is instead of recomputed.
+        let allocate_scanline = || -> Result<Vec<u8>> {
+            let mut buffer = Vec::new();
+            buffer
                 .try_reserve_exact(dimensions.stride_usize)
                 .map_err(|error| {
                     Error::invalid_data(format!("cannot allocate PNG filter scanline: {error}"))
                 })?;
-            filtered.resize(dimensions.stride_usize, 0);
-            for output_row in 0..dimensions.height_usize {
-                let current = display_row(image, dimensions, row_order, output_row)?;
-                let prior = if output_row > 0 {
-                    Some(display_row(image, dimensions, row_order, output_row - 1)?)
-                } else {
-                    None
-                };
-                let filter = select_png_filter(current, prior);
-                for (index, destination) in filtered.iter_mut().enumerate() {
-                    *destination = png_filtered_byte(filter, current, prior, index);
+            buffer.resize(dimensions.stride_usize, 0);
+            Ok(buffer)
+        };
+        let zero_prior = allocate_scanline()?;
+        let mut sub = allocate_scanline()?;
+        let mut up = allocate_scanline()?;
+        let mut average = allocate_scanline()?;
+        let mut paeth = allocate_scanline()?;
+        for output_row in 0..dimensions.height_usize {
+            let current = display_row(image, dimensions, row_order, output_row)?;
+            let prior = if output_row > 0 {
+                display_row(image, dimensions, row_order, output_row - 1)?
+            } else {
+                &zero_prior
+            };
+            let sums = [
+                scanline_magnitude(current),
+                fill_sub_filter(current, &mut sub),
+                fill_up_filter(current, prior, &mut up),
+                fill_average_filter(current, prior, &mut average),
+                fill_paeth_filter(current, prior, &mut paeth),
+            ];
+            let mut filter = 0_u8;
+            let mut best_sum = sums[0];
+            for (candidate, &sum) in (1..).zip(&sums[1..]) {
+                if sum < best_sum {
+                    best_sum = sum;
+                    filter = candidate;
                 }
-                encoder.write_all(&[filter])?;
-                encoder.write_all(&filtered)?;
             }
+            let filtered: &[u8] = match filter {
+                0 => current,
+                1 => &sub,
+                2 => &up,
+                3 => &average,
+                _ => &paeth,
+            };
+            encoder.write_all(&[filter])?;
+            encoder.write_all(filtered)?;
+        }
+    } else {
+        for output_row in 0..dimensions.height_usize {
+            encoder.write_all(&[0])?;
+            encoder.write_all(display_row(image, dimensions, row_order, output_row)?)?;
         }
     }
     let idat = encoder.finish()?;
@@ -551,63 +592,116 @@ fn write_png<W: Write>(
 /// on the left.
 const PNG_FILTER_BPP: usize = 4;
 
-/// Chooses the scanline filter with the libpng/ImageSharp heuristic: the
-/// candidate whose filtered bytes have the smallest sum of absolute values
-/// when read as signed deltas.
-fn select_png_filter(current: &[u8], prior: Option<&[u8]>) -> u8 {
-    let mut best_filter = 0;
-    let mut best_sum = u64::MAX;
-    for filter in 0..=4 {
-        let mut sum = 0_u64;
-        for index in 0..current.len() {
-            let byte = png_filtered_byte(filter, current, prior, index);
-            let magnitude = if byte < 128 {
-                u64::from(byte)
-            } else {
-                256 - u64::from(byte)
-            };
-            sum = sum.saturating_add(magnitude);
-            if sum >= best_sum {
-                break;
-            }
-        }
-        if sum < best_sum {
-            best_sum = sum;
-            best_filter = filter;
-        }
-    }
-    best_filter
+/// The filter-selection weight of one filtered byte: its absolute value read
+/// as a signed delta, the libpng/ImageSharp minimum-sum heuristic.
+fn signed_magnitude(byte: u8) -> u64 {
+    u64::from(i8::from_le_bytes([byte]).unsigned_abs())
 }
 
-/// Applies one standard PNG filter to a single byte position. The neighbor
-/// bytes left of the row start or above the first row are zero, exactly as
-/// the PNG specification defines them.
-fn png_filtered_byte(filter: u8, current: &[u8], prior: Option<&[u8]>, index: usize) -> u8 {
-    let raw = current[index];
-    let left = if index >= PNG_FILTER_BPP {
-        current[index - PNG_FILTER_BPP]
-    } else {
-        0
-    };
-    let above = prior.map_or(0, |row| row[index]);
-    let upper_left = if index >= PNG_FILTER_BPP {
-        prior.map_or(0, |row| row[index - PNG_FILTER_BPP])
-    } else {
-        0
-    };
-    match filter {
-        0 => raw,
-        1 => raw.wrapping_sub(left),
-        2 => raw.wrapping_sub(above),
-        // (left + above) / 2 without leaving u8: shifted halves plus the
-        // carry bit both operands share.
-        3 => raw.wrapping_sub(
+/// The heuristic sum of an unfiltered scanline (filter type 0).
+fn scanline_magnitude(current: &[u8]) -> u64 {
+    current.iter().map(|&byte| signed_magnitude(byte)).sum()
+}
+
+/// Fills `output` with the Sub filter of `current` and returns its heuristic
+/// sum. The first pixel has no left neighbor, so its bytes pass through.
+fn fill_sub_filter(current: &[u8], output: &mut [u8]) -> u64 {
+    let mut sum = 0_u64;
+    for (destination, &raw) in output.iter_mut().zip(current).take(PNG_FILTER_BPP) {
+        *destination = raw;
+        sum += signed_magnitude(raw);
+    }
+    let lefts = current.iter();
+    for ((destination, &raw), &left) in output
+        .iter_mut()
+        .zip(current)
+        .skip(PNG_FILTER_BPP)
+        .zip(lefts)
+    {
+        let value = raw.wrapping_sub(left);
+        *destination = value;
+        sum += signed_magnitude(value);
+    }
+    sum
+}
+
+/// Fills `output` with the Up filter of `current` against `prior` and
+/// returns its heuristic sum. Row zero passes an all-zero prior row, which
+/// reproduces the specification's missing-row semantics.
+fn fill_up_filter(current: &[u8], prior: &[u8], output: &mut [u8]) -> u64 {
+    let mut sum = 0_u64;
+    for ((destination, &raw), &above) in output.iter_mut().zip(current).zip(prior) {
+        let value = raw.wrapping_sub(above);
+        *destination = value;
+        sum += signed_magnitude(value);
+    }
+    sum
+}
+
+/// Fills `output` with the Average filter and returns its heuristic sum.
+/// `floor((left + above) / 2)` stays inside `u8` as the shifted halves plus
+/// the carry bit both operands share.
+fn fill_average_filter(current: &[u8], prior: &[u8], output: &mut [u8]) -> u64 {
+    let mut sum = 0_u64;
+    for ((destination, &raw), &above) in output
+        .iter_mut()
+        .zip(current)
+        .zip(prior)
+        .take(PNG_FILTER_BPP)
+    {
+        let value = raw.wrapping_sub(above >> 1);
+        *destination = value;
+        sum += signed_magnitude(value);
+    }
+    let lefts = current.iter();
+    for (((destination, &raw), &above), &left) in output
+        .iter_mut()
+        .zip(current)
+        .zip(prior)
+        .skip(PNG_FILTER_BPP)
+        .zip(lefts)
+    {
+        let value = raw.wrapping_sub(
             (left >> 1)
                 .wrapping_add(above >> 1)
                 .wrapping_add(left & above & 1),
-        ),
-        _ => raw.wrapping_sub(paeth_predictor(left, above, upper_left)),
+        );
+        *destination = value;
+        sum += signed_magnitude(value);
     }
+    sum
+}
+
+/// Fills `output` with the Paeth filter and returns its heuristic sum. The
+/// first pixel's left and upper-left neighbors are zero, where the predictor
+/// degenerates to the byte above.
+fn fill_paeth_filter(current: &[u8], prior: &[u8], output: &mut [u8]) -> u64 {
+    let mut sum = 0_u64;
+    for ((destination, &raw), &above) in output
+        .iter_mut()
+        .zip(current)
+        .zip(prior)
+        .take(PNG_FILTER_BPP)
+    {
+        let value = raw.wrapping_sub(paeth_predictor(0, above, 0));
+        *destination = value;
+        sum += signed_magnitude(value);
+    }
+    let lefts = current.iter();
+    let upper_lefts = prior.iter();
+    for ((((destination, &raw), &above), &left), &upper_left) in output
+        .iter_mut()
+        .zip(current)
+        .zip(prior)
+        .skip(PNG_FILTER_BPP)
+        .zip(lefts)
+        .zip(upper_lefts)
+    {
+        let value = raw.wrapping_sub(paeth_predictor(left, above, upper_left));
+        *destination = value;
+        sum += signed_magnitude(value);
+    }
+    sum
 }
 
 /// The PNG Paeth predictor: whichever of left, above, and upper-left is
@@ -1170,6 +1264,9 @@ mod tests {
                 ImageRowOrder::Display,
                 &ImageEncodeOptions {
                     png_compression: compression,
+                    // Pinned so every effort produces filter-type-0
+                    // scanlines that can be compared byte for byte.
+                    png_filter: PngFilter::None,
                     ..encode_options()
                 },
             )
@@ -1267,6 +1364,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(from_decoded, adaptive);
+    }
+
+    /// The default `Auto` filter must follow the compression choice: the
+    /// fdeflate fast path gets adaptive filtering (unfiltered fast output
+    /// barely compresses) and the flate2 levels keep the historical
+    /// unfiltered scanlines byte for byte.
+    #[test]
+    fn auto_png_filter_follows_the_compression_choice() {
+        let image = gradient_image();
+        let encode = |compression: PngCompression, filter: PngFilter| {
+            encode_rgba_image(
+                &image,
+                ImageFormat::Png,
+                ImageRowOrder::Display,
+                &ImageEncodeOptions {
+                    png_compression: compression,
+                    png_filter: filter,
+                    ..encode_options()
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            encode(PngCompression::Fast, PngFilter::Auto),
+            encode(PngCompression::Fast, PngFilter::Adaptive),
+        );
+        assert_eq!(
+            encode(PngCompression::Default, PngFilter::Auto),
+            encode(PngCompression::Default, PngFilter::None),
+        );
+        assert_eq!(
+            encode(PngCompression::Best, PngFilter::Auto),
+            encode(PngCompression::Best, PngFilter::None),
+        );
+        // The pairing Auto exists to prevent: unfiltered fast output is
+        // dramatically larger than the filtered default on gradients.
+        let fast_auto = encode(PngCompression::Fast, PngFilter::Auto);
+        let fast_unfiltered = encode(PngCompression::Fast, PngFilter::None);
+        assert!(
+            fast_auto.len() < fast_unfiltered.len(),
+            "auto {} bytes should beat unfiltered fast {} bytes",
+            fast_auto.len(),
+            fast_unfiltered.len()
+        );
     }
 
     /// Each JPEG knob must change the produced stream while remaining

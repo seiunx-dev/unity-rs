@@ -595,7 +595,7 @@ class RgbaImage:
         jpeg_optimized_huffman: bool = False,
         jpeg_background: Optional[tuple[int, int, int]] = None,
         compression: Optional[Union[int, str]] = None,
-        png_filter: str = "none",
+        png_filter: str = "auto",
         maximum_bytes: int = 536_870_912,
     ) -> bytes: ...
 

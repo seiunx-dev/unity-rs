@@ -1704,7 +1704,8 @@ impl PyRgbaImage {
     /// (an `(r, g, b)` tuple compositing translucent pixels instead of the
     /// default drop-alpha semantics). PNG: `compression` (`fast`,
     /// `default`, `best`, or an explicit zlib level 0-9) and `png_filter`
-    /// (`none` or `adaptive`; every choice is lossless). `maximum_bytes`
+    /// (`auto`, `none`, or `adaptive`; every choice is lossless, and `auto`
+    /// pairs adaptive filtering with the `fast` effort). `maximum_bytes`
     /// caps the encoded output for every format.
     #[pyo3(signature = (
         image_format="png",
@@ -1715,7 +1716,7 @@ impl PyRgbaImage {
         jpeg_optimized_huffman=false,
         jpeg_background=None,
         compression=None,
-        png_filter="none",
+        png_filter="auto",
         maximum_bytes=536_870_912
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -5930,7 +5931,9 @@ fn parse_png_compression_input(value: Option<PngCompressionInput>) -> PyResult<P
 
 fn parse_png_filter(value: &str) -> PyResult<PngFilter> {
     let value = value.trim();
-    if value.eq_ignore_ascii_case("none") {
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(PngFilter::Auto)
+    } else if value.eq_ignore_ascii_case("none") {
         Ok(PngFilter::None)
     } else if value.eq_ignore_ascii_case("adaptive") {
         Ok(PngFilter::Adaptive)

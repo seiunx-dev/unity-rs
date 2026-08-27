@@ -739,9 +739,15 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   较小值且全程 fallible；格式旋钮收敛在 `ImageEncodeOptions`，默认值逐字节复现历史输出。
   PNG 侧：`PngCompression`（`fast` 走 fdeflate——`png` crate fast 档背后的 PNG 专用
   deflate；`default`/`best` 映射 flate2 level 6/9，另接受显式 `Level(0..=9)` 走 flate2，
-  超 9 拒绝不钳制）与 `PngFilter`（`none` 保持历史 filter-type-0 输出；`adaptive` 按
-  libpng/ImageSharp 的最小绝对差启发逐行在五种标准 filter 里选优，工作内存恒为单行 stride
-  且 fallible 预留）。块 CRC32 从逐位循环换成 crc32fast（本就在依赖树内；PNG 的 CRC 覆盖
+  超 9 拒绝不钳制）与 `PngFilter`（默认 `auto` 跟随压缩档：fast/fdeflate 下取 adaptive——
+  实测 fdeflate 配无 filter 基本不压缩（同图 6.83 MB vs 1.59 MB），flate2 各档下取 none——
+  实测 default/best 配 adaptive 反而略大（1.36→1.39 MB）；`none` 保持历史 filter-type-0
+  输出；`adaptive` 按 libpng/ImageSharp 的最小绝对差启发逐行在五种标准 filter 里选优）。
+  自适应 filter 的实现按下游 profiling 重写过一轮：最初的逐字节调度函数每输出字节最多带
+  分支/Option 解包跑 6 遍，是编码环节比 image crate fast 档慢 3.5 倍的主因；现为每种 filter
+  一个专用无分支循环、SAD 边填边累加、五个候选各写各的缓冲、选中直接复用不重算，工作内存
+  恒为五行 stride 且全部 fallible 预留，新旧实现的 filter 选择逐行一致由 UnityDecoded/
+  Display 两路输出逐字节相等的回归钉住。块 CRC32 从逐位循环换成 crc32fast（本就在依赖树内；PNG 的 CRC 覆盖
   全部压缩输出，逐位实现约 100–200 MB/s 是确定热点），测试以规范逐位实现作独立参照钉住。
   手写 writer 与 `BoundedWriter`/`IdatWriter` 的预算与 fallible 分配保证原样保留，仅替换
   热点；fdeflate 会对其 writer 的错误 `unwrap`，故其下垫一层错误捕获 writer——首个错误被

@@ -383,9 +383,12 @@ pub struct EncodeImageOptions {
     /// numeric level 0 through 9. Defaults to `default`. Every level is
     /// lossless; the effort trades encode CPU for file size.
     pub compression: Option<Either<String, u32>>,
-    /// PNG-only scanline filter strategy: `none` or `adaptive`. Defaults to
-    /// `none`, the historical output. Both are lossless; `adaptive`
-    /// compresses continuous-tone images substantially better.
+    /// PNG-only scanline filter strategy: `auto`, `none`, or `adaptive`.
+    /// Every choice is lossless. The default `auto` follows the compression
+    /// choice — adaptive filtering under the fdeflate `fast` effort, whose
+    /// output barely compresses unfiltered, and the historical unfiltered
+    /// scanlines under the flate2 levels, where filtering costs CPU without
+    /// buying size on decoded-texture content.
     pub png_filter: Option<String>,
     /// Cap on the encoded output length in bytes. Defaults to 512 MiB.
     pub maximum_bytes: Option<i64>,
@@ -5234,12 +5237,18 @@ fn parse_png_filter(value: Option<String>) -> Result<PngFilter> {
         return Ok(PngFilter::default());
     };
     let value = value.trim();
-    if value.eq_ignore_ascii_case("none") {
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(PngFilter::Auto)
+    } else if value.eq_ignore_ascii_case("none") {
         Ok(PngFilter::None)
     } else if value.eq_ignore_ascii_case("adaptive") {
         Ok(PngFilter::Adaptive)
     } else {
-        Err(unsupported_option("PNG filter", value, "none or adaptive"))
+        Err(unsupported_option(
+            "PNG filter",
+            value,
+            "auto, none, or adaptive",
+        ))
     }
 }
 

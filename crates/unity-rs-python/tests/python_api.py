@@ -2948,6 +2948,7 @@ def main() -> None:
             {"compression": " Fast "},
             {"compression": 0},
             {"compression": 9},
+            {"png_filter": "auto"},
             {"png_filter": " Adaptive "},
         ):
             encoded_variant = tight_sprite.encode("png", **kwargs)

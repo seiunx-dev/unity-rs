@@ -1703,6 +1703,7 @@ assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
     { compression: 'fast' },
     { compression: 0 },
     { compression: 9 },
+    { pngFilter: 'auto' },
     { pngFilter: 'adaptive' },
   ]) {
     const variant = addon.UnityRs.encodeImage(decodedTexture, options)

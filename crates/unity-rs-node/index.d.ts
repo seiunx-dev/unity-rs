@@ -682,9 +682,12 @@ export interface EncodeImageOptions {
    */
   compression?: string | number
   /**
-   * PNG-only scanline filter strategy: `none` or `adaptive`. Defaults to
-   * `none`, the historical output. Both are lossless; `adaptive`
-   * compresses continuous-tone images substantially better.
+   * PNG-only scanline filter strategy: `auto`, `none`, or `adaptive`.
+   * Every choice is lossless. The default `auto` follows the compression
+   * choice — adaptive filtering under the fdeflate `fast` effort, whose
+   * output barely compresses unfiltered, and the historical unfiltered
+   * scanlines under the flate2 levels, where filtering costs CPU without
+   * buying size on decoded-texture content.
    */
   pngFilter?: string
   /** Cap on the encoded output length in bytes. Defaults to 512 MiB. */
