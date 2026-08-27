@@ -515,12 +515,51 @@ impl UnityFsBundle {
     }
 
     pub fn copy_entry<W: Write>(&self, index: usize, output: &mut W) -> Result<u64> {
+        self.copy_entry_with_cache(index, output, &mut BlockDecodeCache::new())
+    }
+
+    /// [`Self::copy_entry`] reusing the caller's decoded-block cache across
+    /// calls.
+    pub fn copy_entry_with_cache<W: Write>(
+        &self,
+        index: usize,
+        output: &mut W,
+        cache: &mut BlockDecodeCache,
+    ) -> Result<u64> {
+        self.copy_entry_range(index, u64::MAX, output, cache)
+    }
+
+    /// Copies at most the first `limit` bytes of one entry.
+    ///
+    /// The walk stops as soon as the prefix is covered, so a header probe of
+    /// a many-block entry touches one block instead of all of them. Unlike
+    /// the full copy, the caller is responsible for knowing that a short
+    /// result is intentional; the returned count always equals
+    /// `min(limit, entry.size)` or the copy failed.
+    pub fn copy_entry_prefix<W: Write>(
+        &self,
+        index: usize,
+        limit: u64,
+        output: &mut W,
+        cache: &mut BlockDecodeCache,
+    ) -> Result<u64> {
+        self.copy_entry_range(index, limit, output, cache)
+    }
+
+    fn copy_entry_range<W: Write>(
+        &self,
+        index: usize,
+        limit: u64,
+        output: &mut W,
+        cache: &mut BlockDecodeCache,
+    ) -> Result<u64> {
         let entry = self.entries.get(index).ok_or_else(|| {
             Error::invalid_data(format!("UnityFS entry index {index} is out of range"))
         })?;
+        let wanted = entry.size.min(limit);
         let entry_end = entry
             .offset
-            .checked_add(entry.size)
+            .checked_add(wanted)
             .ok_or_else(|| Error::invalid_data("UnityFS entry range overflowed"))?;
         let mut written = 0_u64;
 
@@ -544,12 +583,7 @@ impl UnityFsBundle {
                     self.region.copy_range(source_offset, length, output)?;
                 }
                 CompressionType::Lz4 | CompressionType::Lz4Hc => {
-                    let compressed = self.block_bytes(block, block_index)?;
-                    let decoded = decompress_lz4(
-                        &compressed,
-                        u64::from(block.uncompressed_size),
-                        "UnityFS data block",
-                    )?;
+                    let decoded = self.decoded_block(block, block_index, cache)?;
                     let relative_start = usize::try_from(overlap_start - block.uncompressed_offset)
                         .map_err(|_| Error::invalid_data("UnityFS block overlap is too large"))?;
                     let overlap_length = usize::try_from(length)
@@ -562,19 +596,7 @@ impl UnityFsBundle {
                     )?)?;
                 }
                 CompressionType::Lzma | CompressionType::Zstd | CompressionType::Oodle => {
-                    let compressed = self.block_bytes(block, block_index)?;
-                    let decoded = decompress_unity_block(
-                        block.compression,
-                        &compressed,
-                        u64::from(block.uncompressed_size),
-                        BundleParseLimits {
-                            max_lzma_memory_kib: self.max_lzma_memory_kib,
-                            max_zstd_window_log: self.max_zstd_window_log,
-                            ..BundleParseLimits::default()
-                        },
-                        "UnityFS data block",
-                        self.oodle_decoder.as_deref(),
-                    )?;
+                    let decoded = self.decoded_block(block, block_index, cache)?;
                     let relative_start = usize::try_from(overlap_start - block.uncompressed_offset)
                         .map_err(|_| Error::invalid_data("UnityFS block overlap is too large"))?;
                     let overlap_length = usize::try_from(length)
@@ -593,15 +615,52 @@ impl UnityFsBundle {
                 }
             }
             written += length;
+            if written >= wanted {
+                break;
+            }
         }
 
-        if written != entry.size {
+        if written != wanted {
             return Err(Error::invalid_data(format!(
                 "UnityFS entry {:?} mapped {written} bytes but declares {} bytes",
                 entry.path, entry.size
             )));
         }
         Ok(written)
+    }
+
+    /// Decodes one compressed storage block, reusing the cache slot when the
+    /// caller's walk asks for the same block again.
+    fn decoded_block<'cache>(
+        &self,
+        block: &StorageBlock,
+        block_index: usize,
+        cache: &'cache mut BlockDecodeCache,
+    ) -> Result<&'cache [u8]> {
+        if cache.slot.as_ref().map(|(cached, _)| *cached) != Some(block_index) {
+            let compressed = self.block_bytes(block, block_index)?;
+            let decoded = match block.compression {
+                CompressionType::Lz4 | CompressionType::Lz4Hc => decompress_lz4(
+                    &compressed,
+                    u64::from(block.uncompressed_size),
+                    "UnityFS data block",
+                )?,
+                _ => decompress_unity_block(
+                    block.compression,
+                    &compressed,
+                    u64::from(block.uncompressed_size),
+                    BundleParseLimits {
+                        max_lzma_memory_kib: self.max_lzma_memory_kib,
+                        max_zstd_window_log: self.max_zstd_window_log,
+                        ..BundleParseLimits::default()
+                    },
+                    "UnityFS data block",
+                    self.oodle_decoder.as_deref(),
+                )?,
+            };
+            cache.slot = Some((block_index, decoded));
+        }
+        Ok(&cache.slot.as_ref().expect("slot was just filled").1)
     }
 
     pub fn read_entry(&self, index: usize) -> Result<Vec<u8>> {
@@ -622,6 +681,52 @@ impl UnityFsBundle {
         })?;
         self.copy_entry(index, &mut bytes)?;
         Ok(bytes)
+    }
+
+    /// [`Self::read_entry`] reusing the caller's decoded-block cache.
+    pub fn read_entry_with_cache(
+        &self,
+        index: usize,
+        cache: &mut BlockDecodeCache,
+    ) -> Result<Vec<u8>> {
+        let entry = self.entries.get(index).ok_or_else(|| {
+            Error::invalid_data(format!("UnityFS entry index {index} is out of range"))
+        })?;
+        if entry.size > self.entry_read_limit {
+            return Err(Error::invalid_data(format!(
+                "UnityFS entry is {} bytes, exceeding the configured read limit {}",
+                entry.size, self.entry_read_limit
+            )));
+        }
+        let length = usize::try_from(entry.size)
+            .map_err(|_| Error::invalid_data("UnityFS entry is too large for this platform"))?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate UnityFS entry: {error}"))
+        })?;
+        self.copy_entry_with_cache(index, &mut bytes, cache)?;
+        Ok(bytes)
+    }
+}
+
+/// One-slot cache of the most recently decoded storage block, shared across
+/// the entry reads of a single bundle walk.
+///
+/// Real LZMA bundles hold every entry in one block, so without sharing, each
+/// entry read decodes the whole stream again — a two-entry bundle paid the
+/// full LZMA decode twice. The cache never holds more than one decoded
+/// block, which the per-entry read path already materialized transiently, so
+/// peak memory is unchanged; only the decode count drops. A fresh cache
+/// holds nothing.
+#[derive(Debug, Default)]
+pub struct BlockDecodeCache {
+    slot: Option<(usize, Vec<u8>)>,
+}
+
+impl BlockDecodeCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -1722,6 +1827,79 @@ mod tests {
         let bundle_size = i64::try_from(bytes.len()).unwrap();
         bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
         (bytes, blocks_info)
+    }
+
+    /// Two entries packed into one compressed block: reads through a shared
+    /// decode cache must equal independent full reads, and a prefix copy
+    /// stops at the requested count instead of demanding the whole entry.
+    #[test]
+    fn shared_block_cache_and_prefix_reads_match_full_entry_reads() {
+        let payload: Vec<u8> = (0_u32..512).flat_map(u32::to_le_bytes).collect();
+        let split = 800_usize;
+        let compressed = compress(&payload);
+
+        let mut info = vec![0_u8; 16];
+        info.extend_from_slice(&1_i32.to_be_bytes());
+        info.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        info.extend_from_slice(&u32::try_from(compressed.len()).unwrap().to_be_bytes());
+        info.extend_from_slice(&u16::from(CompressionType::Lz4.code()).to_be_bytes());
+        info.extend_from_slice(&2_i32.to_be_bytes());
+        for (offset, size, path) in [
+            (0_usize, split, b"a.bin".as_slice()),
+            (split, payload.len() - split, b"b.bin".as_slice()),
+        ] {
+            info.extend_from_slice(&i64::try_from(offset).unwrap().to_be_bytes());
+            info.extend_from_slice(&i64::try_from(size).unwrap().to_be_bytes());
+            info.extend_from_slice(&0_u32.to_be_bytes());
+            info.extend_from_slice(path);
+            info.push(0);
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"UnityFS\0");
+        bytes.extend_from_slice(&6_u32.to_be_bytes());
+        bytes.extend_from_slice(b"5.x.x\0");
+        bytes.extend_from_slice(b"2018.4.0f1\0");
+        let size_position = bytes.len();
+        bytes.extend_from_slice(&0_i64.to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&BLOCKS_AND_DIRECTORY_INFO_COMBINED.to_be_bytes());
+        bytes.extend_from_slice(&info);
+        bytes.extend_from_slice(&compressed);
+        let bundle_size = i64::try_from(bytes.len()).unwrap();
+        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
+
+        let bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
+        assert_eq!(bundle.entries.len(), 2);
+
+        let mut cache = super::BlockDecodeCache::new();
+        let first = bundle.read_entry_with_cache(0, &mut cache).unwrap();
+        let second = bundle.read_entry_with_cache(1, &mut cache).unwrap();
+        assert_eq!(first, &payload[..split]);
+        assert_eq!(second, &payload[split..]);
+        assert_eq!(first, bundle.read_entry(0).unwrap());
+        assert_eq!(second, bundle.read_entry(1).unwrap());
+
+        // Prefix copies stop at the requested count, both under and over the
+        // entry size, and reuse the same cache.
+        let mut prefix = Vec::new();
+        let copied = bundle
+            .copy_entry_prefix(1, 16, &mut prefix, &mut cache)
+            .unwrap();
+        assert_eq!(copied, 16);
+        assert_eq!(prefix, &payload[split..split + 16]);
+        let mut whole = Vec::new();
+        let copied = bundle
+            .copy_entry_prefix(1, u64::MAX, &mut whole, &mut cache)
+            .unwrap();
+        assert_eq!(copied, second.len() as u64);
+        assert_eq!(whole, second);
+        assert!(
+            bundle
+                .copy_entry_prefix(9, 16, &mut Vec::new(), &mut cache)
+                .is_err()
+        );
     }
 
     fn make_encoded_data_bundle(data: &[u8], compression: CompressionType) -> Vec<u8> {

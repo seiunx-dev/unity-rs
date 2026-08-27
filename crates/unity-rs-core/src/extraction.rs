@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::bundle::{
-    BundleHeader, BundleOpenOptions, BundleParseLimits, OodleDecoder, UnityFsBundle,
+    BlockDecodeCache, BundleHeader, BundleOpenOptions, BundleParseLimits, OodleDecoder,
+    UnityFsBundle,
 };
 use crate::compression::{CompressionLimits, ZipContainer, decompress_brotli, decompress_gzip};
 use crate::endian::{Endian, EndianReader};
@@ -540,6 +541,10 @@ impl Extractor {
         }
         let container = self.allocate_container_directory(desired_path)?;
         let next_depth = self.next_depth(depth)?;
+        // One decoded-block cache for the whole bundle: the header probe and
+        // the write pass of every entry reuse each other's block decodes
+        // instead of decompressing the same blocks again.
+        let mut block_cache = BlockDecodeCache::new();
         for index in 0..bundle.entries.len() {
             let entry = &bundle.entries[index];
             let child_label = self.nested_label(label, &entry.path)?;
@@ -559,6 +564,7 @@ impl Extractor {
                         next_depth,
                         bundle,
                         index,
+                        &mut block_cache,
                     )
                 });
             if let Err(error) = result {
@@ -568,6 +574,7 @@ impl Extractor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_unity_fs_entry(
         &mut self,
         label: &str,
@@ -575,16 +582,24 @@ impl Extractor {
         depth: usize,
         bundle: &UnityFsBundle,
         index: usize,
+        block_cache: &mut BlockDecodeCache,
     ) -> Result<()> {
         let entry = bundle.entries.get(index).ok_or_else(|| {
             Error::invalid_data(format!("UnityFS entry index {index} is out of range"))
         })?;
+        // The probe only needs the detection window: copying the prefix
+        // stops the block walk early instead of decompressing the whole
+        // entry and discarding it, and the write pass below re-verifies the
+        // full declared size.
+        let probe_length = u64::try_from(HEADER_SCAN_LENGTH)
+            .map_err(|_| Error::invalid_data("header scan length does not fit u64"))?
+            .min(entry.size);
         let mut probe = HeaderProbe::new();
-        let probed = bundle.copy_entry(index, &mut probe)?;
-        if probed != entry.size || probe.written != entry.size {
+        let probed = bundle.copy_entry_prefix(index, probe_length, &mut probe, block_cache)?;
+        if probed != probe_length || probe.written != probe_length {
             return Err(Error::invalid_data(format!(
-                "UnityFS entry probe wrote {} bytes; expected {}",
-                probe.written, entry.size
+                "UnityFS entry probe wrote {} bytes; expected {probe_length}",
+                probe.written
             )));
         }
         let detection = detect_file_type(&probe.header, entry.size);
@@ -593,10 +608,10 @@ impl Extractor {
             FileType::AssetsFile | FileType::ResourceFile
         ) {
             return self.write_streaming_leaf(label, &desired_path, entry.size, |output| {
-                bundle.copy_entry(index, output)
+                bundle.copy_entry_with_cache(index, output, block_cache)
             });
         }
-        let region = Region::from_bytes(bundle.read_entry(index)?);
+        let region = Region::from_bytes(bundle.read_entry_with_cache(index, block_cache)?);
         self.process_detected_region(label, region, desired_path, depth, detection)
     }
 

@@ -744,9 +744,15 @@ impl AssetCollection {
                             (!bundle.header.common.unity_revision.is_stripped())
                                 .then(|| bundle.header.common.unity_revision.clone());
                         charge_pending_inputs(&mut pending, bundle.entries.len(), budget, limits)?;
+                        // One decoded-block cache across the walk: a
+                        // single-block (LZMA) bundle decodes once for all
+                        // entries instead of once per entry.
+                        let mut block_cache = crate::bundle::BlockDecodeCache::new();
                         for index in 0..bundle.entries.len() {
                             let entry = &bundle.entries[index];
-                            let region = Region::from_bytes(bundle.read_entry(index)?);
+                            let region = Region::from_bytes(
+                                bundle.read_entry_with_cache(index, &mut block_cache)?,
+                            );
                             charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
                             pending.push_back(PendingInput {
                                 path: nested_path(&input.path, &entry.path, limits, budget)?,

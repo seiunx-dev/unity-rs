@@ -838,6 +838,26 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   census、或 DDS/KTX2 归档场景立项），而非继续打磨本条已榨干的规则。整条线累计：该管线
   42.8s/333 CPU 秒/8.96 GB → 14.2s/104.6 CPU 秒/7.117 GB，并全面超过参照 Rust 服务
   （114.1 CPU 秒）；
+- **子系统性能调研确认的四项代码缺陷已于 2026-08-27 修复（全部经对抗验证确认）**：
+  (1) binary FBX 的 `encode_array` 逐元素（8 字节）喂 `ZlibEncoder`，500k 顶点写入 1490 ms
+  中约 480 ms 是纯逐调用开销——现经 16 KiB 栈上分块批量喂入，进入压缩器的字节流不变，
+  输出逐字节恒等（既有独立 ZlibEncoder 对比测试与全套 FBX 测试钉住）。(2) 大数组 deflate
+  档位写死 level 6，而 mesh 浮点数据上 level 1 快 7.5–12.6× 只大约 7%——新增
+  `FbxArrayCompression`（`Default`/`Fast`）与 `write/read_fbx_binary_with_encoding` 入口；
+  既有入口与 `FbxBinaryWriteLimits` 均不变（0.3.0 兼容），默认档保持与 managed 导出器逐
+  字节对齐，Fast 档由独立 reader 回环钉住节点树等价。(3) 提取时每个 UnityFS entry 被完整
+  解压两遍——一遍全量解出仅取 1152 字节 header probe 即丢弃：新增 `copy_entry_prefix`
+  使 probe 到 `HEADER_SCAN_LENGTH` 即停止块走读（entry 尺寸取自目录，写出趟本就复核全量）。
+  (4) 单块（典型 LZMA）bundle 的每个 entry 读取都从头解压整个块——2-entry bundle 付 2×、
+  实测 3-entry 50 MB 付 2.95×：新增单槽 `BlockDecodeCache`（一次 bundle 走读内每块至多
+  解一次，峰值内存不变——被缓存的块本就在逐 entry 路径中瞬态物化），loader 的
+  `load_root` 与提取的 entry 循环各持一个缓存贯穿全 bundle。实测 17 MB 单块 LZMA bundle
+  全 entry 读取 1980→672 ms（2.95×），与裸 LZMA 解码地板持平；Studio e2e 同步 662 ms；
+  LZ4/未压缩路径不变。新增回归：单块双 entry bundle 的缓存共享读与独立读逐字节相等、
+  前缀拷贝在请求字节数处截止（欠/超两侧）、越界索引仍拒绝；malformed-input 与提取原子性
+  套件全过。这四项对 member_cutout 管线均为零收益（该语料非 LZMA、不走 FBX/extract），
+  受益者是模型提取规则（binary FBX 合计 ~1.5×，加 Fast 档 ~4.5–7×）、CLI extract（≥2×）
+  与 LZMA 压缩的游戏语料；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量
