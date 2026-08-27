@@ -18,7 +18,9 @@ use unity_rs_core::export::{
     ExportReport as CoreExportReport, FilenameFormat,
 };
 use unity_rs_core::extraction::ExtractionOptions;
-use unity_rs_core::image_export::ImageFormat;
+use unity_rs_core::image_export::{
+    DEFAULT_JPEG_QUALITY, ImageFormat, ImageRowOrder, PngCompression,
+};
 use unity_rs_core::live2d_clip_motion::CubismClipMotionReadLimits;
 use unity_rs_core::live2d_motion::{
     CubismFadeMotionReadLimits, CubismMotionTargetIndexLimits, CubismMotionTargetNames,
@@ -356,6 +358,21 @@ pub struct RgbaImage {
     /// output. `Texture2D` decoders work bottom-up, so these rows have already
     /// been flipped.
     pub pixels: Buffer,
+}
+
+/// Options for encoding one decoded RGBA image into a file payload.
+#[napi(object)]
+pub struct EncodeImageOptions {
+    /// `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`. Defaults to `png`.
+    pub image_format: Option<String>,
+    /// JPEG-only quality from 1 through 100. Defaults to 75.
+    pub jpeg_quality: Option<u32>,
+    /// PNG-only zlib effort: `fast`, `default`, or `best`. Defaults to
+    /// `default`. Every level is lossless; the effort trades encode CPU for
+    /// file size.
+    pub compression: Option<String>,
+    /// Cap on the encoded output length in bytes. Defaults to 512 MiB.
+    pub maximum_bytes: Option<i64>,
 }
 
 /// One `AudioClip`'s stored payload and the extension its container implies.
@@ -1824,6 +1841,34 @@ impl UnityRs {
             file_index: usize::try_from(file_index).expect("u32 fits usize"),
             path_id: bigint_i64(path_id, "pathId")?,
             maximum: byte_limit(maximum_bytes)?,
+        }))
+    }
+
+    /// Encodes one decoded RGBA image into a complete file payload using the
+    /// same bounded Core encoders as `exportWithOptions`: `png` (the
+    /// default), `jpeg`, `bmp`, `tga`, `webp`, or `raw-rgba`.
+    ///
+    /// The pixels must be display-order rows exactly as `readTexture`,
+    /// `readTextureArray`, and `readSprite` return them.
+    // napi marshals JavaScript objects by value; references do not expand.
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn encode_image(image: RgbaImage, options: Option<EncodeImageOptions>) -> Result<Buffer> {
+        let plan = encode_image_plan(&image, options)?;
+        plan.encode().map(Into::into)
+    }
+
+    /// The worker-thread variant of `encodeImage` for pipelines that keep
+    /// pixel-proportional encoding off the event loop.
+    // napi marshals JavaScript objects by value; references do not expand.
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi(ts_return_type = "Promise<Buffer>")]
+    pub fn encode_image_async(
+        image: RgbaImage,
+        options: Option<EncodeImageOptions>,
+    ) -> Result<AsyncTask<EncodeImageTask>> {
+        Ok(AsyncTask::new(EncodeImageTask {
+            plan: encode_image_plan(&image, options)?,
         }))
     }
 
@@ -3766,6 +3811,106 @@ impl Task for ReadSpriteTask {
     }
 }
 
+/// Fully validated, JavaScript-independent inputs for one image encode. The
+/// pixel bytes were length-checked against the declared dimensions and copied
+/// out of the caller's `Buffer` with a fallible reservation, so the worker
+/// thread never touches JavaScript-owned memory.
+pub struct EncodeImagePlan {
+    image: unity_rs_core::texture::RgbaImage,
+    format: ImageFormat,
+    jpeg_quality: u8,
+    png_compression: PngCompression,
+    maximum_bytes: u64,
+}
+
+impl EncodeImagePlan {
+    fn encode(&self) -> Result<Vec<u8>> {
+        unity_rs_core::image_export::encode_rgba_image(
+            &self.image,
+            self.format,
+            ImageRowOrder::Display,
+            self.jpeg_quality,
+            self.png_compression,
+            self.maximum_bytes,
+        )
+        .map_err(core_error)
+    }
+}
+
+fn encode_image_plan(
+    image: &RgbaImage,
+    options: Option<EncodeImageOptions>,
+) -> Result<EncodeImagePlan> {
+    let (format, jpeg_quality, png_compression, maximum_bytes) = match options {
+        None => (
+            ImageFormat::Png,
+            DEFAULT_JPEG_QUALITY,
+            PngCompression::default(),
+            DEFAULT_PAYLOAD_LIMIT,
+        ),
+        Some(options) => {
+            let format = parse_image_format(options.image_format)?;
+            let jpeg_quality = options
+                .jpeg_quality
+                .unwrap_or(u32::from(DEFAULT_JPEG_QUALITY));
+            if !(1..=100).contains(&jpeg_quality) {
+                return Err(invalid_arg(format!(
+                    "jpegQuality {jpeg_quality} is outside the supported range 1 through 100"
+                )));
+            }
+            let jpeg_quality = u8::try_from(jpeg_quality)
+                .map_err(|_| invalid_arg("jpegQuality does not fit in one byte"))?;
+            (
+                format,
+                jpeg_quality,
+                parse_png_compression(options.compression)?,
+                byte_limit(options.maximum_bytes)?,
+            )
+        }
+    };
+    let expected_bytes = u64::from(image.width)
+        .checked_mul(4)
+        .and_then(|stride| stride.checked_mul(u64::from(image.height)))
+        .ok_or_else(|| invalid_arg("image pixel byte length overflowed"))?;
+    let actual_bytes = u64::try_from(image.pixels.len())
+        .map_err(|_| invalid_arg("image pixel buffer length does not fit in u64"))?;
+    if actual_bytes != expected_bytes {
+        return Err(invalid_arg(format!(
+            "image pixel buffer holds {actual_bytes} bytes, but {}x{} RGBA8 requires {expected_bytes}",
+            image.width, image.height
+        )));
+    }
+    let pixels = copy_slice(image.pixels.as_ref(), "image pixels")?;
+    Ok(EncodeImagePlan {
+        image: unity_rs_core::texture::RgbaImage {
+            width: image.width,
+            height: image.height,
+            pixels,
+        },
+        format,
+        jpeg_quality,
+        png_compression,
+        maximum_bytes,
+    })
+}
+
+pub struct EncodeImageTask {
+    plan: EncodeImagePlan,
+}
+
+impl Task for EncodeImageTask {
+    type Output = Vec<u8>;
+    type JsValue = Buffer;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.plan.encode()
+    }
+
+    fn resolve(&mut self, _env: Env, bytes: Self::Output) -> Result<Self::JsValue> {
+        Ok(bytes.into())
+    }
+}
+
 fn studio_object(studio: &Studio, file_index: usize, path_id: i64) -> Result<StudioObject<'_>> {
     studio.object(file_index, path_id).ok_or_else(|| {
         invalid_arg(format!(
@@ -5013,6 +5158,26 @@ fn parse_image_format(value: Option<String>) -> Result<ImageFormat> {
             "image format",
             value,
             "jpeg, png, bmp, tga, webp, or raw-rgba",
+        ))
+    }
+}
+
+fn parse_png_compression(value: Option<String>) -> Result<PngCompression> {
+    let Some(value) = value else {
+        return Ok(PngCompression::default());
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("fast") {
+        Ok(PngCompression::Fast)
+    } else if value.eq_ignore_ascii_case("default") {
+        Ok(PngCompression::Default)
+    } else if value.eq_ignore_ascii_case("best") {
+        Ok(PngCompression::Best)
+    } else {
+        Err(unsupported_option(
+            "PNG compression",
+            value,
+            "fast, default, or best",
         ))
     }
 }

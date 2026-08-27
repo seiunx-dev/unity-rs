@@ -1679,6 +1679,59 @@ assert.equal(decodedTexture.width, 2)
 assert.equal(decodedTexture.height, 2)
 assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
 
+// encodeImage hands single decoded images to Core's bounded encoders, so a
+// caller no longer needs the on-disk export layout (or a JavaScript encoder)
+// just to save one texture or sprite.
+{
+  const encodedPng = addon.UnityRs.encodeImage(decodedTexture)
+  assert.deepEqual(
+    encodedPng.subarray(0, 8),
+    Buffer.from('\x89PNG\r\n\x1a\n', 'binary'),
+  )
+  // The IHDR dimensions prove the pixels went in as a 2x2 image rather than
+  // the call merely succeeding on some buffer.
+  assert.equal(encodedPng.readUInt32BE(16), 2)
+  assert.equal(encodedPng.readUInt32BE(20), 2)
+  const encodedRaw = addon.UnityRs.encodeImage(decodedTexture, {
+    imageFormat: 'raw-rgba',
+  })
+  assert.equal(encodedRaw.subarray(0, 16).toString('ascii'), 'HARUKI_RGBAIR_V1')
+  // The zlib effort knob changes the compressed stream, never the pixels:
+  // fast output is still a valid PNG with the same IHDR geometry.
+  const encodedFast = addon.UnityRs.encodeImage(decodedTexture, {
+    compression: 'fast',
+  })
+  assert.deepEqual(encodedFast.subarray(0, 8), encodedPng.subarray(0, 8))
+  assert.deepEqual(encodedFast.subarray(16, 24), encodedPng.subarray(16, 24))
+  assert.throws(
+    () => addon.UnityRs.encodeImage(decodedTexture, { compression: 'turbo' }),
+    /unsupported PNG compression/i,
+  )
+  assert.throws(
+    () => addon.UnityRs.encodeImage(decodedTexture, { imageFormat: 'gif' }),
+    /unsupported image format/i,
+  )
+  assert.throws(
+    () => addon.UnityRs.encodeImage(decodedTexture, { maximumBytes: 8 }),
+    /exceed/i,
+  )
+  assert.throws(
+    () =>
+      addon.UnityRs.encodeImage(decodedTexture, {
+        imageFormat: 'jpeg',
+        jpegQuality: 0,
+      }),
+    /range 1 through 100/i,
+  )
+  // A pixel buffer that disagrees with the declared dimensions is rejected
+  // before any encoder sees it.
+  assert.throws(
+    () =>
+      addon.UnityRs.encodeImage({ width: 2, height: 2, pixels: Buffer.alloc(3) }),
+    /requires 16/i,
+  )
+}
+
 // Model texture encoding is a public Node option, not a PNG-only wrapper over
 // Core. This fixture has a real Renderer -> Material -> Texture2D chain so the
 // assertion cannot pass merely because the method accepted another argument.
@@ -1837,6 +1890,17 @@ async function testAsyncWorkers() {
   )
   const asyncTexture = await asyncTextureStudio.readTextureAsync(0, 7n)
   assert.deepEqual(Buffer.from(asyncTexture.pixels), DISPLAY_ORDER_PIXELS)
+
+  // The worker-thread encoder must produce exactly the synchronous bytes and
+  // keep its input validation.
+  assert.deepEqual(
+    await addon.UnityRs.encodeImageAsync(asyncTexture, { imageFormat: 'png' }),
+    addon.UnityRs.encodeImage(asyncTexture),
+  )
+  await assert.rejects(
+    addon.UnityRs.encodeImageAsync(asyncTexture, { maximumBytes: 8 }),
+    /exceed/i,
+  )
 
   const textureArrayInput = syntheticTexture2dArray()
   const asyncTextureArrayStudio = await addon.UnityRs.fromBufferAsync(

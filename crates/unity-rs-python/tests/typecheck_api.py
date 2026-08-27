@@ -203,6 +203,10 @@ def consume_public_api(
         sprite_render_data.secondary_textures
     )
     sprite: RgbaImage = studio.read_sprite(0, 1)
+    encoded_sprite: bytes = sprite.encode(
+        "png", jpeg_quality=90, compression="fast", maximum_bytes=1_048_576
+    )
+    encoded_default: bytes = sprite.encode()
     audio: AudioClip = studio.read_audio_clip(0, 1)
     font: BinaryAsset = studio.read_font(0, 1)
     movie: BinaryAsset = studio.read_movie_texture(0, 1)
@@ -307,6 +311,8 @@ def consume_public_api(
         sprite_settings,
         sprite_secondary,
         sprite,
+        encoded_sprite,
+        encoded_default,
         audio,
         font,
         movie,

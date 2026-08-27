@@ -102,6 +102,20 @@ export declare class UnityRs {
   readSpriteMetadata(fileIndex: number, pathId: bigint, limits?: SpriteMetadataLimits | undefined | null): SpriteMetadata
   readSprite(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): RgbaImage
   readSpriteAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<RgbaImage>
+  /**
+   * Encodes one decoded RGBA image into a complete file payload using the
+   * same bounded Core encoders as `exportWithOptions`: `png` (the
+   * default), `jpeg`, `bmp`, `tga`, `webp`, or `raw-rgba`.
+   *
+   * The pixels must be display-order rows exactly as `readTexture`,
+   * `readTextureArray`, and `readSprite` return them.
+   */
+  static encodeImage(image: RgbaImage, options?: EncodeImageOptions | undefined | null): Buffer
+  /**
+   * The worker-thread variant of `encodeImage` for pipelines that keep
+   * pixel-proportional encoding off the event loop.
+   */
+  static encodeImageAsync(image: RgbaImage, options?: EncodeImageOptions | undefined | null): Promise<Buffer>
   /** Reads an `AudioClip`'s stored payload without transcoding it. */
   readAudio(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): AudioClip
   /**
@@ -638,6 +652,22 @@ export interface CubismPosePart {
   pathId: bigint
   groupIndex: number
   links: Array<string>
+}
+
+/** Options for encoding one decoded RGBA image into a file payload. */
+export interface EncodeImageOptions {
+  /** `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`. Defaults to `png`. */
+  imageFormat?: string
+  /** JPEG-only quality from 1 through 100. Defaults to 75. */
+  jpegQuality?: number
+  /**
+   * PNG-only zlib effort: `fast`, `default`, or `best`. Defaults to
+   * `default`. Every level is lossless; the effort trades encode CPU for
+   * file size.
+   */
+  compression?: string
+  /** Cap on the encoded output length in bytes. Defaults to 512 MiB. */
+  maximumBytes?: number
 }
 
 /**

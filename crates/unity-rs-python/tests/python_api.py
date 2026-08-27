@@ -2932,6 +2932,40 @@ def main() -> None:
             (30, 3, 3, 255, 0, 0, 0, 0, 10, 1, 1, 255, 20, 2, 2, 255)
         )
 
+        # RgbaImage.encode exposes Core's bounded per-image encoders so a
+        # caller can save one decoded texture or sprite without the on-disk
+        # export layout or a Python-side encoder.
+        encoded_png = tight_sprite.encode()
+        assert encoded_png[:8] == b"\x89PNG\r\n\x1a\n"
+        # IHDR dimensions prove the pixels were encoded as this 2x2 image.
+        assert encoded_png[16:24] == (2).to_bytes(4, "big") * 2
+        encoded_raw = tight_sprite.encode(" Raw-RGBA ")
+        assert encoded_raw[:16] == b"HARUKI_RGBAIR_V1"
+        # The zlib effort changes the compressed stream, never the pixels:
+        # every level stays a valid PNG carrying the same IHDR geometry.
+        encoded_fast = tight_sprite.encode("png", compression=" Fast ")
+        assert encoded_fast[:8] == b"\x89PNG\r\n\x1a\n"
+        assert encoded_fast[16:24] == encoded_png[16:24]
+        for failing_call in (
+            lambda: tight_sprite.encode("gif"),
+            lambda: tight_sprite.encode("jpeg", jpeg_quality=0),
+            lambda: tight_sprite.encode("png", compression="turbo"),
+        ):
+            try:
+                failing_call()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("encode should enforce format and quality")
+        # A mid-stream PNG budget violation keeps its I/O error family, the
+        # same classification the streaming export writer reports.
+        try:
+            tight_sprite.encode(maximum_bytes=8)
+        except OSError as error:
+            assert "exceed" in str(error)
+        else:
+            raise AssertionError("encode should enforce the output budget")
+
         webp_output = Path(directory) / "webp-export"
         webp_report = texture_studio.export(webp_output, image_format=" WeBp ")
         assert webp_report.failures == []

@@ -84,6 +84,34 @@ pub enum ImageRowOrder {
     Display,
 }
 
+/// Zlib effort used by the PNG encoder.
+///
+/// The compression level trades encode CPU for file size; the pixels are
+/// lossless at every level and decode to identical scanlines. Formats other
+/// than PNG ignore this value, the same way non-JPEG formats ignore the JPEG
+/// quality.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PngCompression {
+    /// The lightest zlib level, for throughput-oriented pipelines that prefer
+    /// encode speed over the last few percent of file size.
+    Fast,
+    /// The historical exporter default (zlib level 6).
+    #[default]
+    Default,
+    /// The heaviest zlib level, for archives that prefer size over speed.
+    Best,
+}
+
+impl PngCompression {
+    fn zlib_level(self) -> Compression {
+        match self {
+            Self::Fast => Compression::fast(),
+            Self::Default => Compression::default(),
+            Self::Best => Compression::best(),
+        }
+    }
+}
+
 /// Flips `image` in place between [`ImageRowOrder::UnityDecoded`] and
 /// [`ImageRowOrder::Display`].
 ///
@@ -137,6 +165,31 @@ pub fn write_rgba_image_with_quality<W: Write>(
     maximum_output_bytes: u64,
     output: &mut W,
 ) -> Result<u64> {
+    write_rgba_image_with_encoding(
+        image,
+        format,
+        row_order,
+        jpeg_quality,
+        PngCompression::default(),
+        maximum_output_bytes,
+        output,
+    )
+}
+
+/// Writes one RGBA8 image with an explicit JPEG quality and PNG zlib effort.
+///
+/// Each knob applies only to its own format: the quality to JPEG, the
+/// compression to PNG. Every other budget and row-order rule matches
+/// [`write_rgba_image`].
+pub fn write_rgba_image_with_encoding<W: Write>(
+    image: &RgbaImage,
+    format: ImageFormat,
+    row_order: ImageRowOrder,
+    jpeg_quality: u8,
+    png_compression: PngCompression,
+    maximum_output_bytes: u64,
+    output: &mut W,
+) -> Result<u64> {
     let dimensions = validate_image(image)?;
     let mut output = BoundedWriter::new(output, maximum_output_bytes);
     match format {
@@ -148,7 +201,7 @@ pub fn write_rgba_image_with_quality<W: Write>(
             maximum_output_bytes,
             &mut output,
         )?,
-        ImageFormat::Png => write_png(image, dimensions, row_order, &mut output)?,
+        ImageFormat::Png => write_png(image, dimensions, row_order, png_compression, &mut output)?,
         ImageFormat::Bmp => write_bmp(image, dimensions, row_order, &mut output)?,
         ImageFormat::Tga => write_tga(image, dimensions, row_order, &mut output)?,
         ImageFormat::Webp => write_webp(
@@ -175,6 +228,46 @@ pub fn write_rgba_image_with_quality<W: Write>(
         }
     }
     Ok(output.written())
+}
+
+/// Encodes one RGBA8 image into an owned byte vector under a hard output cap.
+///
+/// This is the per-object counterpart to the collection-level exporter: the
+/// same encoders, the same budget enforcement, but the encoded file lands in
+/// memory so bindings can hand single decoded images to callers without going
+/// through an on-disk export layout. The buffer reservation is fallible and
+/// sized by the smaller of the raw pixel estimate and `maximum_output_bytes`;
+/// the bounded writer then enforces the cap exactly as [`write_rgba_image`]
+/// does.
+pub fn encode_rgba_image(
+    image: &RgbaImage,
+    format: ImageFormat,
+    row_order: ImageRowOrder,
+    jpeg_quality: u8,
+    png_compression: PngCompression,
+    maximum_output_bytes: u64,
+) -> Result<Vec<u8>> {
+    let dimensions = validate_image(image)?;
+    let estimate = dimensions
+        .pixel_bytes
+        .saturating_add(RGBA_IR_HEADER_BYTES)
+        .min(maximum_output_bytes);
+    let estimate = usize::try_from(estimate)
+        .map_err(|_| Error::invalid_data("encoded image reservation does not fit this platform"))?;
+    let mut output = Vec::new();
+    output.try_reserve(estimate).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate encoded image buffer: {error}"))
+    })?;
+    write_rgba_image_with_encoding(
+        image,
+        format,
+        row_order,
+        jpeg_quality,
+        png_compression,
+        maximum_output_bytes,
+        &mut output,
+    )?;
+    Ok(output)
 }
 
 fn write_jpeg<W: Write>(
@@ -254,6 +347,7 @@ fn write_png<W: Write>(
     image: &RgbaImage,
     dimensions: ImageDimensions,
     row_order: ImageRowOrder,
+    compression: PngCompression,
     output: &mut BoundedWriter<'_, W>,
 ) -> Result<()> {
     if image.width > PNG_MAX_DIMENSION || image.height > PNG_MAX_DIMENSION {
@@ -272,7 +366,7 @@ fn write_png<W: Write>(
     write_png_chunk(output, *b"IHDR", &ihdr)?;
 
     let idat = IdatWriter::new(output)?;
-    let mut encoder = ZlibEncoder::new(idat, Compression::default());
+    let mut encoder = ZlibEncoder::new(idat, compression.zlib_level());
     for output_row in 0..dimensions.height_usize {
         encoder.write_all(&[0])?;
         encoder.write_all(display_row(image, dimensions, row_order, output_row)?)?;
@@ -609,10 +703,116 @@ mod tests {
     use zune_jpeg::JpegDecoder;
 
     use super::{
-        ImageFormat, ImageRowOrder, PNG_SIGNATURE, flip_rgba_rows, png_crc32, write_rgba_image,
-        write_rgba_image_with_quality,
+        ImageFormat, ImageRowOrder, PNG_SIGNATURE, PngCompression, encode_rgba_image,
+        flip_rgba_rows, png_crc32, write_rgba_image, write_rgba_image_with_quality,
     };
     use crate::texture::RgbaImage;
+
+    /// The owned-buffer entry point must produce exactly the streaming
+    /// writer's bytes, keep enforcing the output cap, and keep JPEG quality
+    /// validation instead of silently clamping.
+    #[test]
+    fn encoding_to_owned_bytes_matches_the_streaming_writer_and_keeps_budgets() {
+        let image = two_by_two();
+        let encoded = encode_rgba_image(
+            &image,
+            ImageFormat::Png,
+            ImageRowOrder::Display,
+            75,
+            PngCompression::Default,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert!(encoded.starts_with(PNG_SIGNATURE));
+        let mut streamed = Vec::new();
+        write_rgba_image(
+            &image,
+            ImageFormat::Png,
+            ImageRowOrder::Display,
+            1024 * 1024,
+            &mut streamed,
+        )
+        .unwrap();
+        assert_eq!(encoded, streamed);
+
+        assert!(
+            encode_rgba_image(
+                &image,
+                ImageFormat::Png,
+                ImageRowOrder::Display,
+                75,
+                PngCompression::Default,
+                8
+            )
+            .is_err()
+        );
+        assert!(
+            encode_rgba_image(
+                &image,
+                ImageFormat::Jpeg,
+                ImageRowOrder::Display,
+                0,
+                PngCompression::Default,
+                1024
+            )
+            .is_err()
+        );
+    }
+
+    /// Every PNG compression level is lossless: the zlib effort may change
+    /// the compressed stream, never the decoded scanlines.
+    #[test]
+    fn png_compression_levels_change_effort_but_not_pixels() {
+        let image = RgbaImage {
+            width: 16,
+            height: 16,
+            pixels: (0_u32..16 * 16 * 4)
+                .map(|value| u8::try_from(value % 251).expect("residue fits u8"))
+                .collect(),
+        };
+        let mut scanlines_by_level = Vec::new();
+        for compression in [
+            PngCompression::Fast,
+            PngCompression::Default,
+            PngCompression::Best,
+        ] {
+            let encoded = encode_rgba_image(
+                &image,
+                ImageFormat::Png,
+                ImageRowOrder::Display,
+                75,
+                compression,
+                1024 * 1024,
+            )
+            .unwrap();
+            assert!(encoded.starts_with(PNG_SIGNATURE));
+            scanlines_by_level.push(png_idat_scanlines(&encoded));
+        }
+        assert_eq!(scanlines_by_level[0], scanlines_by_level[1]);
+        assert_eq!(scanlines_by_level[1], scanlines_by_level[2]);
+    }
+
+    fn png_idat_scanlines(png: &[u8]) -> Vec<u8> {
+        assert!(png.starts_with(PNG_SIGNATURE));
+        let mut cursor = PNG_SIGNATURE.len();
+        let mut idat = Vec::new();
+        while cursor < png.len() {
+            let length = usize::try_from(u32::from_be_bytes(
+                png[cursor..cursor + 4].try_into().unwrap(),
+            ))
+            .unwrap();
+            let kind: [u8; 4] = png[cursor + 4..cursor + 8].try_into().unwrap();
+            if &kind == b"IDAT" {
+                idat.extend_from_slice(&png[cursor + 8..cursor + 8 + length]);
+            }
+            cursor += 12 + length;
+        }
+        let mut scanlines = Vec::new();
+        ZlibDecoder::new(idat.as_slice())
+            .read_to_end(&mut scanlines)
+            .unwrap();
+        scanlines
+    }
 
     #[test]
     fn flipping_rows_is_an_involution_and_rejects_mismatched_buffers() {

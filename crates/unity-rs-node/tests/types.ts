@@ -8,6 +8,7 @@ import type {
   AudioClip,
   Avatar,
   AvatarPathEntry,
+  EncodeImageOptions,
   ExportConfiguration,
   LegacyAnimationInfo,
   Live2DPackageSet,
@@ -323,6 +324,17 @@ function consumeEveryUnityRsMember(studio: UnityRs): void {
   void studio.readSpriteMetadata(0, 1n, spriteLimits);
   void studio.readSprite(0, 1n, 1024);
   void studio.readSpriteAsync(0, 1n, 1024);
+  const sprite = studio.readSprite(0, 1n, 1024);
+  const encodeOptions: EncodeImageOptions = {
+    imageFormat: "png",
+    jpegQuality: 90,
+    compression: "fast",
+    maximumBytes: 1024 * 1024,
+  };
+  const encodedSprite: Buffer = UnityRs.encodeImage(sprite, encodeOptions);
+  void encodedSprite;
+  const encodedSpriteAsync: Promise<Buffer> = UnityRs.encodeImageAsync(sprite);
+  void encodedSpriteAsync;
   void studio.readAudio(0, 1n, 1024);
   void studio.readAudioClip(0, 1n, "auto", 1024);
   void studio.readMonoScript(0, 1n, 1024);

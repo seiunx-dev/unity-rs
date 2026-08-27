@@ -259,6 +259,17 @@ PAYLOAD_GIL_EXPECTATIONS = (
 )
 
 
+def validate_image_encode_gil_boundary(source: str) -> None:
+    """Keep pixel-proportional image encoding inside the detached closure."""
+    method = rust_braced_block(source, "fn encode<")
+    detach_offset = method.find("py.detach")
+    if detach_offset < 0:
+        raise AuditError("RgbaImage.encode does not release the GIL")
+    detached = rust_braced_block(method[detach_offset:], "py.detach")
+    if "encode_rgba_image(" not in detached:
+        raise AuditError("RgbaImage.encode encodes pixels outside py.detach")
+
+
 def validate_payload_gil_boundary(source: str) -> None:
     """Keep source-bound byte materialization inside the detached closure."""
     for method_marker, materialization in PAYLOAD_GIL_EXPECTATIONS:
@@ -537,6 +548,7 @@ def main() -> None:
             PYTHON_BINDING.read_text(encoding="utf-8")
         )
         validate_payload_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
+        validate_image_encode_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
         validate_cubism_json_gil_boundary(PYTHON_BINDING.read_text(encoding="utf-8"))
         validate_metadata_projection_gil_boundary(
             PYTHON_BINDING.read_text(encoding="utf-8")

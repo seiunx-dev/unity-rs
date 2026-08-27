@@ -26,7 +26,7 @@ use unity_rs_core::bundle::OodleDecoder;
 use unity_rs_core::compression::CompressionLimits;
 use unity_rs_core::export::{AudioExportFormat, ExportMode, ExportOptions, ExportReport};
 use unity_rs_core::extraction::{ExtractionLimits, ExtractionOptions, ExtractionReport};
-use unity_rs_core::image_export::ImageFormat;
+use unity_rs_core::image_export::{ImageFormat, ImageRowOrder, PngCompression, encode_rgba_image};
 use unity_rs_core::live2d_clip_motion::CubismClipMotionReadLimits;
 use unity_rs_core::live2d_motion::{
     CubismFadeMotion, CubismFadeMotionReadLimits, CubismMotionTargetIndexLimits,
@@ -1509,9 +1509,10 @@ struct PyFbxCandidate {
 #[pyclass(name = "RgbaImage", frozen)]
 #[derive(Debug)]
 struct PyRgbaImage {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
+    /// Display-order rows: every constructor either receives Sprite output,
+    /// which is already display-ordered, or flips `Texture2D` decoder rows
+    /// first. `encode` relies on this invariant.
+    image: unity_rs_core::texture::RgbaImage,
 }
 
 /// A decoded texture whose pixels already use the top-down row order exposed
@@ -1527,12 +1528,7 @@ impl DisplayRowPyImage {
     }
 
     fn into_python(self) -> PyRgbaImage {
-        let image = self.0;
-        PyRgbaImage {
-            width: image.width,
-            height: image.height,
-            pixels: image.pixels,
-        }
+        PyRgbaImage { image: self.0 }
     }
 }
 
@@ -1682,21 +1678,67 @@ impl PyAudioClip {
 impl PyRgbaImage {
     #[getter]
     const fn width(&self) -> u32 {
-        self.width
+        self.image.width
     }
 
     #[getter]
     const fn height(&self) -> u32 {
-        self.height
+        self.image.height
     }
 
     #[getter]
     fn rgba<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        python_bytes(py, &self.pixels)
+        python_bytes(py, &self.image.pixels)
+    }
+
+    /// Encodes this image into one complete file payload using the same
+    /// bounded Core encoders as `export`: `png`, `jpeg`, `bmp`, `tga`,
+    /// `webp`, or `raw_rgba`. The quality applies to JPEG only, the zlib
+    /// `compression` effort (`fast`, `default`, or `best`) to PNG only, and
+    /// `maximum_bytes` caps the encoded output.
+    #[pyo3(signature = (
+        image_format="png",
+        *,
+        jpeg_quality=75,
+        compression="default",
+        maximum_bytes=536_870_912
+    ))]
+    fn encode<'py>(
+        &self,
+        py: Python<'py>,
+        image_format: &str,
+        jpeg_quality: i64,
+        compression: &str,
+        maximum_bytes: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let format = parse_image_format(image_format)?;
+        if !(1..=100).contains(&jpeg_quality) {
+            return Err(PyValueError::new_err(format!(
+                "JPEG quality {jpeg_quality} is outside the supported range 1 through 100"
+            )));
+        }
+        let jpeg_quality = u8::try_from(jpeg_quality)
+            .map_err(|_| PyValueError::new_err("JPEG quality must fit in one byte"))?;
+        let compression = parse_png_compression(compression)?;
+        let bytes = py.detach(|| {
+            encode_rgba_image(
+                &self.image,
+                format,
+                ImageRowOrder::Display,
+                jpeg_quality,
+                compression,
+                maximum_bytes,
+            )
+            .map_err(core_error)
+        })?;
+        python_bytes(py, &bytes)
     }
 
     fn __repr__(&self) -> String {
-        format!("RgbaImage(width={}, height={})", self.width, self.height)
+        format!(
+            "RgbaImage(width={}, height={})",
+            self.image.width, self.image.height
+        )
     }
 }
 
@@ -3735,11 +3777,7 @@ impl PyUnityRs {
                 .decode_sprite(sprite_limits, texture_limits)
                 .map_err(core_error)
         })?;
-        Ok(PyRgbaImage {
-            width: image.width,
-            height: image.height,
-            pixels: image.pixels,
-        })
+        Ok(PyRgbaImage { image })
     }
 
     #[pyo3(signature = (file_index, path_id, *, format="auto", maximum_bytes=536_870_912))]
@@ -5830,6 +5868,19 @@ fn parse_image_format(value: &str) -> PyResult<ImageFormat> {
         Ok(ImageFormat::RawRgba)
     } else {
         Err(unsupported_option("image format", value))
+    }
+}
+
+fn parse_png_compression(value: &str) -> PyResult<PngCompression> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("fast") {
+        Ok(PngCompression::Fast)
+    } else if value.eq_ignore_ascii_case("default") {
+        Ok(PngCompression::Default)
+    } else if value.eq_ignore_ascii_case("best") {
+        Ok(PngCompression::Best)
+    } else {
+        Err(unsupported_option("PNG compression", value))
     }
 }
 

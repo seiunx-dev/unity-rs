@@ -585,6 +585,14 @@ class RgbaImage:
     def height(self) -> int: ...
     @property
     def rgba(self) -> bytes: ...
+    def encode(
+        self,
+        image_format: str = "png",
+        *,
+        jpeg_quality: int = 75,
+        compression: str = "default",
+        maximum_bytes: int = 536_870_912,
+    ) -> bytes: ...
 
 class AudioClip:
     @property

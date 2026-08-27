@@ -49,6 +49,9 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
         check_python_api_surface.validate_payload_gil_boundary(
             check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
         )
+        check_python_api_surface.validate_image_encode_gil_boundary(
+            check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        )
         check_python_api_surface.validate_cubism_json_gil_boundary(
             check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
         )
@@ -86,6 +89,24 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
             r"read_texture_array.*outside py\.detach",
         ):
             check_python_api_surface.validate_texture_gil_boundary(altered)
+
+    def test_image_encoding_must_stay_detached(self) -> None:
+        binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
+        marker = "fn encode<"
+        method_offset = binding.find(marker)
+        self.assertGreaterEqual(method_offset, 0)
+        call_offset = binding.find("encode_rgba_image(", method_offset)
+        self.assertGreaterEqual(call_offset, 0)
+        altered = (
+            binding[:call_offset]
+            + "encode_rgba_image_elsewhere("
+            + binding[call_offset + len("encode_rgba_image(") :]
+        )
+        with self.assertRaisesRegex(
+            check_python_api_surface.AuditError,
+            r"encode.*outside py\.detach",
+        ):
+            check_python_api_surface.validate_image_encode_gil_boundary(altered)
 
     def test_binary_payload_materialization_must_stay_detached(self) -> None:
         binding = check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")

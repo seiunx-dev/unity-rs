@@ -731,6 +731,29 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   且三种路径像素一致。`cargo fmt --check`、`cargo check --locked --all-targets`、严格 workspace
   Clippy `-D warnings` 与完整 `cargo test --locked` 均通过（Core 库 631 项常规测试全绿，12 项
   可选外部依赖测试按设计跳过；CLI/Python/Node/进程级集成套件同轮全部通过）；
+- **逐对象图像编码已于 2026-08-27 暴露到绑定层**：Core 的 PNG/JPEG/BMP/TGA/lossless-WebP/
+  raw-RGBA 编码器此前只能通过整集合 `export()` 的落盘布局使用，Python/Node 调用方拿到
+  `RgbaImage` 后想存单张图只能自带编码器（Pillow/sharp），既慢又绕开 Core 已有的预算语义。
+  现 Core 新增 `image_export::encode_rgba_image` 与 `write_rgba_image_with_encoding`，与流式
+  writer 共用同一组编码器和 `BoundedWriter` 输出预算，缓冲区预留取原始像素估计与输出上限的
+  较小值且全程 fallible。PNG 的 zlib 档位通过新 `PngCompression`（`fast`/`default`/`best`，
+  映射 flate2 level 1/6/9）显式可选：下游真实语料实测（member_cutout 全量，2,609 张）发现固定
+  `Compression::default()` 在吞吐场景是负收益——同体积下比 Pillow level=3 慢 1.9 倍、比同一
+  生态 image crate 的 `CompressionType::Fast` 编码环节慢约 6.6 倍——所以吞吐管线要能显式选
+  `fast`；默认档保持既有 `default` 不变，`export()` 行为不受影响。所有档位无损，Core 回归
+  断言三档解出的扫描线逐字节一致。Python 在
+  `RgbaImage.encode(image_format="png", *, jpeg_quality=75, compression="default",
+  maximum_bytes=512MiB)` 返回 `bytes`（编码在 `py.detach` 内完成，GIL 边界已纳入 surface
+  审计门），Node 增加静态 `UnityRs.encodeImage`/`encodeImageAsync`（options 含 `compression`；
+  napi worker `compute` 内编码；像素 Buffer 先按声明尺寸做长度校验、再 fallible 拷贝，worker
+  不触碰 JS 内存）。两端格式串、JPEG 质量 1–100 校验与默认值同 `export` 完全一致；`RgbaImage`
+  三端仍是 display 行序，编码固定 `Display` 不再翻转。回归：Core 单测锁定 owned 输出与流式
+  writer 逐字节一致、预算与质量拒绝、三档无损等价；Python/Node 各自验证 PNG 签名+IHDR 尺寸、
+  fast 档 PNG 有效性、raw-RGBA IR 魔数、非法格式/预算/质量/档位的错误族（PNG 中途超预算保留
+  I/O 族），Node 另断言 async 与 sync 字节一致；`.pyi`、严格 mypy 消费端、napi 重生成声明、
+  严格 TS 消费端与安装包 87 方法计数全部同步。
+  `cargo fmt/check/clippy -D warnings/test`、两个 API surface 审计与
+  `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 零跳过通过；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量
