@@ -442,6 +442,19 @@ def groups(interpreter: str) -> list[Group]:
             "python",
             [
                 Step(
+                    # A previous run's wheel or sdist (a version bump) would
+                    # make the sdist-contents audit ambiguous and let the
+                    # install steps pick a stale artifact; the directories
+                    # must only hold what this run builds.
+                    "clear stale Python distributions",
+                    [
+                        "python3", "-c",
+                        "import shutil; shutil.rmtree('dist', ignore_errors=True); "
+                        "shutil.rmtree('sdist-dist', ignore_errors=True)",
+                    ],
+                    cwd=PYTHON,
+                ),
+                Step(
                     "build wheel",
                     [
                         "maturin", "build", "--release", "--locked",
