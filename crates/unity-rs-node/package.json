@@ -1,6 +1,6 @@
 {
   "name": "unity-rs-node",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Native Node.js bindings for unity-rs",
   "license": "MIT",
   "repository": {
