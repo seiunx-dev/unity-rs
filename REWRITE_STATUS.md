@@ -797,6 +797,25 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   LDR 4×4 57.4→37.6 ms/帧（1.53×）、6×6 36.1→24.1、12×12 25.8→19.1；HDR 4×4
   79.5→55.6（1.43×）。算术逐字节不变由 LDR/HDR 双 fixture 套件与 managed oracle 差分钉住
   （fork 后 oracle 实跑两轮全过），malformed-input 套件确认敌意行为契约保持错误族不变；
+- **下游真实语料复测确认图像管线收益并关闭 filter 档位议题（2026-08-27）**：member_cutout
+  语料 census（1,951 bundles / 3,269 Texture2D / 21,971 Sprite）显示格式 100% 为
+  ASTC_RGB_6x6、全部单 mip、sprite:texture=6.7:1（图集缓存理论命中 85.1%）。ASTC fork 落地后
+  该管线解码 44.5→30.4 CPU 秒（−32%），Python+unity-rs 整链 CPU 106.1 秒**首次低于**同产出的
+  参照 Rust 服务（116.2 秒），UnityPy 对照组不动确认非漂移。`PngFilter::Auto` 的档位策略在
+  60 张整图集 + 200 张裁切 sprite 的真实采样上得到确认：fast 配 adaptive 体积 0.334× 只花
+  1.9× 时间（必须开，Auto 已如此）；default/best 配 adaptive 仅省 5–6% 体积却花 1.7–4.0×
+  时间（best 11.2s vs 2.8s）——Auto 在 flate2 档取 none 维持不变，合成梯度图上"adaptive 小
+  8.3 倍"的结论不迁移到真实立绘裁切内容，相关文档依据已改写为真实语料数字；
+- **sprite 页缓存计数器与 QOI 输出格式已于 2026-08-27 暴露**：
+  `Studio::sprite_page_cache_stats() -> (hits, misses)` 使解码页复用率可观测（fresh
+  collection 从零起），Python `sprite_page_cache_stats()` 返回元组、Node
+  `spritePageCacheStats()` 返回 BigInt 对象；Python 行为回归钉住零起、首次 miss、重复解码
+  miss 全转 hit，两个 surface 审计计数同步至 67/88 方法、Core 108 分类。QOI（`qoi` 0.4.1，
+  forbid-unsafe 纯 Rust，规范已冻结）作为第七种图像输出接入 `encode`/`export` 全部表面
+  （格式串 `qoi`）：编码经 fallible 预留的规范上限暂存缓冲（每像素 5 字节 + 头尾，受调用方
+  已解码像素数约束）后过输出预算；无损性由测试内**独立的按规范手写解码器**回环钉住（非
+  qoi crate 自证），display/UnityDecoded 两种行序输出一致，导出格式循环、Python/Node magic
+  与尺寸断言、CLI 格式串同步，许可证 bundle 已重生成（qoi 为唯一新包）；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

@@ -197,7 +197,7 @@ Node-facing handoff.
 - TextAsset, TypeTree dump/JSON, raw objects, Font, MovieTexture, AudioClip,
   VideoClip, Shader, Material, BuildSettings, and PlayerSettings;
 - Texture2D, Texture2DArray, Sprite, and SpriteAtlas, with bounded
-  JPEG/PNG/BMP/TGA/lossless-WebP/raw-RGBA output;
+  JPEG/PNG/BMP/TGA/lossless-WebP/QOI/raw-RGBA output;
 - BC/DXT, ETC/EAC, ASTC, PVRTC, ATC, Crunch, Xbox 360, and verified Nintendo
   Switch mip-zero texture paths;
 - Mesh and scene graph parsing, OBJ/MTL, ASCII/binary FBX 7.4, materials,

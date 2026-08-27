@@ -2920,6 +2920,18 @@ def main() -> None:
         else:
             raise AssertionError("sprite output limit should raise ValueError")
 
+        # The sprite-page cache counters are observable: a fresh collection
+        # starts at zero, the first decode misses, and repeating the same
+        # decode turns every miss into a hit.
+        stats_studio = UnityRs(sprite_path)
+        assert stats_studio.sprite_page_cache_stats() == (0, 0)
+        stats_studio.read_sprite(0, 7)
+        first_hits, first_misses = stats_studio.sprite_page_cache_stats()
+        assert first_hits == 0 and first_misses >= 1
+        stats_studio.read_sprite(0, 7)
+        second_hits, second_misses = stats_studio.sprite_page_cache_stats()
+        assert second_hits == first_misses and second_misses == first_misses
+
         tight_sprite_path = Path(directory) / "tight-sprite.assets"
         tight_sprite_path.write_bytes(synthetic_tight_sprite())
         tight_sprite_studio = UnityRs(tight_sprite_path)
@@ -2941,6 +2953,9 @@ def main() -> None:
         assert encoded_png[16:24] == (2).to_bytes(4, "big") * 2
         encoded_raw = tight_sprite.encode(" Raw-RGBA ")
         assert encoded_raw[:16] == b"HARUKI_RGBAIR_V1"
+        encoded_qoi = tight_sprite.encode("qoi")
+        assert encoded_qoi[:4] == b"qoif"
+        assert encoded_qoi[4:12] == (2).to_bytes(4, "big") * 2
         # The zlib effort and scanline filter change the compressed stream,
         # never the pixels: every choice stays a valid PNG carrying the same
         # IHDR geometry, and an explicit numeric level is accepted.

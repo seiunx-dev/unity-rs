@@ -364,7 +364,7 @@ pub struct RgbaImage {
 /// Options for encoding one decoded RGBA image into a file payload.
 #[napi(object)]
 pub struct EncodeImageOptions {
-    /// `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`. Defaults to `png`.
+    /// `jpeg`, `png`, `bmp`, `tga`, `webp`, `qoi`, or `raw-rgba`. Defaults to `png`.
     pub image_format: Option<String>,
     /// JPEG-only quality from 1 through 100. Defaults to 75.
     pub jpeg_quality: Option<u32>,
@@ -387,8 +387,8 @@ pub struct EncodeImageOptions {
     /// Every choice is lossless. The default `auto` follows the compression
     /// choice — adaptive filtering under the fdeflate `fast` effort, whose
     /// output barely compresses unfiltered, and the historical unfiltered
-    /// scanlines under the flate2 levels, where filtering costs CPU without
-    /// buying size on decoded-texture content.
+    /// scanlines under the flate2 levels, where real corpora show filtering
+    /// buys only a few percent of size for a multiple of the time.
     pub png_filter: Option<String>,
     /// Cap on the encoded output length in bytes. Defaults to 512 MiB.
     pub maximum_bytes: Option<i64>,
@@ -610,6 +610,13 @@ pub struct ExportReport {
     /// caller can tell "this build carries shaders we do not read" from "the
     /// export went wrong".
     pub unsupported: Vec<ExportFailure>,
+}
+
+/// Hit and miss counters of the bounded decoded sprite-page cache.
+#[napi(object)]
+pub struct SpritePageCacheStats {
+    pub hits: BigInt,
+    pub misses: BigInt,
 }
 
 /// What an extraction run produced.
@@ -897,7 +904,7 @@ pub struct ExportConfiguration {
     pub mode: Option<String>,
     /// `asset-name`, `asset-name-path-id`, or `path-id`.
     pub filename_format: Option<String>,
-    /// `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`.
+    /// `jpeg`, `png`, `bmp`, `tga`, `webp`, `qoi`, or `raw-rgba`.
     pub image_format: Option<String>,
     pub jpeg_quality: Option<u32>,
     /// PNG-only zlib effort: `fast`, `default`, `best`, or an explicit
@@ -1478,6 +1485,20 @@ impl UnityRs {
             self.studio.load_diagnostics().len(),
             "load diagnostic count",
         )
+    }
+
+    /// Returns the hit and miss counters of the bounded decoded
+    /// sprite-page cache. Sprites packed into one atlas page decode that
+    /// page once and reuse it from the cache, so these counters make a
+    /// workload's reuse rate observable without instrumenting decodes.
+    #[must_use]
+    #[napi]
+    pub fn sprite_page_cache_stats(&self) -> SpritePageCacheStats {
+        let (hits, misses) = self.studio.sprite_page_cache_stats();
+        SpritePageCacheStats {
+            hits: BigInt::from(hits),
+            misses: BigInt::from(misses),
+        }
     }
 
     #[napi]
@@ -5193,6 +5214,8 @@ fn parse_image_format(value: Option<String>) -> Result<ImageFormat> {
         Ok(ImageFormat::Tga)
     } else if value.eq_ignore_ascii_case("webp") {
         Ok(ImageFormat::Webp)
+    } else if value.eq_ignore_ascii_case("qoi") {
+        Ok(ImageFormat::Qoi)
     } else if value.eq_ignore_ascii_case("raw_rgba")
         || value.eq_ignore_ascii_case("raw-rgba")
         || value.eq_ignore_ascii_case("rgba")
@@ -5202,7 +5225,7 @@ fn parse_image_format(value: Option<String>) -> Result<ImageFormat> {
         Err(unsupported_option(
             "image format",
             value,
-            "jpeg, png, bmp, tga, webp, or raw-rgba",
+            "jpeg, png, bmp, tga, webp, qoi, or raw-rgba",
         ))
     }
 }

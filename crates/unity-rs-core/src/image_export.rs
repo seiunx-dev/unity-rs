@@ -49,6 +49,10 @@ pub enum ImageFormat {
     Tga,
     /// Pure-Rust lossless VP8L WebP with RGBA preservation.
     Webp,
+    /// Lossless QOI ("Quite OK Image"), RGBA8 with alpha preserved. The
+    /// fastest encoded format in the set; files land in the fast-PNG size
+    /// class.
+    Qoi,
     /// The existing `HARUKI_RGBAIR_V1` interchange contract.
     RawRgba,
 }
@@ -62,6 +66,7 @@ impl ImageFormat {
             Self::Bmp => ".bmp",
             Self::Tga => ".tga",
             Self::Webp => ".webp",
+            Self::Qoi => ".qoi",
             Self::RawRgba => ".rgba",
         }
     }
@@ -74,6 +79,7 @@ impl ImageFormat {
             Self::Bmp => "image_bmp",
             Self::Tga => "image_tga",
             Self::Webp => "image_webp",
+            Self::Qoi => "image_qoi",
             Self::RawRgba => "image_raw_rgba",
         }
     }
@@ -138,10 +144,11 @@ impl PngCompression {
 pub enum PngFilter {
     /// Follows the compression choice: [`Self::Adaptive`] under
     /// [`PngCompression::Fast`], whose simple fdeflate Huffman model barely
-    /// compresses unfiltered scanlines, and [`Self::None`] under the flate2
-    /// levels, where measurement showed filtering costs CPU without buying
-    /// size on decoded-texture content. This keeps every compression choice
-    /// usable on its own.
+    /// compresses unfiltered scanlines (filtering there cuts real
+    /// sprite-cutout corpora to a third of the size for under twice the
+    /// time), and [`Self::None`] under the flate2 levels, where the same
+    /// corpora showed filtering buys only 5-6% of size for 1.7-4x the time.
+    /// This keeps every compression choice usable on its own.
     #[default]
     Auto,
     /// Filter type zero on every scanline — the historical output.
@@ -314,6 +321,13 @@ pub fn write_rgba_image_with_options<W: Write>(
             maximum_output_bytes,
             &mut output,
         )?,
+        ImageFormat::Qoi => write_qoi(
+            image,
+            dimensions,
+            row_order,
+            maximum_output_bytes,
+            &mut output,
+        )?,
         ImageFormat::RawRgba => {
             let expected = RGBA_IR_HEADER_BYTES
                 .checked_add(dimensions.pixel_bytes)
@@ -449,6 +463,46 @@ fn composite_over_background(rgba: &[u8], rgb_bytes: u64, background: [u8; 3]) -
         }
     }
     Ok(rgb)
+}
+
+/// Encodes lossless QOI through a bounded staging buffer.
+///
+/// QOI's RIFF-free layout still cannot stream through the bounded writer
+/// directly because the encoder needs one contiguous output slice, so the
+/// worst-case buffer (five bytes per pixel plus header and padding) is
+/// reserved fallibly; it is bounded by the caller's already-decoded pixel
+/// count. The working-input copy for `UnityDecoded` rows and the staging
+/// buffer are both charged against the output budget before encoding.
+fn write_qoi<W: Write>(
+    image: &RgbaImage,
+    dimensions: ImageDimensions,
+    row_order: ImageRowOrder,
+    maximum_output_bytes: u64,
+    output: &mut BoundedWriter<'_, W>,
+) -> Result<()> {
+    if dimensions.pixel_bytes > maximum_output_bytes {
+        return Err(Error::invalid_data(format!(
+            "QOI encoder requires {} input bytes, exceeding working limit {maximum_output_bytes}",
+            dimensions.pixel_bytes
+        )));
+    }
+    let pixels = display_order_rgba(image, dimensions, row_order)?;
+    let maximum_length = qoi::encode_max_len(image.width, image.height, 4);
+    let mut staging = Vec::new();
+    staging.try_reserve_exact(maximum_length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate QOI staging buffer: {error}"))
+    })?;
+    staging.resize(maximum_length, 0);
+    let encoder = qoi::Encoder::new(pixels.as_ref(), image.width, image.height)
+        .map_err(|error| Error::invalid_data(format!("cannot encode QOI: {error}")))?;
+    let encoded_length = encoder
+        .encode_to_buf(&mut staging)
+        .map_err(|error| Error::invalid_data(format!("cannot encode QOI: {error}")))?;
+    let encoded_length_u64 = u64::try_from(encoded_length)
+        .map_err(|_| Error::invalid_data("QOI output length does not fit in u64"))?;
+    ensure_output_budget(encoded_length_u64, maximum_output_bytes, "QOI")?;
+    output.write_all(&staging[..encoded_length])?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1407,6 +1461,115 @@ mod tests {
             "auto {} bytes should beat unfiltered fast {} bytes",
             fast_auto.len(),
             fast_unfiltered.len()
+        );
+    }
+
+    /// Decodes a QOI stream with a from-the-specification reference decoder,
+    /// independent of the `qoi` crate that produced it, so the round trip is
+    /// not one implementation agreeing with itself.
+    fn reference_qoi_decode(encoded: &[u8]) -> (u32, u32, Vec<u8>) {
+        assert_eq!(&encoded[..4], b"qoif");
+        let width = u32::from_be_bytes(encoded[4..8].try_into().unwrap());
+        let height = u32::from_be_bytes(encoded[8..12].try_into().unwrap());
+        assert_eq!(encoded[13], 0, "linear colorspace flag expected");
+        let mut pixels = Vec::new();
+        let mut index = [[0_u8; 4]; 64];
+        let mut previous = [0_u8, 0, 0, 255];
+        let mut cursor = 14;
+        let pixel_count = (width as usize) * (height as usize);
+        while pixels.len() < pixel_count * 4 {
+            let byte = encoded[cursor];
+            cursor += 1;
+            match byte {
+                0xfe => {
+                    previous[..3].copy_from_slice(&encoded[cursor..cursor + 3]);
+                    cursor += 3;
+                }
+                0xff => {
+                    previous.copy_from_slice(&encoded[cursor..cursor + 4]);
+                    cursor += 4;
+                }
+                _ => match byte >> 6 {
+                    0b00 => previous = index[usize::from(byte & 0x3f)],
+                    0b01 => {
+                        previous[0] = previous[0].wrapping_add(byte >> 4 & 3).wrapping_sub(2);
+                        previous[1] = previous[1].wrapping_add(byte >> 2 & 3).wrapping_sub(2);
+                        previous[2] = previous[2].wrapping_add(byte & 3).wrapping_sub(2);
+                    }
+                    0b10 => {
+                        let green_delta = (byte & 0x3f).wrapping_sub(32);
+                        let second = encoded[cursor];
+                        cursor += 1;
+                        previous[0] = previous[0]
+                            .wrapping_add(green_delta)
+                            .wrapping_add(second >> 4)
+                            .wrapping_sub(8);
+                        previous[1] = previous[1].wrapping_add(green_delta);
+                        previous[2] = previous[2]
+                            .wrapping_add(green_delta)
+                            .wrapping_add(second & 0x0f)
+                            .wrapping_sub(8);
+                    }
+                    _ => {
+                        for _ in 0..(byte & 0x3f) {
+                            pixels.extend_from_slice(&previous);
+                        }
+                    }
+                },
+            }
+            pixels.extend_from_slice(&previous);
+            index[usize::from(
+                previous[0]
+                    .wrapping_mul(3)
+                    .wrapping_add(previous[1].wrapping_mul(5))
+                    .wrapping_add(previous[2].wrapping_mul(7))
+                    .wrapping_add(previous[3].wrapping_mul(11))
+                    & 0x3f,
+            )] = previous;
+        }
+        assert_eq!(&encoded[cursor..], &[0, 0, 0, 0, 0, 0, 0, 1]);
+        (width, height, pixels)
+    }
+
+    /// QOI output must decode back to the exact input pixels through the
+    /// independent reference decoder, honor both row orders, and keep the
+    /// output budget.
+    #[test]
+    fn qoi_is_lossless_top_down_and_respects_the_budget() {
+        let image = gradient_image();
+        let encoded = encode_rgba_image(
+            &image,
+            ImageFormat::Qoi,
+            ImageRowOrder::Display,
+            &encode_options(),
+        )
+        .unwrap();
+        let (width, height, pixels) = reference_qoi_decode(&encoded);
+        assert_eq!((width, height), (image.width, image.height));
+        assert_eq!(pixels, image.pixels);
+
+        let mut flipped = image.clone();
+        flip_rgba_rows(&mut flipped).unwrap();
+        let from_decoded = encode_rgba_image(
+            &flipped,
+            ImageFormat::Qoi,
+            ImageRowOrder::UnityDecoded,
+            &encode_options(),
+        )
+        .unwrap();
+        assert_eq!(from_decoded, encoded);
+
+        assert!(
+            encode_rgba_image(
+                &image,
+                ImageFormat::Qoi,
+                ImageRowOrder::Display,
+                &ImageEncodeOptions {
+                    maximum_output_bytes: 32,
+                    ..ImageEncodeOptions::default()
+                },
+            )
+            .is_err()
         );
     }
 

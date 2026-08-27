@@ -36,6 +36,7 @@ CORE_TO_PYTHON = {
     "Studio.object_count": "UnityRs.object_count",
     "Studio.resource_count": "UnityRs.resource_count",
     "Studio.load_diagnostics": "UnityRs.load_diagnostic_page",
+    "Studio.sprite_page_cache_stats": "UnityRs.sprite_page_cache_stats",
     "Studio.files": "UnityRs.files",
     "Studio.file": "UnityRs.file_page",
     "Studio.resources": "UnityRs.resources",

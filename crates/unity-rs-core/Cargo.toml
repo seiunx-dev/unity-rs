@@ -18,6 +18,7 @@ jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"]
 lewton = { version = "0.10.2", default-features = false }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
 lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std"] }
+qoi = { version = "0.4.1", default-features = false, features = ["std"] }
 ruopus = { version = "0.1.2", default-features = false, features = ["std"] }
 serde = "1.0.229"
 serde_json = "1.0.151"

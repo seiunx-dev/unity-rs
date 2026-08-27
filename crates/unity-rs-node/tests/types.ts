@@ -20,6 +20,7 @@ import type {
   PreloadDataInfo,
   ResourceManagerInfo,
   SceneLimits,
+  SpritePageCacheStats,
   SceneNode,
   SpriteAtlasInfo,
   SpriteAtlasRenderData,
@@ -299,6 +300,8 @@ function consumeEveryUnityRsMember(studio: UnityRs): void {
   void studio.resourceCount;
   void studio.loadDiagnosticCount;
   const loadDiagnostics: Array<LoadDiagnosticInfo> = studio.loadDiagnosticPage(0, 1);
+  const cacheStats: SpritePageCacheStats = studio.spritePageCacheStats();
+  void cacheStats;
   void loadDiagnostics;
   void studio.filePage(0, 1);
   void studio.objectPage(0, 0, 1);

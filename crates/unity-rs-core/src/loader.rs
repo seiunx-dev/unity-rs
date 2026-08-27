@@ -405,7 +405,6 @@ impl SpriteTextureCache {
         );
     }
 
-    #[cfg(test)]
     fn stats(&self) -> (u64, u64) {
         let inner = self.lock();
         (inner.hits, inner.misses)
@@ -1304,7 +1303,8 @@ impl AssetCollection {
             .insert(file_index, object_index, limits, image);
     }
 
-    #[cfg(test)]
+    /// Returns the hit and miss counters of the bounded decoded
+    /// sprite-page cache, in that order.
     pub(crate) fn sprite_texture_cache_stats(&self) -> (u64, u64) {
         self.sprite_texture_cache.stats()
     }

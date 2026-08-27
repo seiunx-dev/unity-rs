@@ -128,6 +128,7 @@ def consume_public_api(
     resource_count: int = studio.resource_count
     load_diagnostic_count: int = studio.load_diagnostic_count
     load_diagnostics: list[LoadDiagnostic] = studio.load_diagnostic_page(limit=1)
+    cache_stats: tuple[int, int] = studio.sprite_page_cache_stats()
     files: list[FileInfo] = studio.files()
     objects: list[ObjectInfo] = studio.objects()
     resources: list[ResourceInfo] = studio.resources()
@@ -325,6 +326,7 @@ def consume_public_api(
         sprite_settings,
         sprite_secondary,
         sprite,
+        cache_stats,
         encoded_sprite,
         encoded_level,
         encoded_jpeg,

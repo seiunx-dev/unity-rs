@@ -976,7 +976,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          --texture-format <FORMAT>     As above; textures are shared across the batch\n\n\
          Export options:\n  --mode <auto|raw|typetree-json|dump-text>\n  \
          --filename <asset-name|asset-name-path-id|path-id>\n  --overwrite\n  \
-         --image-format <jpg|jpeg|png|bmp|tga|webp|raw-rgba>\n  \
+         --image-format <jpg|jpeg|png|bmp|tga|webp|qoi|raw-rgba>\n  \
          --jpeg-quality <1-100>\n  \
          --png-compression <fast|default|best|0-9>  fast is the fdeflate throughput path\n  \
          --png-filter <auto|none|adaptive>  auto pairs adaptive filtering with fast\n  \
@@ -1563,9 +1563,10 @@ fn parse_image_format(value: &OsString) -> Result<ImageFormat> {
         Some("bmp") => Ok(ImageFormat::Bmp),
         Some("tga") => Ok(ImageFormat::Tga),
         Some("webp") => Ok(ImageFormat::Webp),
+        Some("qoi") => Ok(ImageFormat::Qoi),
         Some("raw-rgba" | "raw_rgba" | "rgba") => Ok(ImageFormat::RawRgba),
         _ => Err(Error::invalid_data(format!(
-            "invalid image format: {} (expected jpg, jpeg, png, bmp, tga, webp, or raw-rgba)",
+            "invalid image format: {} (expected jpg, jpeg, png, bmp, tga, webp, qoi, or raw-rgba)",
             CliArgumentDisplay(value)
         ))),
     }

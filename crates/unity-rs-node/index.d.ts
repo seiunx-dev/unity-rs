@@ -72,6 +72,13 @@ export declare class UnityRs {
   get objectCount(): number
   get resourceCount(): number
   get loadDiagnosticCount(): number
+  /**
+   * Returns the hit and miss counters of the bounded decoded
+   * sprite-page cache. Sprites packed into one atlas page decode that
+   * page once and reuse it from the cache, so these counters make a
+   * workload's reuse rate observable without instrumenting decodes.
+   */
+  spritePageCacheStats(): SpritePageCacheStats
   loadDiagnosticPage(offset?: number | undefined | null, limit?: number | undefined | null): Array<LoadDiagnosticInfo>
   filePage(offset?: number | undefined | null, limit?: number | undefined | null): Array<FileInfo>
   objectPage(fileIndex: number, offset?: number | undefined | null, limit?: number | undefined | null): Array<ObjectInfo>
@@ -656,7 +663,7 @@ export interface CubismPosePart {
 
 /** Options for encoding one decoded RGBA image into a file payload. */
 export interface EncodeImageOptions {
-  /** `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`. Defaults to `png`. */
+  /** `jpeg`, `png`, `bmp`, `tga`, `webp`, `qoi`, or `raw-rgba`. Defaults to `png`. */
   imageFormat?: string
   /** JPEG-only quality from 1 through 100. Defaults to 75. */
   jpegQuality?: number
@@ -686,8 +693,8 @@ export interface EncodeImageOptions {
    * Every choice is lossless. The default `auto` follows the compression
    * choice — adaptive filtering under the fdeflate `fast` effort, whose
    * output barely compresses unfiltered, and the historical unfiltered
-   * scanlines under the flate2 levels, where filtering costs CPU without
-   * buying size on decoded-texture content.
+   * scanlines under the flate2 levels, where real corpora show filtering
+   * buys only a few percent of size for a multiple of the time.
    */
   pngFilter?: string
   /** Cap on the encoded output length in bytes. Defaults to 512 MiB. */
@@ -706,7 +713,7 @@ export interface ExportConfiguration {
   mode?: string
   /** `asset-name`, `asset-name-path-id`, or `path-id`. */
   filenameFormat?: string
-  /** `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`. */
+  /** `jpeg`, `png`, `bmp`, `tga`, `webp`, `qoi`, or `raw-rgba`. */
   imageFormat?: string
   jpegQuality?: number
   /**
@@ -1184,6 +1191,12 @@ export interface SpriteMetadataLimits {
   maximumStringBytes?: number
   maximumTotalStringBytes?: number
   maximumMeshBytes?: number
+}
+
+/** Hit and miss counters of the bounded decoded sprite-page cache. */
+export interface SpritePageCacheStats {
+  hits: bigint
+  misses: bigint
 }
 
 export interface SpriteRect {

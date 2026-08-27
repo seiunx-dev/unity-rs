@@ -40,6 +40,7 @@ CORE_TO_NODE = {
     "Studio.object_count": "UnityRs.objectCount",
     "Studio.resource_count": "UnityRs.resourceCount",
     "Studio.load_diagnostics": "UnityRs.loadDiagnosticPage",
+    "Studio.sprite_page_cache_stats": "UnityRs.spritePageCacheStats",
     "Studio.files": "UnityRs.filePage",
     "Studio.file": "UnityRs.filePage",
     "Studio.resources": "UnityRs.resourcePage",

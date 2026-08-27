@@ -1696,7 +1696,7 @@ impl PyRgbaImage {
 
     /// Encodes this image into one complete file payload using the same
     /// bounded Core encoders as `export`: `png`, `jpeg`, `bmp`, `tga`,
-    /// `webp`, or `raw_rgba`.
+    /// `webp`, `qoi`, or `raw_rgba`.
     ///
     /// Each knob applies only to its own format. JPEG: `jpeg_quality`
     /// (1-100), `jpeg_sampling` (`auto`, `4:4:4`, `4:2:2`, `4:2:0`),
@@ -2642,6 +2642,14 @@ impl PyUnityRs {
     #[getter]
     fn load_diagnostic_count(&self) -> usize {
         self.studio.load_diagnostics().len()
+    }
+
+    /// Returns the `(hits, misses)` counters of the bounded decoded
+    /// sprite-page cache. Sprites packed into one atlas page decode that
+    /// page once and reuse it from the cache, so these counters make a
+    /// workload's reuse rate observable without instrumenting decodes.
+    fn sprite_page_cache_stats(&self) -> (u64, u64) {
+        self.studio.sprite_page_cache_stats()
     }
 
     /// Returns a bounded page of inputs skipped by the tolerant load policy.
@@ -5894,6 +5902,8 @@ fn parse_image_format(value: &str) -> PyResult<ImageFormat> {
         Ok(ImageFormat::Tga)
     } else if value.eq_ignore_ascii_case("webp") {
         Ok(ImageFormat::Webp)
+    } else if value.eq_ignore_ascii_case("qoi") {
+        Ok(ImageFormat::Qoi)
     } else if value.eq_ignore_ascii_case("raw_rgba")
         || value.eq_ignore_ascii_case("raw-rgba")
         || value.eq_ignore_ascii_case("rgba")

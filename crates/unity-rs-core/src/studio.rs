@@ -178,6 +178,18 @@ impl Studio {
         &self.collection.diagnostics
     }
 
+    /// Returns the hit and miss counters of the bounded decoded
+    /// sprite-page cache, in that order.
+    ///
+    /// Sprites packed into one atlas page decode that page once and reuse
+    /// it from this cache; the counters make the reuse rate of a workload
+    /// observable without instrumenting the decode path. Both start at
+    /// zero for a freshly opened or cloned collection.
+    #[must_use]
+    pub fn sprite_page_cache_stats(&self) -> (u64, u64) {
+        self.collection.sprite_texture_cache_stats()
+    }
+
     /// Iterates files in deterministic collection order.
     #[must_use]
     pub fn files(&self) -> impl ExactSizeIterator<Item = StudioFile<'_>> {

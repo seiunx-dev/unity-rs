@@ -2335,6 +2335,7 @@ mod tests {
             (ImageFormat::Bmp, "bmp", "image_bmp"),
             (ImageFormat::Tga, "tga", "image_tga"),
             (ImageFormat::Webp, "webp", "image_webp"),
+            (ImageFormat::Qoi, "qoi", "image_qoi"),
             (ImageFormat::RawRgba, "rgba", "image_raw_rgba"),
         ] {
             let output = unique_temp_directory(&format!("unity-rs-texture-{extension}"));
@@ -2363,6 +2364,13 @@ mod tests {
                 ImageFormat::Bmp => bytes[122..126].try_into().map(bgra_to_rgba).unwrap(),
                 ImageFormat::Tga => bytes[18..22].try_into().map(bgra_to_rgba).unwrap(),
                 ImageFormat::Webp => webp_first_pixel(&bytes),
+                ImageFormat::Qoi => {
+                    // The fixture's first pixel changes alpha from the QOI
+                    // start state, so the first chunk must be an RGBA op.
+                    assert_eq!(&bytes[..4], b"qoif");
+                    assert_eq!(bytes[14], 0xff);
+                    bytes[15..19].try_into().unwrap()
+                }
                 ImageFormat::RawRgba => bytes[36..40].try_into().unwrap(),
             };
             assert_eq!(displayed_top_left, [0, 0, 255, 3]);

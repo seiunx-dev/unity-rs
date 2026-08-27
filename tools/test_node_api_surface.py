@@ -24,7 +24,7 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
                 self.rust,
                 self.declarations,
             ),
-            (87, 4),
+            (88, 4),
         )
         self.assertEqual(
             check_node_api_surface.validate_core_mapping(
@@ -32,14 +32,14 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
                 self.rust,
                 self.declarations,
             ),
-            (107, 4),
+            (108, 4),
         )
         self.assertEqual(
             check_node_api_surface.validate_surface(
                 self.declarations,
                 self.consumer,
             ),
-            (87, 4),
+            (88, 4),
         )
 
     def test_live2d_worker_must_return_the_projected_table(self) -> None:

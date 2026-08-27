@@ -1696,6 +1696,12 @@ assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
     imageFormat: 'raw-rgba',
   })
   assert.equal(encodedRaw.subarray(0, 16).toString('ascii'), 'HARUKI_RGBAIR_V1')
+  const encodedQoi = addon.UnityRs.encodeImage(decodedTexture, {
+    imageFormat: 'qoi',
+  })
+  assert.equal(encodedQoi.subarray(0, 4).toString('ascii'), 'qoif')
+  assert.equal(encodedQoi.readUInt32BE(4), 2)
+  assert.equal(encodedQoi.readUInt32BE(8), 2)
   // The zlib effort and scanline filter change the compressed stream, never
   // the pixels: every choice stays a valid PNG with the same IHDR geometry,
   // and the compression option accepts an explicit numeric level.
@@ -2794,6 +2800,13 @@ console.log('node api: export, extract and fbx ok')
   const spriteStudio = addon.UnityRs.fromBuffers([
     { name: 'sprite.assets', data: syntheticSpriteMetadata() },
   ])
+  // The sprite-page cache counters marshal as BigInt and start at zero on a
+  // fresh collection; the hit/miss semantics are pinned by core and Python
+  // decode tests.
+  assert.deepStrictEqual(spriteStudio.spritePageCacheStats(), {
+    hits: 0n,
+    misses: 0n,
+  })
   assert.deepStrictEqual(spriteStudio.readSpriteMetadata(0, 7n), {
     objectIndex: 0,
     pathId: 7n,
