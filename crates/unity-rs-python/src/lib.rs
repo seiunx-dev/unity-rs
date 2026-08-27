@@ -26,7 +26,10 @@ use unity_rs_core::bundle::OodleDecoder;
 use unity_rs_core::compression::CompressionLimits;
 use unity_rs_core::export::{AudioExportFormat, ExportMode, ExportOptions, ExportReport};
 use unity_rs_core::extraction::{ExtractionLimits, ExtractionOptions, ExtractionReport};
-use unity_rs_core::image_export::{ImageFormat, ImageRowOrder, PngCompression, encode_rgba_image};
+use unity_rs_core::image_export::{
+    ImageEncodeOptions, ImageFormat, ImageRowOrder, JpegSampling, PngCompression, PngFilter,
+    encode_rgba_image,
+};
 use unity_rs_core::live2d_clip_motion::CubismClipMotionReadLimits;
 use unity_rs_core::live2d_motion::{
     CubismFadeMotion, CubismFadeMotionReadLimits, CubismMotionTargetIndexLimits,
@@ -1693,22 +1696,40 @@ impl PyRgbaImage {
 
     /// Encodes this image into one complete file payload using the same
     /// bounded Core encoders as `export`: `png`, `jpeg`, `bmp`, `tga`,
-    /// `webp`, or `raw_rgba`. The quality applies to JPEG only, the zlib
-    /// `compression` effort (`fast`, `default`, or `best`) to PNG only, and
-    /// `maximum_bytes` caps the encoded output.
+    /// `webp`, or `raw_rgba`.
+    ///
+    /// Each knob applies only to its own format. JPEG: `jpeg_quality`
+    /// (1-100), `jpeg_sampling` (`auto`, `4:4:4`, `4:2:2`, `4:2:0`),
+    /// `jpeg_progressive`, `jpeg_optimized_huffman`, and `jpeg_background`
+    /// (an `(r, g, b)` tuple compositing translucent pixels instead of the
+    /// default drop-alpha semantics). PNG: `compression` (`fast`,
+    /// `default`, `best`, or an explicit zlib level 0-9) and `png_filter`
+    /// (`none` or `adaptive`; every choice is lossless). `maximum_bytes`
+    /// caps the encoded output for every format.
     #[pyo3(signature = (
         image_format="png",
         *,
         jpeg_quality=75,
-        compression="default",
+        jpeg_sampling="auto",
+        jpeg_progressive=false,
+        jpeg_optimized_huffman=false,
+        jpeg_background=None,
+        compression=None,
+        png_filter="none",
         maximum_bytes=536_870_912
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn encode<'py>(
         &self,
         py: Python<'py>,
         image_format: &str,
         jpeg_quality: i64,
-        compression: &str,
+        jpeg_sampling: &str,
+        jpeg_progressive: bool,
+        jpeg_optimized_huffman: bool,
+        jpeg_background: Option<(u8, u8, u8)>,
+        compression: Option<PngCompressionInput>,
+        png_filter: &str,
         maximum_bytes: u64,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let format = parse_image_format(image_format)?;
@@ -1719,17 +1740,19 @@ impl PyRgbaImage {
         }
         let jpeg_quality = u8::try_from(jpeg_quality)
             .map_err(|_| PyValueError::new_err("JPEG quality must fit in one byte"))?;
-        let compression = parse_png_compression(compression)?;
+        let options = ImageEncodeOptions {
+            jpeg_quality,
+            jpeg_sampling: parse_jpeg_sampling(jpeg_sampling)?,
+            jpeg_progressive,
+            jpeg_optimized_huffman,
+            jpeg_background: jpeg_background.map(|(red, green, blue)| [red, green, blue]),
+            png_compression: parse_png_compression_input(compression)?,
+            png_filter: parse_png_filter(png_filter)?,
+            maximum_output_bytes: maximum_bytes,
+        };
         let bytes = py.detach(|| {
-            encode_rgba_image(
-                &self.image,
-                format,
-                ImageRowOrder::Display,
-                jpeg_quality,
-                compression,
-                maximum_bytes,
-            )
-            .map_err(core_error)
+            encode_rgba_image(&self.image, format, ImageRowOrder::Display, &options)
+                .map_err(core_error)
         })?;
         python_bytes(py, &bytes)
     }
@@ -5871,16 +5894,63 @@ fn parse_image_format(value: &str) -> PyResult<ImageFormat> {
     }
 }
 
-fn parse_png_compression(value: &str) -> PyResult<PngCompression> {
+/// A PNG compression choice arriving from Python as either a named effort
+/// string or an explicit zlib level integer.
+#[derive(FromPyObject)]
+enum PngCompressionInput {
+    Level(i64),
+    Name(String),
+}
+
+fn parse_png_compression_input(value: Option<PngCompressionInput>) -> PyResult<PngCompression> {
+    match value {
+        None => Ok(PngCompression::Default),
+        Some(PngCompressionInput::Level(level)) => {
+            let level = u8::try_from(level).ok().filter(|level| *level <= 9);
+            level.map(PngCompression::Level).ok_or_else(|| {
+                PyValueError::new_err(
+                    "PNG compression level is outside the supported range 0 through 9",
+                )
+            })
+        }
+        Some(PngCompressionInput::Name(name)) => {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("fast") {
+                Ok(PngCompression::Fast)
+            } else if name.eq_ignore_ascii_case("default") {
+                Ok(PngCompression::Default)
+            } else if name.eq_ignore_ascii_case("best") {
+                Ok(PngCompression::Best)
+            } else {
+                Err(unsupported_option("PNG compression", name))
+            }
+        }
+    }
+}
+
+fn parse_png_filter(value: &str) -> PyResult<PngFilter> {
     let value = value.trim();
-    if value.eq_ignore_ascii_case("fast") {
-        Ok(PngCompression::Fast)
-    } else if value.eq_ignore_ascii_case("default") {
-        Ok(PngCompression::Default)
-    } else if value.eq_ignore_ascii_case("best") {
-        Ok(PngCompression::Best)
+    if value.eq_ignore_ascii_case("none") {
+        Ok(PngFilter::None)
+    } else if value.eq_ignore_ascii_case("adaptive") {
+        Ok(PngFilter::Adaptive)
     } else {
-        Err(unsupported_option("PNG compression", value))
+        Err(unsupported_option("PNG filter", value))
+    }
+}
+
+fn parse_jpeg_sampling(value: &str) -> PyResult<JpegSampling> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(JpegSampling::Auto)
+    } else if value == "4:4:4" || value == "444" {
+        Ok(JpegSampling::Yuv444)
+    } else if value == "4:2:2" || value == "422" {
+        Ok(JpegSampling::Yuv422)
+    } else if value == "4:2:0" || value == "420" {
+        Ok(JpegSampling::Yuv420)
+    } else {
+        Err(unsupported_option("JPEG sampling", value))
     }
 }
 

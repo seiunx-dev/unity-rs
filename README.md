@@ -136,7 +136,7 @@ for obj in studio.iter_objects():
     print(obj.file_index, obj.path_id, obj.class_id, obj.name)
 
 image = studio.read_texture(0, 28)
-png_bytes = image.encode("png", compression="fast")
+png_bytes = image.encode("png", compression="fast", png_filter="adaptive")
 scene = studio.scene(limits=SceneLimits(maximum_game_objects=100_000))
 report = studio.export(
     "exported",

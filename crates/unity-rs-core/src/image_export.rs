@@ -11,7 +11,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image_webp::{ColorType as WebPColorType, EncodingError as WebPEncodingError, WebPEncoder};
-use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, EncodingError};
+use jpeg_encoder::{
+    ColorType as JpegColorType, Encoder as JpegEncoder, EncodingError,
+    SamplingFactor as JpegSamplingFactor,
+};
 
 use crate::texture::{RgbaImage, write_rgba_ir, write_rgba_ir_display_order};
 use crate::{Error, Result};
@@ -92,22 +95,118 @@ pub enum ImageRowOrder {
 /// quality.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PngCompression {
-    /// The lightest zlib level, for throughput-oriented pipelines that prefer
-    /// encode speed over the last few percent of file size.
+    /// The lightest zlib level (1), for throughput-oriented pipelines that
+    /// prefer encode speed over the last few percent of file size.
     Fast,
     /// The historical exporter default (zlib level 6).
     #[default]
     Default,
-    /// The heaviest zlib level, for archives that prefer size over speed.
+    /// The heaviest zlib level (9), for archives that prefer size over speed.
     Best,
+    /// An explicit zlib level from 0 (stored) through 9. Values above 9 are
+    /// rejected rather than clamped.
+    Level(u8),
 }
 
 impl PngCompression {
-    fn zlib_level(self) -> Compression {
-        match self {
+    fn zlib_level(self) -> Result<Compression> {
+        Ok(match self {
             Self::Fast => Compression::fast(),
             Self::Default => Compression::default(),
             Self::Best => Compression::best(),
+            Self::Level(level) => {
+                if level > 9 {
+                    return Err(Error::invalid_data(format!(
+                        "PNG compression level {level} is outside the supported range 0 through 9"
+                    )));
+                }
+                Compression::new(u32::from(level))
+            }
+        })
+    }
+}
+
+/// Scanline filter strategy used by the PNG encoder.
+///
+/// Filtering happens before zlib compression and is fully reversible, so
+/// every strategy is lossless. The choice trades a little encode CPU for the
+/// compression ratio the filtered scanlines allow.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PngFilter {
+    /// Filter type zero on every scanline — the historical output.
+    #[default]
+    None,
+    /// Chooses among the five standard filters per scanline with the
+    /// minimum-sum-of-absolute-differences heuristic used by libpng and
+    /// `ImageSharp`. Continuous-tone images compress substantially better.
+    Adaptive,
+}
+
+/// JPEG chroma subsampling choice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum JpegSampling {
+    /// The encoder's quality-driven default: 4:2:0 below quality 90 and
+    /// 4:4:4 at 90 and above. This is the historical output.
+    #[default]
+    Auto,
+    /// 4:4:4 — full chroma resolution.
+    Yuv444,
+    /// 4:2:2 — chroma halved horizontally.
+    Yuv422,
+    /// 4:2:0 — chroma halved in both directions.
+    Yuv420,
+}
+
+impl JpegSampling {
+    const fn sampling_factor(self) -> Option<JpegSamplingFactor> {
+        match self {
+            Self::Auto => None,
+            Self::Yuv444 => Some(JpegSamplingFactor::R_4_4_4),
+            Self::Yuv422 => Some(JpegSamplingFactor::R_4_2_2),
+            Self::Yuv420 => Some(JpegSamplingFactor::R_4_2_0),
+        }
+    }
+}
+
+/// Format-specific knobs for one image encode.
+///
+/// Every field defaults to the historical exporter behavior, so
+/// `ImageEncodeOptions::default()` reproduces `write_rgba_image` byte for
+/// byte. Each knob applies only to its own format and is ignored elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageEncodeOptions {
+    /// JPEG quality from 1 through 100.
+    pub jpeg_quality: u8,
+    /// JPEG chroma subsampling.
+    pub jpeg_sampling: JpegSampling,
+    /// Write a progressive JPEG instead of a baseline one.
+    pub jpeg_progressive: bool,
+    /// Spend extra encode CPU on optimized Huffman tables.
+    pub jpeg_optimized_huffman: bool,
+    /// Composite translucent pixels over this RGB background before JPEG
+    /// encoding. `None` keeps the managed exporter's semantics of retaining
+    /// RGB values and discarding alpha outright.
+    pub jpeg_background: Option<[u8; 3]>,
+    /// PNG zlib effort.
+    pub png_compression: PngCompression,
+    /// PNG scanline filter strategy.
+    pub png_filter: PngFilter,
+    /// Cap on the encoded output length in bytes. For JPEG and lossless WebP
+    /// it also bounds the contiguous encoder working input.
+    pub maximum_output_bytes: u64,
+}
+
+impl Default for ImageEncodeOptions {
+    fn default() -> Self {
+        Self {
+            jpeg_quality: DEFAULT_JPEG_QUALITY,
+            jpeg_sampling: JpegSampling::Auto,
+            jpeg_progressive: false,
+            jpeg_optimized_huffman: false,
+            jpeg_background: None,
+            png_compression: PngCompression::Default,
+            png_filter: PngFilter::None,
+            maximum_output_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -165,43 +264,37 @@ pub fn write_rgba_image_with_quality<W: Write>(
     maximum_output_bytes: u64,
     output: &mut W,
 ) -> Result<u64> {
-    write_rgba_image_with_encoding(
+    write_rgba_image_with_options(
         image,
         format,
         row_order,
-        jpeg_quality,
-        PngCompression::default(),
-        maximum_output_bytes,
+        &ImageEncodeOptions {
+            jpeg_quality,
+            maximum_output_bytes,
+            ..ImageEncodeOptions::default()
+        },
         output,
     )
 }
 
-/// Writes one RGBA8 image with an explicit JPEG quality and PNG zlib effort.
+/// Writes one RGBA8 image with the complete set of format-specific knobs.
 ///
-/// Each knob applies only to its own format: the quality to JPEG, the
-/// compression to PNG. Every other budget and row-order rule matches
-/// [`write_rgba_image`].
-pub fn write_rgba_image_with_encoding<W: Write>(
+/// Each knob applies only to its own format; see [`ImageEncodeOptions`].
+/// Every budget and row-order rule matches [`write_rgba_image`], and the
+/// default options reproduce it byte for byte.
+pub fn write_rgba_image_with_options<W: Write>(
     image: &RgbaImage,
     format: ImageFormat,
     row_order: ImageRowOrder,
-    jpeg_quality: u8,
-    png_compression: PngCompression,
-    maximum_output_bytes: u64,
+    options: &ImageEncodeOptions,
     output: &mut W,
 ) -> Result<u64> {
     let dimensions = validate_image(image)?;
+    let maximum_output_bytes = options.maximum_output_bytes;
     let mut output = BoundedWriter::new(output, maximum_output_bytes);
     match format {
-        ImageFormat::Jpeg => write_jpeg(
-            image,
-            dimensions,
-            row_order,
-            jpeg_quality,
-            maximum_output_bytes,
-            &mut output,
-        )?,
-        ImageFormat::Png => write_png(image, dimensions, row_order, png_compression, &mut output)?,
+        ImageFormat::Jpeg => write_jpeg(image, dimensions, row_order, options, &mut output)?,
+        ImageFormat::Png => write_png(image, dimensions, row_order, options, &mut output)?,
         ImageFormat::Bmp => write_bmp(image, dimensions, row_order, &mut output)?,
         ImageFormat::Tga => write_tga(image, dimensions, row_order, &mut output)?,
         ImageFormat::Webp => write_webp(
@@ -243,30 +336,20 @@ pub fn encode_rgba_image(
     image: &RgbaImage,
     format: ImageFormat,
     row_order: ImageRowOrder,
-    jpeg_quality: u8,
-    png_compression: PngCompression,
-    maximum_output_bytes: u64,
+    options: &ImageEncodeOptions,
 ) -> Result<Vec<u8>> {
     let dimensions = validate_image(image)?;
     let estimate = dimensions
         .pixel_bytes
         .saturating_add(RGBA_IR_HEADER_BYTES)
-        .min(maximum_output_bytes);
+        .min(options.maximum_output_bytes);
     let estimate = usize::try_from(estimate)
         .map_err(|_| Error::invalid_data("encoded image reservation does not fit this platform"))?;
     let mut output = Vec::new();
     output.try_reserve(estimate).map_err(|error| {
         Error::invalid_data(format!("cannot allocate encoded image buffer: {error}"))
     })?;
-    write_rgba_image_with_encoding(
-        image,
-        format,
-        row_order,
-        jpeg_quality,
-        png_compression,
-        maximum_output_bytes,
-        &mut output,
-    )?;
+    write_rgba_image_with_options(image, format, row_order, options, &mut output)?;
     Ok(output)
 }
 
@@ -274,10 +357,11 @@ fn write_jpeg<W: Write>(
     image: &RgbaImage,
     dimensions: ImageDimensions,
     row_order: ImageRowOrder,
-    quality: u8,
-    maximum_working_bytes: u64,
+    options: &ImageEncodeOptions,
     output: &mut BoundedWriter<'_, W>,
 ) -> Result<()> {
+    let quality = options.jpeg_quality;
+    let maximum_working_bytes = options.maximum_output_bytes;
     if !(1..=100).contains(&quality) {
         return Err(Error::invalid_data(format!(
             "JPEG quality {quality} is outside the supported range 1 through 100"
@@ -287,20 +371,42 @@ fn write_jpeg<W: Write>(
         .map_err(|_| Error::invalid_data("JPEG width exceeds 65535 pixels"))?;
     let height = u16::try_from(image.height)
         .map_err(|_| Error::invalid_data("JPEG height exceeds 65535 pixels"))?;
-    if dimensions.pixel_bytes > maximum_working_bytes {
+    // The background composite materializes an extra RGB copy, so it is
+    // charged against the same working limit as the RGBA encoder input.
+    let rgb_bytes = dimensions.pixel_bytes / 4 * 3;
+    let working_bytes = if options.jpeg_background.is_some() {
+        dimensions
+            .pixel_bytes
+            .checked_add(rgb_bytes)
+            .ok_or_else(|| Error::invalid_data("JPEG working size overflowed"))?
+    } else {
+        dimensions.pixel_bytes
+    };
+    if working_bytes > maximum_working_bytes {
         return Err(Error::invalid_data(format!(
-            "JPEG encoder requires {} input bytes, exceeding working limit {}",
-            dimensions.pixel_bytes, maximum_working_bytes
+            "JPEG encoder requires {working_bytes} input bytes, exceeding working limit {maximum_working_bytes}"
         )));
     }
     let pixels = display_order_rgba(image, dimensions, row_order)?;
+    let (pixels, color_type) = match options.jpeg_background {
+        None => (pixels, JpegColorType::Rgba),
+        Some(background) => (
+            Cow::Owned(composite_over_background(&pixels, rgb_bytes, background)?),
+            JpegColorType::Rgb,
+        ),
+    };
     let result = catch_unwind(AssertUnwindSafe(|| {
-        JpegEncoder::new(output, quality).encode(
-            pixels.as_ref(),
-            width,
-            height,
-            JpegColorType::Rgba,
-        )
+        let mut encoder = JpegEncoder::new(output, quality);
+        if let Some(sampling) = options.jpeg_sampling.sampling_factor() {
+            encoder.set_sampling_factor(sampling);
+        }
+        if options.jpeg_progressive {
+            encoder.set_progressive(true);
+        }
+        if options.jpeg_optimized_huffman {
+            encoder.set_optimized_huffman_tables(true);
+        }
+        encoder.encode(pixels.as_ref(), width, height, color_type)
     }));
     match result {
         Ok(Ok(())) => Ok(()),
@@ -308,6 +414,31 @@ fn write_jpeg<W: Write>(
         Ok(Err(error)) => Err(Error::invalid_data(format!("cannot encode JPEG: {error}"))),
         Err(_) => Err(Error::invalid_data("JPEG encoder panicked")),
     }
+}
+
+/// Alpha-composites display-order RGBA pixels over an opaque RGB background
+/// using the exact integer rounding `round(c*a/255 + bg*(255-a)/255)`.
+fn composite_over_background(rgba: &[u8], rgb_bytes: u64, background: [u8; 3]) -> Result<Vec<u8>> {
+    let length = usize::try_from(rgb_bytes).map_err(|_| {
+        Error::invalid_data("JPEG composite working buffer does not fit this platform")
+    })?;
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(length).map_err(|error| {
+        Error::invalid_data(format!(
+            "cannot allocate JPEG composite working buffer: {error}"
+        ))
+    })?;
+    for pixel in rgba.chunks_exact(4) {
+        let alpha = u32::from(pixel[3]);
+        let inverse = 255 - alpha;
+        for channel in 0..3 {
+            let blended =
+                u32::from(pixel[channel]) * alpha + u32::from(background[channel]) * inverse;
+            // alpha + inverse is exactly 255, so the rounded quotient is <= 255.
+            rgb.push(u8::try_from((blended + 127) / 255).expect("alpha blend fits u8"));
+        }
+    }
+    Ok(rgb)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -347,7 +478,7 @@ fn write_png<W: Write>(
     image: &RgbaImage,
     dimensions: ImageDimensions,
     row_order: ImageRowOrder,
-    compression: PngCompression,
+    options: &ImageEncodeOptions,
     output: &mut BoundedWriter<'_, W>,
 ) -> Result<()> {
     if image.width > PNG_MAX_DIMENSION || image.height > PNG_MAX_DIMENSION {
@@ -356,6 +487,7 @@ fn write_png<W: Write>(
             image.width, image.height
         )));
     }
+    let zlib_level = options.png_compression.zlib_level()?;
     output.write_all(PNG_SIGNATURE)?;
 
     let mut ihdr = [0_u8; 13];
@@ -366,16 +498,125 @@ fn write_png<W: Write>(
     write_png_chunk(output, *b"IHDR", &ihdr)?;
 
     let idat = IdatWriter::new(output)?;
-    let mut encoder = ZlibEncoder::new(idat, compression.zlib_level());
-    for output_row in 0..dimensions.height_usize {
-        encoder.write_all(&[0])?;
-        encoder.write_all(display_row(image, dimensions, row_order, output_row)?)?;
+    let mut encoder = ZlibEncoder::new(idat, zlib_level);
+    match options.png_filter {
+        PngFilter::None => {
+            for output_row in 0..dimensions.height_usize {
+                encoder.write_all(&[0])?;
+                encoder.write_all(display_row(image, dimensions, row_order, output_row)?)?;
+            }
+        }
+        PngFilter::Adaptive => {
+            // One reusable scanline buffer holds the filtered candidate; the
+            // prior row is borrowed straight from the pixel buffer, so the
+            // working memory stays a single stride regardless of image size.
+            let mut filtered = Vec::new();
+            filtered
+                .try_reserve_exact(dimensions.stride_usize)
+                .map_err(|error| {
+                    Error::invalid_data(format!("cannot allocate PNG filter scanline: {error}"))
+                })?;
+            filtered.resize(dimensions.stride_usize, 0);
+            for output_row in 0..dimensions.height_usize {
+                let current = display_row(image, dimensions, row_order, output_row)?;
+                let prior = if output_row > 0 {
+                    Some(display_row(image, dimensions, row_order, output_row - 1)?)
+                } else {
+                    None
+                };
+                let filter = select_png_filter(current, prior);
+                for (index, destination) in filtered.iter_mut().enumerate() {
+                    *destination = png_filtered_byte(filter, current, prior, index);
+                }
+                encoder.write_all(&[filter])?;
+                encoder.write_all(&filtered)?;
+            }
+        }
     }
     let idat = encoder.finish()?;
     idat.finish()?;
 
     write_png_chunk(output, *b"IEND", &[])?;
     Ok(())
+}
+
+/// RGBA8 bytes per pixel, which is also the PNG filter distance to the pixel
+/// on the left.
+const PNG_FILTER_BPP: usize = 4;
+
+/// Chooses the scanline filter with the libpng/ImageSharp heuristic: the
+/// candidate whose filtered bytes have the smallest sum of absolute values
+/// when read as signed deltas.
+fn select_png_filter(current: &[u8], prior: Option<&[u8]>) -> u8 {
+    let mut best_filter = 0;
+    let mut best_sum = u64::MAX;
+    for filter in 0..=4 {
+        let mut sum = 0_u64;
+        for index in 0..current.len() {
+            let byte = png_filtered_byte(filter, current, prior, index);
+            let magnitude = if byte < 128 {
+                u64::from(byte)
+            } else {
+                256 - u64::from(byte)
+            };
+            sum = sum.saturating_add(magnitude);
+            if sum >= best_sum {
+                break;
+            }
+        }
+        if sum < best_sum {
+            best_sum = sum;
+            best_filter = filter;
+        }
+    }
+    best_filter
+}
+
+/// Applies one standard PNG filter to a single byte position. The neighbor
+/// bytes left of the row start or above the first row are zero, exactly as
+/// the PNG specification defines them.
+fn png_filtered_byte(filter: u8, current: &[u8], prior: Option<&[u8]>, index: usize) -> u8 {
+    let raw = current[index];
+    let left = if index >= PNG_FILTER_BPP {
+        current[index - PNG_FILTER_BPP]
+    } else {
+        0
+    };
+    let above = prior.map_or(0, |row| row[index]);
+    let upper_left = if index >= PNG_FILTER_BPP {
+        prior.map_or(0, |row| row[index - PNG_FILTER_BPP])
+    } else {
+        0
+    };
+    match filter {
+        0 => raw,
+        1 => raw.wrapping_sub(left),
+        2 => raw.wrapping_sub(above),
+        // (left + above) / 2 without leaving u8: shifted halves plus the
+        // carry bit both operands share.
+        3 => raw.wrapping_sub(
+            (left >> 1)
+                .wrapping_add(above >> 1)
+                .wrapping_add(left & above & 1),
+        ),
+        _ => raw.wrapping_sub(paeth_predictor(left, above, upper_left)),
+    }
+}
+
+/// The PNG Paeth predictor: whichever of left, above, and upper-left is
+/// closest to `left + above - upper_left`, with ties resolved in that order.
+fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
+    let estimate = i16::from(left) + i16::from(above) - i16::from(upper_left);
+    let distance_left = (estimate - i16::from(left)).abs();
+    let distance_above = (estimate - i16::from(above)).abs();
+    let distance_upper_left = (estimate - i16::from(upper_left)).abs();
+    if distance_left <= distance_above && distance_left <= distance_upper_left {
+        left
+    } else if distance_above <= distance_upper_left {
+        above
+    } else {
+        upper_left
+    }
 }
 
 fn write_bmp<W: Write>(
@@ -703,10 +944,18 @@ mod tests {
     use zune_jpeg::JpegDecoder;
 
     use super::{
-        ImageFormat, ImageRowOrder, PNG_SIGNATURE, PngCompression, encode_rgba_image,
-        flip_rgba_rows, png_crc32, write_rgba_image, write_rgba_image_with_quality,
+        ImageEncodeOptions, ImageFormat, ImageRowOrder, JpegSampling, PNG_SIGNATURE,
+        PngCompression, PngFilter, encode_rgba_image, flip_rgba_rows, png_crc32, write_rgba_image,
+        write_rgba_image_with_quality,
     };
     use crate::texture::RgbaImage;
+
+    fn encode_options() -> ImageEncodeOptions {
+        ImageEncodeOptions {
+            maximum_output_bytes: 1024 * 1024,
+            ..ImageEncodeOptions::default()
+        }
+    }
 
     /// The owned-buffer entry point must produce exactly the streaming
     /// writer's bytes, keep enforcing the output cap, and keep JPEG quality
@@ -718,9 +967,7 @@ mod tests {
             &image,
             ImageFormat::Png,
             ImageRowOrder::Display,
-            75,
-            PngCompression::Default,
-            1024 * 1024,
+            &encode_options(),
         )
         .unwrap();
         assert!(encoded.starts_with(PNG_SIGNATURE));
@@ -740,9 +987,10 @@ mod tests {
                 &image,
                 ImageFormat::Png,
                 ImageRowOrder::Display,
-                75,
-                PngCompression::Default,
-                8
+                &ImageEncodeOptions {
+                    maximum_output_bytes: 8,
+                    ..ImageEncodeOptions::default()
+                },
             )
             .is_err()
         );
@@ -751,45 +999,262 @@ mod tests {
                 &image,
                 ImageFormat::Jpeg,
                 ImageRowOrder::Display,
-                0,
-                PngCompression::Default,
-                1024
+                &ImageEncodeOptions {
+                    jpeg_quality: 0,
+                    maximum_output_bytes: 1024,
+                    ..ImageEncodeOptions::default()
+                },
             )
             .is_err()
         );
     }
 
-    /// Every PNG compression level is lossless: the zlib effort may change
-    /// the compressed stream, never the decoded scanlines.
-    #[test]
-    fn png_compression_levels_change_effort_but_not_pixels() {
-        let image = RgbaImage {
+    fn gradient_image() -> RgbaImage {
+        RgbaImage {
             width: 16,
             height: 16,
             pixels: (0_u32..16 * 16 * 4)
                 .map(|value| u8::try_from(value % 251).expect("residue fits u8"))
                 .collect(),
-        };
+        }
+    }
+
+    /// Every PNG compression level is lossless: the zlib effort may change
+    /// the compressed stream, never the decoded scanlines. An explicit
+    /// numeric level behaves the same, and levels above 9 are rejected.
+    #[test]
+    fn png_compression_levels_change_effort_but_not_pixels() {
+        let image = gradient_image();
         let mut scanlines_by_level = Vec::new();
         for compression in [
             PngCompression::Fast,
             PngCompression::Default,
             PngCompression::Best,
+            PngCompression::Level(0),
+            PngCompression::Level(9),
         ] {
             let encoded = encode_rgba_image(
                 &image,
                 ImageFormat::Png,
                 ImageRowOrder::Display,
-                75,
-                compression,
-                1024 * 1024,
+                &ImageEncodeOptions {
+                    png_compression: compression,
+                    ..encode_options()
+                },
             )
             .unwrap();
             assert!(encoded.starts_with(PNG_SIGNATURE));
             scanlines_by_level.push(png_idat_scanlines(&encoded));
         }
-        assert_eq!(scanlines_by_level[0], scanlines_by_level[1]);
-        assert_eq!(scanlines_by_level[1], scanlines_by_level[2]);
+        for scanlines in &scanlines_by_level[1..] {
+            assert_eq!(scanlines, &scanlines_by_level[0]);
+        }
+
+        let error = encode_rgba_image(
+            &image,
+            ImageFormat::Png,
+            ImageRowOrder::Display,
+            &ImageEncodeOptions {
+                png_compression: PngCompression::Level(10),
+                ..encode_options()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("0 through 9"));
+    }
+
+    /// The adaptive scanline filter is reversible and, on continuous-tone
+    /// pixels, strictly smaller than unfiltered output at the same zlib
+    /// level. Unfiltering must reproduce the raw rows byte for byte.
+    #[test]
+    fn adaptive_png_filter_is_lossless_and_smaller_on_gradients() {
+        let image = gradient_image();
+        let unfiltered = encode_rgba_image(
+            &image,
+            ImageFormat::Png,
+            ImageRowOrder::Display,
+            &ImageEncodeOptions {
+                png_compression: PngCompression::Fast,
+                png_filter: PngFilter::None,
+                ..encode_options()
+            },
+        )
+        .unwrap();
+        let adaptive = encode_rgba_image(
+            &image,
+            ImageFormat::Png,
+            ImageRowOrder::Display,
+            &ImageEncodeOptions {
+                png_compression: PngCompression::Fast,
+                png_filter: PngFilter::Adaptive,
+                ..encode_options()
+            },
+        )
+        .unwrap();
+        assert!(adaptive.starts_with(PNG_SIGNATURE));
+        assert!(
+            adaptive.len() < unfiltered.len(),
+            "adaptive {} bytes should beat unfiltered {} bytes on a gradient",
+            adaptive.len(),
+            unfiltered.len()
+        );
+
+        let stride = 16 * 4;
+        let restored = unfilter_png_scanlines(&png_idat_scanlines(&adaptive), stride);
+        assert_eq!(restored, image.pixels);
+
+        // The UnityDecoded orientation must flip before filtering, exactly
+        // as the unfiltered writer does.
+        let mut flipped = image.clone();
+        flip_rgba_rows(&mut flipped).unwrap();
+        let from_decoded = encode_rgba_image(
+            &flipped,
+            ImageFormat::Png,
+            ImageRowOrder::UnityDecoded,
+            &ImageEncodeOptions {
+                png_compression: PngCompression::Fast,
+                png_filter: PngFilter::Adaptive,
+                ..encode_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(from_decoded, adaptive);
+    }
+
+    /// Each JPEG knob must change the produced stream while remaining
+    /// decodable, and the background composite must actually blend
+    /// translucent pixels instead of dropping alpha.
+    #[test]
+    fn jpeg_sampling_progressive_and_background_knobs_stay_decodable() {
+        let image = gradient_image();
+        let baseline = encode_rgba_image(
+            &image,
+            ImageFormat::Jpeg,
+            ImageRowOrder::Display,
+            &encode_options(),
+        )
+        .unwrap();
+
+        let mut variant_streams = vec![baseline.clone()];
+        for options in [
+            ImageEncodeOptions {
+                jpeg_sampling: JpegSampling::Yuv444,
+                ..encode_options()
+            },
+            ImageEncodeOptions {
+                jpeg_sampling: JpegSampling::Yuv422,
+                ..encode_options()
+            },
+            ImageEncodeOptions {
+                jpeg_progressive: true,
+                ..encode_options()
+            },
+            ImageEncodeOptions {
+                jpeg_optimized_huffman: true,
+                ..encode_options()
+            },
+        ] {
+            let encoded =
+                encode_rgba_image(&image, ImageFormat::Jpeg, ImageRowOrder::Display, &options)
+                    .unwrap();
+            assert_ne!(encoded, baseline);
+            let mut decoder = JpegDecoder::new(Cursor::new(&encoded));
+            decoder.decode().unwrap();
+            let info = decoder.info().unwrap();
+            assert_eq!((info.width, info.height), (16, 16));
+            variant_streams.push(encoded);
+        }
+        // Quality-driven auto sampling picks 4:2:0 below quality 90, so an
+        // explicit 4:2:0 must reproduce the baseline exactly.
+        let explicit_420 = encode_rgba_image(
+            &image,
+            ImageFormat::Jpeg,
+            ImageRowOrder::Display,
+            &ImageEncodeOptions {
+                jpeg_sampling: JpegSampling::Yuv420,
+                ..encode_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(explicit_420, baseline);
+
+        // A fully transparent red image composited over white must decode to
+        // near-white; without the background it keeps the red RGB values.
+        let transparent_red = RgbaImage {
+            width: 16,
+            height: 16,
+            pixels: [255, 0, 0, 0].repeat(16 * 16),
+        };
+        let composited = encode_rgba_image(
+            &transparent_red,
+            ImageFormat::Jpeg,
+            ImageRowOrder::Display,
+            &ImageEncodeOptions {
+                jpeg_background: Some([255, 255, 255]),
+                ..encode_options()
+            },
+        )
+        .unwrap();
+        let mut decoder = JpegDecoder::new(Cursor::new(&composited));
+        let restored = decoder.decode().unwrap();
+        let center = &restored[(8 * 16 + 8) * 3..][..3];
+        assert!(center.iter().all(|&channel| channel > 240), "{center:?}");
+
+        let dropped = encode_rgba_image(
+            &transparent_red,
+            ImageFormat::Jpeg,
+            ImageRowOrder::Display,
+            &encode_options(),
+        )
+        .unwrap();
+        let mut decoder = JpegDecoder::new(Cursor::new(&dropped));
+        let restored = decoder.decode().unwrap();
+        let center = &restored[(8 * 16 + 8) * 3..][..3];
+        assert!(
+            center[0] > 220 && center[1] < 30 && center[2] < 30,
+            "{center:?}"
+        );
+    }
+
+    /// Reverses the standard PNG filters, mirroring the specification's
+    /// reconstruction functions independently of the encoder's helpers.
+    fn unfilter_png_scanlines(scanlines: &[u8], stride: usize) -> Vec<u8> {
+        let mut output: Vec<u8> = Vec::new();
+        for line in scanlines.chunks_exact(stride + 1) {
+            let filter = line[0];
+            let row_start = output.len();
+            for (index, &byte) in line[1..].iter().enumerate() {
+                let left = if index >= 4 {
+                    output[row_start + index - 4]
+                } else {
+                    0
+                };
+                let above = if row_start >= stride {
+                    output[row_start + index - stride]
+                } else {
+                    0
+                };
+                let upper_left = if row_start >= stride && index >= 4 {
+                    output[row_start + index - stride - 4]
+                } else {
+                    0
+                };
+                let restored = match filter {
+                    0 => byte,
+                    1 => byte.wrapping_add(left),
+                    2 => byte.wrapping_add(above),
+                    3 => byte.wrapping_add(
+                        u16::midpoint(u16::from(left), u16::from(above))
+                            .try_into()
+                            .expect("average of two u8 fits u8"),
+                    ),
+                    4 => byte.wrapping_add(super::paeth_predictor(left, above, upper_left)),
+                    _ => panic!("unexpected PNG filter {filter}"),
+                };
+                output.push(restored);
+            }
+        }
+        output
     }
 
     fn png_idat_scanlines(png: &[u8]) -> Vec<u8> {

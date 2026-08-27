@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use napi::bindgen_prelude::{Array, AsyncTask, BigInt, Buffer, FnArgs, Object};
+use napi::bindgen_prelude::{Array, AsyncTask, BigInt, Buffer, Either, FnArgs, Object};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Error, JsString, JsValue, Result, Status, Task, Unknown, ValueType};
 use napi_derive::napi;
@@ -19,7 +19,8 @@ use unity_rs_core::export::{
 };
 use unity_rs_core::extraction::ExtractionOptions;
 use unity_rs_core::image_export::{
-    DEFAULT_JPEG_QUALITY, ImageFormat, ImageRowOrder, PngCompression,
+    DEFAULT_JPEG_QUALITY, ImageEncodeOptions, ImageFormat, ImageRowOrder, JpegSampling,
+    PngCompression, PngFilter,
 };
 use unity_rs_core::live2d_clip_motion::CubismClipMotionReadLimits;
 use unity_rs_core::live2d_motion::{
@@ -367,10 +368,25 @@ pub struct EncodeImageOptions {
     pub image_format: Option<String>,
     /// JPEG-only quality from 1 through 100. Defaults to 75.
     pub jpeg_quality: Option<u32>,
-    /// PNG-only zlib effort: `fast`, `default`, or `best`. Defaults to
-    /// `default`. Every level is lossless; the effort trades encode CPU for
-    /// file size.
-    pub compression: Option<String>,
+    /// JPEG-only chroma subsampling: `auto`, `4:4:4`, `4:2:2`, or `4:2:0`.
+    /// Defaults to `auto`, the encoder's quality-driven choice.
+    pub jpeg_sampling: Option<String>,
+    /// JPEG-only: write a progressive stream instead of a baseline one.
+    pub jpeg_progressive: Option<bool>,
+    /// JPEG-only: spend extra encode CPU on optimized Huffman tables.
+    pub jpeg_optimized_huffman: Option<bool>,
+    /// JPEG-only `[r, g, b]` background compositing translucent pixels
+    /// before encoding. Omitted, alpha is discarded outright, matching the
+    /// managed exporter.
+    pub jpeg_background: Option<Vec<u32>>,
+    /// PNG-only zlib effort: `fast`, `default`, `best`, or an explicit
+    /// numeric level 0 through 9. Defaults to `default`. Every level is
+    /// lossless; the effort trades encode CPU for file size.
+    pub compression: Option<Either<String, u32>>,
+    /// PNG-only scanline filter strategy: `none` or `adaptive`. Defaults to
+    /// `none`, the historical output. Both are lossless; `adaptive`
+    /// compresses continuous-tone images substantially better.
+    pub png_filter: Option<String>,
     /// Cap on the encoded output length in bytes. Defaults to 512 MiB.
     pub maximum_bytes: Option<i64>,
 }
@@ -3818,9 +3834,7 @@ impl Task for ReadSpriteTask {
 pub struct EncodeImagePlan {
     image: unity_rs_core::texture::RgbaImage,
     format: ImageFormat,
-    jpeg_quality: u8,
-    png_compression: PngCompression,
-    maximum_bytes: u64,
+    options: ImageEncodeOptions,
 }
 
 impl EncodeImagePlan {
@@ -3829,9 +3843,7 @@ impl EncodeImagePlan {
             &self.image,
             self.format,
             ImageRowOrder::Display,
-            self.jpeg_quality,
-            self.png_compression,
-            self.maximum_bytes,
+            &self.options,
         )
         .map_err(core_error)
     }
@@ -3841,12 +3853,13 @@ fn encode_image_plan(
     image: &RgbaImage,
     options: Option<EncodeImageOptions>,
 ) -> Result<EncodeImagePlan> {
-    let (format, jpeg_quality, png_compression, maximum_bytes) = match options {
+    let (format, encode_options) = match options {
         None => (
             ImageFormat::Png,
-            DEFAULT_JPEG_QUALITY,
-            PngCompression::default(),
-            DEFAULT_PAYLOAD_LIMIT,
+            ImageEncodeOptions {
+                maximum_output_bytes: DEFAULT_PAYLOAD_LIMIT,
+                ..ImageEncodeOptions::default()
+            },
         ),
         Some(options) => {
             let format = parse_image_format(options.image_format)?;
@@ -3862,9 +3875,16 @@ fn encode_image_plan(
                 .map_err(|_| invalid_arg("jpegQuality does not fit in one byte"))?;
             (
                 format,
-                jpeg_quality,
-                parse_png_compression(options.compression)?,
-                byte_limit(options.maximum_bytes)?,
+                ImageEncodeOptions {
+                    jpeg_quality,
+                    jpeg_sampling: parse_jpeg_sampling(options.jpeg_sampling)?,
+                    jpeg_progressive: options.jpeg_progressive.unwrap_or(false),
+                    jpeg_optimized_huffman: options.jpeg_optimized_huffman.unwrap_or(false),
+                    jpeg_background: parse_jpeg_background(options.jpeg_background)?,
+                    png_compression: parse_png_compression(options.compression)?,
+                    png_filter: parse_png_filter(options.png_filter)?,
+                    maximum_output_bytes: byte_limit(options.maximum_bytes)?,
+                },
             )
         }
     };
@@ -3888,10 +3908,25 @@ fn encode_image_plan(
             pixels,
         },
         format,
-        jpeg_quality,
-        png_compression,
-        maximum_bytes,
+        options: encode_options,
     })
+}
+
+fn parse_jpeg_background(value: Option<Vec<u32>>) -> Result<Option<[u8; 3]>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let channels: Option<Vec<u8>> = value
+        .iter()
+        .map(|&channel| u8::try_from(channel).ok())
+        .collect();
+    channels
+        .as_deref()
+        .and_then(|channels| <[u8; 3]>::try_from(channels).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            invalid_arg("jpegBackground must be three RGB channel values from 0 through 255")
+        })
 }
 
 pub struct EncodeImageTask {
@@ -5162,9 +5197,21 @@ fn parse_image_format(value: Option<String>) -> Result<ImageFormat> {
     }
 }
 
-fn parse_png_compression(value: Option<String>) -> Result<PngCompression> {
-    let Some(value) = value else {
-        return Ok(PngCompression::default());
+fn parse_png_compression(value: Option<Either<String, u32>>) -> Result<PngCompression> {
+    let value = match value {
+        None => return Ok(PngCompression::default()),
+        Some(Either::B(level)) => {
+            return u8::try_from(level)
+                .ok()
+                .filter(|level| *level <= 9)
+                .map(PngCompression::Level)
+                .ok_or_else(|| {
+                    invalid_arg(format!(
+                        "PNG compression level {level} is outside the supported range 0 through 9"
+                    ))
+                });
+        }
+        Some(Either::A(value)) => value,
     };
     let value = value.trim();
     if value.eq_ignore_ascii_case("fast") {
@@ -5177,7 +5224,43 @@ fn parse_png_compression(value: Option<String>) -> Result<PngCompression> {
         Err(unsupported_option(
             "PNG compression",
             value,
-            "fast, default, or best",
+            "fast, default, best, or a level from 0 through 9",
+        ))
+    }
+}
+
+fn parse_png_filter(value: Option<String>) -> Result<PngFilter> {
+    let Some(value) = value else {
+        return Ok(PngFilter::default());
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        Ok(PngFilter::None)
+    } else if value.eq_ignore_ascii_case("adaptive") {
+        Ok(PngFilter::Adaptive)
+    } else {
+        Err(unsupported_option("PNG filter", value, "none or adaptive"))
+    }
+}
+
+fn parse_jpeg_sampling(value: Option<String>) -> Result<JpegSampling> {
+    let Some(value) = value else {
+        return Ok(JpegSampling::default());
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(JpegSampling::Auto)
+    } else if value == "4:4:4" || value == "444" {
+        Ok(JpegSampling::Yuv444)
+    } else if value == "4:2:2" || value == "422" {
+        Ok(JpegSampling::Yuv422)
+    } else if value == "4:2:0" || value == "420" {
+        Ok(JpegSampling::Yuv420)
+    } else {
+        Err(unsupported_option(
+            "JPEG sampling",
+            value,
+            "auto, 4:4:4, 4:2:2, or 4:2:0",
         ))
     }
 }

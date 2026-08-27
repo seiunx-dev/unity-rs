@@ -661,11 +661,32 @@ export interface EncodeImageOptions {
   /** JPEG-only quality from 1 through 100. Defaults to 75. */
   jpegQuality?: number
   /**
-   * PNG-only zlib effort: `fast`, `default`, or `best`. Defaults to
-   * `default`. Every level is lossless; the effort trades encode CPU for
-   * file size.
+   * JPEG-only chroma subsampling: `auto`, `4:4:4`, `4:2:2`, or `4:2:0`.
+   * Defaults to `auto`, the encoder's quality-driven choice.
    */
-  compression?: string
+  jpegSampling?: string
+  /** JPEG-only: write a progressive stream instead of a baseline one. */
+  jpegProgressive?: boolean
+  /** JPEG-only: spend extra encode CPU on optimized Huffman tables. */
+  jpegOptimizedHuffman?: boolean
+  /**
+   * JPEG-only `[r, g, b]` background compositing translucent pixels
+   * before encoding. Omitted, alpha is discarded outright, matching the
+   * managed exporter.
+   */
+  jpegBackground?: Array<number>
+  /**
+   * PNG-only zlib effort: `fast`, `default`, `best`, or an explicit
+   * numeric level 0 through 9. Defaults to `default`. Every level is
+   * lossless; the effort trades encode CPU for file size.
+   */
+  compression?: string | number
+  /**
+   * PNG-only scanline filter strategy: `none` or `adaptive`. Defaults to
+   * `none`, the historical output. Both are lossless; `adaptive`
+   * compresses continuous-tone images substantially better.
+   */
+  pngFilter?: string
   /** Cap on the encoded output length in bytes. Defaults to 512 MiB. */
   maximumBytes?: number
 }

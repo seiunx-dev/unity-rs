@@ -328,11 +328,18 @@ function consumeEveryUnityRsMember(studio: UnityRs): void {
   const encodeOptions: EncodeImageOptions = {
     imageFormat: "png",
     jpegQuality: 90,
+    jpegSampling: "4:2:0",
+    jpegProgressive: true,
+    jpegOptimizedHuffman: true,
+    jpegBackground: [255, 255, 255],
     compression: "fast",
+    pngFilter: "adaptive",
     maximumBytes: 1024 * 1024,
   };
   const encodedSprite: Buffer = UnityRs.encodeImage(sprite, encodeOptions);
   void encodedSprite;
+  const numericCompression: EncodeImageOptions = { compression: 6 };
+  void UnityRs.encodeImage(sprite, numericCompression);
   const encodedSpriteAsync: Promise<Buffer> = UnityRs.encodeImageAsync(sprite);
   void encodedSpriteAsync;
   void studio.readAudio(0, 1n, 1024);

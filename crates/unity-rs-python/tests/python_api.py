@@ -2941,15 +2941,38 @@ def main() -> None:
         assert encoded_png[16:24] == (2).to_bytes(4, "big") * 2
         encoded_raw = tight_sprite.encode(" Raw-RGBA ")
         assert encoded_raw[:16] == b"HARUKI_RGBAIR_V1"
-        # The zlib effort changes the compressed stream, never the pixels:
-        # every level stays a valid PNG carrying the same IHDR geometry.
-        encoded_fast = tight_sprite.encode("png", compression=" Fast ")
-        assert encoded_fast[:8] == b"\x89PNG\r\n\x1a\n"
-        assert encoded_fast[16:24] == encoded_png[16:24]
+        # The zlib effort and scanline filter change the compressed stream,
+        # never the pixels: every choice stays a valid PNG carrying the same
+        # IHDR geometry, and an explicit numeric level is accepted.
+        for kwargs in (
+            {"compression": " Fast "},
+            {"compression": 0},
+            {"compression": 9},
+            {"png_filter": " Adaptive "},
+        ):
+            encoded_variant = tight_sprite.encode("png", **kwargs)
+            assert encoded_variant[:8] == b"\x89PNG\r\n\x1a\n"
+            assert encoded_variant[16:24] == encoded_png[16:24]
+        # The JPEG knobs produce decodable streams that differ from the
+        # baseline, and the background composite accepts an RGB tuple.
+        encoded_jpeg = tight_sprite.encode("jpeg")
+        assert encoded_jpeg[:2] == b"\xff\xd8"
+        for kwargs in (
+            {"jpeg_sampling": "4:4:4"},
+            {"jpeg_progressive": True},
+            {"jpeg_optimized_huffman": True},
+            {"jpeg_background": (255, 255, 255)},
+        ):
+            variant = tight_sprite.encode("jpeg", **kwargs)
+            assert variant[:2] == b"\xff\xd8"
+            assert variant != encoded_jpeg
         for failing_call in (
             lambda: tight_sprite.encode("gif"),
             lambda: tight_sprite.encode("jpeg", jpeg_quality=0),
+            lambda: tight_sprite.encode("jpeg", jpeg_sampling="4:1:1"),
             lambda: tight_sprite.encode("png", compression="turbo"),
+            lambda: tight_sprite.encode("png", compression=10),
+            lambda: tight_sprite.encode("png", png_filter="paeth"),
         ):
             try:
                 failing_call()

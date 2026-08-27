@@ -1696,16 +1696,65 @@ assert.deepEqual(Buffer.from(decodedTexture.pixels), DISPLAY_ORDER_PIXELS)
     imageFormat: 'raw-rgba',
   })
   assert.equal(encodedRaw.subarray(0, 16).toString('ascii'), 'HARUKI_RGBAIR_V1')
-  // The zlib effort knob changes the compressed stream, never the pixels:
-  // fast output is still a valid PNG with the same IHDR geometry.
-  const encodedFast = addon.UnityRs.encodeImage(decodedTexture, {
-    compression: 'fast',
+  // The zlib effort and scanline filter change the compressed stream, never
+  // the pixels: every choice stays a valid PNG with the same IHDR geometry,
+  // and the compression option accepts an explicit numeric level.
+  for (const options of [
+    { compression: 'fast' },
+    { compression: 0 },
+    { compression: 9 },
+    { pngFilter: 'adaptive' },
+  ]) {
+    const variant = addon.UnityRs.encodeImage(decodedTexture, options)
+    assert.deepEqual(variant.subarray(0, 8), encodedPng.subarray(0, 8))
+    assert.deepEqual(variant.subarray(16, 24), encodedPng.subarray(16, 24))
+  }
+  // Each JPEG knob produces a stream that differs from the baseline while
+  // remaining a JPEG, and the background composite takes an RGB triple.
+  const encodedJpeg = addon.UnityRs.encodeImage(decodedTexture, {
+    imageFormat: 'jpeg',
   })
-  assert.deepEqual(encodedFast.subarray(0, 8), encodedPng.subarray(0, 8))
-  assert.deepEqual(encodedFast.subarray(16, 24), encodedPng.subarray(16, 24))
+  assert.deepEqual(encodedJpeg.subarray(0, 2), Buffer.from([0xff, 0xd8]))
+  for (const options of [
+    { jpegSampling: '4:4:4' },
+    { jpegProgressive: true },
+    { jpegOptimizedHuffman: true },
+    { jpegBackground: [255, 255, 255] },
+  ]) {
+    const variant = addon.UnityRs.encodeImage(decodedTexture, {
+      imageFormat: 'jpeg',
+      ...options,
+    })
+    assert.deepEqual(variant.subarray(0, 2), Buffer.from([0xff, 0xd8]))
+    assert.notDeepEqual(variant, encodedJpeg)
+  }
   assert.throws(
     () => addon.UnityRs.encodeImage(decodedTexture, { compression: 'turbo' }),
     /unsupported PNG compression/i,
+  )
+  assert.throws(
+    () => addon.UnityRs.encodeImage(decodedTexture, { compression: 10 }),
+    /range 0 through 9/i,
+  )
+  assert.throws(
+    () => addon.UnityRs.encodeImage(decodedTexture, { pngFilter: 'paeth' }),
+    /unsupported PNG filter/i,
+  )
+  assert.throws(
+    () =>
+      addon.UnityRs.encodeImage(decodedTexture, {
+        imageFormat: 'jpeg',
+        jpegSampling: '4:1:1',
+      }),
+    /unsupported JPEG sampling/i,
+  )
+  assert.throws(
+    () =>
+      addon.UnityRs.encodeImage(decodedTexture, {
+        imageFormat: 'jpeg',
+        jpegBackground: [255, 255],
+      }),
+    /three RGB channel values/i,
   )
   assert.throws(
     () => addon.UnityRs.encodeImage(decodedTexture, { imageFormat: 'gif' }),

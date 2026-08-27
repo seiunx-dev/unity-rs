@@ -590,7 +590,12 @@ class RgbaImage:
         image_format: str = "png",
         *,
         jpeg_quality: int = 75,
-        compression: str = "default",
+        jpeg_sampling: str = "auto",
+        jpeg_progressive: bool = False,
+        jpeg_optimized_huffman: bool = False,
+        jpeg_background: Optional[tuple[int, int, int]] = None,
+        compression: Optional[Union[int, str]] = None,
+        png_filter: str = "none",
         maximum_bytes: int = 536_870_912,
     ) -> bytes: ...
 

@@ -734,24 +734,34 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 - **逐对象图像编码已于 2026-08-27 暴露到绑定层**：Core 的 PNG/JPEG/BMP/TGA/lossless-WebP/
   raw-RGBA 编码器此前只能通过整集合 `export()` 的落盘布局使用，Python/Node 调用方拿到
   `RgbaImage` 后想存单张图只能自带编码器（Pillow/sharp），既慢又绕开 Core 已有的预算语义。
-  现 Core 新增 `image_export::encode_rgba_image` 与 `write_rgba_image_with_encoding`，与流式
+  现 Core 新增 `image_export::encode_rgba_image` 与 `write_rgba_image_with_options`，与流式
   writer 共用同一组编码器和 `BoundedWriter` 输出预算，缓冲区预留取原始像素估计与输出上限的
-  较小值且全程 fallible。PNG 的 zlib 档位通过新 `PngCompression`（`fast`/`default`/`best`，
-  映射 flate2 level 1/6/9）显式可选：下游真实语料实测（member_cutout 全量，2,609 张）发现固定
-  `Compression::default()` 在吞吐场景是负收益——同体积下比 Pillow level=3 慢 1.9 倍、比同一
-  生态 image crate 的 `CompressionType::Fast` 编码环节慢约 6.6 倍——所以吞吐管线要能显式选
-  `fast`；默认档保持既有 `default` 不变，`export()` 行为不受影响。所有档位无损，Core 回归
-  断言三档解出的扫描线逐字节一致。Python 在
-  `RgbaImage.encode(image_format="png", *, jpeg_quality=75, compression="default",
-  maximum_bytes=512MiB)` 返回 `bytes`（编码在 `py.detach` 内完成，GIL 边界已纳入 surface
-  审计门），Node 增加静态 `UnityRs.encodeImage`/`encodeImageAsync`（options 含 `compression`；
-  napi worker `compute` 内编码；像素 Buffer 先按声明尺寸做长度校验、再 fallible 拷贝，worker
-  不触碰 JS 内存）。两端格式串、JPEG 质量 1–100 校验与默认值同 `export` 完全一致；`RgbaImage`
-  三端仍是 display 行序，编码固定 `Display` 不再翻转。回归：Core 单测锁定 owned 输出与流式
-  writer 逐字节一致、预算与质量拒绝、三档无损等价；Python/Node 各自验证 PNG 签名+IHDR 尺寸、
-  fast 档 PNG 有效性、raw-RGBA IR 魔数、非法格式/预算/质量/档位的错误族（PNG 中途超预算保留
-  I/O 族），Node 另断言 async 与 sync 字节一致；`.pyi`、严格 mypy 消费端、napi 重生成声明、
-  严格 TS 消费端与安装包 87 方法计数全部同步。
+  较小值且全程 fallible；格式旋钮收敛在 `ImageEncodeOptions`，默认值逐字节复现历史输出。
+  PNG 侧：`PngCompression`（`fast`/`default`/`best` 映射 flate2 level 1/6/9，另接受显式
+  `Level(0..=9)`，超 9 拒绝不钳制）与 `PngFilter`（`none` 保持历史 filter-type-0 输出；
+  `adaptive` 按 libpng/ImageSharp 的最小绝对差启发逐行在五种标准 filter 里选优，工作内存
+  恒为单行 stride 且 fallible 预留）。动机是下游真实语料实测（member_cutout 全量，2,609 张）：
+  固定 `Compression::default()` 加无 filter 在吞吐场景是负收益——同体积下比 Pillow level=3
+  慢 1.9 倍、比同一生态 image crate 的 `CompressionType::Fast`+Adaptive 编码环节慢约 6.6 倍。
+  JPEG 侧透出 jpeg-encoder 已有能力：`JpegSampling`（`auto` 保持质量驱动的历史默认，
+  显式 4:4:4/4:2:2/4:2:0）、progressive、optimized Huffman，以及 `jpeg_background`（给定
+  RGB 底色时按 `round(c*a/255+bg*(1-a/255))` 整数合成半透明像素，替代默认的丢 alpha 语义；
+  合成缓冲计入同一工作预算）。所有 PNG 档位/filter 无损，Core 回归断言五种压缩组合解出的
+  扫描线逐字节一致、adaptive 输出经独立 unfilter 复原后与原始像素逐字节相等且在渐变图上
+  严格小于无 filter 输出、显式 4:2:0 与 auto 基线逐字节一致、透明像素合成白底后解码近白而
+  丢 alpha 路径保持原 RGB。`export()` 行为不受任何旋钮影响。Python 在
+  `RgbaImage.encode(image_format="png", *, jpeg_quality, jpeg_sampling, jpeg_progressive,
+  jpeg_optimized_huffman, jpeg_background, compression（名字或 0–9 整数）, png_filter,
+  maximum_bytes)` 返回 `bytes`（编码在 `py.detach` 内完成，GIL 边界已纳入 surface 审计门），
+  Node 静态 `UnityRs.encodeImage`/`encodeImageAsync` 的 options 同形（`compression` 为
+  `string | number`；napi worker `compute` 内编码；像素 Buffer 先按声明尺寸做长度校验、再
+  fallible 拷贝，worker 不触碰 JS 内存）。两端格式串、质量/档位/采样校验与默认值完全一致；
+  `RgbaImage` 三端仍是 display 行序，编码固定 `Display` 不再翻转。回归：Core 单测锁定 owned
+  输出与流式 writer 逐字节一致、预算与质量拒绝；Python/Node 各自验证 PNG 签名+IHDR 尺寸、
+  各档位/filter/数字级有效性、JPEG 各旋钮产出可解码且异于基线、raw-RGBA IR 魔数、非法格式/
+  预算/质量/档位/采样/filter/底色形状的错误族（PNG 中途超预算保留 I/O 族），Node 另断言
+  async 与 sync 字节一致；`.pyi`、严格 mypy 消费端、napi 重生成声明、严格 TS 消费端与安装包
+  87 方法计数全部同步。
   `cargo fmt/check/clippy -D warnings/test`、两个 API surface 审计与
   `tools/local_ci.py --fail-on-skip quality rust python node typing oracle` 零跳过通过；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
