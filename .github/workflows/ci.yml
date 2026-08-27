@@ -87,7 +87,12 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
       - name: Verify publishable Rust core crate
-        run: cargo package --locked -p unity-rs-core
+        # The restored target/ cache can carry the previous version's
+        # .crate archive; the legal-files audit and the tag-run upload must
+        # only ever see the archive this run produced.
+        run: |
+          rm -rf target/package
+          cargo package --locked -p unity-rs-core
       - name: Verify locked third-party license bundle
         run: python3 tools/generate_dependency_licenses.py --check
       - name: Verify headless delivery scope

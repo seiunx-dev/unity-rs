@@ -185,6 +185,16 @@ def groups(interpreter: str) -> list[Group]:
                     env={"RUSTDOCFLAGS": "-D warnings"},
                 ),
                 Step(
+                    # A previous run's archive (a version bump, a cached
+                    # target/) would make the legal-files audit ambiguous;
+                    # it must only see the archive this run produced.
+                    "clear stale core crate archives",
+                    [
+                        "python3", "-c",
+                        "import shutil; shutil.rmtree('target/package', ignore_errors=True)",
+                    ],
+                ),
+                Step(
                     "package the core crate",
                     [
                         "cargo", "package", "--allow-dirty", "--locked",
