@@ -5305,11 +5305,29 @@ fn core_error(error: Error) -> PyErr {
     }
 }
 
+/// Payload size from which [`python_bytes`] releases the GIL for the copy.
+///
+/// Detaching costs a thread-state save/restore, so tiny buffers copy faster
+/// while attached; from tens of kilobytes the memcpy dominates and holding
+/// the GIL through multi-megabyte pixel or payload copies is what starves
+/// other Python threads (measured 4x1024x1024-RGBA `rgba` readers driving a
+/// pure-Python thread down to a fifth of its idle throughput).
+const DETACHED_BYTES_COPY_THRESHOLD: usize = 64 * 1024;
+
 /// Copies bounded Rust output into a Python `bytes` object without turning a
 /// Python allocation failure into a Rust panic.
+///
+/// Large copies run with the GIL released: the freshly allocated `bytes`
+/// object is not yet reachable by any other Python code, its refcount keeps
+/// it alive for the duration, and the closure performs no Python calls, so
+/// other threads may run during the memcpy.
 fn python_bytes<'py>(py: Python<'py>, bytes: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
     PyBytes::new_with(py, bytes.len(), |output| {
-        output.copy_from_slice(bytes);
+        if bytes.len() >= DETACHED_BYTES_COPY_THRESHOLD {
+            py.detach(|| output.copy_from_slice(bytes));
+        } else {
+            output.copy_from_slice(bytes);
+        }
         Ok(())
     })
 }

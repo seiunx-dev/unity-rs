@@ -889,6 +889,20 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   等于 none、default 档 Auto 严格小于 none、批量导出默认流与显式 adaptive 相等而显式 none
   改变流；CLI/Python/Node 的 `auto` 语义文档三面同改（Node `index.d.ts` 随 napi 再生）。
   fast 出厂路径（fast+Auto）字节不变，Haruki 管线无影响；
+- **Python 绑定多线程（GIL）审计与大缓冲出口的解锁复制（2026-08-28）**：面向多线程
+  CPython 调用方全面审计绑定的 GIL 行为：全部 `read_*`/`export`/`extract`/`encode`/构造
+  入口确认在 `py.detach` 内执行重活；迭代器仅做常数级元数据查表；sprite 页缓存的
+  Mutex 临界区仅覆盖查表/插入（解码在锁外）；文件底座在 Unix 走无锁 `pread`——结构上
+  并发读同一 `UnityRs` 真正并行。实测（1024² RGBA32 合成资产，3.14 GIL 构建）
+  load+decode+encode 全链 8 线程 6.4×，重活方法的心跳占用接近纯 sleep 对照的测量上限。
+  唯一大户是 `python_bytes` 的 `PyBytes` 复制全程持锁：4 线程反复取 `rgba`（4 MiB/次）把
+  纯 Python 线程压到闲置吞吐的 19%，且聚合吞吐随线程数负伸缩（8 线程低于单线程的 GIL
+  车队效应）。现 `python_bytes` 对 ≥64 KiB 的载荷在 `PyBytes::new_with` 预分配后于
+  `py.detach` 内 memcpy——新分配对象尚不可达、引用计数持有、闭包无 Python 调用，故解锁
+  复制安全；全部字节出口（`rgba`/payload/JSON/FBX/OBJ/编码结果）经由该助手同步受益。
+  复测：`rgba` 8 线程聚合 5385→7542 it/s（+40%，转为正伸缩），他线程 GIL 可用性
+  19%→67%（对照上限 85%），阈值边界 63/64 KiB 单线程 2.30 vs 2.32 µs——无竞争 detach
+  往返开销不可测。API 面与输出字节均无变化；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量
