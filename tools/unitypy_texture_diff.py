@@ -23,7 +23,11 @@ What it checks:
   excused, and the count is reported rather than hidden;
 * ASTC may differ, but by at most one level per channel. Two correct
   implementations of the same block format can land either side of a half;
-  more than that is a decode defect. Alpha is included: an ASTC block decodes
+  more than that is a decode defect. Since the LDR conversion adopted the
+  specification's top byte (`docs/upstream-defects.md`, defect 3) both sides
+  decode LDR the specification's way, so the expected result is byte identity
+  and the one-level allowance is the alarm threshold rather than the norm.
+  Alpha is included: an ASTC block decodes
   all four channels through the same endpoint arithmetic, and an `ASTC_RGB_*`
   texture can still carry a varying alpha -- one in the corpus this was
   written against holds values 0, 1, 2 and 4 rather than a constant 255;

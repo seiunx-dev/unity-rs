@@ -980,6 +980,57 @@ fn assert_bc6h_textures(executable: &Path) {
     assert_eq!(managed, rust, "BC6H decoding");
 }
 
+/// The LDR half of `assert_astc_textures`: a declared divergence rather than
+/// an exact comparison.
+///
+/// This crate follows the ASTC specification's top-byte conversion (pinned
+/// byte for byte against `astcenc` reference blobs in `texture.rs`), while
+/// the managed decoder rounds a `* 255 / 65535` rescale. Both committed blobs
+/// re-earn their names here -- the managed one against the live managed
+/// decoder, the astcenc one against this crate's live output -- and the
+/// divergence between them stays bounded to one per byte and non-empty. If
+/// the two ever converge, the managed decoder adopted the specification's
+/// conversion and LDR moves back into the exact set.
+fn assert_ldr_astc_divergence(
+    directory: &Path,
+    name: &str,
+    managed_decoded: &Value,
+    rust_decoded: &Value,
+) {
+    let managed_blob = fs::read(directory.join(format!("{name}-managed.rgba")))
+        .unwrap_or_else(|error| panic!("cannot read {name}-managed.rgba: {error}"));
+    assert_eq!(
+        managed_decoded["Fnv64"].as_str().unwrap(),
+        format!("{:016x}", fnv1a64(&managed_blob)),
+        "the committed {name} blob is no longer what the managed decoder produces"
+    );
+    let astcenc_blob = fs::read(directory.join(format!("{name}-astcenc.rgba")))
+        .unwrap_or_else(|error| panic!("cannot read {name}-astcenc.rgba: {error}"));
+    assert_eq!(
+        rust_decoded["Fnv64"].as_str().unwrap(),
+        format!("{:016x}", fnv1a64(&astcenc_blob)),
+        "the Rust decoder no longer matches the committed {name} astcenc reference"
+    );
+    assert_ne!(
+        managed_decoded, rust_decoded,
+        "{name} now decodes identically in both implementations; the \
+         declared LDR rounding divergence no longer exists"
+    );
+    assert_eq!(
+        managed_blob.len(),
+        astcenc_blob.len(),
+        "{name} sizes differ"
+    );
+    for (index, (theirs, ours)) in managed_blob.iter().zip(&astcenc_blob).enumerate() {
+        let delta = i16::from(*theirs) - i16::from(*ours);
+        assert!(
+            delta.abs() <= 1,
+            "{name} byte {index} diverges by more than rounding: \
+             managed {theirs} vs astcenc {ours}"
+        );
+    }
+}
+
 /// Compares ASTC decoding against the managed decoder on real encoder output.
 ///
 /// ASTC sat outside this comparison because the other formats are fed
@@ -987,6 +1038,13 @@ fn assert_bc6h_textures(executable: &Path) {
 /// encodings that no encoder produces, and the two implementations diverge on
 /// those by design. Payloads from ARM's `astcenc` remove that objection; see
 /// `tests/fixtures/astc/README.md`.
+///
+/// The comparison is exact for HDR. For LDR the normative reference is the
+/// ASTC specification's decode, pinned in `texture.rs` against committed
+/// `astcenc` reference blobs; the managed decoder rounds its 16-to-8-bit
+/// conversion differently, so LDR here is a compatibility differential that
+/// re-earns both committed blobs and holds the divergence to at most one per
+/// byte.
 fn assert_astc_textures(executable: &Path) {
     // (block size, RGB format, RGBA format, HDR format)
     const FOOTPRINTS: &[(i32, i32, i32, i32)] = &[
@@ -1038,7 +1096,7 @@ fn assert_astc_textures(executable: &Path) {
                 // The committed blob is what `texture.rs` compares against, so
                 // this re-earns the right to call it managed output rather than
                 // trusting a hash recorded once. The comparison below is exact
-                // for HDR as it is for LDR.
+                // for HDR.
                 let blob = fs::read(directory.join(format!("{name}-managed.rgba")))
                     .unwrap_or_else(|error| panic!("cannot read {name}-managed.rgba: {error}"));
                 assert_eq!(
@@ -1046,6 +1104,10 @@ fn assert_astc_textures(executable: &Path) {
                     format!("{:016x}", fnv1a64(&blob)),
                     "the committed {name} blob is no longer what the managed decoder produces"
                 );
+            } else {
+                assert_ldr_astc_divergence(&directory, &name, managed_decoded, rust_decoded);
+                compared += 1;
+                continue;
             }
 
             if managed_decoded != rust_decoded {

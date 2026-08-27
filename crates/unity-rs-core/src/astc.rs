@@ -13,9 +13,16 @@
 //!   whole-image `InvalidData` the contained panic used to produce) instead
 //!   of relying on `catch_unwind`.
 //!
-//! The decode arithmetic is unchanged from the vendored copy, including its
-//! `VENDOR FIX` rounding restoration in `select_color_hdr`: the LDR and HDR
-//! fixture suites and the managed differential pin every output byte.
+//! The decode arithmetic follows the vendored copy with one deliberate
+//! departure: LDR interpolation converts its 16-bit result to 8 bits by
+//! taking the top byte, as the ASTC specification's `unorm16` decode mode
+//! and Khronos `astcenc` do, where the AssetStudio lineage rounds a
+//! `* 255 / 65535` rescale instead. The two differ by at most one per byte;
+//! `astcenc` reference blobs pin the LDR output exactly and the managed
+//! differential carries the divergence as a declared bound (see
+//! `tests/fixtures/astc/README.md`). HDR keeps the vendored arithmetic,
+//! including its `VENDOR FIX` rounding restoration in `select_color_hdr`,
+//! and still matches the managed decoder byte for byte.
 //! `texture2ddecoder` is MIT OR Apache-2.0; the upstream notice sits beside
 //! the remaining vendored copy in `vendor/texture2ddecoder`.
 //!
@@ -335,10 +342,14 @@ fn set_endpoint_hdr_clamp(
 
 // typedef uint_fast8_t (*t_select_folor_func_ptr)(int, int, int);
 
+// The `>> 8` is the ASTC specification's `unorm16` to 8-bit conversion: the
+// interpolated 16-bit value keeps its top byte, matching Khronos `astcenc`.
+// The AssetStudio-lineage decoders round `* 255 / 65535` here instead, which
+// differs by one on some values; that divergence is pinned in the managed
+// differential rather than reproduced.
 #[inline]
 const fn select_color(v0: i32, v1: i32, weight: i32) -> u8 {
-    (((((v0 << 8 | v0) * (64 - weight) + (v1 << 8 | v1) * weight + 32) >> 6) * 255 + 32768) / 65536)
-        as u8
+    ((((v0 << 8 | v0) * (64 - weight) + (v1 << 8 | v1) * weight + 32) >> 6) >> 8) as u8
 }
 
 #[inline]
@@ -1882,10 +1893,10 @@ fn select_a(cem: usize, v0: i32, v1: i32, weight: i32) -> u8 {
 
 /// Interpolation constants for one partition's four LDR channels.
 ///
-/// `select_color` computes `((c0*(64-w) + c1*w + 32) >> 6) * 255 + 32768)
-/// / 65536` per channel; with `base = c0*64 + 32` and `delta = c1 - c0` the
-/// numerator is exactly `base + delta*w` in `i32` (`c0,c1 <= 65535`, so
-/// every term stays far inside the type and the sum is non-negative), which
+/// `select_color` computes `((c0*(64-w) + c1*w + 32) >> 6) >> 8` per
+/// channel; with `base = c0*64 + 32` and `delta = c1 - c0` the interpolated
+/// value is exactly `base + delta*w` in `i32` (`c0,c1 <= 65535`, so every
+/// term stays far inside the type and the sum is non-negative), which
 /// trades two multiplies per channel for one.
 #[derive(Clone, Copy, Default)]
 struct LdrPartition {
@@ -1910,9 +1921,7 @@ impl LdrPartition {
     fn pixel(&self, weight: i32) -> u32 {
         let mut channels = [0_u8; 4];
         for index in 0..4 {
-            channels[index] = ((((self.base[index] + self.delta[index] * weight) >> 6) * 255
-                + 32768)
-                / 65536) as u8;
+            channels[index] = (((self.base[index] + self.delta[index] * weight) >> 6) >> 8) as u8;
         }
         color(channels[0], channels[1], channels[2], channels[3])
     }

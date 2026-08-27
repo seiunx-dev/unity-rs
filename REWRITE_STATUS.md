@@ -858,6 +858,24 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   套件全过。这四项对 member_cutout 管线均为零收益（该语料非 LZMA、不走 FBX/extract），
   受益者是模型提取规则（binary FBX 合计 ~1.5×，加 Fast 档 ~4.5–7×）、CLI extract（≥2×）
   与 LZMA 压缩的游戏语料；
+- **ASTC LDR 解码改为遵循 ASTC 规范——破坏性输出变更（2026-08-27）**：下游对同一批真实
+  图集做三方对照（Khronos `astcenc` 5.7.0 官方解码 / UnityPy 经 `astc_encoder` 带
+  `USE_DECODE_UNORM8` / 本项目）证明：AssetStudio 谱系（托管、C++、`texture2ddecoder`
+  移植）的 LDR 16→8 位转换用 `round(C*255/65536)`，而规范 `decode_unorm8` 取插值结果高
+  字节 `C >> 8`；两者在本仓库 fixture 上 2.7%–27% 的字节恰差 1（方向不定），UnityPy 与
+  规范逐字节一致，本项目彼时与托管一致、同为规范离群者。经评审决定以规范为准——GPU 与
+  一切合规解码器的输出才是 ground truth，AssetStudio 一致性是迁移属性而非正确性目标——
+  `astc.rs` 的 `select_color` 与 `LdrPartition` 快路径改为 `>> 8`，不提供旧行为开关
+  （需要旧输出者钉住 0.3.x）。测试契约就此切分：规范性门禁是新增的 12 份
+  `-astcenc.rgba` 参考 blob（`tools/decode_astc_references.py` 用官方 astcenc 二进制从
+  已提交载荷再生，逐字节可复现），`texture.rs` 新增
+  `ldr_astc_decodes_exactly_like_the_khronos_reference` 逐字节钉住；托管差分对 LDR 降级
+  为兼容性差分——新增 12 份 `-managed.rgba`（由改动前实现生成，oracle 每轮对在线托管
+  解码器重新赚取其哈希，本轮已实测 12/12 命中），声明偏差必须非空且逐字节 ≤1，两侧若
+  收敛则测试失败提示撤销声明。HDR 六格式与 BC6H 不受影响，仍与托管逐字节一致。
+  `docs/upstream-defects.md` 新增缺陷 3 记录测量与不依赖本项目的复现。**这是破坏性输出
+  变更，随下一个 minor 版本（0.4.0）发布，不作为 patch 悄发**。对 Haruki member_cutout
+  管线无影响（下游已确认其基线随升级一并迁移，且新输出与 UnityPy/astcenc 生态一致）；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量
@@ -1537,10 +1555,11 @@ CI 在 Linux、Windows、macOS 上运行 Rust 测试，并分别验证 Python、
 Linux amd64 完全一致；差异来源尚未隔离，因此暂不把任一 profile 外推为所有平台的结论。
 `docs/upstream-defects.md` 记录了测量数据、不依赖本项目的复现步骤和门禁策略。
 
-- `texture2ddecoder` 0.1.2 的 `f32_to_u8` 有两份移植（ASTC 一份、BC6H 一份），都把参考实现的 `roundf` 丢了；影响 6 个 ASTC HDR 格式加 BC6H，每个受影响通道恒低一格。上游 master 至今未修，仓库通过 vendored ASTC/BC6H 解码器修正并由托管差分把守。
+- `texture2ddecoder` 0.1.2 的 `f32_to_u8` 有两份移植（ASTC 一份、BC6H 一份），都把参考实现的 `roundf` 丢了；影响 6 个 ASTC HDR 格式加 BC6H，每个受影响通道恒低一格。上游 master 至今未修，仓库通过 vendored/fork 的 ASTC 与 BC6H 解码器修正并由托管差分把守（ASTC 解码器其后已迁入第一方 `astc.rs` fork，修复随迁）。
+- `texture2ddecoder` 0.1.2 的 LDR `select_color`（承自 AssetStudio Texture2DDecoder）用 `round(C*255/65536)` 代替 ASTC 规范 `decode_unorm8` 的取高字节；影响 12 个 LDR ASTC 格式，2.7%–27% 的字节恰差 1（方向不定）。本项目自 2026-08-27 起在 `astc.rs` fork 中采用规范转换，以 astcenc 参考 blob 为规范性门禁，对托管解码器保留声明式 ±1 兼容性差分。
 - `ruopus` 0.1.2 的 SILK 路径在此前本地 oracle/build 中偏早且不精确（宽带早 2 个采样、窄带早 4 个，对齐后约差峰值的 3%）；固定 r2117 Linux amd64 对 CI fixture 完全一致。CELT 路径在两类测量中都准确。
 
-纹理那处已于 2026-08-15 决定采用 vendor 修复：`crates/unity-rs-core/src/vendor/texture2ddecoder/` 收入 ASTC 与 BC6H 解码器，只改两个舍入表达式（就地标 `VENDOR FIX`），并删除一段本项目不用、依赖 `paste` 的宏（标 `VENDOR DELTA`），其余保持可与上游直接 diff。18 个 ASTC 格式加 BC6H 现在与托管解码器**完全一致**，测试也由“钉住已知偏差”改为要求相等。Opus 未采用同一路线：独立纯 Rust 候选 `opus-rs` 0.1.26/0.1.28 已实测仍有更大的时序偏差并使 CELT 精度回退，剩余已知替代只有 libopus 绑定，会为仅 SILK 路径的偏差引入新的原生运行时依赖并终结该解码链的纯 Rust 性质，而当前 CELT 路径本身已经准确；因此现阶段保留明确记录与有界偏差测试，等待可审计的纯 Rust 修复或上游版本。
+纹理第一处已于 2026-08-15 决定采用 vendor 修复：`crates/unity-rs-core/src/vendor/texture2ddecoder/` 收入 ASTC 与 BC6H 解码器，只改两个舍入表达式（就地标 `VENDOR FIX`），并删除一段本项目不用、依赖 `paste` 的宏（标 `VENDOR DELTA`），其余保持可与上游直接 diff。当时 18 个 ASTC 格式加 BC6H 与托管解码器**完全一致**，测试也由“钉住已知偏差”改为要求相等；2026-08-27 起 12 个 LDR 格式改钉 ARM 参考解码器（见上一条与 `docs/upstream-defects.md` 缺陷 3），6 个 HDR 格式与 BC6H 仍与托管完全一致。Opus 未采用同一路线：独立纯 Rust 候选 `opus-rs` 0.1.26/0.1.28 已实测仍有更大的时序偏差并使 CELT 精度回退，剩余已知替代只有 libopus 绑定，会为仅 SILK 路径的偏差引入新的原生运行时依赖并终结该解码链的纯 Rust 性质，而当前 CELT 路径本身已经准确；因此现阶段保留明确记录与有界偏差测试，等待可审计的纯 Rust 修复或上游版本。
 
 公开 runner 的完全一致 profile 进一步降低了立即替换 decoder 的收益，但并未解释另一环境的
 稳定偏差；在原因被隔离前，不能据此删除第二个已测 profile，也不能声称 SILK 已在所有平台修复。

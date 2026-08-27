@@ -4035,6 +4035,99 @@ mod tests {
         }
     }
 
+    const LDR_ASTC_CASES: &[(usize, &str, TextureFormat)] = &[
+        (4, "rgb", TextureFormat::ASTC_RGB_4X4),
+        (4, "rgba", TextureFormat::ASTC_RGBA_4X4),
+        (5, "rgb", TextureFormat::ASTC_RGB_5X5),
+        (5, "rgba", TextureFormat::ASTC_RGBA_5X5),
+        (6, "rgb", TextureFormat::ASTC_RGB_6X6),
+        (6, "rgba", TextureFormat::ASTC_RGBA_6X6),
+        (8, "rgb", TextureFormat::ASTC_RGB_8X8),
+        (8, "rgba", TextureFormat::ASTC_RGBA_8X8),
+        (10, "rgb", TextureFormat::ASTC_RGB_10X10),
+        (10, "rgba", TextureFormat::ASTC_RGBA_10X10),
+        (12, "rgb", TextureFormat::ASTC_RGB_12X12),
+        (12, "rgba", TextureFormat::ASTC_RGBA_12X12),
+    ];
+
+    fn decode_ldr_astc_fixture(
+        directory: &std::path::Path,
+        name: &str,
+        block: usize,
+        format: TextureFormat,
+    ) -> Vec<u8> {
+        let payload = std::fs::read(directory.join(format!("{name}.bin"))).unwrap();
+        let size = i32::try_from(block * 2).unwrap();
+        let object = texture_object(size, size, format, 1, &payload, None);
+        let file = parse_asset(&object);
+        let collection = collection_with(file.clone(), "unused", b"");
+        let texture = read_texture2d(&collection, &file, 0, TextureReadLimits::default()).unwrap();
+        texture
+            .decode_mip_rgba8(0, TextureReadLimits::default())
+            .unwrap()
+            .pixels
+    }
+
+    /// Every LDR ASTC footprint decodes exactly as Khronos `astcenc` does.
+    ///
+    /// The committed `-astcenc.rgba` blobs are `astcenc` 5.7.0's own
+    /// decompression of the fixture payloads, so this pins the decoder to the
+    /// ASTC specification's decode -- the output GPUs and every conformant
+    /// decoder produce -- rather than to another port of the `AssetStudio`
+    /// lineage. See `tests/fixtures/astc/README.md` for provenance.
+    #[test]
+    fn ldr_astc_decodes_exactly_like_the_khronos_reference() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
+        for (block, variant, format) in LDR_ASTC_CASES {
+            let name = format!("astc-{variant}-{block}x{block}");
+            let expected = std::fs::read(directory.join(format!("{name}-astcenc.rgba"))).unwrap();
+            let actual = decode_ldr_astc_fixture(&directory, &name, *block, *format);
+            assert_eq!(
+                actual, expected,
+                "{name} no longer matches the astcenc reference decode"
+            );
+        }
+    }
+
+    /// The managed decoder's LDR ASTC output differs from this crate's by at
+    /// most one per byte, and does differ.
+    ///
+    /// The `AssetStudio` lineage converts interpolated 16-bit values with a
+    /// rounded `* 255 / 65535` rescale where the specification keeps the top
+    /// byte, so some bytes land one apart. The committed `-managed.rgba`
+    /// blobs hold that output; the managed differential re-earns them
+    /// against the live managed decoder. Asserting both the bound and the
+    /// presence of a difference means a divergence of any other shape fails,
+    /// and so does the two decoders silently converging -- the signal to
+    /// retire this declared divergence.
+    #[test]
+    fn ldr_astc_differs_from_the_managed_decoder_only_by_rounding() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
+        for (block, variant, format) in LDR_ASTC_CASES {
+            let name = format!("astc-{variant}-{block}x{block}");
+            let managed = std::fs::read(directory.join(format!("{name}-managed.rgba"))).unwrap();
+            let actual = decode_ldr_astc_fixture(&directory, &name, *block, *format);
+            assert_eq!(actual.len(), managed.len(), "{name} sizes differ");
+            let mut differing = 0_usize;
+            for (index, (ours, theirs)) in actual.iter().zip(&managed).enumerate() {
+                let delta = i16::from(*ours) - i16::from(*theirs);
+                assert!(
+                    delta.abs() <= 1,
+                    "{name} byte {index} diverges by more than rounding: \
+                     ours {ours} vs managed {theirs}"
+                );
+                differing += usize::from(delta != 0);
+            }
+            assert!(
+                differing > 0,
+                "{name} now matches the managed decoder exactly; the declared \
+                 divergence no longer exists"
+            );
+        }
+    }
+
     #[test]
     fn decodes_pvrtc_2bpp_and_4bpp_like_the_native_cpp_oracle() {
         // Deterministic compressed words were decoded with

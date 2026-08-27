@@ -1,13 +1,13 @@
 # Upstream defects
 
 Two dependencies produce output this project can show is wrong. Neither can be
-corrected from outside the dependency, so one is fixed by vendoring the code
-that carries it and the other is recorded and left alone. Both are written up
-with the measurement that found them and a reproduction that does not depend on
-this project, so filing either upstream is a copy rather than a
-re-investigation. The texture defect also has its patch here; the Opus one does
-not, because it has been characterised from the outside but not traced to a
-line.
+corrected from outside the dependency, so the texture defects are fixed in
+code this repository carries -- vendored or forked -- and the Opus one is
+recorded and left alone. Each is written up with the measurement that found it
+and a reproduction that does not depend on this project, so filing any of them
+upstream is a copy rather than a re-investigation. The texture defects also
+have their patches here; the Opus one does not, because it has been
+characterised from the outside but not traced to a line.
 
 ---
 
@@ -104,14 +104,20 @@ malformed block produces.
 
 Present on `master` as of 2026-08-15; 0.1.2 is the latest release. Not filed.
 
-**Fixed here by vendoring.** `crates/unity-rs-core/src/vendor/texture2ddecoder/`
-carries the ASTC and BC6H decoders with the two expressions above corrected
-and nothing else changed, so the copy diffs cleanly against the published
-source. Every other format still comes from the crate. All eighteen ASTC
-formats and BC6H now compare exactly against the managed decoder, so the
-copy is held to the same standard as the rest of the texture path rather
-than trusted because it was copied. Drop the directory and restore the two
-call sites in `texture.rs` when upstream releases the fix.
+**Fixed here by vendoring and forking.** BC6H comes from
+`crates/unity-rs-core/src/vendor/texture2ddecoder/`, which carries that
+decoder with `f32_to_u8` corrected and nothing else changed, so the copy
+diffs cleanly against the published source. The ASTC decoder began the same
+way and has since moved to the maintained first-party fork in
+`crates/unity-rs-core/src/astc.rs`, which keeps the corrected
+`select_color_hdr` rounding. Every other format still comes from the crate.
+The six HDR ASTC formats and BC6H compare exactly against the managed
+decoder, so the copies are held to the same standard as the rest of the
+texture path rather than trusted because they were copied; the twelve LDR
+ASTC formats are pinned against ARM's reference decoder instead, with the
+managed relationship bounded separately (defect 3). Drop the vendored BC6H
+copy and restore its call site in `texture.rs` when upstream releases the
+fix.
 
 ### Scope, and a correction
 
@@ -131,12 +137,16 @@ decode ASTC with `texture2ddecoder` at all -- it uses `astc_encoder`, a
 binding to ARM's reference codec, with `USE_DECODE_UNORM8`.
 
 What those measurements do show is worth keeping, stated correctly. On two
-shipping games this crate's LDR ASTC decode is byte-identical to the managed
-native decoder, and within one level per channel of ARM's reference decoder --
-including alpha, since an ASTC block decodes all four channels through the
-same endpoint arithmetic and an `ASTC_RGB_*` texture can still carry a varying
-alpha. `tools/unitypy_texture_diff.py` checks exactly that and reports
-anything outside it.
+shipping games this crate's LDR ASTC decode was, at the time, byte-identical
+to the managed native decoder, and within one level per channel of ARM's
+reference decoder -- including alpha, since an ASTC block decodes all four
+channels through the same endpoint arithmetic and an `ASTC_RGB_*` texture can
+still carry a varying alpha. Defect 3 below is that one level located and
+resolved: the crate has since adopted the specification's conversion, so the
+identity and the bound trade places -- byte-identical to ARM's reference
+decoder, within one level of the managed one.
+`tools/unitypy_texture_diff.py` checks the bound and reports anything outside
+it.
 
 ---
 
@@ -208,7 +218,75 @@ suggestion, because until then neither had a test of any kind.
 
 ---
 
-## 3. `ruopus` 0.1.2 — SILK comparison has two measured profiles
+## 3. `texture2ddecoder` 0.1.2 — LDR interpolation rounds a rescale where the specification keeps the top byte
+
+**Affects** the twelve LDR ASTC formats -- every LDR ASTC texture the decoder
+handles, since the conversion runs on every texel.
+
+**Severity** between 2.7% and 27% of bytes in the project's fixtures move by
+exactly one level, in either direction, relative to the specification's
+decode.
+
+### What is wrong
+
+The ASTC specification interpolates LDR endpoints at 16-bit precision and, in
+its 8-bit `decode_unorm8` mode, keeps the top byte of the result:
+
+```text
+C = (C0 * (64 - w) + C1 * w + 32) >> 6    // 16-bit interpolation
+out = C >> 8                              // the top byte is the 8-bit result
+```
+
+The AssetStudio lineage -- the managed decoder, the Texture2DDecoder C++, and
+the `texture2ddecoder` port's `select_color` -- converts with a rounded
+rescale instead:
+
+```rust
+((C * 255 + 32768) / 65536) as u8
+```
+
+The two functions agree on most inputs and differ by exactly one on the rest,
+on both sides: `C = 0x00ff` decodes to 0 under the specification and 1 under
+the rescale, `C = 0xff00` to 255 and 254. Every ASTC decoder that follows the
+specification -- GPUs, ARM's `astcenc`, UnityPy through `astc_encoder` with
+`USE_DECODE_UNORM8` -- produces the top-byte result, so the rescale makes the
+lineage a one-level outlier on real textures rather than a different-but-equal
+convention.
+
+### Measurement
+
+ARM's `astcenc` 5.7.0, the specification's reference codec, decompressed the
+twelve committed LDR fixtures (`astcenc -dl` over the payloads wrapped in
+`.astc` containers; `tools/decode_astc_references.py` reproduces this). This
+crate's pre-change output disagreed with the reference on 2.7% to 27% of bytes
+depending on footprint, every difference exactly one level; the managed
+decoder carries the same disagreement, byte for byte. The same relationship
+was measured on a shipping game's sprite atlases against UnityPy, which
+matched the reference exactly while this crate and the managed decoder
+differed from it by one level on the same texels.
+
+### The fix
+
+In the first-party fork `crates/unity-rs-core/src/astc.rs`, `select_color`
+and the `LdrPartition` fast path now convert with `>> 8`.
+`ldr_astc_decodes_exactly_like_the_khronos_reference` in `texture.rs` pins
+the result against committed `astcenc` reference blobs byte for byte, and the
+managed differential keeps the managed relationship as a declared divergence
+bounded to one per byte; `tests/fixtures/astc/README.md` records both
+contracts.
+
+### Status
+
+Present in `texture2ddecoder` 0.1.2 and on `master`, inherited from
+AssetStudio's Texture2DDecoder. Not filed: in the upstream projects the
+rescale is long-standing behaviour their consumers may depend on. This
+project chose the specification's conversion because it is what GPUs and
+every conformant decoder produce, and records the managed difference instead
+of reproducing it.
+
+---
+
+## 4. `ruopus` 0.1.2 — SILK comparison has two measured profiles
 
 **Affects** FSB5 Opus decoding wherever the stream uses SILK or hybrid packets,
 which is what libopus selects at lower bitrates. CELT-only packets are correct.
@@ -291,19 +369,20 @@ Rust.
 
 ## Why the texture defects are fixed here and the Opus one is not
 
-None can be corrected from outside the dependency. For the two rounding
-defects the reason is precise: the conversion is the decoder's last step, so
-nothing downstream can recover what it discarded. The ATC one is a palette
-entry, equally interior. For the Opus defect it is that the divergence has
+None can be corrected from outside the dependency. For the conversion defects
+the reason is precise: the conversion is the decoder's last step, so nothing
+downstream can recover what it discarded or misrounded. The ATC one is a
+palette entry, equally interior. For the Opus defect it is that the divergence has
 been characterised from the outside but not located in the source -- the
 measurements above say what `ruopus` does and where it does it by packet mode,
 not which line is responsible.
 
-The texture defects are fixed by vendoring the three decoders that carry them,
-a change of one expression each. That was worth roughly 3,000 lines because it
-makes nine texture formats byte-exact against the managed implementation, and
-because the managed differential proves the copy correct rather than the copy
-being taken on trust.
+The texture defects are fixed in code this repository carries -- the vendored
+BC6H and ATC decoders and the first-party ASTC fork -- a change of one
+expression each. That was worth roughly 3,000 lines because it makes nine
+texture formats byte-exact against the managed implementation and twelve more
+byte-exact against ARM's reference decoder, and because the differentials
+prove the copies correct rather than the copies being taken on trust.
 
 The Opus defect is not, for two reasons. The equivalent step would be vendoring
 or replacing an Opus decoder. The currently published independent pure-Rust
