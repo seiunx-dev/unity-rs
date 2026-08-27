@@ -829,7 +829,15 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   每通道单乘插值——`c0*(64-w)+c1*w+32 == base+delta*w` 在 i32 内精确成立（c0,c1≤65535），
   CEM 表查提出循环。实测 600×576/600×824 的 6×6 帧解码 2.24→1.62 / 3.20→2.33 ms（−28%）；
   2048² 上 4×4 相对 vendored 累计 1.91×、6×6 1.61×。LDR/HDR fixture、managed oracle 差分与
-  malformed-input 套件全过，字节逐一不变；
+  malformed-input 套件全过，字节逐一不变。**下游端到端复测后本优化线宣布收工（2026-08-27）**：
+  隔离测量解码 −5.7%、编码 +2.4%（后者在 ±1.6% 噪声底边缘），但六配方端到端 104.7→104.6
+  CPU 秒——收益已低于该基准的本机噪声底，与对照组漂移不可区分。原因有三且都记录在案：
+  85.1% 的图集缓存命中把 ASTC 改进的作用面压缩到 15% 的调用；编码最大项（~70 秒）触底于
+  上游 fdeflate 对过滤输入的固有成本；剩余具名项均不作用于该语料。此语料上不再加压——
+  重启优化的触发条件是新的语料形态（低缓存命中率的 1:1 规则、thumbnail 类 downscale 规则的
+  census、或 DDS/KTX2 归档场景立项），而非继续打磨本条已榨干的规则。整条线累计：该管线
+  42.8s/333 CPU 秒/8.96 GB → 14.2s/104.6 CPU 秒/7.117 GB，并全面超过参照 Rust 服务
+  （114.1 CPU 秒）；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量
