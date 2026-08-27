@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use fdeflate::Compressor as FdeflateCompressor;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image_webp::{ColorType as WebPColorType, EncodingError as WebPEncodingError, WebPEncoder};
@@ -95,16 +96,18 @@ pub enum ImageRowOrder {
 /// quality.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PngCompression {
-    /// The lightest zlib level (1), for throughput-oriented pipelines that
-    /// prefer encode speed over the last few percent of file size.
+    /// The PNG-specialized fdeflate compressor — the same profile behind the
+    /// `png` crate's fast setting. It is the throughput choice; an explicit
+    /// zlib level 1 remains available as `Level(1)` for callers that need
+    /// flate2's own lightest effort.
     Fast,
     /// The historical exporter default (zlib level 6).
     #[default]
     Default,
     /// The heaviest zlib level (9), for archives that prefer size over speed.
     Best,
-    /// An explicit zlib level from 0 (stored) through 9. Values above 9 are
-    /// rejected rather than clamped.
+    /// An explicit flate2 zlib level from 0 (stored) through 9. Values above
+    /// 9 are rejected rather than clamped.
     Level(u8),
 }
 
@@ -487,7 +490,11 @@ fn write_png<W: Write>(
             image.width, image.height
         )));
     }
-    let zlib_level = options.png_compression.zlib_level()?;
+    // Validate the compression choice before any header bytes are written.
+    let zlib_level = match options.png_compression {
+        PngCompression::Fast => None,
+        other => Some(other.zlib_level()?),
+    };
     output.write_all(PNG_SIGNATURE)?;
 
     let mut ihdr = [0_u8; 13];
@@ -498,7 +505,7 @@ fn write_png<W: Write>(
     write_png_chunk(output, *b"IHDR", &ihdr)?;
 
     let idat = IdatWriter::new(output)?;
-    let mut encoder = ZlibEncoder::new(idat, zlib_level);
+    let mut encoder = PngDeflater::new(idat, zlib_level)?;
     match options.png_filter {
         PngFilter::None => {
             for output_row in 0..dimensions.height_usize {
@@ -806,15 +813,14 @@ fn write_png_chunk<W: Write>(
     Ok(())
 }
 
+/// The PNG chunk CRC covers every compressed IDAT byte, so it runs over the
+/// complete encoded output. `crc32fast` keeps that linear pass at table/SIMD
+/// speed; the tests hold it against an independent bitwise reference.
 fn png_crc32(chunk_type: [u8; 4], data: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in chunk_type.iter().chain(data) {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&chunk_type);
+    hasher.update(data);
+    hasher.finalize()
 }
 
 fn ensure_output_budget(length: u64, maximum: u64, format: &str) -> Result<()> {
@@ -859,6 +865,103 @@ impl<'borrow, 'output, W: Write> IdatWriter<'borrow, 'output, W> {
 
     fn finish(mut self) -> io::Result<()> {
         self.flush_chunk()
+    }
+}
+
+/// The zlib stream producer feeding the bounded IDAT chunker.
+///
+/// `Fast` routes through fdeflate, the PNG-specialized deflate used by the
+/// `png` crate's fast profile; every other effort uses flate2 at its explicit
+/// level. Both produce standard zlib streams that any inflate decodes.
+enum PngDeflater<'borrow, 'output, W: Write> {
+    Zlib(ZlibEncoder<IdatWriter<'borrow, 'output, W>>),
+    Fast(FdeflateCompressor<ErrorCapturingWriter<IdatWriter<'borrow, 'output, W>>>),
+}
+
+impl<'borrow, 'output, W: Write> PngDeflater<'borrow, 'output, W> {
+    /// `zlib_level` of `None` selects the fdeflate fast path.
+    fn new(idat: IdatWriter<'borrow, 'output, W>, zlib_level: Option<Compression>) -> Result<Self> {
+        if let Some(level) = zlib_level {
+            return Ok(Self::Zlib(ZlibEncoder::new(idat, level)));
+        }
+        let writer = ErrorCapturingWriter::new(idat);
+        // The capturing writer never fails, so a constructor error can only
+        // be an internal fdeflate defect.
+        let compressor = FdeflateCompressor::new(writer).map_err(|error| {
+            Error::invalid_data(format!("cannot start PNG fast compressor: {error}"))
+        })?;
+        Ok(Self::Fast(compressor))
+    }
+
+    fn finish(self) -> Result<IdatWriter<'borrow, 'output, W>> {
+        match self {
+            Self::Zlib(encoder) => Ok(encoder.finish()?),
+            Self::Fast(compressor) => compressor.finish()?.into_inner(),
+        }
+    }
+}
+
+impl<W: Write> Write for PngDeflater<'_, '_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Zlib(encoder) => encoder.write(bytes),
+            Self::Fast(compressor) => {
+                compressor.write_data(bytes)?;
+                Ok(bytes.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Zlib(encoder) => encoder.flush(),
+            Self::Fast(_) => Ok(()),
+        }
+    }
+}
+
+/// A `Write` adapter that never reports failure to its consumer.
+///
+/// fdeflate unwraps its writer's results instead of propagating them, so a
+/// bounded-writer budget violation inside it would panic. This adapter
+/// captures the first error, silently discards everything after it, and
+/// hands the error back through [`Self::into_inner`] once the stream ends —
+/// the same I/O error family the flate2 path reports directly.
+struct ErrorCapturingWriter<W> {
+    inner: W,
+    error: Option<io::Error>,
+}
+
+impl<W: Write> ErrorCapturingWriter<W> {
+    const fn new(inner: W) -> Self {
+        Self { inner, error: None }
+    }
+
+    fn into_inner(self) -> Result<W> {
+        match self.error {
+            None => Ok(self.inner),
+            Some(error) => Err(error.into()),
+        }
+    }
+}
+
+impl<W: Write> Write for ErrorCapturingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.error.is_none()
+            && let Err(error) = self.inner.write_all(bytes)
+        {
+            self.error = Some(error);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.error.is_none()
+            && let Err(error) = self.inner.flush()
+        {
+            self.error = Some(error);
+        }
+        Ok(())
     }
 }
 
@@ -955,6 +1058,34 @@ mod tests {
             maximum_output_bytes: 1024 * 1024,
             ..ImageEncodeOptions::default()
         }
+    }
+
+    /// The bit-at-a-time CRC32 from the PNG specification, kept as the
+    /// independent reference the production `crc32fast` hasher is held
+    /// against.
+    fn reference_png_crc32(chunk_type: [u8; 4], data: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in chunk_type.iter().chain(data) {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn production_crc32_matches_the_bitwise_specification_reference() {
+        let long: Vec<u8> = (0_u32..4096)
+            .map(|value| u8::try_from(value % 251).expect("residue fits u8"))
+            .collect();
+        for data in [&[] as &[u8], &[0], &[0xff; 64], &long] {
+            assert_eq!(
+                png_crc32(*b"IDAT", data),
+                reference_png_crc32(*b"IDAT", data)
+            );
+        }
+        assert_eq!(png_crc32(*b"IHDR", &[]), reference_png_crc32(*b"IHDR", &[]));
     }
 
     /// The owned-buffer entry point must produce exactly the streaming
@@ -1061,6 +1192,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("0 through 9"));
+
+        // fdeflate unwraps its writer's errors, so the fast path must still
+        // surface a budget violation as the flate2 path's I/O error family
+        // rather than panicking inside the compressor.
+        let error = encode_rgba_image(
+            &image,
+            ImageFormat::Png,
+            ImageRowOrder::Display,
+            &ImageEncodeOptions {
+                png_compression: PngCompression::Fast,
+                maximum_output_bytes: 8,
+                ..ImageEncodeOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::Error::Io(_)), "{error:?}");
+        assert!(error.to_string().contains("exceeds limit"));
     }
 
     /// The adaptive scanline filter is reversible and, on continuous-tone
@@ -1369,7 +1517,7 @@ mod tests {
             cursor += length;
             let crc = u32::from_be_bytes(png[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
-            assert_eq!(crc, png_crc32(*kind, data));
+            assert_eq!(crc, reference_png_crc32(*kind, data));
             match kind {
                 b"IHDR" => {
                     saw_ihdr = true;

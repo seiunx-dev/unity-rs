@@ -737,12 +737,20 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   现 Core 新增 `image_export::encode_rgba_image` 与 `write_rgba_image_with_options`，与流式
   writer 共用同一组编码器和 `BoundedWriter` 输出预算，缓冲区预留取原始像素估计与输出上限的
   较小值且全程 fallible；格式旋钮收敛在 `ImageEncodeOptions`，默认值逐字节复现历史输出。
-  PNG 侧：`PngCompression`（`fast`/`default`/`best` 映射 flate2 level 1/6/9，另接受显式
-  `Level(0..=9)`，超 9 拒绝不钳制）与 `PngFilter`（`none` 保持历史 filter-type-0 输出；
-  `adaptive` 按 libpng/ImageSharp 的最小绝对差启发逐行在五种标准 filter 里选优，工作内存
-  恒为单行 stride 且 fallible 预留）。动机是下游真实语料实测（member_cutout 全量，2,609 张）：
-  固定 `Compression::default()` 加无 filter 在吞吐场景是负收益——同体积下比 Pillow level=3
-  慢 1.9 倍、比同一生态 image crate 的 `CompressionType::Fast`+Adaptive 编码环节慢约 6.6 倍。
+  PNG 侧：`PngCompression`（`fast` 走 fdeflate——`png` crate fast 档背后的 PNG 专用
+  deflate；`default`/`best` 映射 flate2 level 6/9，另接受显式 `Level(0..=9)` 走 flate2，
+  超 9 拒绝不钳制）与 `PngFilter`（`none` 保持历史 filter-type-0 输出；`adaptive` 按
+  libpng/ImageSharp 的最小绝对差启发逐行在五种标准 filter 里选优，工作内存恒为单行 stride
+  且 fallible 预留）。块 CRC32 从逐位循环换成 crc32fast（本就在依赖树内；PNG 的 CRC 覆盖
+  全部压缩输出，逐位实现约 100–200 MB/s 是确定热点），测试以规范逐位实现作独立参照钉住。
+  手写 writer 与 `BoundedWriter`/`IdatWriter` 的预算与 fallible 分配保证原样保留，仅替换
+  热点；fdeflate 会对其 writer 的错误 `unwrap`，故其下垫一层错误捕获 writer——首个错误被
+  捕获、其后写入被丢弃、流结束后按原 I/O 错误族重新抛出，预算超限依旧是错误而非 panic，
+  且有回归钉住该错误族。动机是下游真实语料实测（member_cutout 全量，2,609 张）：固定
+  `Compression::default()` 加无 filter 加逐位 CRC 在吞吐场景是负收益——同体积下比 Pillow
+  level=3 慢 1.9 倍、比同一生态 image crate 的 `CompressionType::Fast`+Adaptive（fdeflate+
+  crc32fast）编码环节慢约 6.6 倍；三个热点现已同构。新依赖仅 fdeflate 一个包（其 simd-adler32
+  依赖本就在树内），许可证 bundle 已由 `tools/generate_dependency_licenses.py` 重生成。
   JPEG 侧透出 jpeg-encoder 已有能力：`JpegSampling`（`auto` 保持质量驱动的历史默认，
   显式 4:4:4/4:2:2/4:2:0）、progressive、optimized Huffman，以及 `jpeg_background`（给定
   RGB 底色时按 `round(c*a/255+bg*(1-a/255))` 整数合成半透明像素，替代默认的丢 alpha 语义；
