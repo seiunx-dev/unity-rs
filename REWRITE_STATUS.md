@@ -816,6 +816,20 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   已解码像素数约束）后过输出预算；无损性由测试内**独立的按规范手写解码器**回环钉住（非
   qoi crate 自证），display/UnityDecoded 两种行序输出一致，导出格式循环、Python/Node magic
   与尺寸断言、CLI 格式串同步，许可证 bundle 已重生成（qoi 为唯一新包）；
+- **图像热循环第二轮打磨已于 2026-08-27 落地（基准按 census 的真实尺寸/内容形态建）**：
+  (1) PNG 自适应 filter 选择改为惰性只读求和——五个候选先做无存储的 SAD pass（任一候选
+  到达不可击败的 0 即终止：sprite 裁切图占大头的全透明行单 pass 选中 filter 0），只有胜者
+  被填充进单一缓冲；工作内存五行 stride 降为两行，字节输出恒等（unfilter 回环与行序等价
+  回归钉住）。600×576 裁切形态内容上收益实测 3–5%——此前把 adaptive 相对 none 的溢价归因
+  于 filter 代码是错的：溢价大头在 fdeflate 对两种输入的差价（未过滤透明区是零串走 RLE
+  快路径，过滤后成非零增量走字面量路径），该部分位于上游 crate 内不可优化，据此下修编码侧
+  剩余空间预期。(2) ASTC 真实内容 `inline(never)` 采样显示 6×6 astcenc 输出上
+  `applicate_color` 占 48%（此前 4×4 随机块剖面的 25% 不代表真实形态）；LDR 非双平面路径
+  （单与多 partition 皆覆盖）改为按 partition 预计算 `(base=c0*64+32, delta=c1-c0)` 常量后
+  每通道单乘插值——`c0*(64-w)+c1*w+32 == base+delta*w` 在 i32 内精确成立（c0,c1≤65535），
+  CEM 表查提出循环。实测 600×576/600×824 的 6×6 帧解码 2.24→1.62 / 3.20→2.33 ms（−28%）；
+  2048² 上 4×4 相对 vendored 累计 1.91×、6×6 1.61×。LDR/HDR fixture、managed oracle 差分与
+  malformed-input 套件全过，字节逐一不变；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

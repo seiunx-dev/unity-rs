@@ -1880,11 +1880,74 @@ fn select_a(cem: usize, v0: i32, v1: i32, weight: i32) -> u8 {
     }
 }
 
+/// Interpolation constants for one partition's four LDR channels.
+///
+/// `select_color` computes `((c0*(64-w) + c1*w + 32) >> 6) * 255 + 32768)
+/// / 65536` per channel; with `base = c0*64 + 32` and `delta = c1 - c0` the
+/// numerator is exactly `base + delta*w` in `i32` (`c0,c1 <= 65535`, so
+/// every term stays far inside the type and the sum is non-negative), which
+/// trades two multiplies per channel for one.
+#[derive(Clone, Copy, Default)]
+struct LdrPartition {
+    base: [i32; 4],
+    delta: [i32; 4],
+}
+
+impl LdrPartition {
+    fn new(endpoints: &[i32; 8]) -> Self {
+        let mut base = [0_i32; 4];
+        let mut delta = [0_i32; 4];
+        for channel in 0..4 {
+            let low = endpoints[channel] << 8 | endpoints[channel];
+            let high = endpoints[channel + 4] << 8 | endpoints[channel + 4];
+            base[channel] = low * 64 + 32;
+            delta[channel] = high - low;
+        }
+        Self { base, delta }
+    }
+
+    #[inline]
+    fn pixel(&self, weight: i32) -> u32 {
+        let mut channels = [0_u8; 4];
+        for index in 0..4 {
+            channels[index] = ((((self.base[index] + self.delta[index] * weight) >> 6) * 255
+                + 32768)
+                / 65536) as u8;
+        }
+        color(channels[0], channels[1], channels[2], channels[3])
+    }
+}
+
 fn applicate_color(data: &BlockData, outbuf: &mut [u32]) {
     let texel_count = data.bw * data.bh;
     let out = &mut outbuf[..texel_count];
     let weights = &data.weights[..texel_count];
-    if data.dual_plane {
+    let ldr = (0..data.part_num).all(|p| !CEM_HDR_C[data.cem[p]] && !CEM_HDR_A[data.cem[p]]);
+    if ldr && !data.dual_plane {
+        // The dominant real-content shape: every selected color endpoint
+        // mode is LDR and there is a single weight plane, so each texel is
+        // four single-multiply interpolations against precomputed partition
+        // constants.
+        if data.part_num > 1 {
+            let mut partitions = [LdrPartition::default(); 4];
+            for (partition, endpoints) in partitions
+                .iter_mut()
+                .zip(&data.endpoints)
+                .take(data.part_num)
+            {
+                *partition = LdrPartition::new(endpoints);
+            }
+            let assignment = &data.partition[..texel_count];
+            for ((pixel, weight), &p) in out.iter_mut().zip(weights).zip(assignment) {
+                *pixel = partitions[p].pixel(weight[0]);
+            }
+        } else {
+            let partition = LdrPartition::new(&data.endpoints[0]);
+            for (pixel, weight) in out.iter_mut().zip(weights) {
+                *pixel = partition.pixel(weight[0]);
+            }
+        }
+    } else if data.dual_plane {
         let mut ps: [usize; 4] = [0; 4];
         ps[data.plane_selector] = 1;
         if data.part_num > 1 {
@@ -1927,41 +1990,14 @@ fn applicate_color(data: &BlockData, outbuf: &mut [u32]) {
     } else {
         let e = &data.endpoints[0];
         let cem = data.cem[0];
-        if !CEM_HDR_C[cem] && !CEM_HDR_A[cem] {
-            // The dominant LDR single-partition shape: the 8-to-16-bit
-            // endpoint expansions are loop constants, so hoisting them leaves
-            // four multiply-add interpolations per texel.
-            let low = [
-                e[0] << 8 | e[0],
-                e[1] << 8 | e[1],
-                e[2] << 8 | e[2],
-                e[3] << 8 | e[3],
-            ];
-            let high = [
-                e[4] << 8 | e[4],
-                e[5] << 8 | e[5],
-                e[6] << 8 | e[6],
-                e[7] << 8 | e[7],
-            ];
-            for (pixel, weight) in out.iter_mut().zip(weights) {
-                let w = weight[0];
-                let inverse = 64 - w;
-                let channel = |index: usize| -> u8 {
-                    ((((low[index] * inverse + high[index] * w + 32) >> 6) * 255 + 32768) / 65536)
-                        as u8
-                };
-                *pixel = color(channel(0), channel(1), channel(2), channel(3));
-            }
-        } else {
-            for (pixel, weight) in out.iter_mut().zip(weights) {
-                let w = weight[0];
-                *pixel = color(
-                    select_c(cem, e[0], e[4], w),
-                    select_c(cem, e[1], e[5], w),
-                    select_c(cem, e[2], e[6], w),
-                    select_a(cem, e[3], e[7], w),
-                );
-            }
+        for (pixel, weight) in out.iter_mut().zip(weights) {
+            let w = weight[0];
+            *pixel = color(
+                select_c(cem, e[0], e[4], w),
+                select_c(cem, e[1], e[5], w),
+                select_c(cem, e[2], e[6], w),
+                select_a(cem, e[3], e[7], w),
+            );
         }
     }
 }
