@@ -1437,6 +1437,8 @@ class UnityRs:
         mode: str = "auto",
         image_format: str = "png",
         jpeg_quality: int = 75,
+        compression: Optional[Union[int, str]] = None,
+        png_filter: str = "auto",
         overwrite: bool = False,
         limits: Optional[ExportLimits] = None,
     ) -> ExportReport: ...

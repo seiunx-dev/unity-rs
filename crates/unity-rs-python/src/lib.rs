@@ -4296,15 +4296,20 @@ impl PyUnityRs {
         mode="auto",
         image_format="png",
         jpeg_quality=75,
+        compression=None,
+        png_filter="auto",
         overwrite=false,
         limits=None
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn export(
         &self,
         output: PathBuf,
         mode: &str,
         image_format: &str,
         jpeg_quality: i64,
+        compression: Option<PngCompressionInput>,
+        png_filter: &str,
         overwrite: bool,
         limits: Option<PyRef<'_, PyExportLimits>>,
     ) -> PyResult<PyExportReport> {
@@ -4317,6 +4322,8 @@ impl PyUnityRs {
         }
         let jpeg_quality = u8::try_from(jpeg_quality)
             .map_err(|_| PyValueError::new_err("JPEG quality must fit in one byte"))?;
+        let png_compression = parse_png_compression_input(compression)?;
+        let png_filter = parse_png_filter(png_filter)?;
         let limits = limits.map_or_else(
             || {
                 let defaults = ExportOptions::default();
@@ -4332,6 +4339,8 @@ impl PyUnityRs {
             mode,
             image_format,
             jpeg_quality,
+            png_compression,
+            png_filter,
             overwrite_existing: overwrite,
             maximum_objects: limits.objects,
             maximum_total_output_bytes: limits.total_output_bytes,

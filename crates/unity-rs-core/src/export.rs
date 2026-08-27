@@ -6,7 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::image_export::{
-    DEFAULT_JPEG_QUALITY, ImageFormat, ImageRowOrder, write_rgba_image_with_quality,
+    DEFAULT_JPEG_QUALITY, ImageEncodeOptions, ImageFormat, ImageRowOrder, PngCompression,
+    PngFilter, write_rgba_image_with_options,
 };
 use crate::json::write_type_value_json;
 use crate::loader::AssetCollection;
@@ -76,6 +77,12 @@ pub struct ExportOptions {
     pub filename_format: FilenameFormat,
     pub image_format: ImageFormat,
     pub jpeg_quality: u8,
+    /// PNG zlib effort for image payloads; `Fast` selects the fdeflate
+    /// throughput path exactly as the per-object encode API does.
+    pub png_compression: PngCompression,
+    /// PNG scanline filter strategy; the `Auto` default follows the
+    /// compression choice.
+    pub png_filter: PngFilter,
     pub audio_format: AudioExportFormat,
     pub overwrite_existing: bool,
     pub restore_text_asset_extension: bool,
@@ -108,6 +115,8 @@ impl Default for ExportOptions {
             filename_format: FilenameFormat::AssetName,
             image_format: ImageFormat::Png,
             jpeg_quality: DEFAULT_JPEG_QUALITY,
+            png_compression: PngCompression::Default,
+            png_filter: PngFilter::Auto,
             audio_format: AudioExportFormat::Auto,
             overwrite_existing: false,
             restore_text_asset_extension: true,
@@ -548,12 +557,17 @@ fn write_export_payload(
             row_order,
             maximum_output_bytes,
         } => {
-            write_rgba_image_with_quality(
+            write_rgba_image_with_options(
                 &image,
                 format,
                 row_order,
-                context.options.jpeg_quality,
-                maximum_output_bytes,
+                &ImageEncodeOptions {
+                    jpeg_quality: context.options.jpeg_quality,
+                    png_compression: context.options.png_compression,
+                    png_filter: context.options.png_filter,
+                    maximum_output_bytes,
+                    ..ImageEncodeOptions::default()
+                },
                 writer,
             )?;
         }
@@ -1663,7 +1677,7 @@ mod tests {
     use zune_jpeg::JpegDecoder;
 
     use crate::Error;
-    use crate::image_export::ImageFormat;
+    use crate::image_export::{ImageFormat, PngCompression, PngFilter};
     use crate::loader::{AssetCollection, LoadedSerializedFile};
     use crate::serialized::SerializedFile;
     use crate::source::Region;
@@ -2260,6 +2274,54 @@ mod tests {
         fs::remove_dir_all(output).unwrap();
     }
 
+    /// The batch exporter must reach the same PNG effort/filter knobs as the
+    /// per-object encode API: `Fast` selects the fdeflate path (whose Auto
+    /// filter pairing produces a different, valid stream), and the default
+    /// options keep the historical bytes.
+    #[test]
+    fn export_reaches_the_png_compression_and_filter_knobs() {
+        let collection = AssetCollection::load(
+            "texture.assets",
+            Region::from_bytes(synthetic_v22_texture2d()),
+        )
+        .unwrap();
+
+        let mut streams = Vec::new();
+        for (name, options) in [
+            ("default", ExportOptions::default()),
+            (
+                "fast",
+                ExportOptions {
+                    png_compression: PngCompression::Fast,
+                    ..ExportOptions::default()
+                },
+            ),
+            (
+                "default-adaptive",
+                ExportOptions {
+                    png_filter: PngFilter::Adaptive,
+                    ..ExportOptions::default()
+                },
+            ),
+        ] {
+            let output = unique_temp_directory(&format!("unity-rs-png-knobs-{name}"));
+            let report = export_collection(&collection, &output, options).unwrap();
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(report.exported.len(), 1);
+            let bytes = fs::read(&report.exported[0].output_path).unwrap();
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+            // Every knob combination must decode to the same top-left pixel.
+            assert_eq!(png_first_pixel(&bytes), [0, 0, 255, 3]);
+            streams.push(bytes);
+            fs::remove_dir_all(&output).ok();
+        }
+        assert_ne!(streams[0], streams[1], "Fast must change the stream");
+        assert_ne!(
+            streams[0], streams[2],
+            "an explicit adaptive filter must change the stream"
+        );
+    }
+
     #[test]
     fn exports_texture2d_auto_in_every_selected_image_format() {
         let collection = AssetCollection::load(
@@ -2638,7 +2700,11 @@ mod tests {
         ZlibDecoder::new(idat.as_slice())
             .read_to_end(&mut scanlines)
             .unwrap();
-        assert_eq!(scanlines[0], 0);
+        // The first pixel of the first scanline equals its raw bytes under
+        // every standard filter (all neighbors are zero there), so accepting
+        // any valid filter type keeps this helper usable for filtered
+        // streams too.
+        assert!(scanlines[0] <= 4, "invalid PNG filter {}", scanlines[0]);
         scanlines[1..5].try_into().unwrap()
     }
 

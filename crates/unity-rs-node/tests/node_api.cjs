@@ -2385,6 +2385,7 @@ console.log('node api: multi-buffer, resource range and scene ok')
     assert.equal(configured.exported[0].payloadKind, 'raw')
     assert.equal(path.basename(configured.exported[0].outputPath), '7.dat')
 
+
     const metadataLimitedRoot = path.join(outputDirectory, 'metadata-limited')
     assert.throws(
       () => exportStudio.exportWithOptions(metadataLimitedRoot, {
@@ -2486,6 +2487,31 @@ console.log('node api: multi-buffer, resource range and scene ok')
     const webpBytes = fs.readFileSync(webp.exported[0].outputPath)
     assert.deepStrictEqual(webpBytes.subarray(0, 4), Buffer.from('RIFF'))
     assert.deepStrictEqual(webpBytes.subarray(8, 12), Buffer.from('WEBP'))
+
+    // Batch export reaches the same PNG effort/filter knobs as encodeImage:
+    // fast produces a different, still-valid PNG stream than the default.
+    const pngDefault = textureStudio.exportWithOptions(
+      path.join(outputDirectory, 'png-default'),
+      {},
+    )
+    const pngFast = textureStudio.exportWithOptions(
+      path.join(outputDirectory, 'png-fast'),
+      { compression: 'fast', pngFilter: 'auto' },
+    )
+    assert.equal(pngDefault.failures.length, 0)
+    assert.equal(pngFast.failures.length, 0)
+    const pngDefaultBytes = fs.readFileSync(pngDefault.exported[0].outputPath)
+    const pngFastBytes = fs.readFileSync(pngFast.exported[0].outputPath)
+    const pngSignature = Buffer.from('\x89PNG\r\n\x1a\n', 'binary')
+    assert.deepEqual(pngDefaultBytes.subarray(0, 8), pngSignature)
+    assert.deepEqual(pngFastBytes.subarray(0, 8), pngSignature)
+    assert.notDeepEqual(pngDefaultBytes, pngFastBytes)
+    assert.throws(
+      () => textureStudio.exportWithOptions(path.join(outputDirectory, 'png-bad'), {
+        compression: 'turbo',
+      }),
+      /unsupported PNG compression/i,
+    )
 
     const audioStudio = addon.UnityRs.fromBuffers([
       { name: 'legacy-pcm.assets', data: syntheticLegacyPcm() },

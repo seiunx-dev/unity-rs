@@ -900,6 +900,11 @@ pub struct ExportConfiguration {
     /// `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`.
     pub image_format: Option<String>,
     pub jpeg_quality: Option<u32>,
+    /// PNG-only zlib effort: `fast`, `default`, `best`, or an explicit
+    /// numeric level 0 through 9, exactly as `encodeImage` accepts.
+    pub compression: Option<Either<String, u32>>,
+    /// PNG-only scanline filter strategy: `auto`, `none`, or `adaptive`.
+    pub png_filter: Option<String>,
     /// `auto`, `raw`, or `wav`.
     pub audio_format: Option<String>,
     pub overwrite_existing: Option<bool>,
@@ -1048,6 +1053,8 @@ fn export_configuration(options: Option<ExportConfiguration>) -> Result<CoreExpo
     configured.filename_format = parse_filename_format(options.filename_format.as_deref())?;
     configured.image_format = parse_image_format(options.image_format)?;
     configured.jpeg_quality = jpeg_quality;
+    configured.png_compression = parse_png_compression(options.compression)?;
+    configured.png_filter = parse_png_filter(options.png_filter)?;
     configured.audio_format = audio_format;
     configured.overwrite_existing = options
         .overwrite_existing

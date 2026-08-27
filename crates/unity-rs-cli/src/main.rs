@@ -25,7 +25,9 @@ use unity_rs_core::fbx_ascii::{
 };
 use unity_rs_core::fbx_binary_scene::write_model_ir_fbx_binary_full;
 use unity_rs_core::file_type::{FileDetection, FileType, HEADER_SCAN_LENGTH, detect_file_type};
-use unity_rs_core::image_export::{ImageFormat, ImageRowOrder, write_rgba_image};
+use unity_rs_core::image_export::{
+    ImageFormat, ImageRowOrder, PngCompression, PngFilter, write_rgba_image,
+};
 use unity_rs_core::live2d_package::{Live2dPackage, Live2dPackageLimits, build_live2d_packages};
 use unity_rs_core::loader::{
     AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy,
@@ -975,7 +977,10 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          Export options:\n  --mode <auto|raw|typetree-json|dump-text>\n  \
          --filename <asset-name|asset-name-path-id|path-id>\n  --overwrite\n  \
          --image-format <jpg|jpeg|png|bmp|tga|webp|raw-rgba>\n  \
-         --jpeg-quality <1-100>\n  --no-restore-text-extension\n  \
+         --jpeg-quality <1-100>\n  \
+         --png-compression <fast|default|best|0-9>  fast is the fdeflate throughput path\n  \
+         --png-filter <auto|none|adaptive>  auto pairs adaptive filtering with fast\n  \
+         --no-restore-text-extension\n  \
          --audio-format <auto|raw|wav>\n  \
          --maximum-metadata-bytes <N>  Cumulative report and output-name index bytes;\n  \
          the default is 268435456\n  \
@@ -1439,6 +1444,14 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
                 .get(index)
                 .ok_or_else(|| Error::invalid_data("--jpeg-quality requires a value"))?;
             options.jpeg_quality = parse_jpeg_quality(value)?;
+        } else if parse_options && argument == "--png-compression" {
+            index += 1;
+            options.png_compression =
+                parse_png_compression(required_flag_value(arguments, index, "--png-compression")?)?;
+        } else if parse_options && argument == "--png-filter" {
+            index += 1;
+            options.png_filter =
+                parse_png_filter(required_flag_value(arguments, index, "--png-filter")?)?;
         } else if parse_options && argument == "--audio-format" {
             index += 1;
             let value = arguments
@@ -1553,6 +1566,46 @@ fn parse_image_format(value: &OsString) -> Result<ImageFormat> {
         Some("raw-rgba" | "raw_rgba" | "rgba") => Ok(ImageFormat::RawRgba),
         _ => Err(Error::invalid_data(format!(
             "invalid image format: {} (expected jpg, jpeg, png, bmp, tga, webp, or raw-rgba)",
+            CliArgumentDisplay(value)
+        ))),
+    }
+}
+
+fn required_flag_value<'a>(
+    arguments: &'a [OsString],
+    index: usize,
+    flag: &str,
+) -> Result<&'a OsString> {
+    arguments
+        .get(index)
+        .ok_or_else(|| Error::invalid_data(format!("{flag} requires a value")))
+}
+
+fn parse_png_compression(value: &OsString) -> Result<PngCompression> {
+    match value.to_str() {
+        Some("fast") => Ok(PngCompression::Fast),
+        Some("default") => Ok(PngCompression::Default),
+        Some("best") => Ok(PngCompression::Best),
+        Some(text) => match text.parse::<u8>() {
+            Ok(level) if level <= 9 => Ok(PngCompression::Level(level)),
+            _ => Err(Error::invalid_data(format!(
+                "invalid PNG compression {} (expected fast, default, best, or 0 through 9)",
+                CliArgumentDisplay(value)
+            ))),
+        },
+        None => Err(Error::invalid_data(
+            "PNG compression must be valid UTF-8".to_owned(),
+        )),
+    }
+}
+
+fn parse_png_filter(value: &OsString) -> Result<PngFilter> {
+    match value.to_str() {
+        Some("auto") => Ok(PngFilter::Auto),
+        Some("none") => Ok(PngFilter::None),
+        Some("adaptive") => Ok(PngFilter::Adaptive),
+        _ => Err(Error::invalid_data(format!(
+            "invalid PNG filter {} (expected auto, none, or adaptive)",
             CliArgumentDisplay(value)
         ))),
     }
@@ -4450,16 +4503,17 @@ mod tests {
         InspectLabelComponent, InspectPathBudget, Live2dCommand, Live2dExportState,
         Live2dOutputNames, Live2dPublicationLock, LoadOptions, LossyOsStr,
         MAX_LIVE2D_OUTPUT_MODELS, MAX_LIVE2D_TOTAL_OUTPUT_BYTES, MAX_MONO_SCHEMA_DOCUMENTS,
-        ModelExportCandidate, MonoSchemaDocumentBudget, NestedInspectLabel, SceneObjectKey,
-        allocate_fbx_batch_name, allocate_fbx_batch_name_with_probe, allocate_live2d_output_path,
-        charge_live2d_model, collect_cli_arguments_with_limits, copy_inspect_path,
-        copy_path_argument, escape_text, fallible_lowercase, increment_class_count,
-        increment_string_count, join_inspect_path, obj_material_library_name, parse_cli_arguments,
-        parse_export_arguments, parse_extract_arguments, parse_live2d_arguments,
-        parse_live2d_package_arguments, persist_temporary_hard_link, positional_path_table,
-        publish_fbx_with_textures, push_class_filter, push_positional_path,
-        read_bounded_schema_document, sanitize_live2d_base_name, sorted_map_entries,
-        split_load_options, write_object_reference, write_scene_key,
+        ModelExportCandidate, MonoSchemaDocumentBudget, NestedInspectLabel, PngCompression,
+        PngFilter, SceneObjectKey, allocate_fbx_batch_name, allocate_fbx_batch_name_with_probe,
+        allocate_live2d_output_path, charge_live2d_model, collect_cli_arguments_with_limits,
+        copy_inspect_path, copy_path_argument, escape_text, fallible_lowercase,
+        increment_class_count, increment_string_count, join_inspect_path,
+        obj_material_library_name, parse_cli_arguments, parse_export_arguments,
+        parse_extract_arguments, parse_live2d_arguments, parse_live2d_package_arguments,
+        persist_temporary_hard_link, positional_path_table, publish_fbx_with_textures,
+        push_class_filter, push_positional_path, read_bounded_schema_document,
+        sanitize_live2d_base_name, sorted_map_entries, split_load_options, write_object_reference,
+        write_scene_key,
     };
     use std::collections::HashMap;
     use std::ffi::{OsStr, OsString};
@@ -5104,6 +5158,10 @@ mod tests {
             "tga",
             "--jpeg-quality",
             "91",
+            "--png-compression",
+            "fast",
+            "--png-filter",
+            "adaptive",
             "--audio-format",
             "wav",
             "--maximum-metadata-bytes",
@@ -5119,11 +5177,36 @@ mod tests {
         assert_eq!(command.options.filename_format, FilenameFormat::PathId);
         assert_eq!(command.options.image_format, ImageFormat::Tga);
         assert_eq!(command.options.jpeg_quality, 91);
+        assert_eq!(command.options.png_compression, PngCompression::Fast);
+        assert_eq!(command.options.png_filter, PngFilter::Adaptive);
         assert_eq!(command.options.audio_format, AudioExportFormat::Wav);
         assert_eq!(command.options.maximum_metadata_bytes, 123);
         assert!(command.options.overwrite_existing);
         assert!(!command.options.restore_text_asset_extension);
         assert!(!command.options.pretty_json);
+    }
+
+    #[test]
+    fn export_arguments_parse_png_knob_values_and_reject_bad_ones() {
+        let command = parse_export_arguments(&arguments(&[
+            "input",
+            "--png-compression",
+            "3",
+            "--png-filter",
+            "none",
+            "output",
+        ]))
+        .unwrap();
+        assert_eq!(command.options.png_compression, PngCompression::Level(3));
+        assert_eq!(command.options.png_filter, PngFilter::None);
+
+        for bad in [
+            &["input", "--png-compression", "10", "output"][..],
+            &["input", "--png-compression", "turbo", "output"],
+            &["input", "--png-filter", "paeth", "output"],
+        ] {
+            assert!(parse_export_arguments(&arguments(bad)).is_err());
+        }
     }
 
     #[test]

@@ -158,6 +158,8 @@ const exportOptions: ExportConfiguration = {
   filenameFormat: "asset-name-path-id",
   imageFormat: "webp",
   jpegQuality: 90,
+  compression: "fast",
+  pngFilter: "auto",
   audioFormat: "wav",
   overwriteExisting: false,
   restoreTextAssetExtension: true,

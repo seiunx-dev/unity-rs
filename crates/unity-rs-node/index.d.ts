@@ -709,6 +709,13 @@ export interface ExportConfiguration {
   /** `jpeg`, `png`, `bmp`, `tga`, `webp`, or `raw-rgba`. */
   imageFormat?: string
   jpegQuality?: number
+  /**
+   * PNG-only zlib effort: `fast`, `default`, `best`, or an explicit
+   * numeric level 0 through 9, exactly as `encodeImage` accepts.
+   */
+  compression?: string | number
+  /** PNG-only scanline filter strategy: `auto`, `none`, or `adaptive`. */
+  pngFilter?: string
   /** `auto`, `raw`, or `wav`. */
   audioFormat?: string
   overwriteExisting?: boolean

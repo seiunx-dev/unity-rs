@@ -251,6 +251,8 @@ def consume_public_api(
 
     export_report: ExportReport = studio.export(
         path,
+        compression="fast",
+        png_filter="auto",
         limits=ExportLimits(maximum_metadata_bytes=268_435_456),
     )
     extraction_limits = ExtractionLimits(

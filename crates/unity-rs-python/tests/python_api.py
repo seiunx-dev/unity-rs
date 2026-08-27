@@ -2990,6 +2990,28 @@ def main() -> None:
         else:
             raise AssertionError("encode should enforce the output budget")
 
+        # Batch export must reach the same PNG effort/filter knobs as
+        # RgbaImage.encode: fast selects the fdeflate path and produces a
+        # different, still-valid stream than the default effort.
+        default_png_output = Path(directory) / "png-default-export"
+        default_png = texture_studio.export(default_png_output)
+        fast_png_output = Path(directory) / "png-fast-export"
+        fast_png = texture_studio.export(fast_png_output, compression="fast")
+        assert default_png.failures == [] and fast_png.failures == []
+        default_bytes = Path(default_png.exported[0]).read_bytes()
+        fast_bytes = Path(fast_png.exported[0]).read_bytes()
+        assert default_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+        assert fast_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+        assert default_bytes != fast_bytes
+        try:
+            texture_studio.export(
+                Path(directory) / "png-bad-export", compression="turbo"
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("export should reject unknown PNG compression")
+
         webp_output = Path(directory) / "webp-export"
         webp_report = texture_studio.export(webp_output, image_format=" WeBp ")
         assert webp_report.failures == []
