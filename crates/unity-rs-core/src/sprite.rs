@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::endian::{Endian, EndianReader, checked_length};
 use crate::loader::AssetCollection;
 use crate::mesh::vertex_format_size;
@@ -390,7 +392,7 @@ fn effective_sprite_atlas<'a>(
             "Sprite atlas",
         )
         .ok()
-        .map(|(file, object_index)| SelectedSpriteAtlas {
+        .map(|(file, object_index, _)| SelectedSpriteAtlas {
             file,
             file_index: None,
             object_index,
@@ -525,6 +527,7 @@ fn resolve_serialized_object_reference<'a>(
         "SpriteAtlas packed Sprite",
     )
     .ok()
+    .map(|(file, object_index, _)| (file, object_index))
 }
 
 fn decode_sprite_from_resident_data(
@@ -539,7 +542,7 @@ fn decode_sprite_from_resident_data(
         sprite.render_data.settings,
         sprite.render_data.downscale_multiplier,
     )?;
-    let texture = resolve_texture_reference(
+    let decoded = decode_texture_reference_mip0(
         collection,
         file,
         file_index,
@@ -547,7 +550,6 @@ fn decode_sprite_from_resident_data(
         texture_limits,
         "Sprite texture",
     )?;
-    let decoded = texture.decode_mip_rgba8(0, texture_limits)?;
     let mut image = crop_and_flip(
         &decoded,
         sprite,
@@ -559,7 +561,7 @@ fn decode_sprite_from_resident_data(
     )?;
 
     if !sprite.render_data.alpha_texture.is_null() {
-        let alpha_texture = resolve_texture_reference(
+        let alpha_decoded = decode_texture_reference_mip0(
             collection,
             file,
             file_index,
@@ -567,7 +569,6 @@ fn decode_sprite_from_resident_data(
             texture_limits,
             "Sprite alpha texture",
         )?;
-        let alpha_decoded = alpha_texture.decode_mip_rgba8(0, texture_limits)?;
         let mut alpha = crop_and_flip(
             &alpha_decoded,
             sprite,
@@ -657,7 +658,7 @@ fn decode_sprite_atlas_data(
 ) -> Result<RgbaImage> {
     let settings = SpriteSettings::from_raw(data.settings.raw);
     validate_renderable(settings, data.downscale_multiplier)?;
-    let texture = resolve_texture_reference(
+    let decoded = decode_texture_reference_mip0(
         collection,
         atlas_file,
         atlas_file_index,
@@ -668,7 +669,6 @@ fn decode_sprite_atlas_data(
         texture_limits,
         "SpriteAtlas texture",
     )?;
-    let decoded = texture.decode_mip_rgba8(0, texture_limits)?;
     crop_and_flip(
         &decoded,
         sprite,
@@ -714,15 +714,24 @@ fn validate_renderable(settings: SpriteSettings, downscale: f32) -> Result<()> {
     Ok(())
 }
 
-fn resolve_texture_reference(
+/// Resolves one Sprite-referenced `Texture2D` and decodes its mip zero,
+/// reusing the collection's bounded decoded-page cache when the target's
+/// collection identity is known.
+///
+/// Sprites packed into one atlas page all decode that page; the cache turns
+/// that into one decode per page instead of one per Sprite. Only successful
+/// decodes are retained, and a cached page is reused only under the exact
+/// `TextureReadLimits` it was decoded with, so failures and limit changes
+/// behave as if no cache existed.
+fn decode_texture_reference_mip0(
     collection: &AssetCollection,
     file: &SerializedFile,
     file_index: Option<usize>,
     reference: ObjectReference,
     limits: TextureReadLimits,
     field: &str,
-) -> Result<crate::texture::Texture2D> {
-    let (target_file, index) = resolve_object_target(
+) -> Result<Arc<RgbaImage>> {
+    let (target_file, index, target_file_index) = resolve_object_target(
         collection,
         file,
         file_index,
@@ -731,9 +740,23 @@ fn resolve_texture_reference(
         "Texture2D",
         field,
     )?;
-    read_texture2d(collection, target_file, index, limits)
+    if let Some(target_file_index) = target_file_index
+        && let Some(cached) = collection.cached_sprite_texture(target_file_index, index, limits)
+    {
+        return Ok(cached);
+    }
+    let texture = read_texture2d(collection, target_file, index, limits)?;
+    let image = Arc::new(texture.decode_mip_rgba8(0, limits)?);
+    if let Some(target_file_index) = target_file_index {
+        collection.cache_sprite_texture(target_file_index, index, limits, &image);
+    }
+    Ok(image)
 }
 
+/// Resolves one typed object reference, additionally reporting the target's
+/// collection file index when the resolution path establishes it. A target
+/// resolved only through the caller-supplied `file` value keeps `None`, since
+/// that file need not be a member of the collection.
 fn resolve_object_target<'a>(
     collection: &'a AssetCollection,
     file: &'a SerializedFile,
@@ -742,7 +765,7 @@ fn resolve_object_target<'a>(
     expected_class_id: i32,
     expected_class_name: &str,
     field: &str,
-) -> Result<(&'a SerializedFile, usize)> {
+) -> Result<(&'a SerializedFile, usize, Option<usize>)> {
     if reference.is_null() {
         // A null reference is a statement about the asset, not about its
         // bytes: a Sprite whose texture was stripped, or one whose atlas is
@@ -764,11 +787,15 @@ fn resolve_object_target<'a>(
             expected_class_id,
         )?
         .ok_or_else(|| Error::unsupported(format!("{field} reference is null")))?;
-        return Ok((resolved.file, resolved.object_index));
+        return Ok((
+            resolved.file,
+            resolved.object_index,
+            Some(resolved.file_index),
+        ));
     }
 
-    let target_file = if reference.file_id == 0 {
-        file
+    let (target_file, target_file_index) = if reference.file_id == 0 {
+        (file, None)
     } else {
         let external_index = reference
             .file_id
@@ -791,10 +818,11 @@ fn resolve_object_target<'a>(
         collection
             .serialized_files
             .iter()
-            .find(|candidate| {
+            .enumerate()
+            .find(|(_, candidate)| {
                 portable_file_name(&candidate.path).eq_ignore_ascii_case(target_name)
             })
-            .map(|candidate| &candidate.file)
+            .map(|(candidate_index, candidate)| (&candidate.file, Some(candidate_index)))
             .ok_or_else(|| {
                 Error::invalid_data(format!(
                     "{field} external file {:?} (portable name {:?}) was not found in the asset collection",
@@ -819,7 +847,7 @@ fn resolve_object_target<'a>(
             reference.path_id, target_file.objects[index].class_id,
         )));
     }
-    Ok((target_file, index))
+    Ok((target_file, index, target_file_index))
 }
 
 fn portable_file_name(path: &str) -> &str {
@@ -2501,6 +2529,95 @@ mod tests {
             ..SpriteReadLimits::default()
         };
         assert!(read_sprite(&file, 0, mesh_limit).is_err());
+    }
+
+    /// Sprites sharing one source texture must decode that texture once: the
+    /// collection's bounded page cache serves the repeats, and only an exact
+    /// (file, object, limits) match may reuse a cached page.
+    #[test]
+    fn sprites_sharing_a_texture_decode_the_page_once() {
+        let pixels = rgba_grid(2, 1, |x, _| [10 + x * 40, 20 + x * 40, 30 + x * 40, 255]);
+        let file = parse_asset(
+            "2022.3.62f1",
+            &[
+                (
+                    SPRITE_CLASS_ID,
+                    1,
+                    modern_sprite_object(
+                        3,
+                        0,
+                        [0.0, 0.0, 1.0, 1.0],
+                        2,
+                        ObjectReferenceFields::default(),
+                    ),
+                ),
+                (
+                    SPRITE_CLASS_ID,
+                    2,
+                    modern_sprite_object(
+                        3,
+                        0,
+                        [1.0, 0.0, 1.0, 1.0],
+                        2,
+                        ObjectReferenceFields::default(),
+                    ),
+                ),
+                (28, 3, texture_object(2, 1, &pixels)),
+            ],
+        );
+        let collection = collection_with(file.clone());
+
+        let first = read_sprite(&file, 0, SpriteReadLimits::default()).unwrap();
+        let second = read_sprite(&file, 1, SpriteReadLimits::default()).unwrap();
+        let first_image = decode_sprite_rgba8_by_file_index(
+            &collection,
+            0,
+            &first,
+            SpriteReadLimits::default(),
+            TextureReadLimits::default(),
+        )
+        .unwrap();
+        let second_image = decode_sprite_rgba8_by_file_index(
+            &collection,
+            0,
+            &second,
+            SpriteReadLimits::default(),
+            TextureReadLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(first_image.pixels, [10, 20, 30, 255]);
+        assert_eq!(second_image.pixels, [50, 60, 70, 255]);
+        // One decode filled the cache, the second Sprite reused it.
+        assert_eq!(collection.sprite_texture_cache_stats(), (1, 1));
+
+        // Different limits must not reuse a page decoded under other limits.
+        let other_limits = TextureReadLimits {
+            maximum_dimension: 16,
+            ..TextureReadLimits::default()
+        };
+        let relimited = decode_sprite_rgba8_by_file_index(
+            &collection,
+            0,
+            &first,
+            SpriteReadLimits::default(),
+            other_limits,
+        )
+        .unwrap();
+        assert_eq!(relimited.pixels, first_image.pixels);
+        assert_eq!(collection.sprite_texture_cache_stats(), (1, 2));
+
+        // The original page is still cached alongside the re-limited one.
+        let repeated = decode_sprite_rgba8_by_file_index(
+            &collection,
+            0,
+            &first,
+            SpriteReadLimits::default(),
+            TextureReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(repeated.pixels, first_image.pixels);
+        assert_eq!(collection.sprite_texture_cache_stats(), (2, 2));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-08-26（Asia/Shanghai）
+最后更新：2026-08-27（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -715,6 +715,22 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   提交 `2c9fb42` 的公开常规矩阵
   [32743479062](https://github.com/seiunx-dev/unity-rs/actions/runs/32743479062) 为 16/16 验证 job 全绿，
   覆盖 Rust、Python、Node、UnityPy、managed 与 vgmstream，另两项仅手工 release 条件任务按设计跳过；
+- **Sprite 解码的逐 Sprite 图集页重解已于 2026-08-27 收口**：同一图集页上的每个 Sprite 都要解析
+  并解码同一张 `Texture2D`（atlas 页或 resident color/alpha 纹理），批量解码 N 个共页 Sprite 会把
+  该页的整页解码成本重复 N 次；生产实测一个 1 Texture2D + 10 Sprite 的 bundle 上，单个 Sprite 的
+  解码耗时约为整页解码的 8 倍（UnityPy 在 `SpriteHelper.get_image` 按 `texture.path_id` 缓存，
+  没有这项放大）。现 `AssetCollection` 持有一个内部有界 MRU 缓存（最多 4 页、累计像素字节
+  256 MiB 封顶，每页本就先受调用方 `TextureReadLimits` 约束），Sprite 解码路径以解析后的
+  `(collection file index, object index, 完整 TextureReadLimits)` 为键复用 mip-0 解码页：只有完全
+  相同的 limits 才命中，解码失败从不缓存，克隆 collection 从空缓存开始，命中与重解的像素逐字节
+  相同，因此不构成任何静默回退或行为变化。高层 `decode_sprite`（Rust/CLI/Python/Node 共用的
+  `by_file_index` 路径）与批量 export 自动受益；仅凭 `&SerializedFile` 的低层本地引用继续按原样
+  逐次解码。非 Sprite 的 `decode_texture_mip` 面不经过缓存。回归覆盖：缓存单测验证仅精确
+  identity+limits 命中、MRU 逐出、字节预算逐出、超预算单页直接不缓存、重插替换；行为测试用两个
+  共享一张纹理的 Sprite 断言第二次解码命中缓存（stats 1 hit/1 miss）、不同 limits 强制重解、
+  且三种路径像素一致。`cargo fmt --check`、`cargo check --locked --all-targets`、严格 workspace
+  Clippy `-D warnings` 与完整 `cargo test --locked` 均通过（Core 库 631 项常规测试全绿，12 项
+  可选外部依赖测试按设计跳过；CLI/Python/Node/进程级集成套件同轮全部通过）；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

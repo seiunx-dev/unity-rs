@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::bundle::{
     BundleHeader, BundleOpenOptions, BundleParseLimits, OodleDecoder, UnityFsBundle,
@@ -25,6 +25,7 @@ use crate::serialized::{
 use crate::source::Region;
 use crate::sprite::SPRITE_CLASS_ID;
 use crate::sprite_atlas::{SPRITE_ATLAS_CLASS_ID, SpriteAtlasReadLimits, read_sprite_atlas};
+use crate::texture::{RgbaImage, TextureReadLimits};
 use crate::unity_cn::UnityCnKey;
 use crate::unity_version::UnityVersion;
 use crate::web_file::{WebFile, WebParseLimits};
@@ -224,6 +225,7 @@ pub struct AssetCollection {
     reference_index: Option<AssetReferenceIndex>,
     resource_index: Option<AssetResourceIndex>,
     sprite_atlas_index: Option<SpriteAtlasIndex>,
+    sprite_texture_cache: SpriteTextureCache,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,6 +270,155 @@ struct SpriteAtlasIndex {
     atlases: Vec<IndexedSpriteAtlas>,
     /// Packed-Sprite assignments sorted by Sprite identity, then atlas order.
     assignments: Vec<SpriteAtlasAssignment>,
+}
+
+/// Maximum decoded texture pages retained by [`SpriteTextureCache`].
+const SPRITE_TEXTURE_CACHE_MAX_ENTRIES: usize = 4;
+/// Maximum cumulative pixel bytes retained by [`SpriteTextureCache`].
+const SPRITE_TEXTURE_CACHE_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Bounded most-recently-used cache of decoded mip-zero Sprite source pages.
+///
+/// Every Sprite packed into an atlas page resolves and decodes that page's
+/// `Texture2D`, so decoding many Sprites over one page repeats its dominant
+/// cost per Sprite. This cache remembers the last few successfully decoded
+/// pages, keyed by resolved collection file/object identity plus the exact
+/// `TextureReadLimits` used, so a batch of Sprites over one page decodes it
+/// once. Retention is capped by entry count and cumulative pixel bytes, and
+/// each retained image was already individually bounded by its caller's
+/// limits. Failed decodes are never cached, and a limits change never reuses
+/// a page decoded under different limits.
+#[derive(Debug, Default)]
+pub(crate) struct SpriteTextureCache {
+    inner: Mutex<SpriteTextureCacheInner>,
+}
+
+#[derive(Debug, Default)]
+struct SpriteTextureCacheInner {
+    /// Most-recently-used first; never longer than the entry cap.
+    entries: Vec<SpriteTextureCacheEntry>,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Debug)]
+struct SpriteTextureCacheEntry {
+    file_index: usize,
+    object_index: usize,
+    limits: TextureReadLimits,
+    image: Arc<RgbaImage>,
+}
+
+impl SpriteTextureCacheEntry {
+    fn matches(&self, file_index: usize, object_index: usize, limits: TextureReadLimits) -> bool {
+        self.file_index == file_index && self.object_index == object_index && self.limits == limits
+    }
+}
+
+impl Clone for SpriteTextureCache {
+    /// Cached pages are derived state; a cloned collection re-decodes on demand.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl SpriteTextureCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SpriteTextureCacheInner> {
+        // The cache is auxiliary state: a panic while another thread held the
+        // lock leaves at worst a smaller cache, never an inconsistent decode.
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn get(
+        &self,
+        file_index: usize,
+        object_index: usize,
+        limits: TextureReadLimits,
+    ) -> Option<Arc<RgbaImage>> {
+        let mut inner = self.lock();
+        let Some(position) = inner
+            .entries
+            .iter()
+            .position(|entry| entry.matches(file_index, object_index, limits))
+        else {
+            inner.misses = inner.misses.saturating_add(1);
+            return None;
+        };
+        let entry = inner.entries.remove(position);
+        let image = Arc::clone(&entry.image);
+        inner.entries.insert(0, entry);
+        inner.hits = inner.hits.saturating_add(1);
+        Some(image)
+    }
+
+    fn insert(
+        &self,
+        file_index: usize,
+        object_index: usize,
+        limits: TextureReadLimits,
+        image: &Arc<RgbaImage>,
+    ) {
+        self.insert_with_caps(
+            file_index,
+            object_index,
+            limits,
+            image,
+            SPRITE_TEXTURE_CACHE_MAX_ENTRIES,
+            SPRITE_TEXTURE_CACHE_MAX_TOTAL_BYTES,
+        );
+    }
+
+    fn insert_with_caps(
+        &self,
+        file_index: usize,
+        object_index: usize,
+        limits: TextureReadLimits,
+        image: &Arc<RgbaImage>,
+        maximum_entries: usize,
+        maximum_total_bytes: u64,
+    ) {
+        let bytes = image.pixels.len() as u64;
+        if maximum_entries == 0 || bytes > maximum_total_bytes {
+            return;
+        }
+        let mut inner = self.lock();
+        inner
+            .entries
+            .retain(|entry| !entry.matches(file_index, object_index, limits));
+        while inner.entries.len() >= maximum_entries
+            || inner.entries.iter().fold(bytes, |total, entry| {
+                total.saturating_add(entry.image.pixels.len() as u64)
+            }) > maximum_total_bytes
+        {
+            if inner.entries.pop().is_none() {
+                return;
+            }
+        }
+        inner.entries.insert(
+            0,
+            SpriteTextureCacheEntry {
+                file_index,
+                object_index,
+                limits,
+                image: Arc::clone(image),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (u64, u64) {
+        let inner = self.lock();
+        (inner.hits, inner.misses)
+    }
+
+    #[cfg(test)]
+    fn cached_images(&self) -> Vec<(usize, usize)> {
+        self.lock()
+            .entries
+            .iter()
+            .map(|entry| (entry.file_index, entry.object_index))
+            .collect()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -326,6 +477,7 @@ impl AssetCollection {
             reference_index: None,
             resource_index: None,
             sprite_atlas_index: None,
+            sprite_texture_cache: SpriteTextureCache::default(),
         }
     }
 
@@ -1126,6 +1278,35 @@ impl AssetCollection {
         self.sprite_atlas_index
             .as_ref()
             .map(|index| index.assignments(sprite_file_index, sprite_object_index, || {}))
+    }
+
+    /// Returns a previously cached decoded mip-zero Sprite source page.
+    pub(crate) fn cached_sprite_texture(
+        &self,
+        file_index: usize,
+        object_index: usize,
+        limits: TextureReadLimits,
+    ) -> Option<Arc<RgbaImage>> {
+        self.sprite_texture_cache
+            .get(file_index, object_index, limits)
+    }
+
+    /// Retains one successfully decoded mip-zero Sprite source page in the
+    /// bounded most-recently-used cache.
+    pub(crate) fn cache_sprite_texture(
+        &self,
+        file_index: usize,
+        object_index: usize,
+        limits: TextureReadLimits,
+        image: &Arc<RgbaImage>,
+    ) {
+        self.sprite_texture_cache
+            .insert(file_index, object_index, limits, image);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sprite_texture_cache_stats(&self) -> (u64, u64) {
+        self.sprite_texture_cache.stats()
     }
 }
 
@@ -2579,10 +2760,74 @@ mod tests {
         AssetCollection, AssetLoadBudget, AssetLoadLimits, AssetLoadOptions, LoadDiagnostic,
         LoadFailurePolicy, LoadPath, LoadedResource, LoadedSerializedFile, ObjectMetadataBuilder,
         ObjectMetadataEntry, ObjectMetadataIndexBudget, ObjectMetadataKey, PendingInput,
-        PendingObjectNames, SpriteAtlasAssignment, SpriteAtlasIndex, charge_pending_inputs,
-        format_load_diagnostic, load_diagnostic_message_length,
+        PendingObjectNames, SpriteAtlasAssignment, SpriteAtlasIndex, SpriteTextureCache,
+        charge_pending_inputs, format_load_diagnostic, load_diagnostic_message_length,
         object_metadata_position_with_probe,
     };
+
+    fn cache_image(byte: u8, pixel_bytes: usize) -> std::sync::Arc<crate::texture::RgbaImage> {
+        std::sync::Arc::new(crate::texture::RgbaImage {
+            width: 1,
+            height: 1,
+            pixels: vec![byte; pixel_bytes],
+        })
+    }
+
+    #[test]
+    fn sprite_texture_cache_reuses_only_exact_identity_and_limits() {
+        use crate::texture::TextureReadLimits;
+
+        let cache = SpriteTextureCache::default();
+        let limits = TextureReadLimits::default();
+        assert!(cache.get(0, 1, limits).is_none());
+
+        let image = cache_image(7, 4);
+        cache.insert(0, 1, limits, &image);
+        let cached = cache.get(0, 1, limits).expect("same key is cached");
+        assert_eq!(cached.pixels, image.pixels);
+
+        // A different object, file, or limits value must decode again rather
+        // than reuse a page decoded under different conditions.
+        assert!(cache.get(0, 2, limits).is_none());
+        assert!(cache.get(1, 1, limits).is_none());
+        let other_limits = TextureReadLimits {
+            maximum_dimension: 16,
+            ..TextureReadLimits::default()
+        };
+        assert!(cache.get(0, 1, other_limits).is_none());
+
+        assert_eq!(cache.stats(), (1, 4));
+    }
+
+    #[test]
+    fn sprite_texture_cache_evicts_least_recently_used_within_caps() {
+        use crate::texture::TextureReadLimits;
+
+        let cache = SpriteTextureCache::default();
+        let limits = TextureReadLimits::default();
+        for object_index in 0..3 {
+            cache.insert_with_caps(0, object_index, limits, &cache_image(1, 4), 2, 64);
+        }
+        // Two-entry cap: object 0 was evicted, 1 and 2 remain.
+        assert_eq!(cache.cached_images(), [(0, 2), (0, 1)]);
+
+        // A hit refreshes recency, so the untouched entry is evicted next.
+        assert!(cache.get(0, 1, limits).is_some());
+        cache.insert_with_caps(0, 3, limits, &cache_image(1, 4), 2, 64);
+        assert_eq!(cache.cached_images(), [(0, 3), (0, 1)]);
+
+        // The byte budget evicts older pages before retaining a new one, and
+        // an image over the whole budget is simply not cached.
+        cache.insert_with_caps(0, 4, limits, &cache_image(1, 62), 2, 64);
+        assert_eq!(cache.cached_images(), [(0, 4)]);
+        cache.insert_with_caps(0, 5, limits, &cache_image(1, 65), 2, 64);
+        assert_eq!(cache.cached_images(), [(0, 4)]);
+
+        // Re-inserting an existing key replaces it instead of duplicating it.
+        cache.insert_with_caps(0, 4, limits, &cache_image(9, 4), 2, 64);
+        assert_eq!(cache.cached_images(), [(0, 4)]);
+        assert_eq!(cache.get(0, 4, limits).expect("still cached").pixels[0], 9);
+    }
 
     #[test]
     fn sprite_atlas_assignment_lookup_scales_with_logarithmic_queries() {
