@@ -2682,9 +2682,11 @@ def main() -> None:
         ]
         assert len(extracted_oodle_files) == 1
         assert extracted_oodle_files[0].read_bytes() == oodle_payload
+        # One data-block decode, not two: the extractor's header probe and
+        # write pass share the bundle's decoded-block cache, so the Oodle
+        # callback runs once for the blocks info and once for the data block.
         assert oodle_calls == [
             (b"fake-oodle-blocks-info", len(oodle_info)),
-            (oodle_data_input, len(oodle_payload)),
             (oodle_data_input, len(oodle_payload)),
         ]
         live2d = studio.read_live2d_packages()
