@@ -786,14 +786,14 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unity-rs-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "unity-rs-core",
 ]
 
 [[package]]
 name = "unity-rs-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "brotli",
  "crc32fast",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "unity-rs-node"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "unity-rs-python"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pyo3",
  "unity-rs-core",
