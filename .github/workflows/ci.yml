@@ -142,24 +142,40 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux wheels cross-link against the manylinux_2_28 glibc floor
+          # through zig; building directly on the runner would tag them with
+          # its own much newer glibc (observed manylinux_2_35), locking out
+          # RHEL 8/9-era and Ubuntu 20.04-era consumers.
           - os: ubuntu-latest
             artifact: linux-x64
             build_python: "3.9"
+            wheel_compatibility: manylinux_2_28
+            wheel_flags: --zig
           - os: ubuntu-24.04-arm
             artifact: linux-arm64
             build_python: "3.9"
+            wheel_compatibility: manylinux_2_28
+            wheel_flags: --zig
           - os: windows-latest
             artifact: windows-x64
             build_python: "3.9"
+            wheel_compatibility: pypi
+            wheel_flags: ""
           - os: windows-11-arm
             artifact: windows-arm64
             build_python: "3.14"
+            wheel_compatibility: pypi
+            wheel_flags: ""
           - os: macos-15-intel
             artifact: macos-x64
             build_python: "3.9"
+            wheel_compatibility: pypi
+            wheel_flags: ""
           - os: macos-latest
             artifact: macos-arm64
             build_python: "3.9"
+            wheel_compatibility: pypi
+            wheel_flags: ""
     defaults:
       run:
         working-directory: crates/unity-rs-python
@@ -175,8 +191,11 @@ jobs:
           python-version: ${{ matrix.build_python }}
       - name: Install wheel builder
         run: python -m pip install "maturin==${{ env.MATURIN_VERSION }}"
+      - name: Install zig for manylinux cross-linking
+        if: matrix.wheel_flags == '--zig'
+        run: python -m pip install "ziglang==0.15.2"
       - name: Build release wheel from the locked workspace
-        run: maturin build --release --locked --compatibility pypi --interpreter "${{ steps.build-python.outputs.python-path }}" --out dist
+        run: maturin build --release --locked --compatibility ${{ matrix.wheel_compatibility }} ${{ matrix.wheel_flags }} --interpreter "${{ steps.build-python.outputs.python-path }}" --out dist
       - name: Build and compile-check the Python source distribution
         if: matrix.artifact == 'linux-x64'
         # Maturin prunes the workspace inside an sdist to Core + Python. Cargo

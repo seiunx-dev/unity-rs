@@ -173,7 +173,7 @@ def validate_platform_job(workflow: str, job_name: str) -> None:
             f"{job_name} platform matrix differs from the documented six targets: {actual}"
         )
     required_entry_keys = {
-        "python": {"os", "artifact", "build_python"},
+        "python": {"os", "artifact", "build_python", "wheel_compatibility", "wheel_flags"},
         "package-cli": {"os", "artifact", "binary", "smoke"},
         "package-node": {"os", "artifact"},
     }[job_name]
@@ -182,6 +182,22 @@ def validate_platform_job(workflow: str, job_name: str) -> None:
             raise AuditError(
                 f"{job_name} matrix entry has unexpected keys: {sorted(entry)}"
             )
+        if job_name == "python":
+            # Linux wheels must cross-link against the manylinux_2_28 floor
+            # through zig; every other platform keeps maturin's host audit.
+            # Building Linux wheels on the bare runner tags them with its own
+            # glibc (manylinux_2_35 observed), excluding older distributions.
+            linux = entry["artifact"].startswith("linux-")
+            expected_compatibility = "manylinux_2_28" if linux else "pypi"
+            expected_flags = "--zig" if linux else ""
+            if (
+                entry["wheel_compatibility"].strip('"') != expected_compatibility
+                or entry["wheel_flags"].strip('"') != expected_flags
+            ):
+                raise AuditError(
+                    "python wheels must pin their manylinux posture for "
+                    f"{entry['artifact']}: {entry}"
+                )
         if job_name == "package-cli":
             windows = entry["artifact"].startswith("windows-")
             expected_binary = (

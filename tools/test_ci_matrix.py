@@ -30,6 +30,18 @@ class CiMatrixAuditTests(unittest.TestCase):
         with self.assertRaises(check_ci_matrix.AuditError):
             check_ci_matrix.validate_workflow(altered)
 
+    def test_linux_wheels_must_keep_the_manylinux_posture(self) -> None:
+        altered = self.workflow.replace(
+            "            wheel_compatibility: manylinux_2_28\n"
+            "            wheel_flags: --zig\n",
+            "            wheel_compatibility: pypi\n"
+            "            wheel_flags: \"\"\n",
+            1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
     def test_duplicate_matrix_key_is_rejected(self) -> None:
         altered = self.workflow.replace(
             "            artifact: windows-arm64\n            binary:",
