@@ -576,12 +576,13 @@ fn write_png<W: Write>(
     let idat = IdatWriter::new(output)?;
     let mut encoder = PngDeflater::new(idat, zlib_level)?;
     if adaptive {
-        // Working memory is five scanline strides regardless of image
-        // size: a zero row standing in for the missing prior of row 0,
-        // and one candidate buffer per non-trivial filter. Each byte is
-        // touched once per filter by a specialized branch-free loop that
-        // accumulates the selection heuristic as it fills, and the
-        // chosen candidate is written out as-is instead of recomputed.
+        // Working memory is two scanline strides regardless of image size:
+        // a zero row standing in for the missing prior of row 0, and one
+        // buffer that only ever holds the winning candidate. Selection runs
+        // store-free sum-only passes per filter, lazily: a candidate that
+        // reaches the unbeatable score of zero ends the contest, which makes
+        // the fully transparent rows that dominate sprite cutouts choose
+        // filter 0 after a single load-only pass.
         let allocate_scanline = || -> Result<Vec<u8>> {
             let mut buffer = Vec::new();
             buffer
@@ -593,10 +594,7 @@ fn write_png<W: Write>(
             Ok(buffer)
         };
         let zero_prior = allocate_scanline()?;
-        let mut sub = allocate_scanline()?;
-        let mut up = allocate_scanline()?;
-        let mut average = allocate_scanline()?;
-        let mut paeth = allocate_scanline()?;
+        let mut winner = allocate_scanline()?;
         for output_row in 0..dimensions.height_usize {
             let current = display_row(image, dimensions, row_order, output_row)?;
             let prior = if output_row > 0 {
@@ -604,27 +602,41 @@ fn write_png<W: Write>(
             } else {
                 &zero_prior
             };
-            let sums = [
-                scanline_magnitude(current),
-                fill_sub_filter(current, &mut sub),
-                fill_up_filter(current, prior, &mut up),
-                fill_average_filter(current, prior, &mut average),
-                fill_paeth_filter(current, prior, &mut paeth),
-            ];
             let mut filter = 0_u8;
-            let mut best_sum = sums[0];
-            for (candidate, &sum) in (1..).zip(&sums[1..]) {
-                if sum < best_sum {
-                    best_sum = sum;
+            let mut best = scanline_magnitude(current);
+            for candidate in 1..=4_u8 {
+                if best == 0 {
+                    break;
+                }
+                let sum = match candidate {
+                    1 => sub_filter_magnitude(current),
+                    2 => up_filter_magnitude(current, prior),
+                    3 => average_filter_magnitude(current, prior),
+                    _ => paeth_filter_magnitude(current, prior),
+                };
+                if sum < best {
+                    best = sum;
                     filter = candidate;
                 }
             }
             let filtered: &[u8] = match filter {
                 0 => current,
-                1 => &sub,
-                2 => &up,
-                3 => &average,
-                _ => &paeth,
+                1 => {
+                    fill_sub_filter(current, &mut winner);
+                    &winner
+                }
+                2 => {
+                    fill_up_filter(current, prior, &mut winner);
+                    &winner
+                }
+                3 => {
+                    fill_average_filter(current, prior, &mut winner);
+                    &winner
+                }
+                _ => {
+                    fill_paeth_filter(current, prior, &mut winner);
+                    &winner
+                }
             };
             encoder.write_all(&[filter])?;
             encoder.write_all(filtered)?;
@@ -657,105 +669,136 @@ fn scanline_magnitude(current: &[u8]) -> u64 {
     current.iter().map(|&byte| signed_magnitude(byte)).sum()
 }
 
-/// Fills `output` with the Sub filter of `current` and returns its heuristic
-/// sum. The first pixel has no left neighbor, so its bytes pass through.
-fn fill_sub_filter(current: &[u8], output: &mut [u8]) -> u64 {
+/// The Sub-filter heuristic sum of one scanline, computed without storing
+/// the filtered bytes. The first pixel has no left neighbor and passes
+/// through.
+fn sub_filter_magnitude(current: &[u8]) -> u64 {
     let mut sum = 0_u64;
-    for (destination, &raw) in output.iter_mut().zip(current).take(PNG_FILTER_BPP) {
-        *destination = raw;
+    for &raw in current.iter().take(PNG_FILTER_BPP) {
         sum += signed_magnitude(raw);
     }
-    let lefts = current.iter();
+    for (&raw, &left) in current.iter().skip(PNG_FILTER_BPP).zip(current) {
+        sum += signed_magnitude(raw.wrapping_sub(left));
+    }
+    sum
+}
+
+/// The Up-filter heuristic sum, store-free. Row zero passes an all-zero
+/// prior row, matching the specification's missing-row semantics.
+fn up_filter_magnitude(current: &[u8], prior: &[u8]) -> u64 {
+    current
+        .iter()
+        .zip(prior)
+        .map(|(&raw, &above)| signed_magnitude(raw.wrapping_sub(above)))
+        .sum()
+}
+
+/// The Average-filter heuristic sum, store-free.
+fn average_filter_magnitude(current: &[u8], prior: &[u8]) -> u64 {
+    let mut sum = 0_u64;
+    for (&raw, &above) in current.iter().zip(prior).take(PNG_FILTER_BPP) {
+        sum += signed_magnitude(raw.wrapping_sub(above >> 1));
+    }
+    for ((&raw, &above), &left) in current.iter().zip(prior).skip(PNG_FILTER_BPP).zip(current) {
+        sum += signed_magnitude(
+            raw.wrapping_sub(
+                (left >> 1)
+                    .wrapping_add(above >> 1)
+                    .wrapping_add(left & above & 1),
+            ),
+        );
+    }
+    sum
+}
+
+/// The Paeth-filter heuristic sum, store-free.
+fn paeth_filter_magnitude(current: &[u8], prior: &[u8]) -> u64 {
+    let mut sum = 0_u64;
+    for (&raw, &above) in current.iter().zip(prior).take(PNG_FILTER_BPP) {
+        sum += signed_magnitude(raw.wrapping_sub(paeth_predictor(0, above, 0)));
+    }
+    for (((&raw, &above), &left), &upper_left) in current
+        .iter()
+        .zip(prior)
+        .skip(PNG_FILTER_BPP)
+        .zip(current)
+        .zip(prior)
+    {
+        sum += signed_magnitude(raw.wrapping_sub(paeth_predictor(left, above, upper_left)));
+    }
+    sum
+}
+
+/// Fills `output` with the Sub filter of `current`. The first pixel has no
+/// left neighbor, so its bytes pass through.
+fn fill_sub_filter(current: &[u8], output: &mut [u8]) {
+    output[..PNG_FILTER_BPP].copy_from_slice(&current[..PNG_FILTER_BPP]);
     for ((destination, &raw), &left) in output
         .iter_mut()
         .zip(current)
         .skip(PNG_FILTER_BPP)
-        .zip(lefts)
+        .zip(current)
     {
-        let value = raw.wrapping_sub(left);
-        *destination = value;
-        sum += signed_magnitude(value);
+        *destination = raw.wrapping_sub(left);
     }
-    sum
 }
 
-/// Fills `output` with the Up filter of `current` against `prior` and
-/// returns its heuristic sum. Row zero passes an all-zero prior row, which
-/// reproduces the specification's missing-row semantics.
-fn fill_up_filter(current: &[u8], prior: &[u8], output: &mut [u8]) -> u64 {
-    let mut sum = 0_u64;
+/// Fills `output` with the Up filter of `current` against `prior`.
+fn fill_up_filter(current: &[u8], prior: &[u8], output: &mut [u8]) {
     for ((destination, &raw), &above) in output.iter_mut().zip(current).zip(prior) {
-        let value = raw.wrapping_sub(above);
-        *destination = value;
-        sum += signed_magnitude(value);
+        *destination = raw.wrapping_sub(above);
     }
-    sum
 }
 
-/// Fills `output` with the Average filter and returns its heuristic sum.
-/// `floor((left + above) / 2)` stays inside `u8` as the shifted halves plus
-/// the carry bit both operands share.
-fn fill_average_filter(current: &[u8], prior: &[u8], output: &mut [u8]) -> u64 {
-    let mut sum = 0_u64;
+/// Fills `output` with the Average filter. `floor((left + above) / 2)`
+/// stays inside `u8` as the shifted halves plus the carry bit both operands
+/// share.
+fn fill_average_filter(current: &[u8], prior: &[u8], output: &mut [u8]) {
     for ((destination, &raw), &above) in output
         .iter_mut()
         .zip(current)
         .zip(prior)
         .take(PNG_FILTER_BPP)
     {
-        let value = raw.wrapping_sub(above >> 1);
-        *destination = value;
-        sum += signed_magnitude(value);
+        *destination = raw.wrapping_sub(above >> 1);
     }
-    let lefts = current.iter();
     for (((destination, &raw), &above), &left) in output
         .iter_mut()
         .zip(current)
         .zip(prior)
         .skip(PNG_FILTER_BPP)
-        .zip(lefts)
+        .zip(current)
     {
-        let value = raw.wrapping_sub(
+        *destination = raw.wrapping_sub(
             (left >> 1)
                 .wrapping_add(above >> 1)
                 .wrapping_add(left & above & 1),
         );
-        *destination = value;
-        sum += signed_magnitude(value);
     }
-    sum
 }
 
-/// Fills `output` with the Paeth filter and returns its heuristic sum. The
-/// first pixel's left and upper-left neighbors are zero, where the predictor
-/// degenerates to the byte above.
-fn fill_paeth_filter(current: &[u8], prior: &[u8], output: &mut [u8]) -> u64 {
-    let mut sum = 0_u64;
+/// Fills `output` with the Paeth filter. The first pixel's left and
+/// upper-left neighbors are zero, where the predictor degenerates to the
+/// byte above.
+fn fill_paeth_filter(current: &[u8], prior: &[u8], output: &mut [u8]) {
     for ((destination, &raw), &above) in output
         .iter_mut()
         .zip(current)
         .zip(prior)
         .take(PNG_FILTER_BPP)
     {
-        let value = raw.wrapping_sub(paeth_predictor(0, above, 0));
-        *destination = value;
-        sum += signed_magnitude(value);
+        *destination = raw.wrapping_sub(paeth_predictor(0, above, 0));
     }
-    let lefts = current.iter();
-    let upper_lefts = prior.iter();
     for ((((destination, &raw), &above), &left), &upper_left) in output
         .iter_mut()
         .zip(current)
         .zip(prior)
         .skip(PNG_FILTER_BPP)
-        .zip(lefts)
-        .zip(upper_lefts)
+        .zip(current)
+        .zip(prior)
     {
-        let value = raw.wrapping_sub(paeth_predictor(left, above, upper_left));
-        *destination = value;
-        sum += signed_magnitude(value);
+        *destination = raw.wrapping_sub(paeth_predictor(left, above, upper_left));
     }
-    sum
 }
 
 /// The PNG Paeth predictor: whichever of left, above, and upper-left is
