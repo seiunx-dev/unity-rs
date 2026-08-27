@@ -29,10 +29,31 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      # Lint, doc and package builds on the fixed Ubuntu runner.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-quality-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-target-quality-
       - name: Install minimum Rust toolchain
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
           rustup override set 1.88.0
+      - name: Cache the locked RustSec auditor
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2-${{ runner.os }}
       - name: Install locked RustSec auditor
         run: cargo install cargo-audit --version 0.22.2 --locked --no-default-features
       - name: Audit locked Rust dependencies
@@ -90,6 +111,22 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      # Workspace debug test builds per OS.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-target-test-${{ runner.os }}-
       - name: Install minimum Rust toolchain
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
@@ -118,6 +155,22 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      # Node-API debug builds per OS.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-node-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-target-node-${{ runner.os }}-
       - name: Install minimum Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install Node.js 24
@@ -182,6 +235,15 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
       - name: Install minimum Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install wheel-build Python
@@ -259,6 +321,22 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      # Shared with the other oracle jobs; see above.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-target-oracle-${{ runner.os }}-
       # The managed reader is the compatibility oracle only; nothing shipped
       # from this repository depends on it. It is pinned to the revision the
       # differential was last validated against, so a change over there shows
@@ -288,6 +366,22 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      # Shared with the other oracle jobs; see above.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-target-oracle-${{ runner.os }}-
       - name: Install minimum Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       # vgmstream is the decoder oracle for the FSB codecs this crate decodes
@@ -318,6 +412,22 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      # The three oracle jobs share one artifact cache: they compile near-identical core test builds, and only the first finisher saves.
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-target-oracle-${{ runner.os }}-
       - name: Install minimum Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install Python
@@ -372,6 +482,15 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
       - name: Install minimum Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install artifact staging Python
@@ -421,6 +540,15 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
       - name: Install minimum Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
       - name: Install Node.js 24
