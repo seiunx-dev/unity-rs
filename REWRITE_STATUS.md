@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-08-27（Asia/Shanghai）
+最后更新：2026-08-28（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -876,6 +876,19 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `docs/upstream-defects.md` 新增缺陷 3 记录测量与不依赖本项目的复现。**这是破坏性输出
   变更，随下一个 minor 版本（0.4.0）发布，不作为 patch 悄发**。对 Haruki member_cutout
   管线无影响（下游已确认其基线随升级一并迁移，且新输出与 UnityPy/astcenc 生态一致）；
+- **`PngFilter::Auto` 在 flate2 档改为自适应滤波——破坏性输出变更（2026-08-28）**：下游在
+  1250 包 / 2075 张 2520×1440 连续色调立绘语料上实测出旧 Auto 策略的陷阱：`png_compression`
+  从 fast 调到 default，CPU 涨 2.1–2.6 倍、产物反而大 13%（77% 的图更大，中位 1.13 倍、最高
+  1.46 倍），因为 Auto 在 flate2 档取不滤波，而连续色调内容上滤波在 default 档省 22%。此前
+  member_cutout 裁切语料的依据是"仅省 5–6%、花 1.7–4 倍时间"——两批语料上滤波都更小，差别
+  只是 ROI，而选高档位者本就是拿 CPU 换体积。故 Auto 改为在所有压缩档取 adaptive，仅 stored
+  `Level(0)`（定长块滤波无益）保持不滤波；历史 filter-type-0 字节输出保留显式 `none` 逃生口。
+  这改变 `ExportOptions::default()`/`write_rgba_image`（Default+Auto）的默认 PNG 字节，
+  **与 ASTC 先例同级，随下一个 minor 版本（0.5.0）发布，不作 patch 悄发**；解码像素不变
+  （滤波无损，unfilter 回环回归钉住）。测试同步：Auto 逐档与 adaptive 字节相等且 `Level(0)`
+  等于 none、default 档 Auto 严格小于 none、批量导出默认流与显式 adaptive 相等而显式 none
+  改变流；CLI/Python/Node 的 `auto` 语义文档三面同改（Node `index.d.ts` 随 napi 再生）。
+  fast 出厂路径（fast+Auto）字节不变，Haruki 管线无影响；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

@@ -142,13 +142,15 @@ impl PngCompression {
 /// compression ratio the filtered scanlines allow.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PngFilter {
-    /// Follows the compression choice: [`Self::Adaptive`] under
-    /// [`PngCompression::Fast`], whose simple fdeflate Huffman model barely
-    /// compresses unfiltered scanlines (filtering there cuts real
-    /// sprite-cutout corpora to a third of the size for under twice the
-    /// time), and [`Self::None`] under the flate2 levels, where the same
-    /// corpora showed filtering buys only 5-6% of size for 1.7-4x the time.
-    /// This keeps every compression choice usable on its own.
+    /// [`Self::Adaptive`] at every compressing effort, [`Self::None`] at the
+    /// stored [`PngCompression::Level`] 0, whose fixed-size blocks a filter
+    /// cannot shrink. Filtering always measured smaller where compression
+    /// runs — it cuts real sprite-cutout corpora to a third of the size
+    /// under [`PngCompression::Fast`] and 5-22% depending on content class
+    /// under the flate2 levels — and pairing the flate2 levels with
+    /// unfiltered scanlines (the historical `Auto`) made raising
+    /// `png_compression` grow continuous-tone output instead of shrinking
+    /// it.
     #[default]
     Auto,
     /// Filter type zero on every scanline — the historical output.
@@ -187,9 +189,12 @@ impl JpegSampling {
 
 /// Format-specific knobs for one image encode.
 ///
-/// Every field defaults to the historical exporter behavior, so
 /// `ImageEncodeOptions::default()` reproduces `write_rgba_image` byte for
-/// byte. Each knob applies only to its own format and is ignored elsewhere.
+/// byte. Every field except `png_filter` defaults to the historical exporter
+/// behavior; since 0.5.0 the default `Auto` filter compresses through
+/// adaptively filtered scanlines, and the historical unfiltered stream needs
+/// an explicit [`PngFilter::None`]. Each knob applies only to its own format
+/// and is ignored elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageEncodeOptions {
     /// JPEG quality from 1 through 100.
@@ -565,13 +570,12 @@ fn write_png<W: Write>(
     ihdr[9] = 6;
     write_png_chunk(output, *b"IHDR", &ihdr)?;
 
-    // `Auto` follows the compression choice: the fdeflate fast path barely
-    // compresses unfiltered scanlines, while measurement shows filtering
-    // buys the flate2 levels nothing on this content class.
+    // `Auto` filters adaptively wherever compression runs; the stored
+    // level 0 emits fixed-size blocks a filter cannot shrink.
     let adaptive = match options.png_filter {
         PngFilter::Adaptive => true,
         PngFilter::None => false,
-        PngFilter::Auto => matches!(options.png_compression, PngCompression::Fast),
+        PngFilter::Auto => !matches!(options.png_compression, PngCompression::Level(0)),
     };
     let idat = IdatWriter::new(output)?;
     let mut encoder = PngDeflater::new(idat, zlib_level)?;
@@ -1463,12 +1467,11 @@ mod tests {
         assert_eq!(from_decoded, adaptive);
     }
 
-    /// The default `Auto` filter must follow the compression choice: the
-    /// fdeflate fast path gets adaptive filtering (unfiltered fast output
-    /// barely compresses) and the flate2 levels keep the historical
-    /// unfiltered scanlines byte for byte.
+    /// The default `Auto` filter must select adaptive filtering at every
+    /// compressing effort and fall back to unfiltered scanlines only at the
+    /// stored level 0, whose fixed-size blocks a filter cannot shrink.
     #[test]
-    fn auto_png_filter_follows_the_compression_choice() {
+    fn auto_png_filter_adapts_at_every_compressing_effort() {
         let image = gradient_image();
         let encode = |compression: PngCompression, filter: PngFilter| {
             encode_rgba_image(
@@ -1483,20 +1486,25 @@ mod tests {
             )
             .unwrap()
         };
+        for compression in [
+            PngCompression::Fast,
+            PngCompression::Default,
+            PngCompression::Best,
+            PngCompression::Level(1),
+        ] {
+            assert_eq!(
+                encode(compression, PngFilter::Auto),
+                encode(compression, PngFilter::Adaptive),
+                "auto must filter adaptively under {compression:?}"
+            );
+        }
         assert_eq!(
-            encode(PngCompression::Fast, PngFilter::Auto),
-            encode(PngCompression::Fast, PngFilter::Adaptive),
+            encode(PngCompression::Level(0), PngFilter::Auto),
+            encode(PngCompression::Level(0), PngFilter::None),
         );
-        assert_eq!(
-            encode(PngCompression::Default, PngFilter::Auto),
-            encode(PngCompression::Default, PngFilter::None),
-        );
-        assert_eq!(
-            encode(PngCompression::Best, PngFilter::Auto),
-            encode(PngCompression::Best, PngFilter::None),
-        );
-        // The pairing Auto exists to prevent: unfiltered fast output is
-        // dramatically larger than the filtered default on gradients.
+        // The trap Auto exists to prevent: unfiltered scanlines compress so
+        // poorly on continuous-tone rows that raising the zlib effort used
+        // to grow the output instead of shrinking it.
         let fast_auto = encode(PngCompression::Fast, PngFilter::Auto);
         let fast_unfiltered = encode(PngCompression::Fast, PngFilter::None);
         assert!(
@@ -1504,6 +1512,14 @@ mod tests {
             "auto {} bytes should beat unfiltered fast {} bytes",
             fast_auto.len(),
             fast_unfiltered.len()
+        );
+        let default_auto = encode(PngCompression::Default, PngFilter::Auto);
+        let default_unfiltered = encode(PngCompression::Default, PngFilter::None);
+        assert!(
+            default_auto.len() < default_unfiltered.len(),
+            "auto {} bytes should beat unfiltered default {} bytes",
+            default_auto.len(),
+            default_unfiltered.len()
         );
     }
 
@@ -1882,11 +1898,15 @@ mod tests {
         ZlibDecoder::new(idat.as_slice())
             .read_to_end(&mut scanlines)
             .unwrap();
+        // The default `Auto` strategy writes adaptively filtered scanlines;
+        // reversing the per-row filters must reproduce the display-order
+        // (top-down) pixels of this UnityDecoded (bottom-up) input.
+        let restored = unfilter_png_scanlines(&scanlines, 2 * 4);
         assert_eq!(
-            scanlines,
+            restored,
             [
-                0, 0, 0, 255, 3, 255, 255, 255, 4, // top row
-                0, 255, 0, 0, 1, 0, 255, 0, 2, // bottom row
+                0, 0, 255, 3, 255, 255, 255, 4, // top row
+                255, 0, 0, 1, 0, 255, 0, 2, // bottom row
             ]
         );
     }

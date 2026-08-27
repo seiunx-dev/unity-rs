@@ -979,7 +979,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          --image-format <jpg|jpeg|png|bmp|tga|webp|qoi|raw-rgba>\n  \
          --jpeg-quality <1-100>\n  \
          --png-compression <fast|default|best|0-9>  fast is the fdeflate throughput path\n  \
-         --png-filter <auto|none|adaptive>  auto pairs adaptive filtering with fast\n  \
+         --png-filter <auto|none|adaptive>  auto filters adaptively except at stored level 0\n  \
          --no-restore-text-extension\n  \
          --audio-format <auto|raw|wav>\n  \
          --maximum-metadata-bytes <N>  Cumulative report and output-name index bytes;\n  \

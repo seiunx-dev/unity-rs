@@ -1705,8 +1705,9 @@ impl PyRgbaImage {
     /// default drop-alpha semantics). PNG: `compression` (`fast`,
     /// `default`, `best`, or an explicit zlib level 0-9) and `png_filter`
     /// (`auto`, `none`, or `adaptive`; every choice is lossless, and `auto`
-    /// pairs adaptive filtering with the `fast` effort). `maximum_bytes`
-    /// caps the encoded output for every format.
+    /// filters adaptively at every compressing effort, leaving only the
+    /// stored level 0 unfiltered). `maximum_bytes` caps the encoded output
+    /// for every format.
     #[pyo3(signature = (
         image_format="png",
         *,

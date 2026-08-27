@@ -80,8 +80,9 @@ pub struct ExportOptions {
     /// PNG zlib effort for image payloads; `Fast` selects the fdeflate
     /// throughput path exactly as the per-object encode API does.
     pub png_compression: PngCompression,
-    /// PNG scanline filter strategy; the `Auto` default follows the
-    /// compression choice.
+    /// PNG scanline filter strategy; the `Auto` default filters adaptively
+    /// at every compressing effort and leaves only the stored level 0
+    /// unfiltered.
     pub png_filter: PngFilter,
     pub audio_format: AudioExportFormat,
     pub overwrite_existing: bool,
@@ -2275,9 +2276,10 @@ mod tests {
     }
 
     /// The batch exporter must reach the same PNG effort/filter knobs as the
-    /// per-object encode API: `Fast` selects the fdeflate path (whose Auto
-    /// filter pairing produces a different, valid stream), and the default
-    /// options keep the historical bytes.
+    /// per-object encode API: `Fast` selects the fdeflate path, the default
+    /// `Auto` filter already writes adaptively filtered scanlines (so an
+    /// explicit `Adaptive` changes nothing), and the historical unfiltered
+    /// stream needs an explicit `None`.
     #[test]
     fn export_reaches_the_png_compression_and_filter_knobs() {
         let collection = AssetCollection::load(
@@ -2303,6 +2305,13 @@ mod tests {
                     ..ExportOptions::default()
                 },
             ),
+            (
+                "default-unfiltered",
+                ExportOptions {
+                    png_filter: PngFilter::None,
+                    ..ExportOptions::default()
+                },
+            ),
         ] {
             let output = unique_temp_directory(&format!("unity-rs-png-knobs-{name}"));
             let report = export_collection(&collection, &output, options).unwrap();
@@ -2316,9 +2325,13 @@ mod tests {
             fs::remove_dir_all(&output).ok();
         }
         assert_ne!(streams[0], streams[1], "Fast must change the stream");
-        assert_ne!(
+        assert_eq!(
             streams[0], streams[2],
-            "an explicit adaptive filter must change the stream"
+            "the default Auto filter must already write the adaptive stream"
+        );
+        assert_ne!(
+            streams[0], streams[3],
+            "an explicit unfiltered choice must change the stream"
         );
     }
 
