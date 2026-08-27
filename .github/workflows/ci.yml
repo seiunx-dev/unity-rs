@@ -55,7 +55,13 @@ jobs:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-0.22.2-${{ runner.os }}
       - name: Install locked RustSec auditor
-        run: cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+        # The cache key pins the version, so a restored binary is already the
+        # right one; cargo install refuses to overwrite it rather than
+        # no-op, hence the existence guard.
+        run: |
+          if [ ! -x "$HOME/.cargo/bin/cargo-audit" ]; then
+            cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+          fi
       - name: Audit locked Rust dependencies
         run: cargo audit --file Cargo.lock --deny unsound --deny yanked
       - name: Check formatting
