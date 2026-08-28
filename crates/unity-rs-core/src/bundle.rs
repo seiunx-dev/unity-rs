@@ -264,6 +264,133 @@ impl fmt::Debug for BundleOpenOptions {
     }
 }
 
+struct UnityFsLayout {
+    size: u64,
+    compressed_blocks_info_size: u32,
+    uncompressed_blocks_info_size: u32,
+    flags: ArchiveFlags,
+    bundle_end: u64,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    decryptor: Option<ArchiveDecryptor>,
+}
+
+fn read_unity_fs_layout<R: Read + Seek>(
+    reader: &mut EndianReader<R>,
+    bundle_start: u64,
+    common: &BundleHeader,
+    is_legacy_v6: bool,
+    limits: BundleParseLimits,
+    unity_cn_key: Option<UnityCnKey>,
+) -> Result<UnityFsLayout> {
+    let size = non_negative_i64(reader.read_i64()?, "UnityFS bundle size")?;
+    let compressed_blocks_info_size = reader.read_u32()?;
+    let uncompressed_blocks_info_size = reader.read_u32()?;
+    let flags = ArchiveFlags(reader.read_u32()?);
+    if is_legacy_v6 {
+        reader.read_u8()?;
+    }
+    let bundle_end = bundle_start
+        .checked_add(size)
+        .ok_or_else(|| Error::invalid_data("UnityFS bundle end overflowed"))?;
+    let stream_length = reader.len()?;
+    if bundle_end > stream_length {
+        return Err(Error::invalid_data(format!(
+            "UnityFS bundle ends at {bundle_end}, beyond stream length {stream_length}"
+        )));
+    }
+    if bundle_end < reader.position()? {
+        return Err(Error::invalid_data(
+            "UnityFS declared size is smaller than its header",
+        ));
+    }
+    let compressed_size = u64::from(compressed_blocks_info_size);
+    let uncompressed_size = u64::from(uncompressed_blocks_info_size);
+    validate_blocks_info_sizes(compressed_size, uncompressed_size, limits)?;
+    let decryptor = read_unity_cn_decryptor(reader, common, flags, unity_cn_key)?;
+    Ok(UnityFsLayout {
+        size,
+        compressed_blocks_info_size,
+        uncompressed_blocks_info_size,
+        flags,
+        bundle_end,
+        compressed_size,
+        uncompressed_size,
+        decryptor,
+    })
+}
+
+fn read_unity_cn_decryptor<R: Read + Seek>(
+    reader: &mut EndianReader<R>,
+    common: &BundleHeader,
+    flags: ArchiveFlags,
+    unity_cn_key: Option<UnityCnKey>,
+) -> Result<Option<ArchiveDecryptor>> {
+    if !has_unity_cn_flag(common, flags) {
+        return Ok(None);
+    }
+    let key = unity_cn_key.ok_or_else(|| {
+        Error::unsupported("UnityCN-encrypted UnityFS bundles need a caller-supplied key")
+    })?;
+    let length = usize::try_from(UNITY_CN_HEADER_BYTES)
+        .map_err(|_| Error::invalid_data("UnityCN header size does not fit this platform"))?;
+    let header = UnityCnHeader::parse(reader.read_bytes(length)?.as_slice())?;
+    Ok(Some(ArchiveDecryptor::new(&header, key)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_compressed_blocks_info<R: Read + Seek>(
+    reader: &mut EndianReader<R>,
+    bundle_start: u64,
+    bundle_end: u64,
+    compressed_size: u64,
+    return_position: u64,
+    flags: ArchiveFlags,
+) -> Result<(Vec<u8>, u64)> {
+    let offset = if flags.blocks_info_at_end() {
+        bundle_end
+            .checked_sub(compressed_size)
+            .ok_or_else(|| Error::invalid_data("UnityFS blocks info exceeds bundle size"))?
+    } else {
+        return_position
+    };
+    let end = offset
+        .checked_add(compressed_size)
+        .ok_or_else(|| Error::invalid_data("UnityFS blocks info range overflowed"))?;
+    if offset < bundle_start || end > bundle_end {
+        return Err(Error::invalid_data(
+            "UnityFS blocks info is outside the declared bundle range",
+        ));
+    }
+    if flags.blocks_info_at_end() && offset < return_position {
+        return Err(Error::invalid_data(
+            "tail UnityFS blocks info overlaps the bundle header",
+        ));
+    }
+    reader.set_position(offset)?;
+    let length = usize::try_from(compressed_size)
+        .map_err(|_| Error::invalid_data("UnityFS blocks info is too large for this platform"))?;
+    let bytes = reader.read_bytes(length)?;
+    if flags.blocks_info_at_end() {
+        reader.set_position(return_position)?;
+    }
+    Ok((bytes, offset))
+}
+
+fn decrypt_blocks_info(
+    bytes: &mut [u8],
+    decryptor: Option<&ArchiveDecryptor>,
+    flags: ArchiveFlags,
+) -> Result<()> {
+    if let Some(decryptor) = decryptor
+        && flags.0 & UNITY_CN_ENCRYPTED_FLAG != 0
+        && flags.compression() != CompressionType::None
+    {
+        decryptor.decrypt_block(bytes, 0)?;
+    }
+    Ok(())
+}
+
 impl UnityFsBundle {
     pub fn open(region: &Region) -> Result<Self> {
         Self::open_with_options(region, BundleOpenOptions::default())
@@ -299,89 +426,37 @@ impl UnityFsBundle {
         // than assumed compatible, because that is the difference between
         // reading a file and guessing at it.
         let is_legacy_v6 = validate_unity_fs_signature(&common)?;
-
-        let size = non_negative_i64(reader.read_i64()?, "UnityFS bundle size")?;
-        let compressed_blocks_info_size = reader.read_u32()?;
-        let uncompressed_blocks_info_size = reader.read_u32()?;
-        let flags = ArchiveFlags(reader.read_u32()?);
-        if is_legacy_v6 {
-            reader.read_u8()?;
-        }
-        let bundle_end = bundle_start
-            .checked_add(size)
-            .ok_or_else(|| Error::invalid_data("UnityFS bundle end overflowed"))?;
-        let stream_length = reader.len()?;
-        if bundle_end > stream_length {
-            return Err(Error::invalid_data(format!(
-                "UnityFS bundle ends at {bundle_end}, beyond stream length {stream_length}"
-            )));
-        }
-        if bundle_end < reader.position()? {
-            return Err(Error::invalid_data(
-                "UnityFS declared size is smaller than its header",
-            ));
-        }
-
-        let compressed_size = u64::from(compressed_blocks_info_size);
-        let uncompressed_size = u64::from(uncompressed_blocks_info_size);
-        validate_blocks_info_sizes(compressed_size, uncompressed_size, limits)?;
-        // UnityCN puts its encryption header immediately after the archive
-        // flags, before the alignment the ordinary layout applies.
-        let decryptor = if has_unity_cn_flag(&common, flags) {
-            let Some(key) = unity_cn_key else {
-                return Err(Error::unsupported(
-                    "UnityCN-encrypted UnityFS bundles need a caller-supplied key",
-                ));
-            };
-            let length = usize::try_from(UNITY_CN_HEADER_BYTES).map_err(|_| {
-                Error::invalid_data("UnityCN header size does not fit this platform")
-            })?;
-            let header = UnityCnHeader::parse(reader.read_bytes(length)?.as_slice())?;
-            Some(ArchiveDecryptor::new(&header, key)?)
-        } else {
-            None
-        };
+        let layout = read_unity_fs_layout(
+            &mut reader,
+            bundle_start,
+            &common,
+            is_legacy_v6,
+            limits,
+            unity_cn_key,
+        )?;
+        let UnityFsLayout {
+            size,
+            compressed_blocks_info_size,
+            uncompressed_blocks_info_size,
+            flags,
+            bundle_end,
+            compressed_size,
+            uncompressed_size,
+            decryptor,
+        } = layout;
 
         align_blocks_info(&mut reader, bundle_start, &common, flags, bundle_end)?;
         let blocks_info_return_position = reader.position()?;
 
-        let blocks_info_offset = if flags.blocks_info_at_end() {
-            bundle_end
-                .checked_sub(compressed_size)
-                .ok_or_else(|| Error::invalid_data("UnityFS blocks info exceeds bundle size"))?
-        } else {
-            blocks_info_return_position
-        };
-        let blocks_info_end = blocks_info_offset
-            .checked_add(compressed_size)
-            .ok_or_else(|| Error::invalid_data("UnityFS blocks info range overflowed"))?;
-        if blocks_info_offset < bundle_start || blocks_info_end > bundle_end {
-            return Err(Error::invalid_data(
-                "UnityFS blocks info is outside the declared bundle range",
-            ));
-        }
-        if flags.blocks_info_at_end() && blocks_info_offset < blocks_info_return_position {
-            return Err(Error::invalid_data(
-                "tail UnityFS blocks info overlaps the bundle header",
-            ));
-        }
-
-        reader.set_position(blocks_info_offset)?;
-        let compressed_length = usize::try_from(compressed_size).map_err(|_| {
-            Error::invalid_data("UnityFS blocks info is too large for this platform")
-        })?;
-        let blocks_info_bytes = reader.read_bytes(compressed_length)?;
-        if flags.blocks_info_at_end() {
-            reader.set_position(blocks_info_return_position)?;
-        }
-
-        let mut blocks_info_bytes = blocks_info_bytes;
-        if let Some(decryptor) = &decryptor
-            && flags.0 & UNITY_CN_ENCRYPTED_FLAG != 0
-            && flags.compression() != CompressionType::None
-        {
-            decryptor.decrypt_block(&mut blocks_info_bytes, 0)?;
-        }
+        let (mut blocks_info_bytes, blocks_info_offset) = read_compressed_blocks_info(
+            &mut reader,
+            bundle_start,
+            bundle_end,
+            compressed_size,
+            blocks_info_return_position,
+            flags,
+        )?;
+        decrypt_blocks_info(&mut blocks_info_bytes, decryptor.as_ref(), flags)?;
         let blocks_info = decompress_blocks_info(
             flags.compression(),
             blocks_info_bytes,

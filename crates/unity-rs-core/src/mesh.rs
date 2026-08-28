@@ -3272,6 +3272,12 @@ mod tests {
 
         push_blend_shapes(object, options.blend_shapes);
         let bone_count = usize::from(options.skinning) * 2;
+        push_mesh_bind_pose_fixture(object, bone_count);
+        push_mesh_bone_hash_fixture(object, bone_count, options.layout_version);
+        push_mesh_fixture_flags(object, options);
+    }
+
+    fn push_mesh_bind_pose_fixture(object: &mut Vec<u8>, bone_count: usize) {
         push_i32(object, i32::try_from(bone_count).unwrap());
         for bone in 0..bone_count {
             for index in 0..16 {
@@ -3285,16 +3291,25 @@ mod tests {
                 object.extend_from_slice(&value.to_le_bytes());
             }
         }
+    }
+
+    fn push_mesh_bone_hash_fixture(
+        object: &mut Vec<u8>,
+        bone_count: usize,
+        layout_version: (u32, u32, u32),
+    ) {
         push_i32(object, i32::try_from(bone_count).unwrap());
         for hash in [111_u32, 222].into_iter().take(bone_count) {
             push_u32(object, hash);
         }
-        push_u32(object, if options.skinning { 333 } else { 0 });
-        if options.layout_version.0 >= 2019 {
+        push_u32(object, if bone_count == 0 { 0 } else { 333 });
+        if layout_version.0 >= 2019 {
             push_i32(object, 0);
             push_i32(object, 0);
         }
+    }
 
+    fn push_mesh_fixture_flags(object: &mut Vec<u8>, options: MeshFixtureOptions) {
         object.push(if options.compressed {
             1
         } else {
@@ -3328,34 +3343,39 @@ mod tests {
     }
 
     fn push_legacy_skin_fixture(object: &mut Vec<u8>, options: MeshFixtureOptions) {
-        if options.layout_version < (2018, 2, 0) {
-            push_i32(object, i32::try_from(options.skin_records).unwrap());
-            for vertex in 0..options.skin_records {
-                let weights: [f32; 4] = if options.skinning {
-                    match vertex {
-                        0 => [1.0, 0.0, 0.0, 0.0],
-                        1 => [0.25, 0.75, 0.0, 0.0],
-                        _ => [0.0, 1.0, 0.0, 0.0],
-                    }
-                } else {
-                    [0.0; 4]
-                };
-                for weight in weights {
-                    object.extend_from_slice(&weight.to_le_bytes());
-                }
-                let indices = if options.skinning {
-                    match vertex {
-                        0 => [0, 0, 0, 0],
-                        1 => [0, 1, 0, 0],
-                        _ => [1, 0, 0, 0],
-                    }
-                } else {
-                    [0; 4]
-                };
-                for index in indices {
-                    push_i32(object, index);
-                }
+        if options.layout_version >= (2018, 2, 0) {
+            return;
+        }
+        push_i32(object, i32::try_from(options.skin_records).unwrap());
+        for vertex in 0..options.skin_records {
+            for weight in legacy_fixture_weights(options.skinning, vertex) {
+                object.extend_from_slice(&weight.to_le_bytes());
             }
+            for index in legacy_fixture_indices(options.skinning, vertex) {
+                push_i32(object, index);
+            }
+        }
+    }
+
+    fn legacy_fixture_weights(skinning: bool, vertex: usize) -> [f32; 4] {
+        if !skinning {
+            return [0.0; 4];
+        }
+        match vertex {
+            0 => [1.0, 0.0, 0.0, 0.0],
+            1 => [0.25, 0.75, 0.0, 0.0],
+            _ => [0.0, 1.0, 0.0, 0.0],
+        }
+    }
+
+    fn legacy_fixture_indices(skinning: bool, vertex: usize) -> [i32; 4] {
+        if !skinning {
+            return [0; 4];
+        }
+        match vertex {
+            0 => [0, 0, 0, 0],
+            1 => [0, 1, 0, 0],
+            _ => [1, 0, 0, 0],
         }
     }
 

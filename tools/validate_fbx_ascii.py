@@ -89,33 +89,54 @@ def scan_records(
     index = 0
     while index < len(lines):
         line = lines[index]
-        if line.startswith("Objects:"):
-            in_objects = True
-        elif line.startswith("Connections:"):
-            in_objects = False
-
-        match = OBJECT_TYPE.match(line)
-        if match:
-            declared[match.group(1)] = int(match.group(2))
-
-        if in_objects:
-            match = OBJECT_ENTRY.match(line)
-            if match:
-                kind, identifier = match.group(1), int(match.group(2))
-                written[kind] = written.get(kind, 0) + 1
-                if identifier in ids:
-                    raise Invalid(f"object id {identifier} is used more than once")
-                ids.add(identifier)
-
-        match = CONNECTION.match(line)
-        if match:
-            connections.append((int(match.group(2)), int(match.group(3))))
-
-        match = ARRAY_HEADER.match(line)
-        if match:
-            validate_array(lines, index, match)
+        in_objects = update_object_section(line, in_objects)
+        record_declared_type(line, declared)
+        record_object(line, in_objects, written, ids)
+        record_connection(line, connections)
+        validate_array_at(lines, index, line)
         index += 1
     return declared, written, ids, connections
+
+
+def update_object_section(line: str, in_objects: bool) -> bool:
+    if line.startswith("Objects:"):
+        return True
+    if line.startswith("Connections:"):
+        return False
+    return in_objects
+
+
+def record_declared_type(line: str, declared: dict[str, int]) -> None:
+    match = OBJECT_TYPE.match(line)
+    if match:
+        declared[match.group(1)] = int(match.group(2))
+
+
+def record_object(
+    line: str, in_objects: bool, written: dict[str, int], ids: set[int]
+) -> None:
+    if not in_objects:
+        return
+    match = OBJECT_ENTRY.match(line)
+    if not match:
+        return
+    kind, identifier = match.group(1), int(match.group(2))
+    written[kind] = written.get(kind, 0) + 1
+    if identifier in ids:
+        raise Invalid(f"object id {identifier} is used more than once")
+    ids.add(identifier)
+
+
+def record_connection(line: str, connections: list[tuple[int, int]]) -> None:
+    match = CONNECTION.match(line)
+    if match:
+        connections.append((int(match.group(2)), int(match.group(3))))
+
+
+def validate_array_at(lines: list[str], index: int, line: str) -> None:
+    match = ARRAY_HEADER.match(line)
+    if match:
+        validate_array(lines, index, match)
 
 
 def validate_array(lines: list[str], index: int, match: re.Match[str]) -> None:

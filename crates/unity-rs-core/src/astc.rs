@@ -1280,7 +1280,14 @@ fn expand_binary_endpoint(bits: u64, precision: usize) -> i32 {
     }
 }
 
-fn decode_endpoint_mode(endpoints: &mut [i32], mode: usize, v: &mut [i32]) {
+fn decode_endpoint_mode(endpoints: &mut [i32], mode: usize, values: &mut [i32]) {
+    match mode {
+        0..=7 => decode_low_endpoint_mode(endpoints, mode, values),
+        _ => decode_high_endpoint_mode(endpoints, mode, values),
+    }
+}
+
+fn decode_low_endpoint_mode(endpoints: &mut [i32], mode: usize, v: &mut [i32]) {
     match mode {
         0 => {
             set_endpoint(endpoints, v[0], v[0], v[0], 255, v[1], v[1], v[1], 255);
@@ -1350,6 +1357,12 @@ fn decode_endpoint_mode(endpoints: &mut [i32], mode: usize, v: &mut [i32]) {
         7 => {
             decode_endpoints_hdr7(endpoints, v);
         }
+        _ => unreachable!("low ASTC endpoint mode is in range"),
+    }
+}
+
+fn decode_high_endpoint_mode(endpoints: &mut [i32], mode: usize, v: &mut [i32]) {
+    match mode {
         8 => {
             if v[0] + v[2] + v[4] <= v[1] + v[3] + v[5] {
                 set_endpoint(endpoints, v[0], v[2], v[4], 255, v[1], v[3], v[5], 255);
