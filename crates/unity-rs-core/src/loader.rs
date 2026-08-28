@@ -1413,25 +1413,8 @@ impl SpriteAtlasIndex {
                     continue;
                 };
 
-                let resolved_count = atlas
-                    .packed_sprites
-                    .iter()
-                    .filter(|reference| {
-                        collection
-                            .resolve_object_location(file_index, **reference)
-                            .and_then(|(target_file_index, target_object_index)| {
-                                collection
-                                    .serialized_files
-                                    .get(target_file_index)?
-                                    .file
-                                    .objects
-                                    .get(target_object_index)
-                                    .filter(|target| target.class_id == SPRITE_CLASS_ID)
-                                    .map(|_| ())
-                            })
-                            .is_some()
-                    })
-                    .count();
+                let resolved_count =
+                    resolved_sprite_count(collection, file_index, &atlas.packed_sprites);
                 let next_entries = retained_entries
                     .checked_add(1)
                     .and_then(|count| count.checked_add(resolved_count))
@@ -1539,6 +1522,29 @@ impl SpriteAtlasIndex {
         });
         &self.assignments[start..start + width]
     }
+}
+
+fn resolved_sprite_count(
+    collection: &AssetCollection,
+    source_file_index: usize,
+    references: &[ObjectReference],
+) -> usize {
+    references
+        .iter()
+        .filter(|reference| {
+            collection
+                .resolve_object_location(source_file_index, **reference)
+                .and_then(|(file_index, object_index)| {
+                    collection
+                        .serialized_files
+                        .get(file_index)?
+                        .file
+                        .objects
+                        .get(object_index)
+                })
+                .is_some_and(|target| target.class_id == SPRITE_CLASS_ID)
+        })
+        .count()
 }
 
 impl AssetResourceIndex {

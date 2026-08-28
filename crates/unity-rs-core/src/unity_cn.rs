@@ -541,41 +541,52 @@ mod tests {
         let mut group = u8::try_from(block_index % 256).expect("a value below 256 fits u8");
         let mut offset = 0_usize;
         while offset < plain.len() {
-            let remaining = plain.len() - offset;
-            let mut counter = group;
-            let mut local = 0_usize;
-            let take = |local: &mut usize, counter: &mut u8, output: &mut Vec<u8>| -> u8 {
-                let value = plain[offset + *local];
-                output[offset + *local] = encrypt_byte(decryptor, value, *counter);
-                *local += 1;
-                *counter = counter.wrapping_add(1);
-                value
-            };
-
-            let token = take(&mut local, &mut counter, &mut output);
-            let mut literal = usize::from(token >> 4);
-            let extends_match = token & 0xF == 0xF;
-            if literal == 0xF {
-                loop {
-                    let value = take(&mut local, &mut counter, &mut output);
-                    literal += usize::from(value);
-                    if value != 0xFF {
-                        break;
-                    }
-                }
-            }
-            local += literal;
-            if local < remaining {
-                take(&mut local, &mut counter, &mut output);
-                take(&mut local, &mut counter, &mut output);
-                if extends_match {
-                    while take(&mut local, &mut counter, &mut output) == 0xFF {}
-                }
-            }
+            let local = encrypt_token_group(decryptor, plain, &mut output, offset, group);
             offset += local;
             group = group.wrapping_add(1);
         }
         output
+    }
+
+    fn encrypt_token_group(
+        decryptor: &ArchiveDecryptor,
+        plain: &[u8],
+        output: &mut [u8],
+        offset: usize,
+        group: u8,
+    ) -> usize {
+        let remaining = plain.len() - offset;
+        let mut counter = group;
+        let mut local = 0_usize;
+        let take = |local: &mut usize, counter: &mut u8, output: &mut [u8]| -> u8 {
+            let value = plain[offset + *local];
+            output[offset + *local] = encrypt_byte(decryptor, value, *counter);
+            *local += 1;
+            *counter = counter.wrapping_add(1);
+            value
+        };
+
+        let token = take(&mut local, &mut counter, output);
+        let mut literal = usize::from(token >> 4);
+        let extends_match = token & 0xF == 0xF;
+        if literal == 0xF {
+            loop {
+                let value = take(&mut local, &mut counter, output);
+                literal += usize::from(value);
+                if value != 0xFF {
+                    break;
+                }
+            }
+        }
+        local += literal;
+        if local < remaining {
+            take(&mut local, &mut counter, output);
+            take(&mut local, &mut counter, output);
+            if extends_match {
+                while take(&mut local, &mut counter, output) == 0xFF {}
+            }
+        }
+        local
     }
 
     #[test]

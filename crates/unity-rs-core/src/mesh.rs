@@ -1053,37 +1053,7 @@ impl VertexData {
         if self.vertex_count == 0 {
             return Err(Error::unsupported("Mesh has no vertices"));
         }
-        for (index, channel) in self.channels.iter().copied().enumerate() {
-            if channel.dimension == 0 {
-                continue;
-            }
-            let size = vertex_format_size(channel.format, version)?;
-            let stream = self
-                .streams
-                .get(usize::from(channel.stream))
-                .ok_or_else(|| {
-                    Error::invalid_data(format!(
-                        "Mesh channel {index} references missing stream {}",
-                        channel.stream
-                    ))
-                })?;
-            let component_bytes = usize::from(channel.dimension)
-                .checked_mul(size)
-                .ok_or_else(|| Error::invalid_data("Mesh channel byte size overflowed"))?;
-            let final_vertex_offset = stream
-                .stride
-                .checked_mul(self.vertex_count - 1)
-                .and_then(|value| stream.offset.checked_add(value))
-                .and_then(|value| value.checked_add(usize::from(channel.offset)))
-                .and_then(|value| value.checked_add(component_bytes))
-                .ok_or_else(|| Error::invalid_data("Mesh channel data range overflowed"))?;
-            if final_vertex_offset > self.bytes.len() {
-                return Err(Error::invalid_data(format!(
-                    "Mesh channel {index} ends at byte {final_vertex_offset}, beyond vertex data size {}",
-                    self.bytes.len()
-                )));
-            }
-        }
+        self.validate_channel_ranges(version)?;
 
         let position = self
             .channels
@@ -1133,13 +1103,47 @@ impl VertexData {
             .map(|channel| self.decode_vec2(channel, endian, version))
             .transpose()?;
         let skin = self.decode_skin(version, endian)?;
-
         Ok(DecodedVertexData {
             vertices,
             normals,
             uv0,
             skin,
         })
+    }
+
+    fn validate_channel_ranges(&self, version: (u32, u32, u32)) -> Result<()> {
+        for (index, channel) in self.channels.iter().copied().enumerate() {
+            if channel.dimension == 0 {
+                continue;
+            }
+            let size = vertex_format_size(channel.format, version)?;
+            let stream = self
+                .streams
+                .get(usize::from(channel.stream))
+                .ok_or_else(|| {
+                    Error::invalid_data(format!(
+                        "Mesh channel {index} references missing stream {}",
+                        channel.stream
+                    ))
+                })?;
+            let component_bytes = usize::from(channel.dimension)
+                .checked_mul(size)
+                .ok_or_else(|| Error::invalid_data("Mesh channel byte size overflowed"))?;
+            let final_vertex_offset = stream
+                .stride
+                .checked_mul(self.vertex_count - 1)
+                .and_then(|value| stream.offset.checked_add(value))
+                .and_then(|value| value.checked_add(usize::from(channel.offset)))
+                .and_then(|value| value.checked_add(component_bytes))
+                .ok_or_else(|| Error::invalid_data("Mesh channel data range overflowed"))?;
+            if final_vertex_offset > self.bytes.len() {
+                return Err(Error::invalid_data(format!(
+                    "Mesh channel {index} ends at byte {final_vertex_offset}, beyond vertex data size {}",
+                    self.bytes.len()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn decode_skin(
