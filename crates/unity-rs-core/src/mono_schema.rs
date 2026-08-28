@@ -519,35 +519,9 @@ fn scan_json_string(document: &[u8], mut cursor: usize) -> Option<(usize, usize)
         match document[cursor] {
             b'"' => return Some((cursor + 1, decoded_bytes)),
             b'\\' => {
-                cursor += 1;
-                let escape = *document.get(cursor)?;
-                match escape {
-                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
-                        decoded_bytes = decoded_bytes.checked_add(1)?;
-                        cursor += 1;
-                    }
-                    b'u' => {
-                        let first = json_hex_u16(document.get(cursor + 1..cursor + 5)?)?;
-                        cursor += 5;
-                        if (0xD800..=0xDBFF).contains(&first) {
-                            if document.get(cursor..cursor + 2)? != b"\\u" {
-                                return None;
-                            }
-                            let second = json_hex_u16(document.get(cursor + 2..cursor + 6)?)?;
-                            if !(0xDC00..=0xDFFF).contains(&second) {
-                                return None;
-                            }
-                            decoded_bytes = decoded_bytes.checked_add(4)?;
-                            cursor += 6;
-                        } else if (0xDC00..=0xDFFF).contains(&first) {
-                            return None;
-                        } else {
-                            decoded_bytes = decoded_bytes
-                                .checked_add(char::from_u32(u32::from(first))?.len_utf8())?;
-                        }
-                    }
-                    _ => return None,
-                }
+                let (next, added) = scan_json_escape(document, cursor + 1)?;
+                decoded_bytes = decoded_bytes.checked_add(added)?;
+                cursor = next;
             }
             byte if byte < 0x20 => return None,
             _ => {
@@ -559,6 +533,30 @@ fn scan_json_string(document: &[u8], mut cursor: usize) -> Option<(usize, usize)
         }
     }
     None
+}
+
+fn scan_json_escape(document: &[u8], cursor: usize) -> Option<(usize, usize)> {
+    match *document.get(cursor)? {
+        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => Some((cursor + 1, 1)),
+        b'u' => scan_json_unicode_escape(document, cursor + 1),
+        _ => None,
+    }
+}
+
+fn scan_json_unicode_escape(document: &[u8], digits: usize) -> Option<(usize, usize)> {
+    let first = json_hex_u16(document.get(digits..digits + 4)?)?;
+    let next = digits + 4;
+    if (0xD800..=0xDBFF).contains(&first) {
+        if document.get(next..next + 2)? != b"\\u" {
+            return None;
+        }
+        let second = json_hex_u16(document.get(next + 2..next + 6)?)?;
+        return (0xDC00..=0xDFFF).contains(&second).then_some((next + 6, 4));
+    }
+    if (0xDC00..=0xDFFF).contains(&first) {
+        return None;
+    }
+    Some((next, char::from_u32(u32::from(first))?.len_utf8()))
 }
 
 fn json_hex_u16(bytes: &[u8]) -> Option<u16> {

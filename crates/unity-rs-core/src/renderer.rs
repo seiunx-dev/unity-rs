@@ -672,61 +672,65 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    #[allow(clippy::struct_excessive_bools)]
+    struct RendererFixtureFlags {
+        rendering_layer: bool,
+        renderer_priority: bool,
+        ray_tracing_mode: bool,
+        ray_trace_procedural: bool,
+        static_shadow_caster: bool,
+        acceleration_structure: bool,
+        small_mesh_culling: bool,
+        mesh_lod_selection: bool,
+    }
+
+    impl RendererFixtureFlags {
+        fn for_version(major: u32, minor: u32) -> Self {
+            Self {
+                rendering_layer: major >= 2018,
+                renderer_priority: major > 2018 || (major == 2018 && minor >= 3),
+                ray_tracing_mode: major > 2019 || (major == 2019 && minor >= 3),
+                ray_trace_procedural: major >= 2020,
+                static_shadow_caster: major >= 2021,
+                acceleration_structure: major > 2023 || (major == 2023 && minor >= 2),
+                small_mesh_culling: major > 2023 || (major == 2023 && minor >= 3),
+                mesh_lod_selection: major > 6000 || (major == 6000 && minor >= 2),
+            }
+        }
+    }
+
     fn renderer_prefix(version: &str) -> Vec<u8> {
         let parsed = UnityVersion::from_str(version).unwrap();
         let (major, minor, patch) = parsed.components();
-        let has_rendering_layer = major >= 2018;
-        let has_renderer_priority = major > 2018 || (major == 2018 && minor >= 3);
-        let has_ray_tracing_mode = major > 2019 || (major == 2019 && minor >= 3);
-        let has_ray_trace_procedural = major >= 2020;
-        let has_static_shadow_caster = major >= 2021;
-        let has_acceleration_structure_flags = major > 2023 || (major == 2023 && minor >= 2);
-        let has_small_mesh_culling = major > 2023 || (major == 2023 && minor >= 3);
-        let has_mesh_lod_selection = major > 6000 || (major == 6000 && minor >= 2);
+        let flags = RendererFixtureFlags::for_version(major, minor);
         let mut object = Vec::new();
         push_pptr(&mut object, 0, 11);
         object.push(1);
         object.push(2);
         object.push(1);
         object.push(0);
-        if has_static_shadow_caster {
-            object.push(0);
-        }
+        push_optional_byte(&mut object, flags.static_shadow_caster, 0);
         object.extend_from_slice(&[0, 0, 0]);
-        if has_ray_tracing_mode {
-            object.push(0);
-        }
-        if has_ray_trace_procedural {
-            object.push(0);
-        }
+        push_optional_byte(&mut object, flags.ray_tracing_mode, 0);
+        push_optional_byte(&mut object, flags.ray_trace_procedural, 0);
         if parsed.is_tuanjie() {
-            object.extend_from_slice(&[7, 8]);
-            let has_shading_rate = (major, minor, patch) > (2022, 3, 48)
-                || ((major, minor, patch) == (2022, 3, 48) && parsed.build >= 3);
-            if has_shading_rate {
-                align(&mut object, 4);
-                object.push(9);
-                if (major, minor, patch) >= (2022, 3, 61) {
-                    object.push(10);
-                }
-            }
+            push_tuanjie_renderer_flags(&mut object, &parsed, (major, minor, patch));
         }
-        if has_acceleration_structure_flags {
+        if flags.acceleration_structure {
             object.extend_from_slice(&[0, 0]);
         }
-        if has_small_mesh_culling {
-            object.push(0);
-        }
+        push_optional_byte(&mut object, flags.small_mesh_culling, 0);
         align(&mut object, 4);
-        if has_mesh_lod_selection {
+        if flags.mesh_lod_selection {
             object.extend_from_slice(&(-1_i16).to_le_bytes());
             align(&mut object, 4);
             object.extend_from_slice(&1.0_f32.to_le_bytes());
         }
-        if has_rendering_layer {
+        if flags.rendering_layer {
             object.extend_from_slice(&u32::MAX.to_le_bytes());
         }
-        if has_renderer_priority {
+        if flags.renderer_priority {
             object.extend_from_slice(&0_i32.to_le_bytes());
         }
         object.extend_from_slice(&0_u16.to_le_bytes());
@@ -744,6 +748,30 @@ mod tests {
         object.extend_from_slice(&43_i16.to_le_bytes());
         align(&mut object, 4);
         object
+    }
+
+    fn push_optional_byte(output: &mut Vec<u8>, enabled: bool, value: u8) {
+        if enabled {
+            output.push(value);
+        }
+    }
+
+    fn push_tuanjie_renderer_flags(
+        output: &mut Vec<u8>,
+        version: &UnityVersion,
+        components: (u32, u32, u32),
+    ) {
+        output.extend_from_slice(&[7, 8]);
+        let has_shading_rate =
+            components > (2022, 3, 48) || (components == (2022, 3, 48) && version.build >= 3);
+        if !has_shading_rate {
+            return;
+        }
+        align(output, 4);
+        output.push(9);
+        if components >= (2022, 3, 61) {
+            output.push(10);
+        }
     }
 
     fn push_pptr(output: &mut Vec<u8>, file_id: i32, path_id: i64) {

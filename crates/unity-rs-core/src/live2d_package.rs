@@ -1516,64 +1516,91 @@ impl<'a> PackageState<'a> {
                 if object.class_id != GAME_OBJECT_CLASS_ID {
                     continue;
                 }
-                let game_object =
-                    read_game_object(&loaded.file, object_index, self.limits.hierarchy.scene)?;
-                let game_object_key = SceneObjectKey {
+                if let Some(model) = self.active_model_for_game_object(
+                    roles,
+                    &model_identities,
+                    &mut model_slots,
                     file_index,
-                    path_id: object.path_id,
-                };
-                let mut transform_seen = false;
-                let mut bindings = ActiveBindings::default();
-                for component in game_object.components {
-                    let Some(target) =
-                        resolve_object_reference(self.collection, file_index, component.component)
-                            .ok()
-                            .flatten()
-                    else {
-                        continue;
-                    };
-                    if matches!(
-                        target.object.class_id,
-                        TRANSFORM_CLASS_ID | RECT_TRANSFORM_CLASS_ID
-                    ) {
-                        transform_seen = true;
-                        continue;
-                    }
-                    if !transform_seen || target.object.class_id != MONO_BEHAVIOUR_CLASS_ID {
-                        continue;
-                    }
-                    let identity = (target.file_index, target.object_index);
-                    let role_position =
-                        roles.partition_point(|(candidate, _)| *candidate < identity);
-                    if let Some(&(candidate, role)) = roles.get(role_position)
-                        && candidate == identity
-                    {
-                        bindings.observe(identity, role);
-                    }
+                    object_index,
+                    object.path_id,
+                )? {
+                    active.push(model);
                 }
-                let Some(identity) = bindings.model else {
-                    continue;
-                };
-                let position = model_identities.partition_point(|candidate| *candidate < identity);
-                if model_identities.get(position) != Some(&identity) {
-                    continue;
-                }
-                let Some(slot) = model_slots.get_mut(position) else {
-                    continue;
-                };
-                let Some(mut model) = slot.take() else {
-                    continue;
-                };
-                model.game_object = Some(game_object_key);
-                active.push(ActiveModel {
-                    component: model,
-                    expression_controller: bindings.expression_controller,
-                    physics_controller: bindings.physics_controller,
-                    fade_controller: bindings.fade_controller,
-                });
             }
         }
         Ok(active)
+    }
+
+    fn active_model_for_game_object(
+        &self,
+        roles: &[((usize, usize), CubismRole)],
+        model_identities: &[(usize, usize)],
+        model_slots: &mut [Option<ScriptedComponent>],
+        file_index: usize,
+        object_index: usize,
+        path_id: i64,
+    ) -> Result<Option<ActiveModel>> {
+        let loaded = &self.collection.serialized_files[file_index];
+        let game_object =
+            read_game_object(&loaded.file, object_index, self.limits.hierarchy.scene)?;
+        let bindings = self.active_bindings(roles, file_index, game_object.components);
+        let Some(identity) = bindings.model else {
+            return Ok(None);
+        };
+        let position = model_identities.partition_point(|candidate| *candidate < identity);
+        if model_identities.get(position) != Some(&identity) {
+            return Ok(None);
+        }
+        let Some(mut model) = model_slots.get_mut(position).and_then(Option::take) else {
+            return Ok(None);
+        };
+        model.game_object = Some(SceneObjectKey {
+            file_index,
+            path_id,
+        });
+        Ok(Some(ActiveModel {
+            component: model,
+            expression_controller: bindings.expression_controller,
+            physics_controller: bindings.physics_controller,
+            fade_controller: bindings.fade_controller,
+        }))
+    }
+
+    fn active_bindings(
+        &self,
+        roles: &[((usize, usize), CubismRole)],
+        file_index: usize,
+        components: Vec<crate::scene::GameObjectComponent>,
+    ) -> ActiveBindings {
+        let mut transform_seen = false;
+        let mut bindings = ActiveBindings::default();
+        for component in components {
+            let Some(target) =
+                resolve_object_reference(self.collection, file_index, component.component)
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            if matches!(
+                target.object.class_id,
+                TRANSFORM_CLASS_ID | RECT_TRANSFORM_CLASS_ID
+            ) {
+                transform_seen = true;
+                continue;
+            }
+            if !transform_seen || target.object.class_id != MONO_BEHAVIOUR_CLASS_ID {
+                continue;
+            }
+            let identity = (target.file_index, target.object_index);
+            let position = roles.partition_point(|(candidate, _)| *candidate < identity);
+            if let Some(&(candidate, role)) = roles.get(position)
+                && candidate == identity
+            {
+                bindings.observe(identity, role);
+            }
+        }
+        bindings
     }
 
     /// The model's expressions, falling back to loose assets in its own file.

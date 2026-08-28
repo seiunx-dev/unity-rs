@@ -118,6 +118,121 @@ def decoded_by_this_crate(
     }
 
 
+def compare_bundle(
+    bundle: Path,
+    output: Path,
+    unity_version: str | None,
+    unitypy,
+    stats: dict[int, collections.Counter],
+    problems: list[str],
+) -> tuple[int, bool]:
+    ours = decoded_by_this_crate(bundle, output, unity_version)
+    if not ours:
+        return 0, True
+    try:
+        environment = unitypy.load(str(bundle))
+    except Exception as error:  # noqa: BLE001
+        problems.append(f"{bundle.name}: UnityPy could not load it: {error}")
+        return 0, False
+    compared = 0
+    for obj in environment.objects:
+        if obj.class_id == 28 and obj.path_id in ours:
+            compared += compare_texture_object(bundle, obj, ours[obj.path_id], stats, problems)
+    return compared, False
+
+
+def compare_texture_object(
+    bundle: Path,
+    obj,
+    mine: bytes,
+    stats: dict[int, collections.Counter],
+    problems: list[str],
+) -> int:
+    try:
+        image = obj.read().image.convert("RGBA")
+        fmt = int(obj.read_typetree().get("m_TextureFormat"))
+    except Exception:  # noqa: BLE001, S112
+        return 0
+    theirs = image.tobytes()
+    if len(mine) != len(theirs):
+        problems.append(
+            f"{bundle.name}:{obj.path_id} format {fmt}: "
+            f"{len(mine)} bytes against UnityPy's {len(theirs)}"
+        )
+        return 0
+    record_texture_difference(bundle, obj.path_id, fmt, mine, theirs, stats, problems)
+    return 1
+
+
+def record_texture_difference(
+    bundle: Path,
+    path_id: int,
+    fmt: int,
+    mine: bytes,
+    theirs: bytes,
+    stats: dict[int, collections.Counter],
+    problems: list[str],
+) -> None:
+    counter = stats[fmt]
+    counter["textures"] += 1
+    if mine == theirs:
+        counter["identical"] += 1
+        return
+    counter["differing"] += 1
+    worst = max(abs(left - right) for left, right in zip(mine, theirs) if left != right)
+    counter["worst"] = max(counter["worst"], worst)
+    if fmt in CHANNEL_CONVENTION and alpha_agrees(mine, theirs):
+        counter["convention"] += 1
+    elif fmt not in INDEPENDENTLY_DECODED:
+        problems.append(
+            f"{bundle.name}:{path_id} format {fmt} differs by up to {worst}, "
+            "and both sides decode it the same way, so they should agree exactly"
+        )
+    elif worst > 1:
+        problems.append(
+            f"{bundle.name}:{path_id} format {fmt} differs by {worst}, "
+            "more than the one level two correct decoders can differ by"
+        )
+
+
+def report_results(
+    stats: dict[int, collections.Counter],
+    problems: list[str],
+    compared: int,
+    bundle_count: int,
+    skipped: int,
+) -> int:
+    print(
+        f"compared {compared} textures from {bundle_count - skipped} bundle(s)"
+        f" ({skipped} skipped, having produced nothing to compare)"
+    )
+    for fmt, counter in sorted(stats.items()):
+        print(format_result_line(fmt, counter))
+    if problems:
+        print(f"\n{len(problems)} unexplained difference(s):", file=sys.stderr)
+        for line in problems[:20]:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    if compared == 0:
+        print("no textures were compared, so nothing was checked", file=sys.stderr)
+        return 1
+    print("every difference is within one level on an independently decoded format")
+    return 0
+
+
+def format_result_line(fmt: int, counter: collections.Counter) -> str:
+    note = " (ARM reference decoder)" if fmt in INDEPENDENTLY_DECODED else ""
+    line = f"  format {fmt}{note}: {counter['identical']}/{counter['textures']} identical"
+    if counter["differing"]:
+        line += f", worst difference {counter['worst']}"
+    if counter["convention"]:
+        line += (
+            f", {counter['convention']} differing only in the channels the"
+            " format does not store, with alpha identical"
+        )
+    return line
+
+
 def main() -> int:
     if len(sys.argv) not in (2, 3, 4):
         print(__doc__)
@@ -145,90 +260,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="unity-rs-texdiff-") as work:
         for bundle in bundles:
             output = Path(work) / bundle.stem
-            ours = decoded_by_this_crate(bundle, output, unity_version)
-            if not ours:
-                # Counted, not passed over. A bundle that silently produced
-                # nothing looks exactly like one that agreed.
-                skipped += 1
-                continue
-            try:
-                env = UnityPy.load(str(bundle))
-            except Exception as error:  # noqa: BLE001
-                problems.append(f"{bundle.name}: UnityPy could not load it: {error}")
-                continue
-            for obj in env.objects:
-                if obj.class_id != 28 or obj.path_id not in ours:
-                    continue
-                try:
-                    image = obj.read().image.convert("RGBA")
-                    fmt = int(obj.read_typetree().get("m_TextureFormat"))
-                except Exception:  # noqa: BLE001, S112
-                    continue
-                theirs = image.tobytes()
-                mine = ours[obj.path_id]
-                if len(mine) != len(theirs):
-                    problems.append(
-                        f"{bundle.name}:{obj.path_id} format {fmt}: "
-                        f"{len(mine)} bytes against UnityPy's {len(theirs)}"
-                    )
-                    continue
-                compared += 1
-                counter = stats[fmt]
-                counter["textures"] += 1
-                if mine == theirs:
-                    counter["identical"] += 1
-                    continue
-                counter["differing"] += 1
-                worst = max(abs(a - b) for a, b in zip(mine, theirs) if a != b)
-                counter["worst"] = max(counter["worst"], worst)
-                if fmt in CHANNEL_CONVENTION and alpha_agrees(mine, theirs):
-                    # Not a decode difference. `Alpha8` stores alpha and
-                    # nothing else, so what lands in red, green and blue is a
-                    # convention: the managed converter this project reproduces
-                    # fills 0xFF and writes alpha over it, giving opaque white,
-                    # while UnityPy gives black. Every alpha byte of the
-                    # 16,777,216-pixel font atlas here matches, which is the
-                    # data; the rest is spelling. Requiring alpha to agree
-                    # exactly keeps the real check -- a wrong alpha is still a
-                    # defect -- while not calling the convention one.
-                    counter["convention"] += 1
-                    continue
-                if fmt not in INDEPENDENTLY_DECODED:
-                    problems.append(
-                        f"{bundle.name}:{obj.path_id} format {fmt} differs by up to {worst}, "
-                        "and both sides decode it the same way, so they should agree exactly"
-                    )
-                elif worst > 1:
-                    problems.append(
-                        f"{bundle.name}:{obj.path_id} format {fmt} differs by {worst}, "
-                        "more than the one level two correct decoders can differ by"
-                    )
-
-    print(
-        f"compared {compared} textures from {len(bundles) - skipped} bundle(s)"
-        f" ({skipped} skipped, having produced nothing to compare)"
-    )
-    for fmt, counter in sorted(stats.items()):
-        note = " (ARM reference decoder)" if fmt in INDEPENDENTLY_DECODED else ""
-        line = f"  format {fmt}{note}: {counter['identical']}/{counter['textures']} identical"
-        if counter["differing"]:
-            line += f", worst difference {counter['worst']}"
-        if counter["convention"]:
-            line += (
-                f", {counter['convention']} differing only in the channels the"
-                " format does not store, with alpha identical"
+            count, empty = compare_bundle(
+                bundle, output, unity_version, UnityPy, stats, problems
             )
-        print(line)
-    if problems:
-        print(f"\n{len(problems)} unexplained difference(s):", file=sys.stderr)
-        for line in problems[:20]:
-            print(f"  {line}", file=sys.stderr)
-        return 1
-    if compared == 0:
-        print("no textures were compared, so nothing was checked", file=sys.stderr)
-        return 1
-    print("every difference is within one level on an independently decoded format")
-    return 0
+            compared += count
+            skipped += int(empty)
+    return report_results(stats, problems, compared, len(bundles), skipped)
 
 
 if __name__ == "__main__":

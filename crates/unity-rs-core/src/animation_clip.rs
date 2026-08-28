@@ -2557,7 +2557,32 @@ mod tests {
         if rich {
             push_floats(output, &[3.0, 4.0, 5.0], endian);
         }
+        push_muscle_curve_fixture(output, version, endian, rich);
+        if version < (2018, 3, 0) {
+            push_legacy_muscle_indices(output, endian, rich);
+        }
+        if is_tuanjie
+            && (version > (2022, 3, 48) || (version == (2022, 3, 48) && version_build >= 3))
+        {
+            push_tuanjie_acl_fixture(output, version, version_build, endian);
+        }
+        push_floats(output, &[0.0; 6], endian);
+        push_i32_array(output, if rich { &[0x1020_3040] } else { &[] }, endian);
+        push_i32(output, i32::from(rich), endian);
+        if rich {
+            push_floats(output, &[6.0, 7.0], endian);
+        }
+        push_f32_array(output, if rich { &[8.0] } else { &[] }, endian);
+        output.extend_from_slice(&[1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        align(output, 4);
+    }
 
+    fn push_muscle_curve_fixture(
+        output: &mut Vec<u8>,
+        version: (u32, u32, u32),
+        endian: Endian,
+        rich: bool,
+    ) {
         for _ in 0..4 {
             push_xform(output, endian);
         }
@@ -2579,45 +2604,41 @@ mod tests {
         push_floats(output, &[30.0, 0.0], endian);
         push_f32_array(output, if rich { &[1.25, 2.5] } else { &[] }, endian);
         push_f32_array(output, if rich { &[3.5] } else { &[] }, endian);
-        if version < (2018, 3, 0) {
-            push_i32(output, i32::from(rich), endian);
-            if rich {
-                push_u32(output, 10, endian);
-                push_u32(output, 20, endian);
-                push_u32(output, 30, endian);
-            }
+    }
+
+    fn push_legacy_muscle_indices(output: &mut Vec<u8>, endian: Endian, rich: bool) {
+        push_i32(output, i32::from(rich), endian);
+        if rich {
+            push_u32(output, 10, endian);
+            push_u32(output, 20, endian);
+            push_u32(output, 30, endian);
         }
-        if is_tuanjie
-            && (version > (2022, 3, 48) || (version == (2022, 3, 48) && version_build >= 3))
-        {
-            push_u32(output, 12, endian);
-            push_u32(output, 3, endian);
-            push_f32(output, 30.0, endian);
-            if version >= (2022, 3, 55) {
-                push_u32(output, 7, endian);
-            }
-            push_i32(output, 3, endian);
-            output.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+    }
+
+    fn push_tuanjie_acl_fixture(
+        output: &mut Vec<u8>,
+        version: (u32, u32, u32),
+        version_build: u32,
+        endian: Endian,
+    ) {
+        push_u32(output, 12, endian);
+        push_u32(output, 3, endian);
+        push_f32(output, 30.0, endian);
+        if version >= (2022, 3, 55) {
+            push_u32(output, 7, endian);
+        }
+        push_i32(output, 3, endian);
+        output.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        if version >= (2022, 3, 61) {
+            align(output, 4);
+        }
+        push_u32_array(output, &[0x10, 0x20], endian);
+        if version > (2022, 3, 55) || (version == (2022, 3, 55) && version_build >= 4) {
+            output.push(1);
             if version >= (2022, 3, 61) {
                 align(output, 4);
             }
-            push_u32_array(output, &[0x10, 0x20], endian);
-            if version > (2022, 3, 55) || (version == (2022, 3, 55) && version_build >= 4) {
-                output.push(1);
-                if version >= (2022, 3, 61) {
-                    align(output, 4);
-                }
-            }
         }
-        push_floats(output, &[0.0; 6], endian);
-        push_i32_array(output, if rich { &[0x1020_3040] } else { &[] }, endian);
-        push_i32(output, i32::from(rich), endian);
-        if rich {
-            push_floats(output, &[6.0, 7.0], endian);
-        }
-        push_f32_array(output, if rich { &[8.0] } else { &[] }, endian);
-        output.extend_from_slice(&[1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
-        align(output, 4);
     }
 
     fn push_hand_pose(output: &mut Vec<u8>, endian: Endian, rich: bool) {

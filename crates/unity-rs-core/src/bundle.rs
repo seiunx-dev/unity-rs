@@ -298,15 +298,7 @@ impl UnityFsBundle {
         // UnityPy once it is accepted. Later versions stay refused rather
         // than assumed compatible, because that is the difference between
         // reading a file and guessing at it.
-        let is_unity_fs = common.signature == "UnityFS" && matches!(common.version, 6..=8);
-        let is_legacy_v6 =
-            matches!(common.signature.as_str(), "UnityWeb" | "UnityRaw") && common.version == 6;
-        if !is_unity_fs && !is_legacy_v6 {
-            return Err(Error::unsupported(format!(
-                "bundle signature {:?} format version {}; expected UnityFS v6/v7/v8 or UnityWeb/UnityRaw v6",
-                common.signature, common.version
-            )));
-        }
+        let is_legacy_v6 = validate_unity_fs_signature(&common)?;
 
         let size = non_negative_i64(reader.read_i64()?, "UnityFS bundle size")?;
         let compressed_blocks_info_size = reader.read_u32()?;
@@ -332,14 +324,7 @@ impl UnityFsBundle {
 
         let compressed_size = u64::from(compressed_blocks_info_size);
         let uncompressed_size = u64::from(uncompressed_blocks_info_size);
-        if compressed_size > limits.max_blocks_info_size
-            || uncompressed_size > limits.max_blocks_info_size
-        {
-            return Err(Error::invalid_data(format!(
-                "UnityFS blocks info exceeds the configured {} byte limit",
-                limits.max_blocks_info_size
-            )));
-        }
+        validate_blocks_info_sizes(compressed_size, uncompressed_size, limits)?;
         // UnityCN puts its encryption header immediately after the archive
         // flags, before the alignment the ordinary layout applies.
         let decryptor = if has_unity_cn_flag(&common, flags) {
@@ -416,54 +401,14 @@ impl UnityFsBundle {
             bundle_end
         };
 
-        let mut compressed_offset = data_offset;
-        let mut uncompressed_offset = 0_u64;
-        for block in &mut blocks {
-            if u64::from(block.compressed_size) > limits.max_compressed_block_size {
-                return Err(Error::invalid_data(format!(
-                    "UnityFS compressed block size {} exceeds configured limit {}",
-                    block.compressed_size, limits.max_compressed_block_size
-                )));
-            }
-            if u64::from(block.uncompressed_size) > limits.max_uncompressed_block_size {
-                return Err(Error::invalid_data(format!(
-                    "UnityFS uncompressed block size {} exceeds configured limit {}",
-                    block.uncompressed_size, limits.max_uncompressed_block_size
-                )));
-            }
-            block.compressed_offset = compressed_offset;
-            block.uncompressed_offset = uncompressed_offset;
-            compressed_offset = compressed_offset
-                .checked_add(u64::from(block.compressed_size))
-                .ok_or_else(|| Error::invalid_data("UnityFS compressed block range overflowed"))?;
-            uncompressed_offset = uncompressed_offset
-                .checked_add(u64::from(block.uncompressed_size))
-                .ok_or_else(|| Error::invalid_data("UnityFS uncompressed size overflowed"))?;
-            if block.compression == CompressionType::None
-                && block.compressed_size != block.uncompressed_size
-            {
-                return Err(Error::invalid_data(
-                    "uncompressed UnityFS block has different compressed and uncompressed sizes",
-                ));
-            }
-        }
+        let (compressed_offset, uncompressed_offset) =
+            layout_storage_blocks(&mut blocks, data_offset, limits)?;
         if compressed_offset > block_data_limit {
             return Err(Error::invalid_data(format!(
                 "UnityFS block data ends at {compressed_offset}, beyond its limit {block_data_limit}"
             )));
         }
-        for entry in &entries {
-            let entry_end = entry
-                .offset
-                .checked_add(entry.size)
-                .ok_or_else(|| Error::invalid_data("UnityFS entry range overflowed"))?;
-            if entry_end > uncompressed_offset {
-                return Err(Error::invalid_data(format!(
-                    "UnityFS entry {:?} ends at {entry_end}, beyond uncompressed data length {uncompressed_offset}",
-                    entry.path
-                )));
-            }
-        }
+        validate_bundle_entries(&entries, uncompressed_offset)?;
 
         let bundle_region = region.subregion(bundle_start, size)?;
 
@@ -707,6 +652,88 @@ impl UnityFsBundle {
         self.copy_entry_with_cache(index, &mut bytes, cache)?;
         Ok(bytes)
     }
+}
+
+fn validate_unity_fs_signature(common: &BundleHeader) -> Result<bool> {
+    let is_unity_fs = common.signature == "UnityFS" && matches!(common.version, 6..=8);
+    let is_legacy_v6 =
+        matches!(common.signature.as_str(), "UnityWeb" | "UnityRaw") && common.version == 6;
+    if !is_unity_fs && !is_legacy_v6 {
+        return Err(Error::unsupported(format!(
+            "bundle signature {:?} format version {}; expected UnityFS v6/v7/v8 or UnityWeb/UnityRaw v6",
+            common.signature, common.version
+        )));
+    }
+    Ok(is_legacy_v6)
+}
+
+fn validate_blocks_info_sizes(
+    compressed: u64,
+    uncompressed: u64,
+    limits: BundleParseLimits,
+) -> Result<()> {
+    if compressed > limits.max_blocks_info_size || uncompressed > limits.max_blocks_info_size {
+        return Err(Error::invalid_data(format!(
+            "UnityFS blocks info exceeds the configured {} byte limit",
+            limits.max_blocks_info_size
+        )));
+    }
+    Ok(())
+}
+
+fn layout_storage_blocks(
+    blocks: &mut [StorageBlock],
+    data_offset: u64,
+    limits: BundleParseLimits,
+) -> Result<(u64, u64)> {
+    let mut compressed_offset = data_offset;
+    let mut uncompressed_offset = 0_u64;
+    for block in blocks {
+        if u64::from(block.compressed_size) > limits.max_compressed_block_size {
+            return Err(Error::invalid_data(format!(
+                "UnityFS compressed block size {} exceeds configured limit {}",
+                block.compressed_size, limits.max_compressed_block_size
+            )));
+        }
+        if u64::from(block.uncompressed_size) > limits.max_uncompressed_block_size {
+            return Err(Error::invalid_data(format!(
+                "UnityFS uncompressed block size {} exceeds configured limit {}",
+                block.uncompressed_size, limits.max_uncompressed_block_size
+            )));
+        }
+        block.compressed_offset = compressed_offset;
+        block.uncompressed_offset = uncompressed_offset;
+        compressed_offset = compressed_offset
+            .checked_add(u64::from(block.compressed_size))
+            .ok_or_else(|| Error::invalid_data("UnityFS compressed block range overflowed"))?;
+        uncompressed_offset = uncompressed_offset
+            .checked_add(u64::from(block.uncompressed_size))
+            .ok_or_else(|| Error::invalid_data("UnityFS uncompressed size overflowed"))?;
+        if block.compression == CompressionType::None
+            && block.compressed_size != block.uncompressed_size
+        {
+            return Err(Error::invalid_data(
+                "uncompressed UnityFS block has different compressed and uncompressed sizes",
+            ));
+        }
+    }
+    Ok((compressed_offset, uncompressed_offset))
+}
+
+fn validate_bundle_entries(entries: &[BundleEntry], uncompressed_length: u64) -> Result<()> {
+    for entry in entries {
+        let entry_end = entry
+            .offset
+            .checked_add(entry.size)
+            .ok_or_else(|| Error::invalid_data("UnityFS entry range overflowed"))?;
+        if entry_end > uncompressed_length {
+            return Err(Error::invalid_data(format!(
+                "UnityFS entry {:?} ends at {entry_end}, beyond uncompressed data length {uncompressed_length}",
+                entry.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One-slot cache of the most recently decoded storage block, shared across

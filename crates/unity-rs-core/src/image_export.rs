@@ -580,84 +580,96 @@ fn write_png<W: Write>(
     let idat = IdatWriter::new(output)?;
     let mut encoder = PngDeflater::new(idat, zlib_level)?;
     if adaptive {
-        // Working memory is two scanline strides regardless of image size:
-        // a zero row standing in for the missing prior of row 0, and one
-        // buffer that only ever holds the winning candidate. Selection runs
-        // store-free sum-only passes per filter, lazily: a candidate that
-        // reaches the unbeatable score of zero ends the contest, which makes
-        // the fully transparent rows that dominate sprite cutouts choose
-        // filter 0 after a single load-only pass. Each later pass also
-        // abandons block by block once its partial sum reaches the standing
-        // best — a partial sum is a lower bound of the final sum, so the
-        // candidate has already lost and the selection stays exact.
-        let allocate_scanline = || -> Result<Vec<u8>> {
-            let mut buffer = Vec::new();
-            buffer
-                .try_reserve_exact(dimensions.stride_usize)
-                .map_err(|error| {
-                    Error::invalid_data(format!("cannot allocate PNG filter scanline: {error}"))
-                })?;
-            buffer.resize(dimensions.stride_usize, 0);
-            Ok(buffer)
-        };
-        let zero_prior = allocate_scanline()?;
-        let mut winner = allocate_scanline()?;
-        for output_row in 0..dimensions.height_usize {
-            let current = display_row(image, dimensions, row_order, output_row)?;
-            let prior = if output_row > 0 {
-                display_row(image, dimensions, row_order, output_row - 1)?
-            } else {
-                &zero_prior
-            };
-            let mut filter = 0_u8;
-            let mut best = scanline_magnitude(current);
-            for candidate in 1..=4_u8 {
-                if best == 0 {
-                    break;
-                }
-                let sum = match candidate {
-                    1 => sub_filter_magnitude(current, best),
-                    2 => up_filter_magnitude(current, prior, best),
-                    3 => average_filter_magnitude(current, prior, best),
-                    _ => paeth_filter_magnitude(current, prior, best),
-                };
-                if sum < best {
-                    best = sum;
-                    filter = candidate;
-                }
-            }
-            let filtered: &[u8] = match filter {
-                0 => current,
-                1 => {
-                    fill_sub_filter(current, &mut winner);
-                    &winner
-                }
-                2 => {
-                    fill_up_filter(current, prior, &mut winner);
-                    &winner
-                }
-                3 => {
-                    fill_average_filter(current, prior, &mut winner);
-                    &winner
-                }
-                _ => {
-                    fill_paeth_filter(current, prior, &mut winner);
-                    &winner
-                }
-            };
-            encoder.write_all(&[filter])?;
-            encoder.write_all(filtered)?;
-        }
+        write_adaptive_png_rows(image, dimensions, row_order, &mut encoder)?;
     } else {
-        for output_row in 0..dimensions.height_usize {
-            encoder.write_all(&[0])?;
-            encoder.write_all(display_row(image, dimensions, row_order, output_row)?)?;
-        }
+        write_unfiltered_png_rows(image, dimensions, row_order, &mut encoder)?;
     }
     let idat = encoder.finish()?;
     idat.finish()?;
 
     write_png_chunk(output, *b"IEND", &[])?;
+    Ok(())
+}
+
+fn allocate_png_scanline(stride: usize) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(stride).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate PNG filter scanline: {error}"))
+    })?;
+    buffer.resize(stride, 0);
+    Ok(buffer)
+}
+
+fn write_adaptive_png_rows<W: Write>(
+    image: &RgbaImage,
+    dimensions: ImageDimensions,
+    row_order: ImageRowOrder,
+    encoder: &mut PngDeflater<'_, '_, W>,
+) -> Result<()> {
+    let zero_prior = allocate_png_scanline(dimensions.stride_usize)?;
+    let mut winner = allocate_png_scanline(dimensions.stride_usize)?;
+    for output_row in 0..dimensions.height_usize {
+        let current = display_row(image, dimensions, row_order, output_row)?;
+        let prior = if output_row > 0 {
+            display_row(image, dimensions, row_order, output_row - 1)?
+        } else {
+            &zero_prior
+        };
+        let filter = select_png_filter(current, prior);
+        let filtered = fill_selected_png_filter(filter, current, prior, &mut winner);
+        encoder.write_all(&[filter])?;
+        encoder.write_all(filtered)?;
+    }
+    Ok(())
+}
+
+fn select_png_filter(current: &[u8], prior: &[u8]) -> u8 {
+    let mut filter = 0_u8;
+    let mut best = scanline_magnitude(current);
+    for candidate in 1..=4_u8 {
+        if best == 0 {
+            break;
+        }
+        let sum = match candidate {
+            1 => sub_filter_magnitude(current, best),
+            2 => up_filter_magnitude(current, prior, best),
+            3 => average_filter_magnitude(current, prior, best),
+            _ => paeth_filter_magnitude(current, prior, best),
+        };
+        if sum < best {
+            best = sum;
+            filter = candidate;
+        }
+    }
+    filter
+}
+
+fn fill_selected_png_filter<'a>(
+    filter: u8,
+    current: &'a [u8],
+    prior: &[u8],
+    winner: &'a mut [u8],
+) -> &'a [u8] {
+    match filter {
+        0 => {}
+        1 => fill_sub_filter(current, winner),
+        2 => fill_up_filter(current, prior, winner),
+        3 => fill_average_filter(current, prior, winner),
+        _ => fill_paeth_filter(current, prior, winner),
+    }
+    if filter == 0 { current } else { winner }
+}
+
+fn write_unfiltered_png_rows<W: Write>(
+    image: &RgbaImage,
+    dimensions: ImageDimensions,
+    row_order: ImageRowOrder,
+    encoder: &mut PngDeflater<'_, '_, W>,
+) -> Result<()> {
+    for output_row in 0..dimensions.height_usize {
+        encoder.write_all(&[0])?;
+        encoder.write_all(display_row(image, dimensions, row_order, output_row)?)?;
+    }
     Ok(())
 }
 

@@ -311,6 +311,13 @@ impl<'a> StaticScene<'a> {
 
     fn write(&self, output: &mut impl Write) -> io::Result<()> {
         self.write_header(output)?;
+        self.write_objects(output)?;
+        output.write_all(b"}\nConnections:  {\n")?;
+        self.write_connections(output)?;
+        output.write_all(b"}\nTakes:  {\n    Current: \"\"\n}\n")
+    }
+
+    fn write_objects(&self, output: &mut impl Write) -> io::Result<()> {
         for node in &self.nodes {
             write_model(node, output)?;
         }
@@ -337,39 +344,15 @@ impl<'a> StaticScene<'a> {
         for animation in &self.animations {
             write_animation(animation, output)?;
         }
-        output.write_all(b"}\nConnections:  {\n")?;
+        Ok(())
+    }
+
+    fn write_connections(&self, output: &mut impl Write) -> io::Result<()> {
         for node in &self.nodes {
             writeln!(output, "    C: \"OO\",{},{}", node.id, node.parent_id)?;
         }
         for geometry in &self.geometries {
-            writeln!(
-                output,
-                "    C: \"OO\",{},{}",
-                geometry.id, geometry.model_id
-            )?;
-            for material_id in &geometry.material_ids {
-                writeln!(output, "    C: \"OO\",{material_id},{}", geometry.model_id)?;
-            }
-            if let Some(skin) = &geometry.skin {
-                writeln!(output, "    C: \"OO\",{},{}", skin.id, geometry.id)?;
-                for cluster in &skin.clusters {
-                    writeln!(output, "    C: \"OO\",{},{}", cluster.id, skin.id)?;
-                    writeln!(
-                        output,
-                        "    C: \"OO\",{},{}",
-                        cluster.bone_model_id, cluster.id
-                    )?;
-                }
-            }
-            if let Some(morph) = &geometry.morph {
-                writeln!(output, "    C: \"OO\",{},{}", morph.id, geometry.id)?;
-                for channel in &morph.channels {
-                    writeln!(output, "    C: \"OO\",{},{}", channel.id, morph.id)?;
-                    for shape in &channel.shapes {
-                        writeln!(output, "    C: \"OO\",{},{}", shape.id, channel.id)?;
-                    }
-                }
-            }
+            write_geometry_connections(geometry, output)?;
         }
         for texture in &self.textures {
             writeln!(output, "    C: \"OO\",{},{}", texture.video_id, texture.id)?;
@@ -388,7 +371,7 @@ impl<'a> StaticScene<'a> {
         for animation in &self.animations {
             write_animation_connections(animation, output)?;
         }
-        output.write_all(b"}\nTakes:  {\n    Current: \"\"\n}\n")
+        Ok(())
     }
 
     fn write_header(&self, output: &mut impl Write) -> io::Result<()> {
@@ -2134,6 +2117,41 @@ fn validate_vertex_attribute<const N: usize>(
         return Err(Error::invalid_data(format!(
             "Mesh {name} contains a non-finite value"
         )));
+    }
+    Ok(())
+}
+
+fn write_geometry_connections(
+    geometry: &GeometryPlan<'_>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "    C: \"OO\",{},{}",
+        geometry.id, geometry.model_id
+    )?;
+    for material_id in &geometry.material_ids {
+        writeln!(output, "    C: \"OO\",{material_id},{}", geometry.model_id)?;
+    }
+    if let Some(skin) = &geometry.skin {
+        writeln!(output, "    C: \"OO\",{},{}", skin.id, geometry.id)?;
+        for cluster in &skin.clusters {
+            writeln!(output, "    C: \"OO\",{},{}", cluster.id, skin.id)?;
+            writeln!(
+                output,
+                "    C: \"OO\",{},{}",
+                cluster.bone_model_id, cluster.id
+            )?;
+        }
+    }
+    if let Some(morph) = &geometry.morph {
+        writeln!(output, "    C: \"OO\",{},{}", morph.id, geometry.id)?;
+        for channel in &morph.channels {
+            writeln!(output, "    C: \"OO\",{},{}", channel.id, morph.id)?;
+            for shape in &channel.shapes {
+                writeln!(output, "    C: \"OO\",{},{}", shape.id, channel.id)?;
+            }
+        }
     }
     Ok(())
 }

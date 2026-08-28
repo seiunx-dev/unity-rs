@@ -201,49 +201,8 @@ fn build_scene_nodes(
             "object records",
         )?;
     }
-    for geometry in &scene.geometries {
-        if let Some(morph) = &geometry.morph {
-            for channel in &morph.channels {
-                for shape in &channel.shapes {
-                    push_node(
-                        &mut objects.children,
-                        shape_geometry_node(geometry.mesh, shape, strings)?,
-                        "object records",
-                    )?;
-                }
-            }
-        }
-    }
-    for geometry in &scene.geometries {
-        if let Some(skin) = &geometry.skin {
-            push_node(
-                &mut objects.children,
-                skin_node(skin, strings)?,
-                "object records",
-            )?;
-            for cluster in &skin.clusters {
-                push_node(
-                    &mut objects.children,
-                    cluster_node(cluster, strings)?,
-                    "object records",
-                )?;
-            }
-        }
-        if let Some(morph) = &geometry.morph {
-            push_node(
-                &mut objects.children,
-                morph_node(morph, strings)?,
-                "object records",
-            )?;
-            for channel in &morph.channels {
-                push_node(
-                    &mut objects.children,
-                    morph_channel_node(channel, strings)?,
-                    "object records",
-                )?;
-            }
-        }
-    }
+    append_shape_objects(scene, &mut objects.children, strings)?;
+    append_deformer_objects(scene, &mut objects.children, strings)?;
 
     let mut animation_objects = Vec::new();
     for animation in &scene.animations {
@@ -266,6 +225,54 @@ fn build_scene_nodes(
         FbxNode::new("Takes")
             .child(FbxNode::new("Current").with(FbxProperty::String(String::new()))),
     ])
+}
+
+fn append_shape_objects(
+    scene: &StaticScene<'_>,
+    objects: &mut Vec<FbxNode>,
+    strings: &mut SceneStringBudget,
+) -> Result<()> {
+    for geometry in &scene.geometries {
+        let Some(morph) = &geometry.morph else {
+            continue;
+        };
+        for channel in &morph.channels {
+            for shape in &channel.shapes {
+                push_node(
+                    objects,
+                    shape_geometry_node(geometry.mesh, shape, strings)?,
+                    "object records",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_deformer_objects(
+    scene: &StaticScene<'_>,
+    objects: &mut Vec<FbxNode>,
+    strings: &mut SceneStringBudget,
+) -> Result<()> {
+    for geometry in &scene.geometries {
+        if let Some(skin) = &geometry.skin {
+            push_node(objects, skin_node(skin, strings)?, "object records")?;
+            for cluster in &skin.clusters {
+                push_node(objects, cluster_node(cluster, strings)?, "object records")?;
+            }
+        }
+        if let Some(morph) = &geometry.morph {
+            push_node(objects, morph_node(morph, strings)?, "object records")?;
+            for channel in &morph.channels {
+                push_node(
+                    objects,
+                    morph_channel_node(channel, strings)?,
+                    "object records",
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn header_extension() -> FbxNode {

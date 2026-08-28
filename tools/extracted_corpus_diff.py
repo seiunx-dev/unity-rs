@@ -275,196 +275,192 @@ def image_difference(ours: Path, theirs: Path) -> ImageComparison:
     )
 
 
-def main() -> int:
-    if len(sys.argv) not in (3, 4, 5):
-        print(__doc__)
-        return 2
-    bundles = Path(sys.argv[1])
-    extracted = Path(sys.argv[2])
-    limit = int(sys.argv[3]) if len(sys.argv) >= 4 else 0
-    try:
-        unity_version = validated_unity_version(sys.argv[4]) if len(sys.argv) == 5 else None
-    except ValueError as error:
-        print(error, file=sys.stderr)
-        return 2
-
-    have_pillow = True
+def pillow_is_available() -> bool:
     try:
         image_pixels  # noqa: B018
         from PIL import Image  # noqa: F401, PLC0415
     except ImportError:
-        have_pillow = False
         print("Pillow is not installed; PNG comparison is skipped", file=sys.stderr)
+        return False
+    return True
 
-    cases = sorted(p for p in extracted.iterdir() if p.is_dir())
-    if limit:
-        cases = cases[:limit]
 
-    totals = collections.Counter()
-    # Keyed by file kind rather than one flat list. A single global cap fills
-    # with whichever kind is alphabetically first and noisiest -- the PNG rows,
-    # in practice -- so 39 meshes this project exported nothing for never
-    # appeared at all and were visible only in the totals. A category that has
-    # something to say should not be silenced by a category that has more.
-    problems: dict[str, list[str]] = collections.defaultdict(list)
-    # Boxed so the comparison loop can raise the running maxima.
-    worst_alpha = [0]
-    worst_drawn = [0.0]
+def export_case(
+    staged: Path,
+    root: Path,
+    case_name: str,
+    unity_version: str | None,
+    problems: dict[str, list[str]],
+) -> tuple[dict[str, Path], set[str], bool]:
+    mine: dict[str, Path] = {}
+    ambiguous: set[str] = set()
+    for suffix, classes in (("", ("28", "43", "49")), ("_sprite", ("213",))):
+        output = root / f"output{suffix or '_plain'}"
+        command = export_command(staged, output, classes, unity_version)
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+        if result.returncode not in (0, 3):
+            problems["export"].append(
+                f"{case_name}: export failed: {result.stderr.strip()[:160]}"
+            )
+            return mine, ambiguous, True
+        for path in output.rglob("*"):
+            if path.is_file():
+                register_exported_path(path, suffix, mine, ambiguous)
+    return mine, ambiguous, False
 
-    with tempfile.TemporaryDirectory(prefix="unity-rs-extracted-") as work:
-        root = Path(work).resolve()
-        for index, case in enumerate(cases, start=1):
-            bundle = bundles / case.name
-            if not bundle.exists():
-                totals["bundle missing"] += 1
-                continue
-            staged = root / "input"
-            staged.mkdir()
-            stage(bundle, staged / bundle.name)
-            mine: dict[str, Path] = {}
-            # A name that more than one asset claims cannot be compared. This
-            # bundle holds sixty-odd textures all called `item_icon`; the export
-            # keeps them apart with path IDs, which are stripped here, and the
-            # extraction numbers its own copies in an order that is not ours.
-            # Comparing them anyway pairs two unrelated icons and reports a
-            # handful of channels differing by three to five -- small enough to
-            # read as a decoder disagreement, which is what it looked like.
-            ambiguous: set[str] = set()
-            failed = False
-            # Bare-named classes first -- Texture2D, Mesh, TextAsset -- then
-            # sprites, whose extraction names carry a suffix.
-            for suffix, classes in (("", ("28", "43", "49")), ("_sprite", ("213",))):
-                output = root / f"output{suffix or '_plain'}"
-                command = [
-                    "cargo", "run", "--release", "--quiet",
-                    "-p", "unity-rs-cli", "--locked", "--",
-                ]
-                if unity_version:
-                    command += ["--unity-version", unity_version]
-                command += ["export"]
-                for class_id in classes:
-                    command += ["--class", class_id]
-                command += [str(staged), str(output)]
-                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
-                if result.returncode not in (0, 3):
-                    problems["export"].append(
-                        f"{case.name}: export failed: {result.stderr.strip()[:160]}"
-                    )
-                    failed = True
-                    break
-                for path in output.rglob("*"):
-                    if not path.is_file():
-                        continue
-                    stem = PATH_ID_SUFFIX.sub("", path.stem) + suffix
-                    primary = stem + path.suffix
-                    if primary in mine and mine[primary] != path:
-                        ambiguous.add(primary)
-                    mine.setdefault(primary, path)
-                    # A sprite atlas texture is named `sactx-0-1024x512-ASTC
-                    # 4x4-...` by Unity, spaces and all. This project keeps the
-                    # asset's own name; the extraction replaces the spaces.
-                    # Without this the file reads as one this project never
-                    # produced, which is a much more alarming thing to report.
-                    mine.setdefault(stem.replace(" ", "_") + path.suffix, path)
-                    # Spaces are not the only thing it replaces. A Spine mesh is
-                    # `Skeleton Prefab Mesh [Spine GameObject (name)]` in the
-                    # asset and `Skeleton_Prefab_Mesh__Spine_GameObject__name__`
-                    # in the extraction, so brackets and parentheses go the same
-                    # way. Matching only on spaces reported 34 of these as never
-                    # exported when all 34 were written and correct -- the alarm
-                    # this arm exists to prevent, raised by the arm itself.
-                    mine.setdefault(sanitized_name(stem) + path.suffix, path)
-                    # A `TextAsset` whose name already carries an extension is
-                    # written under that name here -- a Spine atlas stays
-                    # `x.atlas` -- while the extraction appends `.txt` to every
-                    # text asset regardless, giving `x.atlas.txt`. Only the
-                    # extensions this comparison does not otherwise handle are
-                    # offered, so an image is never matched to `<image>.txt`.
-                    if path.suffix not in (".obj", ".png", ".txt"):
-                        for spelling in (stem, sanitized_name(stem)):
-                            mine.setdefault(spelling + path.suffix + ".txt", path)
-            if failed:
-                subprocess.run(["rm", "-rf", str(root)], check=True)
-                root.mkdir()
-                continue
 
-            for theirs in sorted(case.iterdir()):
-                if theirs.suffix not in (".obj", ".txt", ".png"):
-                    continue
-                if theirs.suffix == ".png" and not have_pillow:
-                    continue
-                totals[f"{theirs.suffix} compared"] += 1
-                if theirs.name in ambiguous:
-                    totals[f"{theirs.suffix} ambiguous name"] += 1
-                    continue
-                ours = mine.get(theirs.name)
-                if ours is None:
-                    totals[f"{theirs.suffix} not exported"] += 1
-                    if len(problems[f"{theirs.suffix} missing"]) < 20:
-                        problems[f"{theirs.suffix} missing"].append(
-                            f"{case.name}/{theirs.name}: this project exported nothing"
-                        )
-                    continue
-                if theirs.suffix == ".obj":
-                    agree = obj_values(ours) == obj_values(theirs)
-                elif theirs.suffix == ".txt":
-                    my_bytes = ours.read_bytes()
-                    their_bytes = theirs.read_bytes()
-                    agree = my_bytes == their_bytes
-                    if not agree and lossy_utf8_reencode(my_bytes) == their_bytes:
-                        # Not a disagreement: the extraction decoded the asset
-                        # as text and wrote the decode back, so every byte that
-                        # is not valid UTF-8 became `?`. A `TextAsset` is
-                        # frequently not text -- most of these are gzip streams,
-                        # and the extraction's copies do not decompress -- so
-                        # the oracle has destroyed the payload rather than
-                        # disagreeing about it. Attributing this exactly, by
-                        # reproducing the transform, keeps the row honest: any
-                        # other difference still fails. What it cannot see is a
-                        # difference confined to bytes that are themselves
-                        # undecodable, since those collapse to `?` on both
-                        # sides.
-                        totals[".txt oracle re-encoded"] += 1
-                        continue
-                else:
-                    try:
-                        comparison = image_difference(ours, theirs)
-                    except Exception as error:  # noqa: BLE001 -- corpus data
-                        problems[".png unreadable"].append(f"{case.name}/{theirs.name}: {error}")
-                        continue
-                    if not comparison.agrees:
-                        totals[".png differing"] += 1
-                        if len(problems[".png"]) < 20:
-                            problems[".png"].append(
-                                f"{case.name}/{theirs.name}: {comparison.reason}, "
-                                "more than two correct decoders can"
-                            )
-                        continue
-                    if comparison.identical:
-                        totals[".png identical"] += 1
-                    else:
-                        totals[".png within decoder tolerance"] += 1
-                        worst_alpha[0] = max(worst_alpha[0], comparison.worst_alpha)
-                        worst_drawn[0] = max(worst_drawn[0], comparison.worst_composited)
-                    continue
-                if agree:
-                    totals[f"{theirs.suffix} identical"] += 1
-                else:
-                    totals[f"{theirs.suffix} differing"] += 1
-                    if len(problems[theirs.suffix]) < 20:
-                        problems[theirs.suffix].append(f"{case.name}/{theirs.name}: differs")
+def export_command(
+    staged: Path,
+    output: Path,
+    classes: tuple[str, ...],
+    unity_version: str | None,
+) -> list[str]:
+    command = [
+        "cargo", "run", "--release", "--quiet",
+        "-p", "unity-rs-cli", "--locked", "--",
+    ]
+    if unity_version:
+        command += ["--unity-version", unity_version]
+    command += ["export"]
+    for class_id in classes:
+        command += ["--class", class_id]
+    return [*command, str(staged), str(output)]
 
-            subprocess.run(["rm", "-rf", str(root)], check=True)
-            root.mkdir()
-            if index % 25 == 0 or index == len(cases):
-                print(f"  {index}/{len(cases)} bundles", file=sys.stderr)
 
+def register_exported_path(
+    path: Path, suffix: str, mine: dict[str, Path], ambiguous: set[str]
+) -> None:
+    stem = PATH_ID_SUFFIX.sub("", path.stem) + suffix
+    primary = stem + path.suffix
+    if primary in mine and mine[primary] != path:
+        ambiguous.add(primary)
+    mine.setdefault(primary, path)
+    mine.setdefault(stem.replace(" ", "_") + path.suffix, path)
+    mine.setdefault(sanitized_name(stem) + path.suffix, path)
+    if path.suffix not in (".obj", ".png", ".txt"):
+        for spelling in (stem, sanitized_name(stem)):
+            mine.setdefault(spelling + path.suffix + ".txt", path)
+
+
+def compare_case_files(
+    case: Path,
+    mine: dict[str, Path],
+    ambiguous: set[str],
+    have_pillow: bool,
+    totals: collections.Counter,
+    problems: dict[str, list[str]],
+    worst_alpha: list[int],
+    worst_drawn: list[float],
+) -> None:
+    for theirs in sorted(case.iterdir()):
+        if theirs.suffix not in (".obj", ".txt", ".png"):
+            continue
+        if theirs.suffix == ".png" and not have_pillow:
+            continue
+        compare_file(
+            case, theirs, mine, ambiguous, totals, problems, worst_alpha, worst_drawn
+        )
+
+
+def compare_file(
+    case: Path,
+    theirs: Path,
+    mine: dict[str, Path],
+    ambiguous: set[str],
+    totals: collections.Counter,
+    problems: dict[str, list[str]],
+    worst_alpha: list[int],
+    worst_drawn: list[float],
+) -> None:
+    suffix = theirs.suffix
+    totals[f"{suffix} compared"] += 1
+    if theirs.name in ambiguous:
+        totals[f"{suffix} ambiguous name"] += 1
+        return
+    ours = mine.get(theirs.name)
+    if ours is None:
+        record_missing(case, theirs, totals, problems)
+        return
+    if suffix == ".png":
+        compare_png(case, ours, theirs, totals, problems, worst_alpha, worst_drawn)
+        return
+    agree = compare_obj_or_text(ours, theirs, totals)
+    if agree is None:
+        return
+    totals[f"{suffix} {'identical' if agree else 'differing'}"] += 1
+    if not agree and len(problems[suffix]) < 20:
+        problems[suffix].append(f"{case.name}/{theirs.name}: differs")
+
+
+def record_missing(
+    case: Path,
+    theirs: Path,
+    totals: collections.Counter,
+    problems: dict[str, list[str]],
+) -> None:
+    key = f"{theirs.suffix} missing"
+    totals[f"{theirs.suffix} not exported"] += 1
+    if len(problems[key]) < 20:
+        problems[key].append(f"{case.name}/{theirs.name}: this project exported nothing")
+
+
+def compare_obj_or_text(
+    ours: Path, theirs: Path, totals: collections.Counter
+) -> bool | None:
+    if theirs.suffix == ".obj":
+        return obj_values(ours) == obj_values(theirs)
+    my_bytes = ours.read_bytes()
+    their_bytes = theirs.read_bytes()
+    if my_bytes == their_bytes:
+        return True
+    if lossy_utf8_reencode(my_bytes) == their_bytes:
+        totals[".txt oracle re-encoded"] += 1
+        return None
+    return False
+
+
+def compare_png(
+    case: Path,
+    ours: Path,
+    theirs: Path,
+    totals: collections.Counter,
+    problems: dict[str, list[str]],
+    worst_alpha: list[int],
+    worst_drawn: list[float],
+) -> None:
+    try:
+        comparison = image_difference(ours, theirs)
+    except Exception as error:  # noqa: BLE001 -- corpus data
+        problems[".png unreadable"].append(f"{case.name}/{theirs.name}: {error}")
+        return
+    if not comparison.agrees:
+        totals[".png differing"] += 1
+        if len(problems[".png"]) < 20:
+            problems[".png"].append(
+                f"{case.name}/{theirs.name}: {comparison.reason}, "
+                "more than two correct decoders can"
+            )
+        return
+    if comparison.identical:
+        totals[".png identical"] += 1
+    else:
+        totals[".png within decoder tolerance"] += 1
+        worst_alpha[0] = max(worst_alpha[0], comparison.worst_alpha)
+        worst_drawn[0] = max(worst_drawn[0], comparison.worst_composited)
+
+
+def report_results(
+    totals: collections.Counter,
+    problems: dict[str, list[str]],
+    worst_alpha: int,
+    worst_drawn: float,
+) -> int:
     for label, count in sorted(totals.items()):
         print(f"{count:8}  {label}")
-    if worst_alpha[0] or worst_drawn[0]:
+    if worst_alpha or worst_drawn:
         print(
-            f"         worst alpha difference {worst_alpha[0]}, "
-            f"worst drawn difference {worst_drawn[0]:.2f}"
+            f"         worst alpha difference {worst_alpha}, "
+            f"worst drawn difference {worst_drawn:.2f}"
         )
     if problems:
         total = sum(len(lines) for lines in problems.values())
@@ -480,6 +476,56 @@ def main() -> int:
         return 1
     print("every compared file agrees with the existing extraction")
     return 0
+
+
+def main() -> int:
+    if len(sys.argv) not in (3, 4, 5):
+        print(__doc__)
+        return 2
+    bundles = Path(sys.argv[1])
+    extracted = Path(sys.argv[2])
+    limit = int(sys.argv[3]) if len(sys.argv) >= 4 else 0
+    try:
+        unity_version = validated_unity_version(sys.argv[4]) if len(sys.argv) == 5 else None
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+
+    have_pillow = pillow_is_available()
+    cases = sorted(p for p in extracted.iterdir() if p.is_dir())
+    if limit:
+        cases = cases[:limit]
+    totals = collections.Counter()
+    problems: dict[str, list[str]] = collections.defaultdict(list)
+    worst_alpha = [0]
+    worst_drawn = [0.0]
+
+    with tempfile.TemporaryDirectory(prefix="unity-rs-extracted-") as work:
+        root = Path(work).resolve()
+        for index, case in enumerate(cases, start=1):
+            bundle = bundles / case.name
+            if not bundle.exists():
+                totals["bundle missing"] += 1
+                continue
+            staged = root / "input"
+            staged.mkdir()
+            stage(bundle, staged / bundle.name)
+            mine, ambiguous, failed = export_case(
+                staged, root, case.name, unity_version, problems
+            )
+            if failed:
+                subprocess.run(["rm", "-rf", str(root)], check=True)
+                root.mkdir()
+                continue
+            compare_case_files(
+                case, mine, ambiguous, have_pillow, totals, problems,
+                worst_alpha, worst_drawn,
+            )
+            subprocess.run(["rm", "-rf", str(root)], check=True)
+            root.mkdir()
+            if index % 25 == 0 or index == len(cases):
+                print(f"  {index}/{len(cases)} bundles", file=sys.stderr)
+    return report_results(totals, problems, worst_alpha[0], worst_drawn[0])
 
 
 if __name__ == "__main__":

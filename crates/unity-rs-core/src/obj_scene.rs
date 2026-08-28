@@ -143,70 +143,110 @@ fn write_obj_inner<W: Write>(
         write!(output, "mtllib {name}\r\n")?;
     }
     // OBJ numbers vertices per file, so each group starts where the last ended.
-    let mut vertex_base = 0_u64;
-    let mut uv_base = 0_u64;
-    let mut normal_base = 0_u64;
+    let mut bases = ObjIndexBases::default();
     for group in groups {
-        let mesh = group.mesh;
-        write!(output, "g {}\r\n", ObjName(group.name))?;
-        for vertex in &mesh.vertices {
-            let placed = place_point(group.transform, *vertex);
+        write_obj_group(group, &mut bases, output)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ObjIndexBases {
+    vertex: u64,
+    uv: u64,
+    normal: u64,
+}
+
+fn write_obj_group<W: Write>(
+    group: &ObjGroup<'_>,
+    bases: &mut ObjIndexBases,
+    output: &mut W,
+) -> io::Result<()> {
+    let mesh = group.mesh;
+    write!(output, "g {}\r\n", ObjName(group.name))?;
+    write_obj_vertices(group, output)?;
+    write_obj_uvs(mesh, output)?;
+    write_obj_normals(group, output)?;
+    for (slot, sub_mesh) in mesh.sub_meshes.iter().enumerate() {
+        write!(output, "usemtl {}\r\n", MaterialName(group, slot))?;
+        for triangle in sub_mesh.indices.chunks_exact(3) {
+            write_obj_triangle(
+                triangle,
+                bases,
+                mesh.uv0.is_some(),
+                mesh.normals.is_some(),
+                output,
+            )?;
+        }
+    }
+    bases.vertex += mesh.vertices.len() as u64;
+    bases.uv += mesh.uv0.as_ref().map_or(0, |values| values.len() as u64);
+    bases.normal += mesh
+        .normals
+        .as_ref()
+        .map_or(0, |values| values.len() as u64);
+    Ok(())
+}
+
+fn write_obj_vertices<W: Write>(group: &ObjGroup<'_>, output: &mut W) -> io::Result<()> {
+    for vertex in &group.mesh.vertices {
+        let placed = place_point(group.transform, *vertex);
+        write!(
+            output,
+            "v {} {} {}\r\n",
+            ObjFloat(placed[0]),
+            ObjFloat(placed[1]),
+            ObjFloat(placed[2])
+        )?;
+    }
+    Ok(())
+}
+
+fn write_obj_uvs<W: Write>(mesh: &Mesh, output: &mut W) -> io::Result<()> {
+    if let Some(uv0) = &mesh.uv0 {
+        for uv in uv0 {
+            write!(output, "vt {} {}\r\n", ObjFloat(uv[0]), ObjFloat(uv[1]))?;
+        }
+    }
+    Ok(())
+}
+
+fn write_obj_normals<W: Write>(group: &ObjGroup<'_>, output: &mut W) -> io::Result<()> {
+    if let Some(normals) = &group.mesh.normals {
+        for normal in normals {
+            let placed = place_direction(group.transform, *normal);
             write!(
                 output,
-                "v {} {} {}\r\n",
+                "vn {} {} {}\r\n",
                 ObjFloat(placed[0]),
                 ObjFloat(placed[1]),
                 ObjFloat(placed[2])
             )?;
         }
-        if let Some(uv0) = &mesh.uv0 {
-            for uv in uv0 {
-                write!(output, "vt {} {}\r\n", ObjFloat(uv[0]), ObjFloat(uv[1]))?;
-            }
-        }
-        if let Some(normals) = &mesh.normals {
-            for normal in normals {
-                let placed = place_direction(group.transform, *normal);
-                write!(
-                    output,
-                    "vn {} {} {}\r\n",
-                    ObjFloat(placed[0]),
-                    ObjFloat(placed[1]),
-                    ObjFloat(placed[2])
-                )?;
-            }
-        }
-        let has_uv = mesh.uv0.is_some();
-        let has_normals = mesh.normals.is_some();
-        for (slot, sub_mesh) in mesh.sub_meshes.iter().enumerate() {
-            write!(output, "usemtl {}\r\n", MaterialName(group, slot))?;
-            for triangle in sub_mesh.indices.chunks_exact(3) {
-                output.write_all(b"f")?;
-                // Unity winds clockwise and the X mirror above flips handedness,
-                // so the triangle is emitted back to front to stay outward.
-                for index in [triangle[2], triangle[1], triangle[0]] {
-                    let vertex = vertex_base + u64::from(index) + 1;
-                    let uv = uv_base + u64::from(index) + 1;
-                    let normal = normal_base + u64::from(index) + 1;
-                    match (has_uv, has_normals) {
-                        (true, true) => write!(output, " {vertex}/{uv}/{normal}")?,
-                        (true, false) => write!(output, " {vertex}/{uv}")?,
-                        (false, true) => write!(output, " {vertex}//{normal}")?,
-                        (false, false) => write!(output, " {vertex}")?,
-                    }
-                }
-                output.write_all(b"\r\n")?;
-            }
-        }
-        vertex_base += mesh.vertices.len() as u64;
-        if let Some(uv0) = &mesh.uv0 {
-            uv_base += uv0.len() as u64;
-        }
-        if let Some(normals) = &mesh.normals {
-            normal_base += normals.len() as u64;
-        }
     }
     Ok(())
+}
+
+fn write_obj_triangle<W: Write>(
+    triangle: &[u32],
+    bases: &ObjIndexBases,
+    has_uv: bool,
+    has_normals: bool,
+    output: &mut W,
+) -> io::Result<()> {
+    output.write_all(b"f")?;
+    for index in [triangle[2], triangle[1], triangle[0]] {
+        let vertex = bases.vertex + u64::from(index) + 1;
+        let uv = bases.uv + u64::from(index) + 1;
+        let normal = bases.normal + u64::from(index) + 1;
+        match (has_uv, has_normals) {
+            (true, true) => write!(output, " {vertex}/{uv}/{normal}")?,
+            (true, false) => write!(output, " {vertex}/{uv}")?,
+            (false, true) => write!(output, " {vertex}//{normal}")?,
+            (false, false) => write!(output, " {vertex}")?,
+        }
+    }
+    output.write_all(b"\r\n")
 }
 
 fn write_mtl_inner<W: Write>(

@@ -1482,70 +1482,87 @@ fn convert_blend_states(
     output: &mut BoundedText,
 ) -> Result<()> {
     for (index, blend) in blends.iter().enumerate() {
-        if !csharp_float_equals(blend.source, 1.0)
-            || !csharp_float_equals(blend.destination, 0.0)
-            || !csharp_float_equals(blend.source_alpha, 1.0)
-            || !csharp_float_equals(blend.destination_alpha, 0.0)
-        {
-            output.push_str("  Blend ")?;
-            if index != 0 || separate_blend {
-                output.push_fmt(format_args!("{index} "))?;
-            }
-            output.push_fmt(format_args!(
-                "{} {}",
-                blend_factor_name(blend.source),
-                blend_factor_name(blend.destination)
-            ))?;
-            if !csharp_float_equals(blend.source_alpha, 1.0)
-                || !csharp_float_equals(blend.destination_alpha, 0.0)
-            {
-                output.push_fmt(format_args!(
-                    ", {} {}",
-                    blend_factor_name(blend.source_alpha),
-                    blend_factor_name(blend.destination_alpha)
-                ))?;
-            }
-            output.push_str("\n")?;
-        }
-        if !csharp_float_equals(blend.operation, 0.0)
-            || !csharp_float_equals(blend.operation_alpha, 0.0)
-        {
-            output.push_str("  BlendOp ")?;
-            if index != 0 || separate_blend {
-                output.push_fmt(format_args!("{index} "))?;
-            }
-            output.push_str(blend_operation_name(blend.operation))?;
-            if !csharp_float_equals(blend.operation_alpha, 0.0) {
-                output.push_fmt(format_args!(
-                    ", {}",
-                    blend_operation_name(blend.operation_alpha)
-                ))?;
-            }
-            output.push_str("\n")?;
-        }
-        let mask = csharp_truncate_float(blend.color_mask);
-        if mask != 0xf {
-            output.push_str("  ColorMask ")?;
-            if mask == 0 {
-                output.push_str("0")?;
-            } else {
-                if mask & 0x2 != 0 {
-                    output.push_str("R")?;
-                }
-                if mask & 0x4 != 0 {
-                    output.push_str("G")?;
-                }
-                if mask & 0x8 != 0 {
-                    output.push_str("B")?;
-                }
-                if mask & 0x1 != 0 {
-                    output.push_str("A")?;
-                }
-            }
-            output.push_fmt(format_args!(" {index}\n"))?;
-        }
+        convert_blend_factors(index, blend, separate_blend, output)?;
+        convert_blend_operation(index, blend, separate_blend, output)?;
+        convert_color_mask(index, blend.color_mask, output)?;
     }
     Ok(())
+}
+
+fn convert_blend_factors(
+    index: usize,
+    blend: &SerializedBlendState,
+    separate_blend: bool,
+    output: &mut BoundedText,
+) -> Result<()> {
+    if csharp_float_equals(blend.source, 1.0)
+        && csharp_float_equals(blend.destination, 0.0)
+        && csharp_float_equals(blend.source_alpha, 1.0)
+        && csharp_float_equals(blend.destination_alpha, 0.0)
+    {
+        return Ok(());
+    }
+    output.push_str("  Blend ")?;
+    if index != 0 || separate_blend {
+        output.push_fmt(format_args!("{index} "))?;
+    }
+    output.push_fmt(format_args!(
+        "{} {}",
+        blend_factor_name(blend.source),
+        blend_factor_name(blend.destination)
+    ))?;
+    if !csharp_float_equals(blend.source_alpha, 1.0)
+        || !csharp_float_equals(blend.destination_alpha, 0.0)
+    {
+        output.push_fmt(format_args!(
+            ", {} {}",
+            blend_factor_name(blend.source_alpha),
+            blend_factor_name(blend.destination_alpha)
+        ))?;
+    }
+    output.push_str("\n")
+}
+
+fn convert_blend_operation(
+    index: usize,
+    blend: &SerializedBlendState,
+    separate_blend: bool,
+    output: &mut BoundedText,
+) -> Result<()> {
+    if csharp_float_equals(blend.operation, 0.0) && csharp_float_equals(blend.operation_alpha, 0.0)
+    {
+        return Ok(());
+    }
+    output.push_str("  BlendOp ")?;
+    if index != 0 || separate_blend {
+        output.push_fmt(format_args!("{index} "))?;
+    }
+    output.push_str(blend_operation_name(blend.operation))?;
+    if !csharp_float_equals(blend.operation_alpha, 0.0) {
+        output.push_fmt(format_args!(
+            ", {}",
+            blend_operation_name(blend.operation_alpha)
+        ))?;
+    }
+    output.push_str("\n")
+}
+
+fn convert_color_mask(index: usize, color_mask: f32, output: &mut BoundedText) -> Result<()> {
+    let mask = csharp_truncate_float(color_mask);
+    if mask == 0xf {
+        return Ok(());
+    }
+    output.push_str("  ColorMask ")?;
+    if mask == 0 {
+        output.push_str("0")?;
+    } else {
+        for (bit, channel) in [(0x2, "R"), (0x4, "G"), (0x8, "B"), (0x1, "A")] {
+            if mask & bit != 0 {
+                output.push_str(channel)?;
+            }
+        }
+    }
+    output.push_fmt(format_args!(" {index}\n"))
 }
 
 fn blend_factor_name(value: f32) -> &'static str {
@@ -1615,61 +1632,83 @@ fn convert_serialized_sub_programs(
             }
             group_end += 1;
         }
-        let mut selected_platform = None;
-        for (index, platform) in platforms.iter().copied().enumerate() {
-            if gpu_program_usable(platform, leader.gpu_program_type)? {
-                selected_platform = Some((index, platform));
-                break;
-            }
-        }
+        let selected_platform = select_shader_platform(platforms, leader.gpu_program_type)?;
         if let Some((platform_index, platform)) = selected_platform {
-            let is_tier = group_end - group_start > 1;
-            for &sub_program_index in &grouped[group_start..group_end] {
-                let sub_program = &serialized[sub_program_index];
-                output.push_fmt(format_args!("SubProgram \"{} ", platform_name(platform)?))?;
-                if is_tier {
-                    output.push_fmt(format_args!("hw_tier{:02} ", sub_program.hardware_tier))?;
-                }
-                output.push_str("\" {\n")?;
-                let blob_index = usize::try_from(sub_program.blob_index).map_err(|_| {
-                    Error::invalid_data("Shader subprogram blob index does not fit in usize")
-                })?;
-                let decoded = programs
-                    .get(platform_index)
-                    .and_then(|program| program.sub_programs.get(blob_index))
-                    .and_then(Option::as_ref);
-                if let Some(decoded) = decoded {
-                    if decoded.program_type != i32::from(sub_program.gpu_program_type) {
-                        return Err(Error::invalid_data(format!(
-                            "Shader blob index {} metadata type {} disagrees with decoded type {}",
-                            sub_program.blob_index,
-                            sub_program.gpu_program_type,
-                            decoded.program_type
-                        )));
-                    }
-                    export_shader_sub_program(decoded, output)?;
-                } else {
-                    // Said rather than left out. The reader knows this record
-                    // exists and where it is; what it does not know is the
-                    // shape Unity 2022 gave it. A listing silently missing from
-                    // an otherwise complete shader would read as a shader that
-                    // has no program.
-                    let reason = programs
-                        .get(platform_index)
-                        .and_then(|program| program.undecoded.get(blob_index))
-                        .and_then(Option::as_deref)
-                        .unwrap_or("no program was supplied for this entry");
-                    output.push_fmt(format_args!(
-                        "// blob index {} was not decoded: {reason}\n",
-                        sub_program.blob_index
-                    ))?;
-                }
-                output.push_str("\n}\n")?;
-            }
+            convert_sub_program_group(
+                &grouped[group_start..group_end],
+                serialized,
+                platform_index,
+                platform,
+                programs,
+                output,
+            )?;
         }
         group_start = group_end;
     }
     Ok(())
+}
+
+fn select_shader_platform(platforms: &[i32], program_type: i8) -> Result<Option<(usize, i32)>> {
+    for (index, platform) in platforms.iter().copied().enumerate() {
+        if gpu_program_usable(platform, program_type)? {
+            return Ok(Some((index, platform)));
+        }
+    }
+    Ok(None)
+}
+
+fn convert_sub_program_group(
+    indexes: &[usize],
+    serialized: &[SerializedSubProgram],
+    platform_index: usize,
+    platform: i32,
+    programs: &[ShaderProgram],
+    output: &mut BoundedText,
+) -> Result<()> {
+    let is_tier = indexes.len() > 1;
+    for &sub_program_index in indexes {
+        let sub_program = &serialized[sub_program_index];
+        output.push_fmt(format_args!("SubProgram \"{} ", platform_name(platform)?))?;
+        if is_tier {
+            output.push_fmt(format_args!("hw_tier{:02} ", sub_program.hardware_tier))?;
+        }
+        output.push_str("\" {\n")?;
+        convert_sub_program_body(*sub_program, platform_index, programs, output)?;
+        output.push_str("\n}\n")?;
+    }
+    Ok(())
+}
+
+fn convert_sub_program_body(
+    sub_program: SerializedSubProgram,
+    platform_index: usize,
+    programs: &[ShaderProgram],
+    output: &mut BoundedText,
+) -> Result<()> {
+    let blob_index = usize::try_from(sub_program.blob_index)
+        .map_err(|_| Error::invalid_data("Shader subprogram blob index does not fit in usize"))?;
+    let decoded = programs
+        .get(platform_index)
+        .and_then(|program| program.sub_programs.get(blob_index))
+        .and_then(Option::as_ref);
+    if let Some(decoded) = decoded {
+        if decoded.program_type != i32::from(sub_program.gpu_program_type) {
+            return Err(Error::invalid_data(format!(
+                "Shader blob index {} metadata type {} disagrees with decoded type {}",
+                sub_program.blob_index, sub_program.gpu_program_type, decoded.program_type
+            )));
+        }
+        return export_shader_sub_program(decoded, output);
+    }
+    let reason = programs
+        .get(platform_index)
+        .and_then(|program| program.undecoded.get(blob_index))
+        .and_then(Option::as_deref)
+        .unwrap_or("no program was supplied for this entry");
+    output.push_fmt(format_args!(
+        "// blob index {} was not decoded: {reason}\n",
+        sub_program.blob_index
+    ))
 }
 
 fn grouped_sub_program_indexes(

@@ -189,17 +189,7 @@ pub fn read_texture2d_array(
     object_index: usize,
     limits: TextureArrayReadLimits,
 ) -> Result<Texture2DArray> {
-    if file.unity_version.is_stripped() {
-        return Err(Error::unsupported(
-            "Texture2DArray requires a Unity version because its layout is version-dependent",
-        ));
-    }
-    if file.unity_version.major < 2019 {
-        return Err(Error::unsupported(format!(
-            "Texture2DArray layout before Unity 2019 is not implemented (found {})",
-            file.unity_version
-        )));
-    }
+    validate_texture_array_version(file)?;
 
     let mut reader = TextureArrayObjectReader::new(file, object_index, limits)?;
     let name = reader.read_named_texture()?;
@@ -222,23 +212,9 @@ pub fn read_texture2d_array(
     } else {
         0
     };
-    if mips_stripped > mip_count {
-        return Err(Error::invalid_data(format!(
-            "Texture2DArray strips {mips_stripped} mip levels but declares only {mip_count}"
-        )));
-    }
+    validate_stripped_mips(mips_stripped, mip_count)?;
     let data_size = u64::from(reader.reader.read_u32()?);
-    if data_size == 0 {
-        return Err(Error::invalid_data(
-            "Texture2DArray declared data size must be positive",
-        ));
-    }
-    if data_size > limits.maximum_payload_bytes {
-        return Err(Error::invalid_data(format!(
-            "Texture2DArray declared data is {data_size} bytes, exceeding limit {}",
-            limits.maximum_payload_bytes
-        )));
-    }
+    validate_array_data_size(data_size, limits.maximum_payload_bytes)?;
     reader.skip(24, "Texture2DArray GL texture settings")?;
     let usage_mode = if version_at_least_major_minor(file, 2020, 2) {
         Some(reader.reader.read_i32()?)
@@ -255,31 +231,13 @@ pub fn read_texture2d_array(
     }
 
     let image_data_size = reader.read_non_negative_i32("Texture2DArray image data")?;
-    let (streaming_info, raw_data) = if image_data_size == 0 {
-        let offset = if file.unity_version.major >= 2020 {
-            reader.read_non_negative_i64("Texture2DArray stream offset")?
-        } else {
-            u64::from(reader.reader.read_u32()?)
-        };
-        let size = u64::from(reader.reader.read_u32()?);
-        let path = reader.read_aligned_string("Texture2DArray stream path")?;
-        let info = TextureArrayStreamingInfo { offset, size, path };
-        let data = if info.path.is_empty() {
-            reader.inline_region(0, limits.maximum_payload_bytes, "Texture2DArray image data")?
-        } else {
-            resolve_external_region(collection, &info, limits.maximum_payload_bytes)?
-        };
-        (Some(info), data)
-    } else {
-        (
-            None,
-            reader.inline_region(
-                u64::from(image_data_size),
-                limits.maximum_payload_bytes,
-                "Texture2DArray image data",
-            )?,
-        )
-    };
+    let (streaming_info, raw_data) = read_array_payload(
+        collection,
+        file,
+        &mut reader,
+        image_data_size,
+        limits.maximum_payload_bytes,
+    )?;
     if raw_data.len() < data_size {
         return Err(Error::invalid_data(format!(
             "Texture2DArray source contains {} bytes, fewer than declared data size {data_size}",
@@ -310,6 +268,75 @@ pub fn read_texture2d_array(
         streaming_info,
         data,
     })
+}
+
+fn validate_texture_array_version(file: &SerializedFile) -> Result<()> {
+    if file.unity_version.is_stripped() {
+        return Err(Error::unsupported(
+            "Texture2DArray requires a Unity version because its layout is version-dependent",
+        ));
+    }
+    if file.unity_version.major < 2019 {
+        return Err(Error::unsupported(format!(
+            "Texture2DArray layout before Unity 2019 is not implemented (found {})",
+            file.unity_version
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stripped_mips(mips_stripped: u32, mip_count: u32) -> Result<()> {
+    if mips_stripped > mip_count {
+        return Err(Error::invalid_data(format!(
+            "Texture2DArray strips {mips_stripped} mip levels but declares only {mip_count}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_array_data_size(data_size: u64, maximum_payload_bytes: u64) -> Result<()> {
+    if data_size == 0 {
+        return Err(Error::invalid_data(
+            "Texture2DArray declared data size must be positive",
+        ));
+    }
+    if data_size > maximum_payload_bytes {
+        return Err(Error::invalid_data(format!(
+            "Texture2DArray declared data is {data_size} bytes, exceeding limit {maximum_payload_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_array_payload(
+    collection: &AssetCollection,
+    file: &SerializedFile,
+    reader: &mut TextureArrayObjectReader,
+    image_data_size: u32,
+    maximum_payload_bytes: u64,
+) -> Result<(Option<TextureArrayStreamingInfo>, Region)> {
+    if image_data_size != 0 {
+        let data = reader.inline_region(
+            u64::from(image_data_size),
+            maximum_payload_bytes,
+            "Texture2DArray image data",
+        )?;
+        return Ok((None, data));
+    }
+    let offset = if file.unity_version.major >= 2020 {
+        reader.read_non_negative_i64("Texture2DArray stream offset")?
+    } else {
+        u64::from(reader.reader.read_u32()?)
+    };
+    let size = u64::from(reader.reader.read_u32()?);
+    let path = reader.read_aligned_string("Texture2DArray stream path")?;
+    let info = TextureArrayStreamingInfo { offset, size, path };
+    let data = if info.path.is_empty() {
+        reader.inline_region(0, maximum_payload_bytes, "Texture2DArray image data")?
+    } else {
+        resolve_external_region(collection, &info, maximum_payload_bytes)?
+    };
+    Ok((Some(info), data))
 }
 
 /// Writes the managed API's exact `HARUKI_ASSET_PAYLOAD_BUNDLE_V1` contract.

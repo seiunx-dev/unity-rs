@@ -247,6 +247,422 @@ struct SerializedParseBudget {
     materialized_metadata_string_bytes: usize,
 }
 
+struct OpenSerializedMetadata {
+    header: SerializedFileHeader,
+    metadata_start: u64,
+    reader: EndianReader<RegionCursor>,
+    budget: SerializedParseBudget,
+}
+
+struct SerializedPreamble {
+    unity_version_string: String,
+    unity_version: UnityVersion,
+    target_platform: i32,
+    type_tree_enabled: bool,
+}
+
+fn open_serialized_metadata(
+    region: &Region,
+    limits: SerializedParseLimits,
+) -> Result<OpenSerializedMetadata> {
+    let mut root_reader = EndianReader::new(region.cursor(), Endian::Big);
+    let header = SerializedFileHeader::read(&mut root_reader)?;
+    validate_serialized_format(header.version)?;
+    let declared = header.metadata_range()?;
+    let metadata_start = root_reader.position()?;
+    let metadata_length = declared
+        .end
+        .checked_sub(metadata_start)
+        .ok_or_else(|| Error::invalid_data("serialized metadata ends before it starts"))?;
+    if metadata_length > limits.maximum_metadata_bytes {
+        return Err(Error::invalid_data(format!(
+            "serialized metadata is {metadata_length} bytes, exceeding limit {}",
+            limits.maximum_metadata_bytes
+        )));
+    }
+    let metadata = region.subregion(metadata_start, metadata_length)?;
+    let endian = if header.endianness == 0 {
+        Endian::Little
+    } else {
+        Endian::Big
+    };
+    Ok(OpenSerializedMetadata {
+        header,
+        metadata_start,
+        reader: EndianReader::new(metadata.cursor(), endian),
+        budget: SerializedParseBudget::default(),
+    })
+}
+
+fn validate_serialized_format(version: SerializedFileFormatVersion) -> Result<()> {
+    if version.0 < 5 {
+        return Err(Error::unsupported(format!(
+            "serialized format version {version} metadata"
+        )));
+    }
+    if version > SerializedFileFormatVersion::LARGE_FILES_SUPPORT {
+        return Err(Error::unsupported(format!(
+            "serialized format version {version} metadata; newest implemented version is {}",
+            SerializedFileFormatVersion::LARGE_FILES_SUPPORT
+        )));
+    }
+    Ok(())
+}
+
+fn read_serialized_preamble(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+    unity_version_override: Option<UnityVersion>,
+    bundle_version_hint: Option<UnityVersion>,
+) -> Result<SerializedPreamble> {
+    let unity_version_string = if version.0 >= 7 {
+        read_metadata_string(reader, "serialized Unity version", limits, budget)?
+    } else {
+        "2.5.0f1".to_owned()
+    };
+    let detected = parse_declared_unity_version(&unity_version_string);
+    let unity_version = unity_version_override
+        .or_else(|| {
+            (version.0 < 7 || detected.is_none())
+                .then_some(bundle_version_hint)
+                .flatten()
+        })
+        .or(detected)
+        .unwrap_or_default();
+    let target_platform = if version.0 >= 8 {
+        reader.read_i32()?
+    } else {
+        UNKNOWN_PLATFORM
+    };
+    let type_tree_enabled = if version >= SerializedFileFormatVersion::HAS_TYPE_TREE_HASHES {
+        reader.read_bool()?
+    } else {
+        true
+    };
+    Ok(SerializedPreamble {
+        unity_version_string,
+        unity_version,
+        target_platform,
+        type_tree_enabled,
+    })
+}
+
+fn parse_declared_unity_version(value: &str) -> Option<UnityVersion> {
+    if value.is_empty() || value == "0.0.0" {
+        None
+    } else {
+        UnityVersion::from_str(value).ok()
+    }
+}
+
+fn read_serialized_types(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    type_tree_enabled: bool,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+) -> Result<(Vec<SerializedType>, HashMap<i32, usize>)> {
+    let count = read_record_count(
+        reader,
+        limits.maximum_types,
+        "serialized type",
+        minimum_serialized_type_size(version, type_tree_enabled, false),
+    )?;
+    let mut types = reserve_vec(count, "serialized types")?;
+    for _ in 0..count {
+        types.push(read_serialized_type(
+            reader,
+            version,
+            type_tree_enabled,
+            false,
+            limits,
+            budget,
+        )?);
+    }
+    let mut index = HashMap::new();
+    index
+        .try_reserve(types.len())
+        .map_err(|error| Error::invalid_data(format!("cannot allocate type index: {error}")))?;
+    for (position, kind) in types.iter().enumerate() {
+        index.entry(kind.class_id).or_insert(position);
+    }
+    Ok((types, index))
+}
+
+fn read_big_id_enabled(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+) -> Result<i32> {
+    if (7..14).contains(&version.0) {
+        reader.read_i32()
+    } else {
+        Ok(0)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_serialized_objects(
+    reader: &mut EndianReader<RegionCursor>,
+    header: &SerializedFileHeader,
+    metadata_start: u64,
+    big_id_enabled: i32,
+    types: &[SerializedType],
+    type_index_by_class_id: &HashMap<i32, usize>,
+    limits: &SerializedParseLimits,
+) -> Result<Vec<ObjectInfo>> {
+    let count = read_record_count(
+        reader,
+        limits.maximum_objects,
+        "serialized object",
+        minimum_object_info_size(header.version, big_id_enabled),
+    )?;
+    let mut objects = reserve_vec(count, "serialized objects")?;
+    for _ in 0..count {
+        objects.push(read_serialized_object(
+            reader,
+            header,
+            metadata_start,
+            big_id_enabled,
+            types,
+            type_index_by_class_id,
+        )?);
+    }
+    reject_duplicate_path_ids(&objects)?;
+    Ok(objects)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_serialized_object(
+    reader: &mut EndianReader<RegionCursor>,
+    header: &SerializedFileHeader,
+    metadata_start: u64,
+    big_id_enabled: i32,
+    types: &[SerializedType],
+    type_index_by_class_id: &HashMap<i32, usize>,
+) -> Result<ObjectInfo> {
+    let path_id = read_object_path_id(reader, header.version, metadata_start, big_id_enabled)?;
+    let relative_start = if header.version >= SerializedFileFormatVersion::LARGE_FILES_SUPPORT {
+        positive_i64(reader.read_i64()?, "serialized object byte start")?
+    } else {
+        u64::from(reader.read_u32()?)
+    };
+    let byte_start = header
+        .data_offset
+        .checked_add(relative_start)
+        .ok_or_else(|| Error::invalid_data("serialized object byte start overflowed"))?;
+    let byte_size = u64::from(reader.read_u32()?);
+    validate_object_range(
+        byte_start,
+        byte_size,
+        header.data_offset,
+        header.object_data_end()?,
+    )?;
+    let type_id = reader.read_i32()?;
+    let (class_id, serialized_type_index) = resolve_object_type(
+        reader,
+        header.version,
+        type_id,
+        types,
+        type_index_by_class_id,
+    )?;
+    let destroyed = if header.version < SerializedFileFormatVersion::HAS_SCRIPT_TYPE_INDEX {
+        reader.read_u16()?
+    } else {
+        0
+    };
+    let script_type_index = if header.version >= SerializedFileFormatVersion::HAS_SCRIPT_TYPE_INDEX
+        && header.version.0 < 17
+    {
+        Some(reader.read_i16()?)
+    } else {
+        None
+    };
+    let stripped = if matches!(header.version.0, 15 | 16) {
+        reader.read_u8()?
+    } else {
+        0
+    };
+    Ok(ObjectInfo {
+        path_id,
+        byte_start,
+        byte_size,
+        type_id,
+        class_id,
+        serialized_type_index,
+        destroyed,
+        stripped,
+        script_type_index,
+    })
+}
+
+fn read_object_path_id(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    metadata_start: u64,
+    big_id_enabled: i32,
+) -> Result<i64> {
+    if big_id_enabled != 0 {
+        reader.read_i64()
+    } else if version.0 < 14 {
+        Ok(i64::from(reader.read_i32()?))
+    } else {
+        align_absolute(reader, metadata_start, 4)?;
+        reader.read_i64()
+    }
+}
+
+fn resolve_object_type(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    type_id: i32,
+    types: &[SerializedType],
+    type_index_by_class_id: &HashMap<i32, usize>,
+) -> Result<(i32, Option<usize>)> {
+    if version.0 < 16 {
+        return Ok((
+            i32::from(reader.read_u16()?),
+            type_index_by_class_id.get(&type_id).copied(),
+        ));
+    }
+    let index = usize::try_from(type_id).map_err(|_| {
+        Error::invalid_data(format!(
+            "serialized object type index cannot be negative: {type_id}"
+        ))
+    })?;
+    let kind = types.get(index).ok_or_else(|| {
+        Error::invalid_data(format!(
+            "serialized object type index {index} exceeds {} types",
+            types.len()
+        ))
+    })?;
+    Ok((kind.class_id, Some(index)))
+}
+
+fn read_script_types(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    metadata_start: u64,
+    limits: &SerializedParseLimits,
+) -> Result<Vec<ScriptIdentifier>> {
+    if version < SerializedFileFormatVersion::HAS_SCRIPT_TYPE_INDEX {
+        return Ok(Vec::new());
+    }
+    let count = read_record_count(
+        reader,
+        limits.maximum_script_types,
+        "serialized script type",
+        if version.0 < 14 { 8 } else { 12 },
+    )?;
+    let mut values = reserve_vec(count, "serialized script types")?;
+    for _ in 0..count {
+        let local_serialized_file_index = reader.read_i32()?;
+        let local_identifier_in_file = if version.0 < 14 {
+            i64::from(reader.read_i32()?)
+        } else {
+            align_absolute(reader, metadata_start, 4)?;
+            reader.read_i64()?
+        };
+        values.push(ScriptIdentifier {
+            local_serialized_file_index,
+            local_identifier_in_file,
+        });
+    }
+    Ok(values)
+}
+
+fn read_externals(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+) -> Result<Vec<ExternalFile>> {
+    let count = read_record_count(
+        reader,
+        limits.maximum_externals,
+        "serialized external",
+        if version.0 >= 6 { 22 } else { 21 },
+    )?;
+    let mut externals = reserve_vec(count, "serialized externals")?;
+    for _ in 0..count {
+        externals.push(read_external(reader, version, limits, budget)?);
+    }
+    Ok(externals)
+}
+
+fn read_external(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+) -> Result<ExternalFile> {
+    let prefix = if version.0 >= 6 {
+        Some(read_metadata_string(
+            reader,
+            "serialized external prefix",
+            limits,
+            budget,
+        )?)
+    } else {
+        None
+    };
+    let (guid, kind) = if version.0 >= 5 {
+        (Some(read_hash(reader)?), Some(reader.read_i32()?))
+    } else {
+        (None, None)
+    };
+    Ok(ExternalFile {
+        prefix,
+        guid,
+        kind,
+        path: read_metadata_string(reader, "serialized external path", limits, budget)?,
+    })
+}
+
+fn read_reference_types(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    type_tree_enabled: bool,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+) -> Result<Vec<SerializedType>> {
+    if version < SerializedFileFormatVersion::SUPPORTS_REF_OBJECT {
+        return Ok(Vec::new());
+    }
+    let count = read_record_count(
+        reader,
+        limits.maximum_reference_types,
+        "serialized reference type",
+        minimum_serialized_type_size(version, type_tree_enabled, true),
+    )?;
+    let mut values = reserve_vec(count, "serialized reference types")?;
+    for _ in 0..count {
+        values.push(read_serialized_type(
+            reader,
+            version,
+            type_tree_enabled,
+            true,
+            limits,
+            budget,
+        )?);
+    }
+    Ok(values)
+}
+
+fn read_user_information(
+    reader: &mut EndianReader<RegionCursor>,
+    version: SerializedFileFormatVersion,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+) -> Result<String> {
+    if version.0 >= 5 {
+        read_metadata_string(reader, "serialized user information", limits, budget)
+    } else {
+        Ok(String::new())
+    }
+}
+
 impl SerializedFile {
     pub fn open(region: Region) -> Result<Self> {
         Self::open_with_options(region, SerializedOpenOptions::default())
@@ -287,307 +703,66 @@ impl SerializedFile {
             bundle_version_hint,
             strict_unity_versions,
         } = options;
-        let mut root_reader = EndianReader::new(region.cursor(), Endian::Big);
-        let header = SerializedFileHeader::read(&mut root_reader)?;
-        if header.version.0 < 5 {
-            return Err(Error::unsupported(format!(
-                "serialized format version {} metadata",
-                header.version
-            )));
-        }
-        if header.version > SerializedFileFormatVersion::LARGE_FILES_SUPPORT {
-            return Err(Error::unsupported(format!(
-                "serialized format version {} metadata; newest implemented version is {}",
-                header.version,
-                SerializedFileFormatVersion::LARGE_FILES_SUPPORT
-            )));
-        }
-
-        let declared_metadata = header.metadata_range()?;
-        let metadata_start = root_reader.position()?;
-        let metadata_end = declared_metadata.end;
-        let metadata_length = metadata_end
-            .checked_sub(metadata_start)
-            .ok_or_else(|| Error::invalid_data("serialized metadata ends before it starts"))?;
-        if metadata_length > limits.maximum_metadata_bytes {
-            return Err(Error::invalid_data(format!(
-                "serialized metadata is {metadata_length} bytes, exceeding limit {}",
-                limits.maximum_metadata_bytes
-            )));
-        }
-        let metadata = region.subregion(metadata_start, metadata_length)?;
-        let endian = if header.endianness == 0 {
-            Endian::Little
-        } else {
-            Endian::Big
-        };
-        let mut reader = EndianReader::new(metadata.cursor(), endian);
-        let mut budget = SerializedParseBudget::default();
-
-        let unity_version_string = if header.version.0 >= 7 {
-            read_metadata_string(
-                &mut reader,
-                "serialized Unity version",
-                &limits,
-                &mut budget,
-            )?
-        } else {
-            "2.5.0f1".to_owned()
-        };
-        let detected_unity_version =
-            if unity_version_string.is_empty() || unity_version_string == "0.0.0" {
-                None
-            } else {
-                UnityVersion::from_str(&unity_version_string).ok()
-            };
-        let unity_version = unity_version_override
-            .or_else(|| {
-                if header.version.0 < 7 || detected_unity_version.is_none() {
-                    bundle_version_hint
-                } else {
-                    None
-                }
-            })
-            .or(detected_unity_version)
-            .unwrap_or_default();
-        let target_platform = if header.version.0 >= 8 {
-            reader.read_i32()?
-        } else {
-            UNKNOWN_PLATFORM
-        };
-        let type_tree_enabled =
-            if header.version >= SerializedFileFormatVersion::HAS_TYPE_TREE_HASHES {
-                reader.read_bool()?
-            } else {
-                true
-            };
-
-        let type_count = read_record_count(
-            &mut reader,
-            limits.maximum_types,
-            "serialized type",
-            minimum_serialized_type_size(header.version, type_tree_enabled, false),
+        let mut metadata = open_serialized_metadata(&region, limits)?;
+        let preamble = read_serialized_preamble(
+            &mut metadata.reader,
+            metadata.header.version,
+            &limits,
+            &mut metadata.budget,
+            unity_version_override,
+            bundle_version_hint,
         )?;
-        let mut types = reserve_vec(type_count, "serialized types")?;
-        for _ in 0..type_count {
-            types.push(read_serialized_type(
-                &mut reader,
-                header.version,
-                type_tree_enabled,
-                false,
-                &limits,
-                &mut budget,
-            )?);
-        }
-        let mut type_index_by_class_id = HashMap::new();
-        type_index_by_class_id
-            .try_reserve(types.len())
-            .map_err(|error| Error::invalid_data(format!("cannot allocate type index: {error}")))?;
-        for (index, kind) in types.iter().enumerate() {
-            type_index_by_class_id.entry(kind.class_id).or_insert(index);
-        }
-
-        let big_id_enabled = if (7..14).contains(&header.version.0) {
-            reader.read_i32()?
-        } else {
-            0
-        };
-
-        let object_count = read_record_count(
-            &mut reader,
-            limits.maximum_objects,
-            "serialized object",
-            minimum_object_info_size(header.version, big_id_enabled),
+        let (types, type_index_by_class_id) = read_serialized_types(
+            &mut metadata.reader,
+            metadata.header.version,
+            preamble.type_tree_enabled,
+            &limits,
+            &mut metadata.budget,
         )?;
-        let mut objects = reserve_vec(object_count, "serialized objects")?;
-        for _ in 0..object_count {
-            let path_id = if big_id_enabled != 0 {
-                reader.read_i64()?
-            } else if header.version.0 < 14 {
-                i64::from(reader.read_i32()?)
-            } else {
-                align_absolute(&mut reader, metadata_start, 4)?;
-                reader.read_i64()?
-            };
-
-            let relative_start =
-                if header.version >= SerializedFileFormatVersion::LARGE_FILES_SUPPORT {
-                    positive_i64(reader.read_i64()?, "serialized object byte start")?
-                } else {
-                    u64::from(reader.read_u32()?)
-                };
-            let byte_start = header
-                .data_offset
-                .checked_add(relative_start)
-                .ok_or_else(|| Error::invalid_data("serialized object byte start overflowed"))?;
-            let byte_size = u64::from(reader.read_u32()?);
-            validate_object_range(
-                byte_start,
-                byte_size,
-                header.data_offset,
-                header.object_data_end()?,
-            )?;
-
-            let type_id = reader.read_i32()?;
-            let (class_id, serialized_type_index) = if header.version.0 < 16 {
-                let class_id = i32::from(reader.read_u16()?);
-                let index = type_index_by_class_id.get(&type_id).copied();
-                (class_id, index)
-            } else {
-                let index = usize::try_from(type_id).map_err(|_| {
-                    Error::invalid_data(format!(
-                        "serialized object type index cannot be negative: {type_id}"
-                    ))
-                })?;
-                let kind = types.get(index).ok_or_else(|| {
-                    Error::invalid_data(format!(
-                        "serialized object type index {index} exceeds {} types",
-                        types.len()
-                    ))
-                })?;
-                (kind.class_id, Some(index))
-            };
-
-            let destroyed = if header.version < SerializedFileFormatVersion::HAS_SCRIPT_TYPE_INDEX {
-                reader.read_u16()?
-            } else {
-                0
-            };
-            let script_type_index = if header.version
-                >= SerializedFileFormatVersion::HAS_SCRIPT_TYPE_INDEX
-                && header.version.0 < 17
-            {
-                let value = reader.read_i16()?;
-                Some(value)
-            } else {
-                None
-            };
-            let stripped = if matches!(header.version.0, 15 | 16) {
-                reader.read_u8()?
-            } else {
-                0
-            };
-
-            objects.push(ObjectInfo {
-                path_id,
-                byte_start,
-                byte_size,
-                type_id,
-                class_id,
-                serialized_type_index,
-                destroyed,
-                stripped,
-                script_type_index,
-            });
-        }
-        reject_duplicate_path_ids(&objects)?;
-
-        let script_types = if header.version >= SerializedFileFormatVersion::HAS_SCRIPT_TYPE_INDEX {
-            let count = read_record_count(
-                &mut reader,
-                limits.maximum_script_types,
-                "serialized script type",
-                if header.version.0 < 14 { 8 } else { 12 },
-            )?;
-            let mut values = reserve_vec(count, "serialized script types")?;
-            for _ in 0..count {
-                let local_serialized_file_index = reader.read_i32()?;
-                let local_identifier_in_file = if header.version.0 < 14 {
-                    i64::from(reader.read_i32()?)
-                } else {
-                    align_absolute(&mut reader, metadata_start, 4)?;
-                    reader.read_i64()?
-                };
-                values.push(ScriptIdentifier {
-                    local_serialized_file_index,
-                    local_identifier_in_file,
-                });
-            }
-            values
-        } else {
-            Vec::new()
-        };
-
-        let external_count = read_record_count(
-            &mut reader,
-            limits.maximum_externals,
-            "serialized external",
-            if header.version.0 >= 6 { 22 } else { 21 },
+        let big_id_enabled = read_big_id_enabled(&mut metadata.reader, metadata.header.version)?;
+        let objects = read_serialized_objects(
+            &mut metadata.reader,
+            &metadata.header,
+            metadata.metadata_start,
+            big_id_enabled,
+            &types,
+            &type_index_by_class_id,
+            &limits,
         )?;
-        let mut externals = reserve_vec(external_count, "serialized externals")?;
-        for _ in 0..external_count {
-            let prefix = if header.version.0 >= 6 {
-                Some(read_metadata_string(
-                    &mut reader,
-                    "serialized external prefix",
-                    &limits,
-                    &mut budget,
-                )?)
-            } else {
-                None
-            };
-            let (guid, kind) = if header.version.0 >= 5 {
-                (Some(read_hash(&mut reader)?), Some(reader.read_i32()?))
-            } else {
-                (None, None)
-            };
-            let path = read_metadata_string(
-                &mut reader,
-                "serialized external path",
-                &limits,
-                &mut budget,
-            )?;
-            externals.push(ExternalFile {
-                prefix,
-                guid,
-                kind,
-                path,
-            });
-        }
-
-        let reference_types = if header.version >= SerializedFileFormatVersion::SUPPORTS_REF_OBJECT
-        {
-            let count = read_record_count(
-                &mut reader,
-                limits.maximum_reference_types,
-                "serialized reference type",
-                minimum_serialized_type_size(header.version, type_tree_enabled, true),
-            )?;
-            let mut values = reserve_vec(count, "serialized reference types")?;
-            for _ in 0..count {
-                values.push(read_serialized_type(
-                    &mut reader,
-                    header.version,
-                    type_tree_enabled,
-                    true,
-                    &limits,
-                    &mut budget,
-                )?);
-            }
-            values
-        } else {
-            Vec::new()
-        };
-
-        let user_information = if header.version.0 >= 5 {
-            read_metadata_string(
-                &mut reader,
-                "serialized user information",
-                &limits,
-                &mut budget,
-            )?
-        } else {
-            String::new()
-        };
-        consume_metadata_tail(&mut reader)?;
+        let script_types = read_script_types(
+            &mut metadata.reader,
+            metadata.header.version,
+            metadata.metadata_start,
+            &limits,
+        )?;
+        let externals = read_externals(
+            &mut metadata.reader,
+            metadata.header.version,
+            &limits,
+            &mut metadata.budget,
+        )?;
+        let reference_types = read_reference_types(
+            &mut metadata.reader,
+            metadata.header.version,
+            preamble.type_tree_enabled,
+            &limits,
+            &mut metadata.budget,
+        )?;
+        let user_information = read_user_information(
+            &mut metadata.reader,
+            metadata.header.version,
+            &limits,
+            &mut metadata.budget,
+        )?;
+        consume_metadata_tail(&mut metadata.reader)?;
 
         Ok(Self {
             region,
-            header,
-            unity_version_string,
-            unity_version,
-            target_platform,
-            type_tree_enabled,
+            header: metadata.header,
+            unity_version_string: preamble.unity_version_string,
+            unity_version: preamble.unity_version,
+            target_platform: preamble.target_platform,
+            type_tree_enabled: preamble.type_tree_enabled,
             types,
             big_id_enabled,
             objects,
@@ -598,7 +773,6 @@ impl SerializedFile {
             strict_unity_versions,
         })
     }
-
     #[must_use]
     pub const fn region(&self) -> &Region {
         &self.region
@@ -968,6 +1142,43 @@ fn read_serialized_type<R: Read + Seek>(
     limits: &SerializedParseLimits,
     budget: &mut SerializedParseBudget,
 ) -> Result<SerializedType> {
+    let header = read_serialized_type_header(reader, version, is_reference_type)?;
+    let details = read_serialized_type_details(
+        reader,
+        version,
+        type_tree_enabled,
+        is_reference_type,
+        limits,
+        budget,
+    )?;
+
+    Ok(SerializedType {
+        class_id: header.class_id,
+        is_stripped_type: header.is_stripped_type,
+        script_type_index: header.script_type_index,
+        script_id: header.script_id,
+        old_type_hash: header.old_type_hash,
+        type_tree: details.type_tree,
+        type_dependencies: details.type_dependencies,
+        class_name: details.class_name,
+        namespace: details.namespace,
+        assembly_name: details.assembly_name,
+    })
+}
+
+struct SerializedTypeHeader {
+    class_id: i32,
+    is_stripped_type: bool,
+    script_type_index: i16,
+    script_id: Option<[u8; 16]>,
+    old_type_hash: Option<[u8; 16]>,
+}
+
+fn read_serialized_type_header<R: Read + Seek>(
+    reader: &mut EndianReader<R>,
+    version: SerializedFileFormatVersion,
+    is_reference_type: bool,
+) -> Result<SerializedTypeHeader> {
     let class_id = reader.read_i32()?;
     let is_stripped_type = if version.0 >= 16 {
         reader.read_bool()?
@@ -979,78 +1190,130 @@ fn read_serialized_type<R: Read + Seek>(
     } else {
         -1
     };
-
-    let (script_id, old_type_hash) = if version >= SerializedFileFormatVersion::HAS_TYPE_TREE_HASHES
-    {
-        let has_script_id = (is_reference_type && script_type_index >= 0)
-            || (version.0 < 16 && class_id < 0)
-            || (version.0 >= 16 && class_id == 114);
-        let script_id = has_script_id.then(|| read_hash(reader)).transpose()?;
-        (script_id, Some(read_hash(reader)?))
-    } else {
-        (None, None)
-    };
-
-    let mut type_dependencies = Vec::new();
-    let mut class_name = None;
-    let mut namespace = None;
-    let mut assembly_name = None;
-    let type_tree = if type_tree_enabled {
-        let tree = if version.0 >= 12 || version.0 == 10 {
-            read_type_tree_blob(reader, version, limits, budget)?
-        } else {
-            read_type_tree_recursive(reader, version, limits, budget)?
-        };
-        if version >= SerializedFileFormatVersion::STORES_TYPE_DEPENDENCIES {
-            if is_reference_type {
-                class_name = Some(read_metadata_string(
-                    reader,
-                    "reference type class name",
-                    limits,
-                    budget,
-                )?);
-                namespace = Some(read_metadata_string(
-                    reader,
-                    "reference type namespace",
-                    limits,
-                    budget,
-                )?);
-                assembly_name = Some(read_metadata_string(
-                    reader,
-                    "reference type assembly name",
-                    limits,
-                    budget,
-                )?);
-            } else {
-                let count = read_record_count(
-                    reader,
-                    limits.maximum_type_dependencies,
-                    "type dependency",
-                    4,
-                )?;
-                type_dependencies = reserve_vec(count, "type dependencies")?;
-                for _ in 0..count {
-                    type_dependencies.push(reader.read_i32()?);
-                }
-            }
-        }
-        Some(tree)
-    } else {
-        None
-    };
-
-    Ok(SerializedType {
+    let (script_id, old_type_hash) = read_serialized_type_hashes(
+        reader,
+        version,
+        is_reference_type,
+        class_id,
+        script_type_index,
+    )?;
+    Ok(SerializedTypeHeader {
         class_id,
         is_stripped_type,
         script_type_index,
         script_id,
         old_type_hash,
-        type_tree,
+    })
+}
+
+type SerializedTypeHashes = (Option<[u8; 16]>, Option<[u8; 16]>);
+
+fn read_serialized_type_hashes<R: Read + Seek>(
+    reader: &mut EndianReader<R>,
+    version: SerializedFileFormatVersion,
+    is_reference_type: bool,
+    class_id: i32,
+    script_type_index: i16,
+) -> Result<SerializedTypeHashes> {
+    if version < SerializedFileFormatVersion::HAS_TYPE_TREE_HASHES {
+        return Ok((None, None));
+    }
+    let has_script_id = (is_reference_type && script_type_index >= 0)
+        || (version.0 < 16 && class_id < 0)
+        || (version.0 >= 16 && class_id == 114);
+    Ok((
+        has_script_id.then(|| read_hash(reader)).transpose()?,
+        Some(read_hash(reader)?),
+    ))
+}
+
+struct SerializedTypeDetails {
+    type_tree: Option<TypeTree>,
+    type_dependencies: Vec<i32>,
+    class_name: Option<String>,
+    namespace: Option<String>,
+    assembly_name: Option<String>,
+}
+
+fn read_serialized_type_details<R: Read + Seek>(
+    reader: &mut EndianReader<R>,
+    version: SerializedFileFormatVersion,
+    type_tree_enabled: bool,
+    is_reference_type: bool,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+) -> Result<SerializedTypeDetails> {
+    if !type_tree_enabled {
+        return Ok(SerializedTypeDetails {
+            type_tree: None,
+            type_dependencies: Vec::new(),
+            class_name: None,
+            namespace: None,
+            assembly_name: None,
+        });
+    }
+    let type_tree = if version.0 >= 12 || version.0 == 10 {
+        read_type_tree_blob(reader, version, limits, budget)?
+    } else {
+        read_type_tree_recursive(reader, version, limits, budget)?
+    };
+    let (type_dependencies, class_name, namespace, assembly_name) =
+        read_serialized_type_dependencies(reader, version, is_reference_type, limits, budget)?;
+    Ok(SerializedTypeDetails {
+        type_tree: Some(type_tree),
         type_dependencies,
         class_name,
         namespace,
         assembly_name,
     })
+}
+
+type SerializedTypeDependencies = (Vec<i32>, Option<String>, Option<String>, Option<String>);
+
+fn read_serialized_type_dependencies<R: Read + Seek>(
+    reader: &mut EndianReader<R>,
+    version: SerializedFileFormatVersion,
+    is_reference_type: bool,
+    limits: &SerializedParseLimits,
+    budget: &mut SerializedParseBudget,
+) -> Result<SerializedTypeDependencies> {
+    if version < SerializedFileFormatVersion::STORES_TYPE_DEPENDENCIES {
+        return Ok((Vec::new(), None, None, None));
+    }
+    if is_reference_type {
+        return Ok((
+            Vec::new(),
+            Some(read_metadata_string(
+                reader,
+                "reference type class name",
+                limits,
+                budget,
+            )?),
+            Some(read_metadata_string(
+                reader,
+                "reference type namespace",
+                limits,
+                budget,
+            )?),
+            Some(read_metadata_string(
+                reader,
+                "reference type assembly name",
+                limits,
+                budget,
+            )?),
+        ));
+    }
+    let count = read_record_count(
+        reader,
+        limits.maximum_type_dependencies,
+        "type dependency",
+        4,
+    )?;
+    let mut dependencies = reserve_vec(count, "type dependencies")?;
+    for _ in 0..count {
+        dependencies.push(reader.read_i32()?);
+    }
+    Ok((dependencies, None, None, None))
 }
 
 fn read_type_tree_blob<R: Read + Seek>(
@@ -2129,94 +2392,153 @@ mod tests {
         path_id: i64,
     }
 
-    #[allow(clippy::too_many_lines)]
     fn synthetic_versioned_file(options: SyntheticOptions) -> SyntheticFixture {
         assert!((5..=21).contains(&options.version));
         assert!(options.version >= 20 || !options.include_reference_type);
-        let endian = options.endian;
         let object = vec![0xde, 0xad, 0xbe, 0xef];
-        let metadata_base = if options.version < 9 { 0 } else { 20 };
-        let type_tree_enabled = options.version < 13 || options.type_tree_enabled;
-        let big_id_enabled = (7..14).contains(&options.version) && options.big_id_enabled;
-        let path_id = if big_id_enabled || options.version >= 14 {
-            0x0102_0304_0506_0708
-        } else {
-            0x0102_0304
-        };
-
+        let layout = SyntheticLayout::new(options);
         let mut metadata = Vec::new();
-        if options.version >= 7 {
-            push_c_string(&mut metadata, "2018.4.0f1");
-        }
-        if options.version >= 8 {
-            endian.push_i32(&mut metadata, 13);
-        }
-        if options.version >= 13 {
-            metadata.push(u8::from(type_tree_enabled));
-        }
-        endian.push_i32(&mut metadata, 1);
-        push_synthetic_type(&mut metadata, options, false, type_tree_enabled);
-
-        if (7..14).contains(&options.version) {
-            endian.push_i32(&mut metadata, i32::from(big_id_enabled));
-        }
-        endian.push_i32(&mut metadata, 1);
-        if big_id_enabled {
-            endian.push_i64(&mut metadata, path_id);
-        } else if options.version < 14 {
-            endian.push_i32(
-                &mut metadata,
-                i32::try_from(path_id).expect("short synthetic path ID fits in i32"),
-            );
-        } else {
-            align_vec_with_base(&mut metadata, metadata_base, 4);
-            endian.push_i64(&mut metadata, path_id);
-        }
-        endian.push_u32(&mut metadata, 0);
-        endian.push_u32(
-            &mut metadata,
-            u32::try_from(object.len()).expect("synthetic object length fits in u32"),
-        );
-        endian.push_i32(&mut metadata, if options.version < 16 { 49 } else { 0 });
-        if options.version < 16 {
-            endian.push_u16(&mut metadata, 49);
-        }
-        if options.version < 11 {
-            endian.push_u16(&mut metadata, 9);
-        }
-        if (11..17).contains(&options.version) {
-            endian.push_i16(&mut metadata, -3);
-        }
-        if matches!(options.version, 15 | 16) {
-            metadata.push(1);
-        }
-
-        if options.version >= 11 {
-            endian.push_i32(&mut metadata, 1);
-            endian.push_i32(&mut metadata, 2);
-            if options.version < 14 {
-                endian.push_i32(&mut metadata, 0x1112_1314);
-            } else {
-                align_vec_with_base(&mut metadata, metadata_base, 4);
-                endian.push_i64(&mut metadata, 0x1112_1314_1516_1718);
-            }
-        }
-
-        endian.push_i32(&mut metadata, 0);
-        if options.version >= 20 {
-            endian.push_i32(&mut metadata, i32::from(options.include_reference_type));
-            if options.include_reference_type {
-                push_synthetic_type(&mut metadata, options, true, type_tree_enabled);
-            }
-        }
-        push_c_string(&mut metadata, "fixture-user");
+        push_synthetic_metadata_header(&mut metadata, options, layout);
+        push_synthetic_object_info(&mut metadata, options, layout, object.len());
+        push_synthetic_script_types(&mut metadata, options, layout.metadata_base);
+        push_synthetic_metadata_tail(&mut metadata, options, layout.type_tree_enabled);
 
         let bytes = assemble_synthetic_file(options, &metadata, &object);
         SyntheticFixture {
             bytes,
             object,
-            path_id,
+            path_id: layout.path_id,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SyntheticLayout {
+        metadata_base: usize,
+        type_tree_enabled: bool,
+        big_id_enabled: bool,
+        path_id: i64,
+    }
+
+    impl SyntheticLayout {
+        fn new(options: SyntheticOptions) -> Self {
+            let big_id_enabled = (7..14).contains(&options.version) && options.big_id_enabled;
+            Self {
+                metadata_base: if options.version < 9 { 0 } else { 20 },
+                type_tree_enabled: options.version < 13 || options.type_tree_enabled,
+                big_id_enabled,
+                path_id: if big_id_enabled || options.version >= 14 {
+                    0x0102_0304_0506_0708
+                } else {
+                    0x0102_0304
+                },
+            }
+        }
+    }
+
+    fn push_synthetic_metadata_header(
+        metadata: &mut Vec<u8>,
+        options: SyntheticOptions,
+        layout: SyntheticLayout,
+    ) {
+        if options.version >= 7 {
+            push_c_string(metadata, "2018.4.0f1");
+        }
+        if options.version >= 8 {
+            options.endian.push_i32(metadata, 13);
+        }
+        if options.version >= 13 {
+            metadata.push(u8::from(layout.type_tree_enabled));
+        }
+        options.endian.push_i32(metadata, 1);
+        push_synthetic_type(metadata, options, false, layout.type_tree_enabled);
+        if (7..14).contains(&options.version) {
+            options
+                .endian
+                .push_i32(metadata, i32::from(layout.big_id_enabled));
+        }
+    }
+
+    fn push_synthetic_object_info(
+        metadata: &mut Vec<u8>,
+        options: SyntheticOptions,
+        layout: SyntheticLayout,
+        object_length: usize,
+    ) {
+        options.endian.push_i32(metadata, 1);
+        push_synthetic_path_id(metadata, options, layout);
+        options.endian.push_u32(metadata, 0);
+        options.endian.push_u32(
+            metadata,
+            u32::try_from(object_length).expect("synthetic object length fits in u32"),
+        );
+        options
+            .endian
+            .push_i32(metadata, if options.version < 16 { 49 } else { 0 });
+        if options.version < 16 {
+            options.endian.push_u16(metadata, 49);
+        }
+        if options.version < 11 {
+            options.endian.push_u16(metadata, 9);
+        }
+        if (11..17).contains(&options.version) {
+            options.endian.push_i16(metadata, -3);
+        }
+        if matches!(options.version, 15 | 16) {
+            metadata.push(1);
+        }
+    }
+
+    fn push_synthetic_path_id(
+        metadata: &mut Vec<u8>,
+        options: SyntheticOptions,
+        layout: SyntheticLayout,
+    ) {
+        if layout.big_id_enabled {
+            options.endian.push_i64(metadata, layout.path_id);
+        } else if options.version < 14 {
+            options.endian.push_i32(
+                metadata,
+                i32::try_from(layout.path_id).expect("short synthetic path ID fits in i32"),
+            );
+        } else {
+            align_vec_with_base(metadata, layout.metadata_base, 4);
+            options.endian.push_i64(metadata, layout.path_id);
+        }
+    }
+
+    fn push_synthetic_script_types(
+        metadata: &mut Vec<u8>,
+        options: SyntheticOptions,
+        metadata_base: usize,
+    ) {
+        if options.version < 11 {
+            return;
+        }
+        options.endian.push_i32(metadata, 1);
+        options.endian.push_i32(metadata, 2);
+        if options.version < 14 {
+            options.endian.push_i32(metadata, 0x1112_1314);
+        } else {
+            align_vec_with_base(metadata, metadata_base, 4);
+            options.endian.push_i64(metadata, 0x1112_1314_1516_1718);
+        }
+    }
+
+    fn push_synthetic_metadata_tail(
+        metadata: &mut Vec<u8>,
+        options: SyntheticOptions,
+        type_tree_enabled: bool,
+    ) {
+        options.endian.push_i32(metadata, 0);
+        if options.version >= 20 {
+            options
+                .endian
+                .push_i32(metadata, i32::from(options.include_reference_type));
+            if options.include_reference_type {
+                push_synthetic_type(metadata, options, true, type_tree_enabled);
+            }
+        }
+        push_c_string(metadata, "fixture-user");
     }
 
     fn push_synthetic_type(

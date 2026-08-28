@@ -1174,58 +1174,49 @@ fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<F
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
-        if parse_options && argument == "--" {
-            parse_options = false;
-        } else if parse_options && argument == "--maximum-output-bytes" {
-            if saw_maximum {
-                return Err(Error::invalid_data(
-                    "--maximum-output-bytes may only be specified once",
-                ));
-            }
+        if !parse_options {
+            push_positional_path(&mut positional, argument, command_name)?;
             index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--maximum-output-bytes requires a value"))?;
-            let value = value.to_str().ok_or_else(|| {
-                Error::invalid_data("--maximum-output-bytes must be valid UTF-8 digits")
-            })?;
-            maximum_output_bytes = value.parse::<u64>().map_err(|_| {
-                Error::invalid_data("--maximum-output-bytes must be a positive integer")
-            })?;
-            if maximum_output_bytes == 0 || maximum_output_bytes > MAX_FBX_OUTPUT_BYTES {
+            continue;
+        }
+        match argument.to_str() {
+            Some("--") => {
+                parse_options = false;
+            }
+            Some("--maximum-output-bytes") => {
+                if saw_maximum {
+                    return Err(Error::invalid_data(
+                        "--maximum-output-bytes may only be specified once",
+                    ));
+                }
+                index += 1;
+                maximum_output_bytes = parse_bounded_fbx_output(arguments, index)?;
+                saw_maximum = true;
+            }
+            Some("--no-textures") => textures = false,
+            Some("--binary") => {
+                // Rejected for `obj` rather than ignored: an option that
+                // silently does nothing is worse than one that says it does
+                // not apply.
+                if command_name != "fbx" {
+                    return Err(Error::invalid_data(
+                        "--binary applies to fbx only; OBJ has a single text encoding",
+                    ));
+                }
+                binary = true;
+            }
+            Some("--texture-format") => {
+                index += 1;
+                texture_format =
+                    parse_image_format(required_flag_value(arguments, index, "--texture-format")?)?;
+            }
+            Some(value) if value.starts_with('-') => {
                 return Err(Error::invalid_data(format!(
-                    "--maximum-output-bytes must be between 1 and {MAX_FBX_OUTPUT_BYTES}"
+                    "unknown {command_name} option: {}",
+                    CliArgumentDisplay(argument)
                 )));
             }
-            saw_maximum = true;
-        } else if parse_options && argument == "--no-textures" {
-            textures = false;
-        } else if parse_options && argument == "--binary" {
-            // Rejected for `obj` rather than ignored: an option that silently
-            // does nothing is worse than one that says it does not apply.
-            if command_name != "fbx" {
-                return Err(Error::invalid_data(
-                    "--binary applies to fbx only; OBJ has a single text encoding",
-                ));
-            }
-            binary = true;
-        } else if parse_options && argument == "--texture-format" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--texture-format requires a value"))?;
-            texture_format = parse_image_format(value)?;
-        } else if parse_options
-            && argument
-                .to_str()
-                .is_some_and(|value| value.starts_with('-'))
-        {
-            return Err(Error::invalid_data(format!(
-                "unknown {command_name} option: {}",
-                CliArgumentDisplay(argument)
-            )));
-        } else {
-            push_positional_path(&mut positional, argument, command_name)?;
+            _ => push_positional_path(&mut positional, argument, command_name)?,
         }
         index += 1;
     }
@@ -1253,6 +1244,22 @@ fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<F
     })
 }
 
+fn parse_bounded_fbx_output(arguments: &[OsString], index: usize) -> Result<u64> {
+    let value = required_flag_value(arguments, index, "--maximum-output-bytes")?;
+    let value = value
+        .to_str()
+        .ok_or_else(|| Error::invalid_data("--maximum-output-bytes must be valid UTF-8 digits"))?;
+    let maximum = value
+        .parse::<u64>()
+        .map_err(|_| Error::invalid_data("--maximum-output-bytes must be a positive integer"))?;
+    if maximum == 0 || maximum > MAX_FBX_OUTPUT_BYTES {
+        return Err(Error::invalid_data(format!(
+            "--maximum-output-bytes must be between 1 and {MAX_FBX_OUTPUT_BYTES}"
+        )));
+    }
+    Ok(maximum)
+}
+
 fn parse_fbx_batch_arguments(
     command_name: &str,
     arguments: &[OsString],
@@ -1272,61 +1279,37 @@ fn parse_fbx_batch_arguments(
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
-        if parse_options && argument == "--" {
-            parse_options = false;
-        } else if parse_options && argument == "--maximum-output-bytes" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--maximum-output-bytes requires a value"))?;
-            maximum_file_bytes = value
-                .to_str()
-                .ok_or_else(|| Error::invalid_data("output limit must be UTF-8 digits"))?
-                .parse::<u64>()
-                .map_err(|_| Error::invalid_data("output limit must be a positive integer"))?;
-            if maximum_file_bytes == 0 || maximum_file_bytes > MAX_FBX_OUTPUT_BYTES {
-                return Err(Error::invalid_data(format!(
-                    "--maximum-output-bytes must be between 1 and {MAX_FBX_OUTPUT_BYTES}"
-                )));
-            }
-        } else if parse_options && argument == "--no-animations" {
-            include_animations = false;
-        } else if parse_options && argument == "--maximum-name-index-bytes" {
-            index += 1;
-            let value = arguments.get(index).ok_or_else(|| {
-                Error::invalid_data("--maximum-name-index-bytes requires a value")
-            })?;
-            maximum_name_index_bytes = value
-                .to_str()
-                .ok_or_else(|| Error::invalid_data("name-index limit must be UTF-8 digits"))?
-                .parse::<u64>()
-                .map_err(|_| {
-                    Error::invalid_data("name-index limit must be a non-negative integer")
-                })?;
-            if maximum_name_index_bytes > MAX_FBX_BATCH_NAME_INDEX_BYTES {
-                return Err(Error::invalid_data(format!(
-                    "--maximum-name-index-bytes must not exceed {MAX_FBX_BATCH_NAME_INDEX_BYTES}"
-                )));
-            }
-        } else if parse_options && argument == "--no-textures" {
-            textures = false;
-        } else if parse_options && argument == "--texture-format" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--texture-format requires a value"))?;
-            texture_format = parse_image_format(value)?;
-        } else if parse_options
-            && argument
-                .to_str()
-                .is_some_and(|value| value.starts_with('-'))
-        {
-            return Err(Error::invalid_data(format!(
-                "unknown {command_name} option: {}",
-                CliArgumentDisplay(argument)
-            )));
-        } else {
+        if !parse_options {
             push_positional_path(&mut positional, argument, command_name)?;
+            index += 1;
+            continue;
+        }
+        match argument.to_str() {
+            Some("--") => {
+                parse_options = false;
+            }
+            Some("--maximum-output-bytes") => {
+                index += 1;
+                maximum_file_bytes = parse_bounded_fbx_output(arguments, index)?;
+            }
+            Some("--no-animations") => include_animations = false,
+            Some("--maximum-name-index-bytes") => {
+                index += 1;
+                maximum_name_index_bytes = parse_fbx_batch_name_limit(arguments, index)?;
+            }
+            Some("--no-textures") => textures = false,
+            Some("--texture-format") => {
+                index += 1;
+                texture_format =
+                    parse_image_format(required_flag_value(arguments, index, "--texture-format")?)?;
+            }
+            Some(value) if value.starts_with('-') => {
+                return Err(Error::invalid_data(format!(
+                    "unknown {command_name} option: {}",
+                    CliArgumentDisplay(argument)
+                )));
+            }
+            _ => push_positional_path(&mut positional, argument, command_name)?,
         }
         index += 1;
     }
@@ -1345,6 +1328,21 @@ fn parse_fbx_batch_arguments(
         textures,
         texture_format,
     })
+}
+
+fn parse_fbx_batch_name_limit(arguments: &[OsString], index: usize) -> Result<u64> {
+    let value = required_flag_value(arguments, index, "--maximum-name-index-bytes")?;
+    let maximum = value
+        .to_str()
+        .ok_or_else(|| Error::invalid_data("name-index limit must be UTF-8 digits"))?
+        .parse::<u64>()
+        .map_err(|_| Error::invalid_data("name-index limit must be a non-negative integer"))?;
+    if maximum > MAX_FBX_BATCH_NAME_INDEX_BYTES {
+        return Err(Error::invalid_data(format!(
+            "--maximum-name-index-bytes must not exceed {MAX_FBX_BATCH_NAME_INDEX_BYTES}"
+        )));
+    }
+    Ok(maximum)
 }
 
 fn parse_live2d_package_arguments(arguments: &[OsString]) -> Result<Live2dCommand> {
@@ -1427,85 +1425,75 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
 
     while index < arguments.len() {
         let argument = &arguments[index];
-        if parse_options && argument == "--" {
-            parse_options = false;
+        if !parse_options {
+            push_positional_path(&mut positional, argument, "export")?;
             index += 1;
             continue;
         }
-
-        if parse_options && argument == "--overwrite" {
-            options.overwrite_existing = true;
-        } else if parse_options && argument == "--no-restore-text-extension" {
-            options.restore_text_asset_extension = false;
-        } else if parse_options && argument == "--compact-json" {
-            options.pretty_json = false;
-        } else if parse_options && argument == "--mode" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--mode requires a value"))?;
-            options.mode = parse_export_mode(value)?;
-        } else if parse_options && argument == "--filename" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--filename requires a value"))?;
-            options.filename_format = parse_filename_format(value)?;
-        } else if parse_options && argument == "--image-format" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--image-format requires a value"))?;
-            options.image_format = parse_image_format(value)?;
-        } else if parse_options && argument == "--jpeg-quality" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--jpeg-quality requires a value"))?;
-            options.jpeg_quality = parse_jpeg_quality(value)?;
-        } else if parse_options && argument == "--png-compression" {
-            index += 1;
-            options.png_compression =
-                parse_png_compression(required_flag_value(arguments, index, "--png-compression")?)?;
-        } else if parse_options && argument == "--png-filter" {
-            index += 1;
-            options.png_filter =
-                parse_png_filter(required_flag_value(arguments, index, "--png-filter")?)?;
-        } else if parse_options && argument == "--audio-format" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--audio-format requires a value"))?;
-            options.audio_format = parse_audio_format(value)?;
-        } else if parse_options && argument == "--maximum-metadata-bytes" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--maximum-metadata-bytes requires a value"))?;
-            options.maximum_metadata_bytes = value
-                .to_str()
-                .ok_or_else(|| Error::invalid_data("metadata limit must be valid UTF-8 digits"))?
-                .parse::<u64>()
-                .map_err(|_| {
-                    Error::invalid_data("metadata limit must be a non-negative integer")
-                })?;
-        } else if parse_options && argument == "--class" {
-            index += 1;
-            let value = arguments
-                .get(index)
-                .ok_or_else(|| Error::invalid_data("--class requires a class ID"))?;
-            push_class_filter(&mut classes, value)?;
-        } else if parse_options
-            && argument
-                .to_str()
-                .is_some_and(|value| value.starts_with('-'))
-        {
-            return Err(Error::invalid_data(format!(
-                "unknown export option: {}",
-                CliArgumentDisplay(argument)
-            )));
-        } else {
-            push_positional_path(&mut positional, argument, "export")?;
+        match argument.to_str() {
+            Some("--") => parse_options = false,
+            Some("--overwrite") => options.overwrite_existing = true,
+            Some("--no-restore-text-extension") => options.restore_text_asset_extension = false,
+            Some("--compact-json") => options.pretty_json = false,
+            Some("--mode") => {
+                index += 1;
+                options.mode = parse_export_mode(required_flag_value(arguments, index, "--mode")?)?;
+            }
+            Some("--filename") => {
+                index += 1;
+                options.filename_format =
+                    parse_filename_format(required_flag_value(arguments, index, "--filename")?)?;
+            }
+            Some("--image-format") => {
+                index += 1;
+                options.image_format =
+                    parse_image_format(required_flag_value(arguments, index, "--image-format")?)?;
+            }
+            Some("--jpeg-quality") => {
+                index += 1;
+                options.jpeg_quality =
+                    parse_jpeg_quality(required_flag_value(arguments, index, "--jpeg-quality")?)?;
+            }
+            Some("--png-compression") => {
+                index += 1;
+                options.png_compression = parse_png_compression(required_flag_value(
+                    arguments,
+                    index,
+                    "--png-compression",
+                )?)?;
+            }
+            Some("--png-filter") => {
+                index += 1;
+                options.png_filter =
+                    parse_png_filter(required_flag_value(arguments, index, "--png-filter")?)?;
+            }
+            Some("--audio-format") => {
+                index += 1;
+                options.audio_format =
+                    parse_audio_format(required_flag_value(arguments, index, "--audio-format")?)?;
+            }
+            Some("--maximum-metadata-bytes") => {
+                index += 1;
+                options.maximum_metadata_bytes = parse_metadata_limit(required_flag_value(
+                    arguments,
+                    index,
+                    "--maximum-metadata-bytes",
+                )?)?;
+            }
+            Some("--class") => {
+                index += 1;
+                push_class_filter(
+                    &mut classes,
+                    required_flag_value(arguments, index, "--class")?,
+                )?;
+            }
+            Some(value) if value.starts_with('-') => {
+                return Err(Error::invalid_data(format!(
+                    "unknown export option: {}",
+                    CliArgumentDisplay(argument)
+                )));
+            }
+            _ => push_positional_path(&mut positional, argument, "export")?,
         }
         index += 1;
     }
@@ -1522,6 +1510,14 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
         options,
         classes,
     })
+}
+
+fn parse_metadata_limit(value: &OsString) -> Result<u64> {
+    value
+        .to_str()
+        .ok_or_else(|| Error::invalid_data("metadata limit must be valid UTF-8 digits"))?
+        .parse::<u64>()
+        .map_err(|_| Error::invalid_data("metadata limit must be a non-negative integer"))
 }
 
 /// Reads a class ID as the `list` and `export` output prints it.
@@ -4220,29 +4216,8 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut directory_count = 1_usize;
     let mut entry_count = 0_usize;
     while let Some(directory) = pending_directories.pop() {
-        let mut children = Vec::new();
-        for child in fs::read_dir(&directory)? {
-            entry_count = entry_count
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid_data("directory entry count overflowed"))?;
-            if entry_count > limits.maximum_directory_entries {
-                return Err(Error::invalid_data(format!(
-                    "directory traversal exceeds {} entries",
-                    limits.maximum_directory_entries
-                )));
-            }
-            let child = child?;
-            let file_type = child.file_type()?;
-            if !file_type.is_dir() && !file_type.is_file() {
-                continue;
-            }
-            let path = join_inspect_path(&directory, &child.file_name(), limits, &mut path_budget)?;
-            children.try_reserve(1).map_err(|error| {
-                Error::invalid_data(format!("cannot allocate directory entries: {error}"))
-            })?;
-            children.push((path, file_type));
-        }
-        children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let children =
+            collect_inspect_children(&directory, limits, &mut path_budget, &mut entry_count)?;
         for (path, file_type) in children.into_iter().rev() {
             if file_type.is_dir() {
                 directory_count = directory_count
@@ -4274,6 +4249,38 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort_unstable();
     Ok(files)
+}
+
+fn collect_inspect_children(
+    directory: &Path,
+    limits: AssetLoadLimits,
+    path_budget: &mut InspectPathBudget,
+    entry_count: &mut usize,
+) -> Result<Vec<(PathBuf, fs::FileType)>> {
+    let mut children = Vec::new();
+    for child in fs::read_dir(directory)? {
+        *entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("directory entry count overflowed"))?;
+        if *entry_count > limits.maximum_directory_entries {
+            return Err(Error::invalid_data(format!(
+                "directory traversal exceeds {} entries",
+                limits.maximum_directory_entries
+            )));
+        }
+        let child = child?;
+        let file_type = child.file_type()?;
+        if !file_type.is_dir() && !file_type.is_file() {
+            continue;
+        }
+        let path = join_inspect_path(directory, &child.file_name(), limits, path_budget)?;
+        children.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate directory entries: {error}"))
+        })?;
+        children.push((path, file_type));
+    }
+    children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(children)
 }
 
 fn inspect_file(path: &Path, output: &mut impl Write) -> Result<()> {

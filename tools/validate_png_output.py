@@ -53,36 +53,78 @@ def unfilter(raw: bytes, width: int, height: int) -> bytes:
             left = line[index - 4] if index >= 4 else 0
             up = previous[index]
             upper_left = previous[index - 4] if index >= 4 else 0
-            if kind == 0:
-                value = line[index]
-            elif kind == 1:
-                value = line[index] + left
-            elif kind == 2:
-                value = line[index] + up
-            elif kind == 3:
-                value = line[index] + (left + up) // 2
-            elif kind == 4:
-                estimate = left + up - upper_left
-                distances = (
-                    abs(estimate - left),
-                    abs(estimate - up),
-                    abs(estimate - upper_left),
-                )
-                if distances[0] <= distances[1] and distances[0] <= distances[2]:
-                    predictor = left
-                elif distances[1] <= distances[2]:
-                    predictor = up
-                else:
-                    predictor = upper_left
-                value = line[index] + predictor
-            else:
-                raise Invalid(f"scanline {row} uses filter {kind}, which is not 0-4")
-            line[index] = value & 0xFF
+            line[index] = unfilter_byte(
+                kind, line[index], left, up, upper_left, row
+            )
         out += line
         previous = line
     if at != len(raw):
         raise Invalid(f"{len(raw) - at} bytes remain after the last scanline")
     return bytes(out)
+
+
+def unfilter_byte(
+    kind: int, value: int, left: int, up: int, upper_left: int, row: int
+) -> int:
+    if kind == 0:
+        predictor = 0
+    elif kind == 1:
+        predictor = left
+    elif kind == 2:
+        predictor = up
+    elif kind == 3:
+        predictor = (left + up) // 2
+    elif kind == 4:
+        predictor = paeth_predictor(left, up, upper_left)
+    else:
+        raise Invalid(f"scanline {row} uses filter {kind}, which is not 0-4")
+    return (value + predictor) & 0xFF
+
+
+def paeth_predictor(left: int, up: int, upper_left: int) -> int:
+    estimate = left + up - upper_left
+    distances = (
+        abs(estimate - left),
+        abs(estimate - up),
+        abs(estimate - upper_left),
+    )
+    if distances[0] <= distances[1] and distances[0] <= distances[2]:
+        return left
+    if distances[1] <= distances[2]:
+        return up
+    return upper_left
+
+
+def read_chunk(data: bytes, at: int) -> tuple[bytes, bytes, int]:
+    if at + 8 > len(data):
+        raise Invalid(f"a chunk header at {at} runs past the end")
+    (length,) = struct.unpack_from(">I", data, at)
+    kind = data[at + 4 : at + 8]
+    body = data[at + 8 : at + 8 + length]
+    if len(body) != length or at + 12 + length > len(data):
+        raise Invalid(
+            f"chunk {kind.decode('ascii', 'replace')} declares {length} bytes "
+            "but the file ends before its data and CRC"
+        )
+    (stored,) = struct.unpack_from(">I", data, at + 8 + length)
+    computed = zlib.crc32(kind + body) & 0xFFFFFFFF
+    if stored != computed:
+        raise Invalid(
+            f"chunk {kind.decode('ascii', 'replace')} has CRC {stored:#010x}; "
+            f"zlib computes {computed:#010x}"
+        )
+    return kind, body, at + 12 + length
+
+
+def png_header(body: bytes) -> tuple[int, int]:
+    width, height, depth, colour, compression, filters, interlace = struct.unpack(
+        ">IIBBBBB", body
+    )
+    if depth != 8 or colour != 6:
+        raise Invalid(f"IHDR is depth {depth} colour type {colour}, not 8-bit RGBA")
+    if compression or filters or interlace:
+        raise Invalid("IHDR declares a non-default compression, filter or interlace")
+    return width, height
 
 
 def decode(data: bytes) -> tuple[int, int, bytes, list[str]]:
@@ -95,43 +137,17 @@ def decode(data: bytes) -> tuple[int, int, bytes, list[str]]:
     pixels = bytearray()
     chunks: list[str] = []
     while at < len(data):
-        if at + 8 > len(data):
-            raise Invalid(f"a chunk header at {at} runs past the end")
-        (length,) = struct.unpack_from(">I", data, at)
-        kind = data[at + 4 : at + 8]
-        body = data[at + 8 : at + 8 + length]
-        # The chunk needs its declared body and the four CRC bytes after it.
-        if len(body) != length or at + 12 + length > len(data):
-            raise Invalid(
-                f"chunk {kind.decode('ascii', 'replace')} declares {length} bytes "
-                "but the file ends before its data and CRC"
-            )
-        (stored,) = struct.unpack_from(">I", data, at + 8 + length)
-        computed = zlib.crc32(kind + body) & 0xFFFFFFFF
-        if stored != computed:
-            raise Invalid(
-                f"chunk {kind.decode('ascii', 'replace')} has CRC {stored:#010x}; "
-                f"zlib computes {computed:#010x}"
-            )
+        kind, body, at = read_chunk(data, at)
         chunks.append(kind.decode("ascii", "replace"))
 
         if kind == b"IHDR":
-            width, height, depth, colour, compression, filters, interlace = struct.unpack(
-                ">IIBBBBB", body
-            )
-            if depth != 8 or colour != 6:
-                raise Invalid(f"IHDR is depth {depth} colour type {colour}, not 8-bit RGBA")
-            if compression or filters or interlace:
-                raise Invalid("IHDR declares a non-default compression, filter or interlace")
-            header = (width, height)
+            header = png_header(body)
         elif kind == b"IDAT":
             pixels += body
         elif kind == b"IEND":
-            if length:
+            if body:
                 raise Invalid("IEND is not empty")
-            at += 12 + length
             break
-        at += 12 + length
 
     if chunks[0] != "IHDR":
         raise Invalid(f"the first chunk is {chunks[0]}, not IHDR")

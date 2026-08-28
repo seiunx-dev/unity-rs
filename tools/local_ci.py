@@ -696,7 +696,7 @@ def executable_version(executable: str) -> str | None:
     return result.stdout.strip()
 
 
-def main() -> int:
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("groups", nargs="*", help="only run these groups")
     parser.add_argument("--list", action="store_true", help="list groups and exit")
@@ -711,106 +711,131 @@ def main() -> int:
         help="Python the wheel is built against and the throwaway virtualenv is "
         "created from; the wheel itself is never installed into it",
     )
-    arguments = parser.parse_args()
+    return parser.parse_args()
 
+
+def selected_groups(arguments: argparse.Namespace) -> tuple[list[Group], int | None]:
     available = groups(arguments.interpreter)
-    if arguments.groups:
-        names = set(arguments.groups)
-        unknown = names - {group.name for group in available}
-        if unknown:
-            print(f"unknown group(s): {', '.join(sorted(unknown))}", file=sys.stderr)
-            return 2
-        available = [group for group in available if group.name in names]
+    if not arguments.groups:
+        return available, None
+    names = set(arguments.groups)
+    unknown = names - {group.name for group in available}
+    if unknown:
+        print(f"unknown group(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+        return [], 2
+    return [group for group in available if group.name in names], None
 
-    if arguments.list:
-        for group in available:
-            if group.requires or group.additional_requires:
-                requirement = group.required_version_output or group.requires
-                requirements = tuple(
-                    value
-                    for value in (requirement, *group.additional_requires)
-                    if value is not None
+
+def list_groups(available: list[Group]) -> None:
+    for group in available:
+        if group.requires or group.additional_requires:
+            requirement = group.required_version_output or group.requires
+            requirements = tuple(
+                value
+                for value in (requirement, *group.additional_requires)
+                if value is not None
+            )
+            note = f"  (needs {', '.join(requirements)})"
+        elif group.probe:
+            note = f"  (optional: {group.reason})"
+        else:
+            note = ""
+        print(f"{group.name}{note}")
+        for step in group.steps:
+            print(f"    {' '.join(step.command)}")
+
+
+def group_skip_reason(group: Group) -> tuple[str, str] | None:
+    if group.requires:
+        executable = shutil.which(group.requires)
+        if executable is None:
+            return group.requires, group.reason
+        if group.required_version_output is not None:
+            actual_version = executable_version(executable)
+            if actual_version != group.required_version_output:
+                actual = actual_version or "unavailable"
+                return (
+                    f"expected {group.required_version_output}, found {actual}",
+                    f"{group.reason}; found {actual}",
                 )
-                note = f"  (needs {', '.join(requirements)})"
-            elif group.probe:
-                note = f"  (optional: {group.reason})"
-            else:
-                note = ""
-            print(f"{group.name}{note}")
-            for step in group.steps:
-                print(f"    {' '.join(step.command)}")
-        return 0
+    missing = next(
+        (
+            requirement
+            for requirement in group.additional_requires
+            if shutil.which(requirement) is None
+        ),
+        None,
+    )
+    if missing is not None:
+        return f"{missing} not found", group.reason
+    if group.probe and not probe_succeeds(group.probe):
+        return group.reason, group.reason
+    return None
 
-    if shutil.which("cargo") is None:
-        print("cargo is required", file=sys.stderr)
-        return 2
 
+def probe_succeeds(command: list[str]) -> bool:
+    try:
+        probe = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+def execute_groups(available: list[Group]) -> tuple[list[str], list[str]]:
     failures: list[str] = []
     skipped: list[str] = []
     for group in available:
-        if group.requires:
-            executable = shutil.which(group.requires)
-            if executable is None:
-                skipped.append(f"{group.name}: {group.reason}")
-                print(f"skip {group.name}: {group.requires} not found")
-                continue
-            if group.required_version_output is not None:
-                actual_version = executable_version(executable)
-                if actual_version != group.required_version_output:
-                    actual = actual_version or "unavailable"
-                    skipped.append(f"{group.name}: {group.reason}; found {actual}")
-                    print(
-                        f"skip {group.name}: expected {group.required_version_output}, "
-                        f"found {actual}"
-                    )
-                    continue
-        missing_additional = next(
-            (
-                requirement
-                for requirement in group.additional_requires
-                if shutil.which(requirement) is None
-            ),
-            None,
-        )
-        if missing_additional is not None:
-            skipped.append(f"{group.name}: {group.reason}")
-            print(f"skip {group.name}: {missing_additional} not found")
+        reason = group_skip_reason(group)
+        if reason is not None:
+            display, retained = reason
+            skipped.append(f"{group.name}: {retained}")
+            print(f"skip {group.name}: {display}")
             continue
-        if group.probe:
-            try:
-                probe = subprocess.run(
-                    group.probe,
-                    cwd=ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-            except OSError:
-                probe = None
-            if probe is None or probe.returncode != 0:
-                skipped.append(f"{group.name}: {group.reason}")
-                print(f"skip {group.name}: {group.reason}")
-                continue
-        for step in group.steps:
-            label = f"{group.name}/{step.name}"
-            print(f"run  {label}", flush=True)
-            ok, tail = run(step)
-            if not ok:
-                failures.append(label)
-                print(f"FAIL {label}\n{tail}\n", file=sys.stderr)
-                # Later steps in a group generally depend on earlier ones.
-                break
+        execute_group(group, failures)
+    return failures, skipped
 
+
+def execute_group(group: Group, failures: list[str]) -> None:
+    for step in group.steps:
+        label = f"{group.name}/{step.name}"
+        print(f"run  {label}", flush=True)
+        ok, tail = run(step)
+        if not ok:
+            failures.append(label)
+            print(f"FAIL {label}\n{tail}\n", file=sys.stderr)
+            return
+
+
+def report_result(
+    failures: list[str], skipped: list[str], fail_on_skip: bool
+) -> int:
     print()
     for note in skipped:
         print(f"skipped {note}")
     if failures:
         print(f"\n{len(failures)} step(s) failed: {', '.join(failures)}")
         return 1
-    if skipped and arguments.fail_on_skip:
+    if skipped and fail_on_skip:
         print(f"\n{len(skipped)} group(s) skipped under --fail-on-skip")
         return 1
     print(f"all steps passed ({len(skipped)} group(s) skipped)")
     return 0
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    available, error = selected_groups(arguments)
+    if error is not None:
+        return error
+
+    if arguments.list:
+        list_groups(available)
+        return 0
+    if shutil.which("cargo") is None:
+        print("cargo is required", file=sys.stderr)
+        return 2
+    failures, skipped = execute_groups(available)
+    return report_result(failures, skipped, arguments.fail_on_skip)
 
 
 if __name__ == "__main__":

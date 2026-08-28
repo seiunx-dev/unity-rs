@@ -100,6 +100,72 @@ def flatten(value: object) -> list[object]:
     return [value]
 
 
+def comparison_inputs(directory: Path, limit: int) -> tuple[list[Path], list[Path]]:
+    everything = sorted(path for path in directory.iterdir() if path.is_file())
+    always = [path for path in everything if "monoscript" in path.name.lower()]
+    rest = [path for path in everything if path not in always]
+    return always, rest[:limit] if limit else rest
+
+
+def compare_batch(
+    root: Path,
+    staged: Path,
+    batch: list[Path],
+    schema: Path,
+    unity_version: str | None,
+    totals: collections.Counter,
+    problems: list[str],
+) -> None:
+    for source in batch:
+        stage(source, staged / source.name)
+    export(staged, root / "plain", None, unity_version)
+    with_schema, _ = export(staged, root / "schema", schema, unity_version)
+    for relative, kind in with_schema.items():
+        compare_schema_object(root, relative, kind, totals, problems)
+
+
+def compare_schema_object(
+    root: Path,
+    relative: Path,
+    kind: str,
+    totals: collections.Counter,
+    problems: list[str],
+) -> None:
+    if kind != "typetree_json_schema":
+        totals["read through the file's own tree"] += 1
+        return
+    embedded = root / "plain" / relative
+    if not embedded.exists():
+        totals["no tree in the file to compare against"] += 1
+        return
+    mine = (root / "schema" / relative).read_text()
+    theirs = embedded.read_text()
+    totals["compared"] += 1
+    if mine == theirs:
+        totals["identical"] += 1
+    elif flatten(json.loads(mine)) == flatten(json.loads(theirs)):
+        totals["same values, different field names"] += 1
+    else:
+        totals["different values"] += 1
+        if len(problems) < 20:
+            problems.append(str(relative))
+
+
+def report_comparison(totals: collections.Counter, problems: list[str]) -> int:
+    for label, count in sorted(totals.items()):
+        print(f"{count:8}  {label}")
+    if problems:
+        print(f"\n{totals['different values']} object(s) read differently:", file=sys.stderr)
+        for line in problems:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    if totals["compared"] == 0:
+        print("nothing was read through a schema, so nothing was checked", file=sys.stderr)
+        return 1
+    print("every object read through a schema holds the values Unity's own tree gives")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) not in (3, 4, 5):
         print(__doc__)
@@ -109,12 +175,7 @@ def main() -> int:
     limit = int(sys.argv[3]) if len(sys.argv) >= 4 else 0
     unity_version = sys.argv[4] if len(sys.argv) == 5 else None
 
-    everything = sorted(p for p in directory.iterdir() if p.is_file())
-    # Present in every batch: the file a MonoScript reference points at.
-    always = [p for p in everything if "monoscript" in p.name.lower()]
-    rest = [p for p in everything if p not in always]
-    if limit:
-        rest = rest[:limit]
+    always, rest = comparison_inputs(directory, limit)
     if not always:
         print(f"{directory}: no monoscripts bundle, so no m_Script will resolve", file=sys.stderr)
         return 2
@@ -128,33 +189,9 @@ def main() -> int:
             batch = rest[start : start + BATCH]
             staged = root / "input"
             staged.mkdir()
-            for source in always + batch:
-                stage(source, staged / source.name)
-
-            export(staged, root / "plain", None, unity_version)
-            with_schema, _ = export(staged, root / "schema", schema, unity_version)
-
-            for relative, kind in with_schema.items():
-                if kind != "typetree_json_schema":
-                    totals["read through the file's own tree"] += 1
-                    continue
-                embedded = root / "plain" / relative
-                if not embedded.exists():
-                    # The file carried no tree either, so there is nothing to
-                    # compare against -- the schema is the only reading.
-                    totals["no tree in the file to compare against"] += 1
-                    continue
-                mine = (root / "schema" / relative).read_text()
-                theirs = embedded.read_text()
-                totals["compared"] += 1
-                if mine == theirs:
-                    totals["identical"] += 1
-                elif flatten(json.loads(mine)) == flatten(json.loads(theirs)):
-                    totals["same values, different field names"] += 1
-                else:
-                    totals["different values"] += 1
-                    if len(problems) < 20:
-                        problems.append(str(relative))
+            compare_batch(
+                root, staged, always + batch, schema, unity_version, totals, problems
+            )
 
             for name in ("input", "plain", "schema"):
                 subprocess.run(["rm", "-rf", str(root / name)], check=True)
@@ -164,18 +201,7 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-    for label, count in sorted(totals.items()):
-        print(f"{count:8}  {label}")
-    if problems:
-        print(f"\n{totals['different values']} object(s) read differently:", file=sys.stderr)
-        for line in problems:
-            print(f"  {line}", file=sys.stderr)
-        return 1
-    if totals["compared"] == 0:
-        print("nothing was read through a schema, so nothing was checked", file=sys.stderr)
-        return 1
-    print("every object read through a schema holds the values Unity's own tree gives")
-    return 0
+    return report_comparison(totals, problems)
 
 
 if __name__ == "__main__":

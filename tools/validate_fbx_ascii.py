@@ -50,8 +50,18 @@ def array_values(line: str) -> str | None:
 def validate(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
-    notes: list[str] = []
+    validate_braces(lines)
+    validate_sections(lines)
+    declared, written, ids, connections = scan_records(lines)
+    validate_declared_counts(declared, written)
+    validate_connections(connections, ids)
+    return [
+        f"{sum(written.values())} object(s) across {len(written)} type(s)",
+        f"{len(connections)} connection(s), all resolving",
+    ]
 
+
+def validate_braces(lines: list[str]) -> None:
     depth = 0
     for number, line in enumerate(lines, 1):
         depth += line.count("{") - line.count("}")
@@ -60,10 +70,16 @@ def validate(path: Path) -> list[str]:
     if depth != 0:
         raise Invalid(f"{depth} brace(s) left open at end of file")
 
+
+def validate_sections(lines: list[str]) -> None:
     for section in REQUIRED_SECTIONS:
         if not any(line.startswith(f"{section}:") for line in lines):
             raise Invalid(f"the file has no {section} section")
 
+
+def scan_records(
+    lines: list[str],
+) -> tuple[dict[str, int], dict[str, int], set[int], list[tuple[int, int]]]:
     declared: dict[str, int] = {}
     written: dict[str, int] = {}
     ids: set[int] = {0}
@@ -97,35 +113,41 @@ def validate(path: Path) -> list[str]:
 
         match = ARRAY_HEADER.match(line)
         if match:
-            name, count = match.group(1), int(match.group(2))
-            values_line = lines[index + 1] if index + 1 < len(lines) else ""
-            values = array_values(values_line)
-            if count == 0:
-                # An empty array may omit its `a:` line entirely.
-                if values is not None and values.strip():
-                    raise Invalid(f"{name} declares *0 but carries values")
-            else:
-                if values is None:
-                    raise Invalid(f"{name} declares *{count} but has no values line")
-                present = len([value for value in values.split(",") if value.strip()])
-                if present != count:
-                    raise Invalid(f"{name} declares *{count} but holds {present} values")
+            validate_array(lines, index, match)
         index += 1
+    return declared, written, ids, connections
 
+
+def validate_array(lines: list[str], index: int, match: re.Match[str]) -> None:
+    name, count = match.group(1), int(match.group(2))
+    values_line = lines[index + 1] if index + 1 < len(lines) else ""
+    values = array_values(values_line)
+    if count == 0:
+        # An empty array may omit its `a:` line entirely.
+        if values is not None and values.strip():
+            raise Invalid(f"{name} declares *0 but carries values")
+        return
+    if values is None:
+        raise Invalid(f"{name} declares *{count} but has no values line")
+    present = len([value for value in values.split(",") if value.strip()])
+    if present != count:
+        raise Invalid(f"{name} declares *{count} but holds {present} values")
+
+
+def validate_declared_counts(declared: dict[str, int], written: dict[str, int]) -> None:
     for kind, count in declared.items():
         actual = written.get(kind, 0)
         if actual != count:
             raise Invalid(
                 f'Definitions says Count {count} for "{kind}" but Objects holds {actual}'
             )
-    notes.append(f"{sum(written.values())} object(s) across {len(written)} type(s)")
 
+
+def validate_connections(connections: list[tuple[int, int]], ids: set[int]) -> None:
     for child, parent in connections:
         for identifier, role in ((child, "child"), (parent, "parent")):
             if identifier not in ids:
                 raise Invalid(f"connection {role} id {identifier} is not an object in this file")
-    notes.append(f"{len(connections)} connection(s), all resolving")
-    return notes
 
 
 def export_and_validate() -> int:

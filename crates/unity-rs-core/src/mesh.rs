@@ -413,23 +413,31 @@ fn triangulate(
     let mut indices = reserve_vec(expanded, "Mesh triangulated indices")?;
 
     if version.0 < 4 || topology == TRIANGLE_STRIP {
-        for (position, window) in source.windows(3).enumerate() {
-            let [first, second, third] = [window[0], window[1], window[2]];
-            if first == second || first == third || second == third {
-                continue;
-            }
-            if position % 2 == 1 {
-                indices.extend_from_slice(&[second, first, third]);
-            } else {
-                indices.extend_from_slice(&[first, second, third]);
-            }
-        }
+        triangulate_strip(source, &mut indices);
     } else {
-        for quad in source.chunks_exact(4) {
-            indices.extend_from_slice(&[quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]);
-        }
+        triangulate_quads(source, &mut indices);
     }
     Ok(indices)
+}
+
+fn triangulate_strip(source: &[u32], indices: &mut Vec<u32>) {
+    for (position, window) in source.windows(3).enumerate() {
+        let [first, second, third] = [window[0], window[1], window[2]];
+        if first == second || first == third || second == third {
+            continue;
+        }
+        if position % 2 == 1 {
+            indices.extend_from_slice(&[second, first, third]);
+        } else {
+            indices.extend_from_slice(&[first, second, third]);
+        }
+    }
+}
+
+fn triangulate_quads(source: &[u32], indices: &mut Vec<u32>) {
+    for quad in source.chunks_exact(4) {
+        indices.extend_from_slice(&[quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]);
+    }
 }
 
 fn read_mesh_inner(
@@ -502,46 +510,7 @@ fn read_mesh_body(
     let mut reader = MeshObjectReader::new(file, object_index, limits)?;
     let name = reader.read_named_object()?;
 
-    let sub_mesh_count = reader.read_record_count(limits.maximum_sub_meshes, 48, "Mesh submesh")?;
-    let mut raw_sub_meshes = reserve_vec(sub_mesh_count, "Mesh submeshes")?;
-    let mut referenced_index_count = 0_usize;
-    for _ in 0..sub_mesh_count {
-        let first_byte = reader.reader.read_u32()?;
-        let index_count = reader.reader.read_u32()?;
-        let topology = reader.reader.read_i32()?;
-        let base_vertex = reader.reader.read_u32()?;
-        if base_vertex != 0 {
-            return Err(Error::unsupported(format!(
-                "Mesh submesh base vertex {base_vertex}; only zero-base index buffers are implemented"
-            )));
-        }
-        let first_vertex = reader.reader.read_u32()?;
-        let vertex_count = reader.reader.read_u32()?;
-        reader.skip(24, "Mesh submesh local AABB")?;
-        let index_count_usize = usize::try_from(index_count)
-            .map_err(|_| Error::invalid_data("Mesh submesh index count does not fit in usize"))?;
-        if !index_count_usize.is_multiple_of(3) {
-            return Err(Error::invalid_data(format!(
-                "Mesh triangle submesh index count {index_count} is not divisible by three"
-            )));
-        }
-        referenced_index_count = referenced_index_count
-            .checked_add(index_count_usize)
-            .ok_or_else(|| Error::invalid_data("Mesh referenced index count overflowed"))?;
-        if referenced_index_count > limits.maximum_indices {
-            return Err(Error::invalid_data(format!(
-                "Mesh submeshes reference {referenced_index_count} indices, exceeding limit {}",
-                limits.maximum_indices
-            )));
-        }
-        raw_sub_meshes.push(RawSubMesh {
-            first_byte,
-            index_count,
-            first_vertex,
-            vertex_count,
-            topology,
-        });
-    }
+    let raw_sub_meshes = read_raw_sub_meshes(&mut reader, limits)?;
 
     let blend_shapes = reader.read_blend_shapes()?;
     let bind_poses = reader.read_bind_poses()?;
@@ -552,51 +521,8 @@ fn read_mesh_body(
         reader.skip_counted_auxiliary_records(4, "Mesh variable bone-count weight")?;
     }
 
-    let mesh_compression = reader.reader.read_u8()?;
-    reader.skip(3, "Mesh readability flags")?;
-    if is_tuanjie {
-        let revision = tuanjie_shared_cluster_revision(file);
-        if revision == 3 {
-            reader.align(4)?;
-        }
-        reader.skip_tuanjie_shared_cluster(revision)?;
-        reader.align(4)?;
-    } else {
-        reader.align(4)?;
-    }
-    let index_width = match reader.reader.read_i32()? {
-        0 => 2_usize,
-        1 => 4_usize,
-        value => {
-            return Err(Error::unsupported(format!(
-                "Mesh index format {value}; expected 16-bit or 32-bit indices"
-            )));
-        }
-    };
-    let index_byte_length = reader.read_length("Mesh index buffer")?;
-    if !index_byte_length.is_multiple_of(index_width) {
-        return Err(Error::invalid_data(format!(
-            "Mesh index buffer length {index_byte_length} is not divisible by index width {index_width}"
-        )));
-    }
-    let index_count = index_byte_length / index_width;
-    if index_count > limits.maximum_indices {
-        return Err(Error::invalid_data(format!(
-            "Mesh index buffer has {index_count} indices, exceeding limit {}",
-            limits.maximum_indices
-        )));
-    }
-    let mut index_buffer = reserve_vec(index_count, "Mesh indices")?;
-    for _ in 0..index_count {
-        index_buffer.push(if index_width == 2 {
-            u32::from(reader.reader.read_u16()?)
-        } else {
-            reader.reader.read_u32()?
-        });
-    }
-    if index_width == 2 {
-        reader.align(4)?;
-    }
+    let mesh_compression = read_mesh_flags(file, &mut reader, is_tuanjie)?;
+    let mut index_buffer = read_mesh_index_buffer(&mut reader, limits)?;
 
     let legacy_skin = if version < (2018, 2, 0) {
         reader.read_legacy_skin()?
@@ -605,74 +531,15 @@ fn read_mesh_body(
     };
     let mut vertex_data = reader.read_vertex_data(version)?;
     let compressed = reader.read_compressed_mesh()?;
-    reader.skip(24, "Mesh local AABB")?;
-    reader.skip(4, "Mesh usage flags")?;
-    if version >= (2022, 1, 0) {
-        reader.skip(4, "Mesh cooking options")?;
-    }
-    reader.skip_counted_auxiliary_bytes("Mesh baked convex collision data")?;
-    reader.align(4)?;
-    reader.skip_counted_auxiliary_bytes("Mesh baked triangle collision data")?;
-    reader.align(4)?;
-    if version >= (2018, 2, 0) {
-        reader.skip(8, "Mesh metrics")?;
-    }
-    if version >= (2018, 3, 0) {
-        reader.align(4)?;
-        let stream_offset = if version >= (2020, 1, 0) {
-            reader.reader.read_i64()?
-        } else {
-            i64::from(reader.reader.read_u32()?)
-        };
-        if stream_offset < 0 {
-            return Err(Error::invalid_data(format!(
-                "Mesh stream offset cannot be negative: {stream_offset}"
-            )));
-        }
-        let stream_size = reader.reader.read_u32()?;
-        let stream_path = reader.read_aligned_string("Mesh stream path")?;
-        if stream_path.is_empty() {
-            if stream_offset != 0 || stream_size != 0 {
-                return Err(Error::invalid_data(format!(
-                    "Mesh has empty stream path with nonzero offset {stream_offset} or size {stream_size}"
-                )));
-            }
-        } else {
-            let collection = collection.ok_or_else(|| {
-                Error::unsupported(format!(
-                    "streamed Mesh vertex data requires an AssetCollection (path {stream_path:?})"
-                ))
-            })?;
-            let stream_size = usize::try_from(stream_size)
-                .map_err(|_| Error::invalid_data("Mesh stream size does not fit in usize"))?;
-            if stream_size > limits.maximum_vertex_data_bytes {
-                return Err(Error::invalid_data(format!(
-                    "Mesh external vertex data is {stream_size} bytes, exceeding limit {}",
-                    limits.maximum_vertex_data_bytes
-                )));
-            }
-            let resource = collection.resource(&stream_path).ok_or_else(|| {
-                Error::invalid_data(format!("external resource was not found: {stream_path}"))
-            })?;
-            let stream_offset =
-                u64::try_from(stream_offset).expect("nonnegative Mesh stream offset fits in u64");
-            let stream_size_u64 = u64::try_from(stream_size)
-                .expect("Mesh stream size fits in u64 after usize conversion");
-            vertex_data.bytes = resource
-                .region
-                .subregion(stream_offset, stream_size_u64)?
-                .read_to_vec(stream_size_u64)?;
-        }
-    }
-    let has_virtual_geometry = if is_tuanjie && tuanjie_has_virtual_geometry_flags(file) {
-        let _generate_geometry_buffer = reader.reader.read_bool()?;
-        reader.reader.read_bool()?
-    } else {
-        false
-    };
-    if !is_tuanjie && version >= (6000, 2, 0) {
-        reader.read_mesh_lod_info()?;
-    }
+    let has_virtual_geometry = read_mesh_tail(
+        collection,
+        file,
+        &mut reader,
+        &mut vertex_data,
+        version,
+        is_tuanjie,
+        limits,
+    )?;
     reader.finish()?;
 
     if has_virtual_geometry {
@@ -681,36 +548,15 @@ fn read_mesh_body(
         ));
     }
 
-    if mesh_compression != 0 && !compressed.has_items() {
-        return Err(Error::invalid_data(format!(
-            "Mesh declares compression mode {mesh_compression} but carries no packed geometry"
-        )));
-    }
-
-    // The packed vectors overlay the vertex data rather than replacing it.
-    // Unity writes one form or the other, never both, but the managed reader
-    // decodes whatever each source carries and lets the compressed values win
-    // per field. Choosing one source outright would drop the channels the other
-    // holds if a file ever arrived with both.
-    let mut decoded = if vertex_data.has_vertices() {
-        vertex_data.decode(reader.reader.endian(), limits, version)?
-    } else {
-        DecodedVertexData::default()
-    };
-    if compressed.has_items() {
-        let indices = compressed.triangles.unpack()?;
-        if indices.len() > limits.maximum_indices {
-            return Err(Error::invalid_data(format!(
-                "compressed Mesh has {} indices, exceeding limit {}",
-                indices.len(),
-                limits.maximum_indices
-            )));
-        }
-        if !indices.is_empty() {
-            index_buffer = indices;
-        }
-        compressed.overlay(&mut decoded, limits)?;
-    }
+    let decoded = decode_mesh_sources(
+        vertex_data,
+        &compressed,
+        mesh_compression,
+        &mut index_buffer.values,
+        reader.reader.endian(),
+        limits,
+        version,
+    )?;
     if decoded.vertices.is_empty() {
         // Unity writes empty meshes -- a placeholder renderer, a mesh whose
         // geometry lives only in a LOD level. The managed exporter skips them
@@ -718,7 +564,6 @@ fn read_mesh_body(
         // bytes were broken, and they were not.
         return Err(Error::unsupported("Mesh has no vertices"));
     }
-    let decoded = decoded;
     let vertex_count = decoded.vertices.len();
     if let Some(shapes) = &blend_shapes {
         validate_blend_shapes(shapes, vertex_count)?;
@@ -732,61 +577,14 @@ fn read_mesh_body(
             weights.len()
         )));
     }
-    let mut sub_meshes = reserve_vec(raw_sub_meshes.len(), "decoded Mesh submeshes")?;
-    for raw in raw_sub_meshes {
-        let first_byte = usize::try_from(raw.first_byte)
-            .map_err(|_| Error::invalid_data("Mesh first-byte offset does not fit in usize"))?;
-        if !first_byte.is_multiple_of(index_width) {
-            return Err(Error::invalid_data(format!(
-                "Mesh submesh first-byte offset {} is not aligned to index width {index_width}",
-                raw.first_byte
-            )));
-        }
-        let first_index = first_byte / index_width;
-        let sub_count = usize::try_from(raw.index_count)
-            .map_err(|_| Error::invalid_data("Mesh submesh index count does not fit in usize"))?;
-        let end = first_index
-            .checked_add(sub_count)
-            .ok_or_else(|| Error::invalid_data("Mesh submesh index range overflowed"))?;
-        let source_indices = index_buffer.get(first_index..end).ok_or_else(|| {
-            Error::invalid_data(format!(
-                "Mesh submesh index range {first_index}..{end} exceeds index buffer length {}",
-                index_buffer.len()
-            ))
-        })?;
-        if let Some(index) = source_indices
-            .iter()
-            .copied()
-            .find(|index| usize::try_from(*index).map_or(true, |value| value >= vertex_count))
-        {
-            return Err(Error::invalid_data(format!(
-                "Mesh index {index} exceeds vertex count {vertex_count}"
-            )));
-        }
-        let vertex_end = usize::try_from(raw.first_vertex)
-            .ok()
-            .and_then(|start| {
-                usize::try_from(raw.vertex_count)
-                    .ok()
-                    .and_then(|count| start.checked_add(count))
-            })
-            .ok_or_else(|| Error::invalid_data("Mesh submesh vertex range overflowed"))?;
-        if vertex_end > vertex_count {
-            return Err(Error::invalid_data(format!(
-                "Mesh submesh vertex range ends at {vertex_end}, beyond vertex count {vertex_count}"
-            )));
-        }
-        let indices = triangulate(source_indices, raw.topology, version, limits)?;
-        let index_count = u32::try_from(indices.len())
-            .map_err(|_| Error::invalid_data("Mesh triangulated index count does not fit u32"))?;
-        sub_meshes.push(MeshSubMesh {
-            first_byte: raw.first_byte,
-            index_count,
-            first_vertex: raw.first_vertex,
-            vertex_count: raw.vertex_count,
-            indices,
-        });
-    }
+    let sub_meshes = decode_mesh_sub_meshes(
+        raw_sub_meshes,
+        &index_buffer.values,
+        index_buffer.width,
+        vertex_count,
+        version,
+        limits,
+    )?;
 
     Ok(Mesh {
         path_id: object.path_id,
@@ -801,6 +599,388 @@ fn read_mesh_body(
         blend_shapes,
         sub_meshes,
     })
+}
+
+fn read_raw_sub_meshes(
+    reader: &mut MeshObjectReader,
+    limits: MeshReadLimits,
+) -> Result<Vec<RawSubMesh>> {
+    let count = reader.read_record_count(limits.maximum_sub_meshes, 48, "Mesh submesh")?;
+    let mut sub_meshes = reserve_vec(count, "Mesh submeshes")?;
+    let mut referenced_indices = 0_usize;
+    for _ in 0..count {
+        let sub_mesh = read_raw_sub_mesh(reader)?;
+        referenced_indices = charge_sub_mesh_indices(referenced_indices, &sub_mesh, limits)?;
+        sub_meshes.push(sub_mesh);
+    }
+    Ok(sub_meshes)
+}
+
+fn read_raw_sub_mesh(reader: &mut MeshObjectReader) -> Result<RawSubMesh> {
+    let first_byte = reader.reader.read_u32()?;
+    let index_count = reader.reader.read_u32()?;
+    let topology = reader.reader.read_i32()?;
+    let base_vertex = reader.reader.read_u32()?;
+    if base_vertex != 0 {
+        return Err(Error::unsupported(format!(
+            "Mesh submesh base vertex {base_vertex}; only zero-base index buffers are implemented"
+        )));
+    }
+    let first_vertex = reader.reader.read_u32()?;
+    let vertex_count = reader.reader.read_u32()?;
+    reader.skip(24, "Mesh submesh local AABB")?;
+    Ok(RawSubMesh {
+        first_byte,
+        index_count,
+        first_vertex,
+        vertex_count,
+        topology,
+    })
+}
+
+fn charge_sub_mesh_indices(
+    current: usize,
+    sub_mesh: &RawSubMesh,
+    limits: MeshReadLimits,
+) -> Result<usize> {
+    let count = usize::try_from(sub_mesh.index_count)
+        .map_err(|_| Error::invalid_data("Mesh submesh index count does not fit in usize"))?;
+    if !count.is_multiple_of(3) {
+        return Err(Error::invalid_data(format!(
+            "Mesh triangle submesh index count {} is not divisible by three",
+            sub_mesh.index_count
+        )));
+    }
+    let total = current
+        .checked_add(count)
+        .ok_or_else(|| Error::invalid_data("Mesh referenced index count overflowed"))?;
+    if total > limits.maximum_indices {
+        return Err(Error::invalid_data(format!(
+            "Mesh submeshes reference {total} indices, exceeding limit {}",
+            limits.maximum_indices
+        )));
+    }
+    Ok(total)
+}
+
+fn read_mesh_flags(
+    file: &SerializedFile,
+    reader: &mut MeshObjectReader,
+    is_tuanjie: bool,
+) -> Result<u8> {
+    let compression = reader.reader.read_u8()?;
+    reader.skip(3, "Mesh readability flags")?;
+    if is_tuanjie {
+        let revision = tuanjie_shared_cluster_revision(file);
+        if revision == 3 {
+            reader.align(4)?;
+        }
+        reader.skip_tuanjie_shared_cluster(revision)?;
+    }
+    reader.align(4)?;
+    Ok(compression)
+}
+
+struct MeshIndexBuffer {
+    width: usize,
+    values: Vec<u32>,
+}
+
+fn read_mesh_index_buffer(
+    reader: &mut MeshObjectReader,
+    limits: MeshReadLimits,
+) -> Result<MeshIndexBuffer> {
+    let width = match reader.reader.read_i32()? {
+        0 => 2_usize,
+        1 => 4_usize,
+        value => {
+            return Err(Error::unsupported(format!(
+                "Mesh index format {value}; expected 16-bit or 32-bit indices"
+            )));
+        }
+    };
+    let byte_length = reader.read_length("Mesh index buffer")?;
+    if !byte_length.is_multiple_of(width) {
+        return Err(Error::invalid_data(format!(
+            "Mesh index buffer length {byte_length} is not divisible by index width {width}"
+        )));
+    }
+    let count = byte_length / width;
+    if count > limits.maximum_indices {
+        return Err(Error::invalid_data(format!(
+            "Mesh index buffer has {count} indices, exceeding limit {}",
+            limits.maximum_indices
+        )));
+    }
+    let mut values = reserve_vec(count, "Mesh indices")?;
+    for _ in 0..count {
+        values.push(read_mesh_index(reader, width)?);
+    }
+    if width == 2 {
+        reader.align(4)?;
+    }
+    Ok(MeshIndexBuffer { width, values })
+}
+
+fn read_mesh_index(reader: &mut MeshObjectReader, width: usize) -> Result<u32> {
+    if width == 2 {
+        Ok(u32::from(reader.reader.read_u16()?))
+    } else {
+        reader.reader.read_u32()
+    }
+}
+
+struct MeshStreamInfo {
+    offset: i64,
+    size: u32,
+    path: String,
+}
+
+fn read_mesh_tail(
+    collection: Option<&AssetCollection>,
+    file: &SerializedFile,
+    reader: &mut MeshObjectReader,
+    vertex_data: &mut VertexData,
+    version: (u32, u32, u32),
+    is_tuanjie: bool,
+    limits: MeshReadLimits,
+) -> Result<bool> {
+    reader.skip(24, "Mesh local AABB")?;
+    reader.skip(4, "Mesh usage flags")?;
+    if version >= (2022, 1, 0) {
+        reader.skip(4, "Mesh cooking options")?;
+    }
+    reader.skip_counted_auxiliary_bytes("Mesh baked convex collision data")?;
+    reader.align(4)?;
+    reader.skip_counted_auxiliary_bytes("Mesh baked triangle collision data")?;
+    reader.align(4)?;
+    if version >= (2018, 2, 0) {
+        reader.skip(8, "Mesh metrics")?;
+    }
+    if version >= (2018, 3, 0) {
+        let stream = read_mesh_stream_info(reader, version)?;
+        resolve_mesh_stream(collection, vertex_data, &stream, limits)?;
+    }
+    let virtual_geometry = read_virtual_geometry_flag(file, reader, is_tuanjie)?;
+    if !is_tuanjie && version >= (6000, 2, 0) {
+        reader.read_mesh_lod_info()?;
+    }
+    Ok(virtual_geometry)
+}
+
+fn read_mesh_stream_info(
+    reader: &mut MeshObjectReader,
+    version: (u32, u32, u32),
+) -> Result<MeshStreamInfo> {
+    reader.align(4)?;
+    let offset = if version >= (2020, 1, 0) {
+        reader.reader.read_i64()?
+    } else {
+        i64::from(reader.reader.read_u32()?)
+    };
+    if offset < 0 {
+        return Err(Error::invalid_data(format!(
+            "Mesh stream offset cannot be negative: {offset}"
+        )));
+    }
+    Ok(MeshStreamInfo {
+        offset,
+        size: reader.reader.read_u32()?,
+        path: reader.read_aligned_string("Mesh stream path")?,
+    })
+}
+
+fn resolve_mesh_stream(
+    collection: Option<&AssetCollection>,
+    vertex_data: &mut VertexData,
+    stream: &MeshStreamInfo,
+    limits: MeshReadLimits,
+) -> Result<()> {
+    if stream.path.is_empty() {
+        return validate_empty_mesh_stream(stream);
+    }
+    let collection = collection.ok_or_else(|| {
+        Error::unsupported(format!(
+            "streamed Mesh vertex data requires an AssetCollection (path {:?})",
+            stream.path
+        ))
+    })?;
+    let size = usize::try_from(stream.size)
+        .map_err(|_| Error::invalid_data("Mesh stream size does not fit in usize"))?;
+    if size > limits.maximum_vertex_data_bytes {
+        return Err(Error::invalid_data(format!(
+            "Mesh external vertex data is {size} bytes, exceeding limit {}",
+            limits.maximum_vertex_data_bytes
+        )));
+    }
+    let resource = collection.resource(&stream.path).ok_or_else(|| {
+        Error::invalid_data(format!("external resource was not found: {}", stream.path))
+    })?;
+    let offset = u64::try_from(stream.offset).expect("nonnegative Mesh stream offset fits in u64");
+    let size = u64::try_from(size).expect("Mesh stream size fits in u64 after usize conversion");
+    vertex_data.bytes = resource.region.subregion(offset, size)?.read_to_vec(size)?;
+    Ok(())
+}
+
+fn validate_empty_mesh_stream(stream: &MeshStreamInfo) -> Result<()> {
+    if stream.offset != 0 || stream.size != 0 {
+        return Err(Error::invalid_data(format!(
+            "Mesh has empty stream path with nonzero offset {} or size {}",
+            stream.offset, stream.size
+        )));
+    }
+    Ok(())
+}
+
+fn read_virtual_geometry_flag(
+    file: &SerializedFile,
+    reader: &mut MeshObjectReader,
+    is_tuanjie: bool,
+) -> Result<bool> {
+    if is_tuanjie && tuanjie_has_virtual_geometry_flags(file) {
+        let _generate_geometry_buffer = reader.reader.read_bool()?;
+        reader.reader.read_bool()
+    } else {
+        Ok(false)
+    }
+}
+
+fn decode_mesh_sources(
+    vertex_data: VertexData,
+    compressed: &CompressedMesh,
+    mesh_compression: u8,
+    index_buffer: &mut Vec<u32>,
+    endian: Endian,
+    limits: MeshReadLimits,
+    version: (u32, u32, u32),
+) -> Result<DecodedVertexData> {
+    if mesh_compression != 0 && !compressed.has_items() {
+        return Err(Error::invalid_data(format!(
+            "Mesh declares compression mode {mesh_compression} but carries no packed geometry"
+        )));
+    }
+    let mut decoded = if vertex_data.has_vertices() {
+        vertex_data.decode(endian, limits, version)?
+    } else {
+        DecodedVertexData::default()
+    };
+    if compressed.has_items() {
+        overlay_compressed_mesh(compressed, index_buffer, &mut decoded, limits)?;
+    }
+    Ok(decoded)
+}
+
+fn overlay_compressed_mesh(
+    compressed: &CompressedMesh,
+    index_buffer: &mut Vec<u32>,
+    decoded: &mut DecodedVertexData,
+    limits: MeshReadLimits,
+) -> Result<()> {
+    let indices = compressed.triangles.unpack()?;
+    if indices.len() > limits.maximum_indices {
+        return Err(Error::invalid_data(format!(
+            "compressed Mesh has {} indices, exceeding limit {}",
+            indices.len(),
+            limits.maximum_indices
+        )));
+    }
+    if !indices.is_empty() {
+        *index_buffer = indices;
+    }
+    compressed.overlay(decoded, limits)
+}
+
+fn decode_mesh_sub_meshes(
+    raw_sub_meshes: Vec<RawSubMesh>,
+    index_buffer: &[u32],
+    index_width: usize,
+    vertex_count: usize,
+    version: (u32, u32, u32),
+    limits: MeshReadLimits,
+) -> Result<Vec<MeshSubMesh>> {
+    let mut sub_meshes = reserve_vec(raw_sub_meshes.len(), "decoded Mesh submeshes")?;
+    for raw in raw_sub_meshes {
+        sub_meshes.push(decode_mesh_sub_mesh(
+            raw,
+            index_buffer,
+            index_width,
+            vertex_count,
+            version,
+            limits,
+        )?);
+    }
+    Ok(sub_meshes)
+}
+
+fn decode_mesh_sub_mesh(
+    raw: RawSubMesh,
+    index_buffer: &[u32],
+    index_width: usize,
+    vertex_count: usize,
+    version: (u32, u32, u32),
+    limits: MeshReadLimits,
+) -> Result<MeshSubMesh> {
+    let first_byte = usize::try_from(raw.first_byte)
+        .map_err(|_| Error::invalid_data("Mesh first-byte offset does not fit in usize"))?;
+    if !first_byte.is_multiple_of(index_width) {
+        return Err(Error::invalid_data(format!(
+            "Mesh submesh first-byte offset {} is not aligned to index width {index_width}",
+            raw.first_byte
+        )));
+    }
+    let first_index = first_byte / index_width;
+    let count = usize::try_from(raw.index_count)
+        .map_err(|_| Error::invalid_data("Mesh submesh index count does not fit in usize"))?;
+    let end = first_index
+        .checked_add(count)
+        .ok_or_else(|| Error::invalid_data("Mesh submesh index range overflowed"))?;
+    let source_indices = index_buffer.get(first_index..end).ok_or_else(|| {
+        Error::invalid_data(format!(
+            "Mesh submesh index range {first_index}..{end} exceeds index buffer length {}",
+            index_buffer.len()
+        ))
+    })?;
+    validate_mesh_sub_mesh_indices(source_indices, vertex_count)?;
+    validate_mesh_sub_mesh_vertices(&raw, vertex_count)?;
+    let indices = triangulate(source_indices, raw.topology, version, limits)?;
+    Ok(MeshSubMesh {
+        first_byte: raw.first_byte,
+        index_count: u32::try_from(indices.len())
+            .map_err(|_| Error::invalid_data("Mesh triangulated index count does not fit u32"))?,
+        first_vertex: raw.first_vertex,
+        vertex_count: raw.vertex_count,
+        indices,
+    })
+}
+
+fn validate_mesh_sub_mesh_indices(indices: &[u32], vertex_count: usize) -> Result<()> {
+    if let Some(index) = indices
+        .iter()
+        .copied()
+        .find(|index| usize::try_from(*index).map_or(true, |value| value >= vertex_count))
+    {
+        return Err(Error::invalid_data(format!(
+            "Mesh index {index} exceeds vertex count {vertex_count}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_mesh_sub_mesh_vertices(raw: &RawSubMesh, vertex_count: usize) -> Result<()> {
+    let end = usize::try_from(raw.first_vertex)
+        .ok()
+        .and_then(|start| {
+            usize::try_from(raw.vertex_count)
+                .ok()
+                .and_then(|count| start.checked_add(count))
+        })
+        .ok_or_else(|| Error::invalid_data("Mesh submesh vertex range overflowed"))?;
+    if end > vertex_count {
+        return Err(Error::invalid_data(format!(
+            "Mesh submesh vertex range ends at {end}, beyond vertex count {vertex_count}"
+        )));
+    }
+    Ok(())
 }
 
 /// Parses a resident mesh and streams the legacy `AssetStudio` OBJ contract.
@@ -1167,46 +1347,46 @@ impl VertexData {
         if weight_channel.is_none() && index_channel.is_none() {
             return Ok(None);
         }
-        if let Some(channel) = weight_channel {
-            require_component_dimension(channel, 12, "blend weight")?;
-            if vertex_format_kind(channel.format, version)?.is_integer() {
-                return Err(Error::unsupported(format!(
-                    "Mesh blend-weight channel uses integer format {}",
-                    channel.format
-                )));
-            }
-        }
-        if let Some(channel) = index_channel {
-            require_component_dimension(channel, 13, "blend index")?;
-            if !vertex_format_kind(channel.format, version)?.is_integer() {
-                return Err(Error::unsupported(format!(
-                    "Mesh blend-index channel uses non-integer format {}",
-                    channel.format
-                )));
-            }
-        }
+        validate_skin_channels(weight_channel, index_channel, version)?;
 
         let mut skin = reserve_vec(self.vertex_count, "Mesh skin weights")?;
         for vertex in 0..self.vertex_count {
-            let mut influence = MeshBoneWeight::default();
-            if let Some(channel) = weight_channel {
-                for component in 0..channel.dimension {
-                    influence.weights[usize::from(component)] =
-                        self.read_float_component(channel, vertex, component, endian, version)?;
-                }
-            }
-            if let Some(channel) = index_channel {
-                if channel.dimension == 1 && weight_channel.is_none() {
-                    influence.weights[0] = 1.0;
-                }
-                for component in 0..channel.dimension {
-                    influence.bone_indices[usize::from(component)] =
-                        self.read_integer_component(channel, vertex, component, endian, version)?;
-                }
-            }
-            skin.push(influence);
+            skin.push(self.decode_skin_vertex(
+                vertex,
+                weight_channel,
+                index_channel,
+                endian,
+                version,
+            )?);
         }
         Ok(Some(skin))
+    }
+
+    fn decode_skin_vertex(
+        &self,
+        vertex: usize,
+        weight_channel: Option<Channel>,
+        index_channel: Option<Channel>,
+        endian: Endian,
+        version: (u32, u32, u32),
+    ) -> Result<MeshBoneWeight> {
+        let mut influence = MeshBoneWeight::default();
+        if let Some(channel) = weight_channel {
+            for component in 0..channel.dimension {
+                influence.weights[usize::from(component)] =
+                    self.read_float_component(channel, vertex, component, endian, version)?;
+            }
+        }
+        if let Some(channel) = index_channel {
+            if channel.dimension == 1 && weight_channel.is_none() {
+                influence.weights[0] = 1.0;
+            }
+            for component in 0..channel.dimension {
+                influence.bone_indices[usize::from(component)] =
+                    self.read_integer_component(channel, vertex, component, endian, version)?;
+            }
+        }
+        Ok(influence)
     }
 
     fn decode_vec3(
@@ -1326,6 +1506,32 @@ impl VertexData {
             .get(offset..end)
             .ok_or_else(|| Error::invalid_data("Mesh component extends beyond vertex data"))
     }
+}
+
+fn validate_skin_channels(
+    weight_channel: Option<Channel>,
+    index_channel: Option<Channel>,
+    version: (u32, u32, u32),
+) -> Result<()> {
+    if let Some(channel) = weight_channel {
+        require_component_dimension(channel, 12, "blend weight")?;
+        if vertex_format_kind(channel.format, version)?.is_integer() {
+            return Err(Error::unsupported(format!(
+                "Mesh blend-weight channel uses integer format {}",
+                channel.format
+            )));
+        }
+    }
+    if let Some(channel) = index_channel {
+        require_component_dimension(channel, 13, "blend index")?;
+        if !vertex_format_kind(channel.format, version)?.is_integer() {
+            return Err(Error::unsupported(format!(
+                "Mesh blend-index channel uses non-integer format {}",
+                channel.format
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct MeshObjectReader {
@@ -3044,19 +3250,29 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn resident_mesh_fixture(options: MeshFixtureOptions) -> Vec<u8> {
         let mut object = Vec::new();
-        push_aligned_string(&mut object, "tri");
-        push_i32(&mut object, 1);
-        push_u32(&mut object, 0);
-        push_u32(&mut object, 3);
-        push_i32(&mut object, options.topology);
-        push_u32(&mut object, options.base_vertex);
-        push_u32(&mut object, 0);
-        push_u32(&mut object, 3);
+        push_mesh_fixture_header(&mut object, options);
+        push_mesh_fixture_indices(&mut object, options);
+        push_legacy_skin_fixture(&mut object, options);
+        push_mesh_fixture_channels(&mut object, options);
+        push_compressed_mesh_fixture(&mut object, options);
+        push_mesh_fixture_tail(&mut object, options);
+        object
+    }
+
+    fn push_mesh_fixture_header(object: &mut Vec<u8>, options: MeshFixtureOptions) {
+        push_aligned_string(object, "tri");
+        push_i32(object, 1);
+        push_u32(object, 0);
+        push_u32(object, 3);
+        push_i32(object, options.topology);
+        push_u32(object, options.base_vertex);
+        push_u32(object, 0);
+        push_u32(object, 3);
         object.extend_from_slice(&[0_u8; 24]);
 
-        push_blend_shapes(&mut object, options.blend_shapes);
+        push_blend_shapes(object, options.blend_shapes);
         let bone_count = usize::from(options.skinning) * 2;
-        push_i32(&mut object, i32::try_from(bone_count).unwrap());
+        push_i32(object, i32::try_from(bone_count).unwrap());
         for bone in 0..bone_count {
             for index in 0..16 {
                 let value = if index % 5 == 0 {
@@ -3069,14 +3285,14 @@ mod tests {
                 object.extend_from_slice(&value.to_le_bytes());
             }
         }
-        push_i32(&mut object, i32::try_from(bone_count).unwrap());
+        push_i32(object, i32::try_from(bone_count).unwrap());
         for hash in [111_u32, 222].into_iter().take(bone_count) {
-            push_u32(&mut object, hash);
+            push_u32(object, hash);
         }
-        push_u32(&mut object, if options.skinning { 333 } else { 0 });
+        push_u32(object, if options.skinning { 333 } else { 0 });
         if options.layout_version.0 >= 2019 {
-            push_i32(&mut object, 0);
-            push_i32(&mut object, 0);
+            push_i32(object, 0);
+            push_i32(object, 0);
         }
 
         object.push(if options.compressed {
@@ -3087,28 +3303,33 @@ mod tests {
         object.extend_from_slice(&[1, 0, 0]);
         if let Some(tuanjie) = options.tuanjie {
             if tuanjie.revision == 3 {
-                align(&mut object, 4);
+                align(object, 4);
             }
-            push_tuanjie_shared_cluster(&mut object, tuanjie.revision, tuanjie.root_cluster_bytes);
-            align(&mut object, 4);
+            push_tuanjie_shared_cluster(object, tuanjie.revision, tuanjie.root_cluster_bytes);
+            align(object, 4);
         } else {
-            align(&mut object, 4);
+            align(object, 4);
         }
-        push_i32(&mut object, i32::from(options.index_width == 4));
-        push_i32(&mut object, i32::try_from(3 * options.index_width).unwrap());
+    }
+
+    fn push_mesh_fixture_indices(object: &mut Vec<u8>, options: MeshFixtureOptions) {
+        push_i32(object, i32::from(options.index_width == 4));
+        push_i32(object, i32::try_from(3 * options.index_width).unwrap());
         for index in 0..3_u32 {
             if options.index_width == 2 {
                 object.extend_from_slice(&u16::try_from(index).unwrap().to_le_bytes());
             } else {
-                push_u32(&mut object, index);
+                push_u32(object, index);
             }
         }
         if options.index_width == 2 {
-            align(&mut object, 4);
+            align(object, 4);
         }
+    }
 
+    fn push_legacy_skin_fixture(object: &mut Vec<u8>, options: MeshFixtureOptions) {
         if options.layout_version < (2018, 2, 0) {
-            push_i32(&mut object, i32::try_from(options.skin_records).unwrap());
+            push_i32(object, i32::try_from(options.skin_records).unwrap());
             for vertex in 0..options.skin_records {
                 let weights: [f32; 4] = if options.skinning {
                     match vertex {
@@ -3132,14 +3353,17 @@ mod tests {
                     [0; 4]
                 };
                 for index in indices {
-                    push_i32(&mut object, index);
+                    push_i32(object, index);
                 }
             }
         }
+    }
+
+    fn push_mesh_fixture_channels(object: &mut Vec<u8>, options: MeshFixtureOptions) {
         if options.layout_version.0 < 2018 {
-            push_u32(&mut object, 0b1011);
+            push_u32(object, 0b1011);
         }
-        push_u32(&mut object, 3);
+        push_u32(object, 3);
         let channel_count = if options.skinning && options.layout_version >= (2018, 2, 0) {
             14
         } else if options.layout_version.0 < 2018 {
@@ -3147,7 +3371,7 @@ mod tests {
         } else {
             5
         };
-        push_i32(&mut object, channel_count);
+        push_i32(object, channel_count);
         object.extend_from_slice(&[0, 0, options.position_format, 3]);
         object.extend_from_slice(&[1, 0, 0, 3]);
         object.extend_from_slice(&[0, 0, 0, 0]);
@@ -3171,74 +3395,70 @@ mod tests {
         if options.truncate_vertex_data {
             vertex_data.truncate(4);
         }
-        push_i32(&mut object, i32::try_from(vertex_data.len()).unwrap());
+        push_i32(object, i32::try_from(vertex_data.len()).unwrap());
         object.extend_from_slice(&vertex_data);
-        align(&mut object, 4);
+        align(object, 4);
+    }
 
+    fn push_compressed_mesh_fixture(object: &mut Vec<u8>, options: MeshFixtureOptions) {
         if options.compressed {
             // A three-vertex triangle. Range 255 with an 8-bit width makes each
             // packed value decode to itself, so the expected geometry is plain.
-            push_packed_float_data(&mut object, 9, 255.0, 0.0, &[1, 0, 0, 0, 2, 0, 0, 0, 3], 8);
-            push_empty_packed_float(&mut object); // UVs
+            push_packed_float_data(object, 9, 255.0, 0.0, &[1, 0, 0, 0, 2, 0, 0, 0, 3], 8);
+            push_empty_packed_float(object); // UVs
             // Normals as octahedral pairs plus their sign bits.
-            push_packed_float_data(
-                &mut object,
-                6,
-                2.0,
-                -1.0,
-                &[255, 128, 255, 128, 255, 128],
-                8,
-            );
-            push_empty_packed_float(&mut object); // tangents
-            push_empty_packed_int(&mut object); // weights
-            push_packed_int_data(&mut object, &[1, 1, 1], 1); // normal signs
-            push_empty_packed_int(&mut object); // tangent signs
-            push_empty_packed_float(&mut object); // float colours
-            push_empty_packed_int(&mut object); // bone indices
-            push_packed_int_data(&mut object, &[0, 1, 2], 8); // triangles
-            push_u32(&mut object, 0); // UV info
+            push_packed_float_data(object, 6, 2.0, -1.0, &[255, 128, 255, 128, 255, 128], 8);
+            push_empty_packed_float(object); // tangents
+            push_empty_packed_int(object); // weights
+            push_packed_int_data(object, &[1, 1, 1], 1); // normal signs
+            push_empty_packed_int(object); // tangent signs
+            push_empty_packed_float(object); // float colours
+            push_empty_packed_int(object); // bone indices
+            push_packed_int_data(object, &[0, 1, 2], 8); // triangles
+            push_u32(object, 0); // UV info
         } else {
-            push_packed_float(&mut object, options.packed_vertex_items);
+            push_packed_float(object, options.packed_vertex_items);
             for _ in 0..3 {
-                push_empty_packed_float(&mut object);
+                push_empty_packed_float(object);
             }
             for _ in 0..3 {
-                push_empty_packed_int(&mut object);
+                push_empty_packed_int(object);
             }
-            push_empty_packed_float(&mut object);
+            push_empty_packed_float(object);
             for _ in 0..2 {
-                push_empty_packed_int(&mut object);
+                push_empty_packed_int(object);
             }
-            push_u32(&mut object, 0);
+            push_u32(object, 0);
         }
+    }
 
+    fn push_mesh_fixture_tail(object: &mut Vec<u8>, options: MeshFixtureOptions) {
         object.extend_from_slice(&[0_u8; 24]);
-        push_i32(&mut object, 0);
+        push_i32(object, 0);
         if options.layout_version >= (2022, 1, 0) {
-            push_i32(&mut object, 0);
+            push_i32(object, 0);
         }
-        push_i32(&mut object, 0);
-        push_i32(&mut object, 0);
+        push_i32(object, 0);
+        push_i32(object, 0);
         if options.layout_version >= (2018, 2, 0) {
             object.extend_from_slice(&[0_u8; 8]);
         }
         if options.layout_version >= (2018, 3, 0) {
-            align(&mut object, 4);
+            align(object, 4);
             if options.layout_version >= (2020, 1, 0) {
                 object.extend_from_slice(
                     &i64::try_from(options.stream_offset).unwrap().to_le_bytes(),
                 );
             } else {
-                push_u32(&mut object, u32::try_from(options.stream_offset).unwrap());
+                push_u32(object, u32::try_from(options.stream_offset).unwrap());
             }
-            push_u32(&mut object, options.stream_size);
-            push_aligned_string(&mut object, options.stream_path);
+            push_u32(object, options.stream_size);
+            push_aligned_string(object, options.stream_path);
         }
         if let Some(tuanjie) = options.tuanjie.filter(|value| value.has_tail_flags) {
             object.push(1);
             object.push(u8::from(tuanjie.virtual_geometry));
         }
-        object
     }
 
     fn push_tuanjie_shared_cluster(output: &mut Vec<u8>, revision: u8, root_page_bytes: usize) {

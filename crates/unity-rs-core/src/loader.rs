@@ -427,6 +427,56 @@ pub struct LoadedObjectMetadata {
     pub container: Option<Arc<str>>,
 }
 
+fn bundle_parse_limits(limits: &AssetLoadLimits) -> BundleParseLimits {
+    let defaults = BundleParseLimits::default();
+    BundleParseLimits {
+        max_path_length: limits.maximum_path_bytes.min(defaults.max_path_length),
+        max_entry_read_size: limits.maximum_single_entry_bytes,
+        ..defaults
+    }
+}
+
+fn enqueue_wrapped_input(
+    input: PendingInput,
+    region: Region,
+    limits: &AssetLoadLimits,
+    pending: &mut VecDeque<PendingInput>,
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
+    charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
+    charge_pending_inputs(pending, 1, budget, limits)?;
+    pending.push_back(PendingInput {
+        path: input.path,
+        region,
+        depth: input.depth + 1,
+        unity_version_hint: input.unity_version_hint,
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_nested_input(
+    input: &PendingInput,
+    entry_path: &str,
+    region: Region,
+    charge_region: bool,
+    unity_version_hint: Option<UnityVersion>,
+    limits: &AssetLoadLimits,
+    pending: &mut VecDeque<PendingInput>,
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
+    if charge_region {
+        charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
+    }
+    pending.push_back(PendingInput {
+        path: nested_path(&input.path, entry_path, limits, budget)?,
+        region,
+        depth: input.depth + 1,
+        unity_version_hint,
+    });
+    Ok(())
+}
+
 impl AssetCollection {
     /// Returns serialized files in stable discovery order.
     #[must_use]
@@ -659,14 +709,7 @@ impl AssetCollection {
         settings: &RootLoadSettings<'_>,
         budget: &mut AssetLoadBudget,
     ) -> Result<()> {
-        let RootLoadSettings {
-            limits,
-            unity_version_override,
-            oodle_decoder,
-            unity_cn_key,
-            strict_unity_versions,
-            ..
-        } = *settings;
+        let limits = settings.limits;
         let mut pending = VecDeque::new();
         charge_pending_inputs(&mut pending, 1, budget, limits)?;
         pending.push_back(PendingInput {
@@ -685,190 +728,254 @@ impl AssetCollection {
             }
 
             let detection = detect_region(&input.region)?;
-            match detection.file_type {
-                FileType::AssetsFile => {
-                    self.serialized_files.try_reserve(1).map_err(|error| {
-                        Error::invalid_data(format!(
-                            "cannot grow loaded serialized-file table: {error}"
-                        ))
-                    })?;
-                    let file = SerializedFile::open_with_options(
-                        input.region,
-                        SerializedOpenOptions {
-                            unity_version_override: unity_version_override.cloned(),
-                            bundle_version_hint: input.unity_version_hint,
-                            strict_unity_versions,
-                            ..SerializedOpenOptions::default()
-                        },
-                    )?;
-                    self.serialized_files.push(LoadedSerializedFile {
-                        path: input.path.into_string(),
-                        file,
-                    });
-                }
-                FileType::BundleFile => {
-                    let length = input
-                        .region
-                        .len()
-                        .checked_sub(detection.data_offset)
-                        .ok_or_else(|| Error::invalid_data("bundle offset exceeds its input"))?;
-                    let bundle_region = input.region.subregion(detection.data_offset, length)?;
-                    let bundle_defaults = BundleParseLimits::default();
-                    let bundle_limits = BundleParseLimits {
-                        max_path_length: limits
-                            .maximum_path_bytes
-                            .min(bundle_defaults.max_path_length),
-                        max_entry_read_size: limits.maximum_single_entry_bytes,
-                        ..bundle_defaults
-                    };
-                    let common = BundleHeader::read(&mut EndianReader::new(
-                        bundle_region.cursor(),
-                        Endian::Big,
-                    ))?;
-                    if common.signature == "UnityArchive" {
-                        return Err(Error::unsupported(
-                            "UnityArchive bundles are recognized, but their layout is not documented or sample-verified",
-                        ));
-                    } else if common.signature == "UnityFS"
-                        || (matches!(common.signature.as_str(), "UnityWeb" | "UnityRaw")
-                            && common.version == 6)
-                    {
-                        let bundle = UnityFsBundle::open_with_options(
-                            &bundle_region,
-                            BundleOpenOptions {
-                                limits: bundle_limits,
-                                oodle_decoder: oodle_decoder.cloned(),
-                                unity_cn_key,
-                            },
-                        )?;
-                        let unity_version_hint =
-                            (!bundle.header.common.unity_revision.is_stripped())
-                                .then(|| bundle.header.common.unity_revision.clone());
-                        charge_pending_inputs(&mut pending, bundle.entries.len(), budget, limits)?;
-                        // One decoded-block cache across the walk: a
-                        // single-block (LZMA) bundle decodes once for all
-                        // entries instead of once per entry.
-                        let mut block_cache = crate::bundle::BlockDecodeCache::new();
-                        for index in 0..bundle.entries.len() {
-                            let entry = &bundle.entries[index];
-                            let region = Region::from_bytes(
-                                bundle.read_entry_with_cache(index, &mut block_cache)?,
-                            );
-                            charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
-                            pending.push_back(PendingInput {
-                                path: nested_path(&input.path, &entry.path, limits, budget)?,
-                                region,
-                                depth: input.depth + 1,
-                                unity_version_hint: unity_version_hint.clone(),
-                            });
-                        }
-                    } else if matches!(common.signature.as_str(), "UnityWeb" | "UnityRaw") {
-                        let bundle = LegacyBundle::open_with_limits(&bundle_region, bundle_limits)?;
-                        let unity_version_hint =
-                            (!bundle.header.common.unity_revision.is_stripped())
-                                .then(|| bundle.header.common.unity_revision.clone());
-                        charge_pending_inputs(&mut pending, bundle.entries.len(), budget, limits)?;
-                        for index in 0..bundle.entries.len() {
-                            let entry = &bundle.entries[index];
-                            let region = Region::from_bytes(bundle.read_entry(index)?);
-                            charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
-                            pending.push_back(PendingInput {
-                                path: nested_path(&input.path, &entry.path, limits, budget)?,
-                                region,
-                                depth: input.depth + 1,
-                                unity_version_hint: unity_version_hint.clone(),
-                            });
-                        }
-                    } else {
-                        return Err(Error::unsupported(format!(
-                            "bundle signature {:?}",
-                            common.signature
-                        )));
-                    }
-                }
-                FileType::WebFile => {
-                    let web_defaults = WebParseLimits::default();
-                    let web_limits = WebParseLimits {
-                        max_path_length: limits
-                            .maximum_path_bytes
-                            .min(web_defaults.max_path_length),
-                        max_entry_read_size: limits.maximum_single_entry_bytes,
-                        ..web_defaults
-                    };
-                    let web = WebFile::open_with_limits(input.region, web_limits)?;
-                    charge_pending_inputs(&mut pending, web.entries.len(), budget, limits)?;
-                    for index in 0..web.entries.len() {
-                        let entry = &web.entries[index];
-                        pending.push_back(PendingInput {
-                            path: nested_path(&input.path, &entry.path, limits, budget)?,
-                            region: web.entry_region(index)?,
-                            depth: input.depth + 1,
-                            unity_version_hint: input.unity_version_hint.clone(),
-                        });
-                    }
-                }
-                // gzip and Brotli wrap exactly one stream, so the decompressed
-                // input keeps the container's own path. Appending a `::gzip`
-                // segment would make the portable name -- which is what
-                // cross-file external references are matched against -- the
-                // literal string "gzip" instead of the file's name, so nothing
-                // could ever reference it. The managed reader keeps the name
-                // too.
-                FileType::GzipFile => {
-                    let region = decompress_gzip(&input.region, limits.compression)?;
-                    charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
-                    charge_pending_inputs(&mut pending, 1, budget, limits)?;
-                    pending.push_back(PendingInput {
-                        path: input.path,
-                        region,
-                        depth: input.depth + 1,
-                        unity_version_hint: input.unity_version_hint,
-                    });
-                }
-                FileType::BrotliFile => {
-                    let region = decompress_brotli(&input.region, limits.compression)?;
-                    charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
-                    charge_pending_inputs(&mut pending, 1, budget, limits)?;
-                    pending.push_back(PendingInput {
-                        path: input.path,
-                        region,
-                        depth: input.depth + 1,
-                        unity_version_hint: input.unity_version_hint,
-                    });
-                }
-                FileType::ZipFile => {
-                    let compression = CompressionLimits {
-                        maximum_zip_path_bytes: limits
-                            .maximum_path_bytes
-                            .min(limits.compression.maximum_zip_path_bytes),
-                        ..limits.compression
-                    };
-                    let archive = ZipContainer::open(&input.region, compression)?;
-                    charge_pending_inputs(&mut pending, archive.entries.len(), budget, limits)?;
-                    for index in 0..archive.entries.len() {
-                        let entry = &archive.entries[index];
-                        let region = archive.read_entry(index)?;
-                        charge_expansion(region.len(), limits, &mut budget.expanded_bytes)?;
-                        pending.push_back(PendingInput {
-                            path: nested_path(&input.path, &entry.path, limits, budget)?,
-                            region,
-                            depth: input.depth + 1,
-                            unity_version_hint: input.unity_version_hint.clone(),
-                        });
-                    }
-                }
-                FileType::ResourceFile => {
-                    self.resources.try_reserve(1).map_err(|error| {
-                        Error::invalid_data(format!("cannot grow loaded resource table: {error}"))
-                    })?;
-                    self.resources.push(LoadedResource {
-                        path: input.path.into_string(),
-                        region: input.region,
-                    });
-                }
-            }
+            self.load_pending_input(input, detection, settings, &mut pending, budget)?;
         }
 
+        Ok(())
+    }
+
+    fn load_pending_input(
+        &mut self,
+        input: PendingInput,
+        detection: crate::file_type::FileDetection,
+        settings: &RootLoadSettings<'_>,
+        pending: &mut VecDeque<PendingInput>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        match detection.file_type {
+            FileType::AssetsFile => self.load_serialized_input(
+                input,
+                settings.unity_version_override,
+                settings.strict_unity_versions,
+            ),
+            FileType::BundleFile => {
+                Self::load_bundle_input(&input, detection.data_offset, settings, pending, budget)
+            }
+            FileType::WebFile => Self::load_web_input(&input, settings.limits, pending, budget),
+            FileType::GzipFile => {
+                let region = decompress_gzip(&input.region, settings.limits.compression)?;
+                enqueue_wrapped_input(input, region, settings.limits, pending, budget)
+            }
+            FileType::BrotliFile => {
+                let region = decompress_brotli(&input.region, settings.limits.compression)?;
+                enqueue_wrapped_input(input, region, settings.limits, pending, budget)
+            }
+            FileType::ZipFile => Self::load_zip_input(&input, settings.limits, pending, budget),
+            FileType::ResourceFile => self.load_resource_input(input),
+        }
+    }
+
+    fn load_serialized_input(
+        &mut self,
+        input: PendingInput,
+        unity_version_override: Option<&UnityVersion>,
+        strict_unity_versions: bool,
+    ) -> Result<()> {
+        self.serialized_files.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow loaded serialized-file table: {error}"))
+        })?;
+        let file = SerializedFile::open_with_options(
+            input.region,
+            SerializedOpenOptions {
+                unity_version_override: unity_version_override.cloned(),
+                bundle_version_hint: input.unity_version_hint,
+                strict_unity_versions,
+                ..SerializedOpenOptions::default()
+            },
+        )?;
+        self.serialized_files.push(LoadedSerializedFile {
+            path: input.path.into_string(),
+            file,
+        });
+        Ok(())
+    }
+
+    fn load_bundle_input(
+        input: &PendingInput,
+        data_offset: u64,
+        settings: &RootLoadSettings<'_>,
+        pending: &mut VecDeque<PendingInput>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        let length = input
+            .region
+            .len()
+            .checked_sub(data_offset)
+            .ok_or_else(|| Error::invalid_data("bundle offset exceeds its input"))?;
+        let bundle_region = input.region.subregion(data_offset, length)?;
+        let bundle_limits = bundle_parse_limits(settings.limits);
+        let common =
+            BundleHeader::read(&mut EndianReader::new(bundle_region.cursor(), Endian::Big))?;
+        match common.signature.as_str() {
+            "UnityArchive" => Err(Error::unsupported(
+                "UnityArchive bundles are recognized, but their layout is not documented or sample-verified",
+            )),
+            "UnityFS" => Self::load_unity_fs_bundle(
+                input,
+                &bundle_region,
+                bundle_limits,
+                settings,
+                pending,
+                budget,
+            ),
+            "UnityWeb" | "UnityRaw" if common.version == 6 => Self::load_unity_fs_bundle(
+                input,
+                &bundle_region,
+                bundle_limits,
+                settings,
+                pending,
+                budget,
+            ),
+            "UnityWeb" | "UnityRaw" => Self::load_legacy_bundle(
+                input,
+                &bundle_region,
+                bundle_limits,
+                settings.limits,
+                pending,
+                budget,
+            ),
+            _ => Err(Error::unsupported(format!(
+                "bundle signature {:?}",
+                common.signature
+            ))),
+        }
+    }
+
+    fn load_unity_fs_bundle(
+        input: &PendingInput,
+        region: &Region,
+        bundle_limits: BundleParseLimits,
+        settings: &RootLoadSettings<'_>,
+        pending: &mut VecDeque<PendingInput>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        let bundle = UnityFsBundle::open_with_options(
+            region,
+            BundleOpenOptions {
+                limits: bundle_limits,
+                oodle_decoder: settings.oodle_decoder.cloned(),
+                unity_cn_key: settings.unity_cn_key,
+            },
+        )?;
+        let version_hint = (!bundle.header.common.unity_revision.is_stripped())
+            .then(|| bundle.header.common.unity_revision.clone());
+        charge_pending_inputs(pending, bundle.entries.len(), budget, settings.limits)?;
+        let mut block_cache = crate::bundle::BlockDecodeCache::new();
+        for index in 0..bundle.entries.len() {
+            let entry = &bundle.entries[index];
+            let region = Region::from_bytes(bundle.read_entry_with_cache(index, &mut block_cache)?);
+            enqueue_nested_input(
+                input,
+                &entry.path,
+                region,
+                true,
+                version_hint.clone(),
+                settings.limits,
+                pending,
+                budget,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_legacy_bundle(
+        input: &PendingInput,
+        region: &Region,
+        bundle_limits: BundleParseLimits,
+        limits: &AssetLoadLimits,
+        pending: &mut VecDeque<PendingInput>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        let bundle = LegacyBundle::open_with_limits(region, bundle_limits)?;
+        let version_hint = (!bundle.header.common.unity_revision.is_stripped())
+            .then(|| bundle.header.common.unity_revision.clone());
+        charge_pending_inputs(pending, bundle.entries.len(), budget, limits)?;
+        for index in 0..bundle.entries.len() {
+            let entry = &bundle.entries[index];
+            enqueue_nested_input(
+                input,
+                &entry.path,
+                Region::from_bytes(bundle.read_entry(index)?),
+                true,
+                version_hint.clone(),
+                limits,
+                pending,
+                budget,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_web_input(
+        input: &PendingInput,
+        limits: &AssetLoadLimits,
+        pending: &mut VecDeque<PendingInput>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        let defaults = WebParseLimits::default();
+        let web = WebFile::open_with_limits(
+            input.region.clone(),
+            WebParseLimits {
+                max_path_length: limits.maximum_path_bytes.min(defaults.max_path_length),
+                max_entry_read_size: limits.maximum_single_entry_bytes,
+                ..defaults
+            },
+        )?;
+        charge_pending_inputs(pending, web.entries.len(), budget, limits)?;
+        for index in 0..web.entries.len() {
+            let entry = &web.entries[index];
+            enqueue_nested_input(
+                input,
+                &entry.path,
+                web.entry_region(index)?,
+                false,
+                input.unity_version_hint.clone(),
+                limits,
+                pending,
+                budget,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_zip_input(
+        input: &PendingInput,
+        limits: &AssetLoadLimits,
+        pending: &mut VecDeque<PendingInput>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<()> {
+        let compression = CompressionLimits {
+            maximum_zip_path_bytes: limits
+                .maximum_path_bytes
+                .min(limits.compression.maximum_zip_path_bytes),
+            ..limits.compression
+        };
+        let archive = ZipContainer::open(&input.region, compression)?;
+        charge_pending_inputs(pending, archive.entries.len(), budget, limits)?;
+        for index in 0..archive.entries.len() {
+            let entry = &archive.entries[index];
+            enqueue_nested_input(
+                input,
+                &entry.path,
+                archive.read_entry(index)?,
+                true,
+                input.unity_version_hint.clone(),
+                limits,
+                pending,
+                budget,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn load_resource_input(&mut self, input: PendingInput) -> Result<()> {
+        self.resources.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot grow loaded resource table: {error}"))
+        })?;
+        self.resources.push(LoadedResource {
+            path: input.path.into_string(),
+            region: input.region,
+        });
         Ok(())
     }
 
@@ -1071,72 +1178,99 @@ impl AssetCollection {
                     .assets;
             }
             ASSET_BUNDLE_CLASS_ID => {
-                let bundle = loaded
-                    .file
-                    .read_asset_bundle_metadata(object_index, limits.container_metadata)?;
-                if !bundle.name.is_empty() {
-                    state
-                        .metadata
-                        .entry_mut((file_index, object.path_id), state.index_budget, limits)?
-                        .name = Some(bundle.name);
-                }
-                if !bundle.is_streamed_scene_asset_bundle {
-                    *preload_table = bundle.preload_table;
-                }
-                for entry in bundle.container {
-                    let preload_size = if bundle.is_streamed_scene_asset_bundle {
-                        preload_table.len()
-                    } else {
-                        entry.preload_size
-                    };
-                    let preload_end =
-                        entry
-                            .preload_index
-                            .checked_add(preload_size)
-                            .ok_or_else(|| {
-                                Error::invalid_data(
-                                    "AssetBundle container preload range overflowed",
-                                )
-                            })?;
-                    let references = preload_table
-                        .get(entry.preload_index..preload_end)
-                        .ok_or_else(|| {
-                            Error::invalid_data(format!(
-                                "AssetBundle container {:?} preload range {}..{} exceeds {} entries",
-                                entry.key,
-                                entry.preload_index,
-                                preload_end,
-                                preload_table.len()
-                            ))
-                        })?;
-                    let key: Arc<str> = Arc::from(entry.key);
-                    for reference in references {
-                        charge_container_assignment(state.assignment_count, limits)?;
-                        if let Some(target) = self.resolve_object_reference(file_index, *reference)
-                        {
-                            state
-                                .metadata
-                                .entry_mut(target, state.index_budget, limits)?
-                                .container = Some(Arc::clone(&key));
-                        }
-                    }
-                }
+                self.collect_asset_bundle_metadata(
+                    file_index,
+                    object_index,
+                    preload_table,
+                    state,
+                    limits,
+                )?;
             }
             RESOURCE_MANAGER_CLASS_ID => {
-                let manager = loaded
-                    .file
-                    .read_resource_manager_metadata(object_index, limits.container_metadata)?;
-                for entry in manager.container {
-                    charge_container_assignment(state.assignment_count, limits)?;
-                    if let Some(target) = self.resolve_object_reference(file_index, entry.asset) {
-                        state
-                            .metadata
-                            .entry_mut(target, state.index_budget, limits)?
-                            .container = Some(Arc::from(entry.key));
-                    }
-                }
+                self.collect_resource_manager_metadata(file_index, object_index, state, limits)?;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn collect_asset_bundle_metadata(
+        &self,
+        file_index: usize,
+        object_index: usize,
+        preload_table: &mut Vec<ObjectReference>,
+        state: &mut ContainerObjectMetadataBuildState<'_>,
+        limits: &AssetLoadLimits,
+    ) -> Result<()> {
+        let loaded = &self.serialized_files[file_index];
+        let object = &loaded.file.objects[object_index];
+        let bundle = loaded
+            .file
+            .read_asset_bundle_metadata(object_index, limits.container_metadata)?;
+        if !bundle.name.is_empty() {
+            state
+                .metadata
+                .entry_mut((file_index, object.path_id), state.index_budget, limits)?
+                .name = Some(bundle.name);
+        }
+        if !bundle.is_streamed_scene_asset_bundle {
+            *preload_table = bundle.preload_table;
+        }
+        for entry in bundle.container {
+            let preload_size = if bundle.is_streamed_scene_asset_bundle {
+                preload_table.len()
+            } else {
+                entry.preload_size
+            };
+            let preload_end = entry
+                .preload_index
+                .checked_add(preload_size)
+                .ok_or_else(|| {
+                    Error::invalid_data("AssetBundle container preload range overflowed")
+                })?;
+            let references = preload_table
+                .get(entry.preload_index..preload_end)
+                .ok_or_else(|| {
+                    Error::invalid_data(format!(
+                        "AssetBundle container {:?} preload range {}..{} exceeds {} entries",
+                        entry.key,
+                        entry.preload_index,
+                        preload_end,
+                        preload_table.len()
+                    ))
+                })?;
+            let key: Arc<str> = Arc::from(entry.key);
+            for reference in references {
+                charge_container_assignment(state.assignment_count, limits)?;
+                if let Some(target) = self.resolve_object_reference(file_index, *reference) {
+                    state
+                        .metadata
+                        .entry_mut(target, state.index_budget, limits)?
+                        .container = Some(Arc::clone(&key));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_resource_manager_metadata(
+        &self,
+        file_index: usize,
+        object_index: usize,
+        state: &mut ContainerObjectMetadataBuildState<'_>,
+        limits: &AssetLoadLimits,
+    ) -> Result<()> {
+        let manager = self.serialized_files[file_index]
+            .file
+            .read_resource_manager_metadata(object_index, limits.container_metadata)?;
+        for entry in manager.container {
+            charge_container_assignment(state.assignment_count, limits)?;
+            if let Some(target) = self.resolve_object_reference(file_index, entry.asset) {
+                state
+                    .metadata
+                    .entry_mut(target, state.index_budget, limits)?
+                    .container = Some(Arc::from(entry.key));
+            }
         }
         Ok(())
     }

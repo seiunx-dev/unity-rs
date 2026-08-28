@@ -146,30 +146,7 @@ def derived(path: Path) -> list[str]:
                 f"chunk {seen[-1]} declares {size} bytes but only {len(body)} remain"
             )
         if identifier == b"fmt ":
-            if size < 16:
-                raise Invalid(f"the fmt chunk is {size} bytes, shorter than PCM's 16")
-            (
-                audio_format,
-                channels,
-                rate,
-                byte_rate,
-                block_align,
-                bits,
-            ) = struct.unpack_from("<HHIIHH", body, 0)
-            if audio_format != 1:
-                raise Invalid(f"fmt declares format {audio_format}, not PCM")
-            expected_block = channels * bits // 8
-            if block_align != expected_block:
-                raise Invalid(
-                    f"block alignment is {block_align}; "
-                    f"{channels} channels at {bits} bits imply {expected_block}"
-                )
-            expected_rate = rate * expected_block
-            if byte_rate != expected_rate:
-                raise Invalid(
-                    f"byte rate is {byte_rate}; "
-                    f"{rate}Hz at {expected_block} bytes per frame imply {expected_rate}"
-                )
+            validate_format_chunk(body, size)
         elif identifier == b"data" and at + 8 + size != len(data):
             raise Invalid(
                 f"the data chunk ends at {at + 8 + size} of {len(data)} bytes"
@@ -180,6 +157,28 @@ def derived(path: Path) -> list[str]:
         if required not in seen:
             raise Invalid(f"the file has no {required} chunk")
     return [f"chunks {'/'.join(seen)}, byte rate and block alignment consistent"]
+
+
+def validate_format_chunk(body: bytes, size: int) -> None:
+    if size < 16:
+        raise Invalid(f"the fmt chunk is {size} bytes, shorter than PCM's 16")
+    audio_format, channels, rate, byte_rate, block_align, bits = struct.unpack_from(
+        "<HHIIHH", body, 0
+    )
+    if audio_format != 1:
+        raise Invalid(f"fmt declares format {audio_format}, not PCM")
+    expected_block = channels * bits // 8
+    if block_align != expected_block:
+        raise Invalid(
+            f"block alignment is {block_align}; "
+            f"{channels} channels at {bits} bits imply {expected_block}"
+        )
+    expected_rate = rate * expected_block
+    if byte_rate != expected_rate:
+        raise Invalid(
+            f"byte rate is {byte_rate}; "
+            f"{rate}Hz at {expected_block} bytes per frame imply {expected_rate}"
+        )
 
 
 def export_and_validate() -> int:

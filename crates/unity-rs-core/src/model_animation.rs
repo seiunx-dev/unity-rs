@@ -17,6 +17,7 @@ use crate::animation_clip::{
 use crate::animation_graph::AnimationGraph;
 use crate::fbx_scene_ascii::quaternion_to_euler_degrees;
 use crate::loader::AssetCollection;
+use crate::mesh::MeshBlendShapeChannel;
 use crate::model_ir::ModelIr;
 use crate::renderer::SKINNED_MESH_RENDERER_CLASS_ID;
 use crate::scene_hierarchy::SceneObjectKey;
@@ -610,55 +611,17 @@ impl BlendShapeIndex {
                     continue;
                 };
                 for channel in &shapes.channels {
-                    if targets.len() >= maximum_channels {
-                        return Err(Error::invalid_data(format!(
-                            "model blend-shape channels exceed limit {maximum_channels}"
-                        )));
-                    }
-                    let exported = channel.name.rsplit('.').next().unwrap_or(&channel.name);
-                    if exported.len() > maximum_name_bytes {
-                        return Err(Error::invalid_data(format!(
-                            "blend-shape channel name is {} bytes, exceeding limit {maximum_name_bytes}",
-                            exported.len()
-                        )));
-                    }
-                    total_string_bytes = total_string_bytes
-                        .checked_add(exported.len())
-                        .ok_or_else(|| {
-                            Error::invalid_data("blend-shape string budget overflowed")
-                        })?;
-                    if total_string_bytes > maximum_string_bytes {
-                        return Err(Error::invalid_data(format!(
-                            "blend-shape strings use {total_string_bytes} bytes, exceeding remaining limit {maximum_string_bytes}"
-                        )));
-                    }
-                    let target = targets.len();
-                    targets.try_reserve(1).map_err(|error| {
-                        Error::invalid_data(format!("cannot grow blend-shape targets: {error}"))
-                    })?;
-                    by_node_hash.try_reserve(2).map_err(|error| {
-                        Error::invalid_data(format!("cannot grow blend-shape lookup: {error}"))
-                    })?;
-                    by_hash.try_reserve(2).map_err(|error| {
-                        Error::invalid_data(format!(
-                            "cannot grow global blend-shape lookup: {error}"
-                        ))
-                    })?;
-                    targets.push(BlendShapeTarget {
-                        node: node.object,
-                        channel: fallible_string(exported, "blend-shape channel")?,
-                    });
-                    for hash in [
-                        blend_shape_crc32(&channel.name),
-                        blend_shape_crc32(exported),
-                    ] {
-                        by_node_hash.push(BlendShapeLookup {
-                            node: node.object,
-                            hash,
-                            target,
-                        });
-                        by_hash.push((hash, target));
-                    }
+                    append_blend_shape_channel(
+                        node.object,
+                        channel,
+                        maximum_channels,
+                        maximum_name_bytes,
+                        maximum_string_bytes,
+                        &mut total_string_bytes,
+                        &mut targets,
+                        &mut by_node_hash,
+                        &mut by_hash,
+                    )?;
                 }
             }
         }
@@ -689,6 +652,62 @@ impl BlendShapeIndex {
             .filter(|entry| entry.0 == hash)
             .map(|entry| entry.1)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_blend_shape_channel(
+    node: SceneObjectKey,
+    channel: &MeshBlendShapeChannel,
+    maximum_channels: usize,
+    maximum_name_bytes: usize,
+    maximum_string_bytes: usize,
+    total_string_bytes: &mut usize,
+    targets: &mut Vec<BlendShapeTarget>,
+    by_node_hash: &mut Vec<BlendShapeLookup>,
+    by_hash: &mut Vec<(u32, usize)>,
+) -> Result<()> {
+    if targets.len() >= maximum_channels {
+        return Err(Error::invalid_data(format!(
+            "model blend-shape channels exceed limit {maximum_channels}"
+        )));
+    }
+    let exported = channel.name.rsplit('.').next().unwrap_or(&channel.name);
+    if exported.len() > maximum_name_bytes {
+        return Err(Error::invalid_data(format!(
+            "blend-shape channel name is {} bytes, exceeding limit {maximum_name_bytes}",
+            exported.len()
+        )));
+    }
+    *total_string_bytes = total_string_bytes
+        .checked_add(exported.len())
+        .ok_or_else(|| Error::invalid_data("blend-shape string budget overflowed"))?;
+    if *total_string_bytes > maximum_string_bytes {
+        return Err(Error::invalid_data(format!(
+            "blend-shape strings use {total_string_bytes} bytes, exceeding remaining limit {maximum_string_bytes}"
+        )));
+    }
+    let target = targets.len();
+    targets.try_reserve(1).map_err(|error| {
+        Error::invalid_data(format!("cannot grow blend-shape targets: {error}"))
+    })?;
+    by_node_hash
+        .try_reserve(2)
+        .map_err(|error| Error::invalid_data(format!("cannot grow blend-shape lookup: {error}")))?;
+    by_hash.try_reserve(2).map_err(|error| {
+        Error::invalid_data(format!("cannot grow global blend-shape lookup: {error}"))
+    })?;
+    targets.push(BlendShapeTarget {
+        node,
+        channel: fallible_string(exported, "blend-shape channel")?,
+    });
+    for hash in [
+        blend_shape_crc32(&channel.name),
+        blend_shape_crc32(exported),
+    ] {
+        by_node_hash.push(BlendShapeLookup { node, hash, target });
+        by_hash.push((hash, target));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2328,7 +2347,6 @@ fn radix_sort_path_entries(
     key: PathRadixKey,
     stack: &mut Vec<PathSortRange>,
 ) -> Result<()> {
-    const BUCKETS: usize = 257;
     stack.clear();
     if indices.len() > 1 {
         stack.push(PathSortRange {
@@ -2338,52 +2356,90 @@ fn radix_sort_path_entries(
         });
     }
     while let Some(range) = stack.pop() {
-        let mut counts = [0_usize; BUCKETS];
-        for entry_index in &indices[range.start..range.end] {
-            let bucket = path_radix_bucket(entries, name_starts, *entry_index, range.depth, key);
-            counts[bucket] += 1;
-        }
-        let mut starts = [0_usize; BUCKETS];
-        let mut ends = [0_usize; BUCKETS];
-        let mut cursor = range.start;
-        for bucket in 0..BUCKETS {
-            starts[bucket] = cursor;
-            cursor = cursor.checked_add(counts[bucket]).ok_or_else(|| {
-                Error::invalid_data("animation path radix bucket range overflowed")
-            })?;
-            ends[bucket] = cursor;
-        }
-        let mut next = starts;
-        for bucket in 0..BUCKETS {
-            while next[bucket] < ends[bucket] {
-                let position = next[bucket];
-                let current =
-                    path_radix_bucket(entries, name_starts, indices[position], range.depth, key);
-                if current == bucket {
-                    next[bucket] += 1;
-                } else {
-                    let target = next[current];
-                    if target >= ends[current] {
-                        return Err(Error::invalid_data(
-                            "animation path radix distribution became inconsistent",
-                        ));
-                    }
-                    indices.swap(position, target);
-                    next[current] += 1;
-                }
+        let (starts, ends) = path_radix_ranges(indices, entries, name_starts, range, key)?;
+        distribute_path_radix_range(indices, entries, name_starts, range, key, &starts, &ends)?;
+        push_path_radix_children(stack, range, &starts, &ends)?;
+    }
+    Ok(())
+}
+
+const PATH_RADIX_BUCKETS: usize = 257;
+
+fn path_radix_ranges(
+    indices: &[usize],
+    entries: &[ModelPathEntry],
+    name_starts: &[usize],
+    range: PathSortRange,
+    key: PathRadixKey,
+) -> Result<([usize; PATH_RADIX_BUCKETS], [usize; PATH_RADIX_BUCKETS])> {
+    let mut counts = [0_usize; PATH_RADIX_BUCKETS];
+    for entry_index in &indices[range.start..range.end] {
+        let bucket = path_radix_bucket(entries, name_starts, *entry_index, range.depth, key);
+        counts[bucket] += 1;
+    }
+    let mut starts = [0_usize; PATH_RADIX_BUCKETS];
+    let mut ends = [0_usize; PATH_RADIX_BUCKETS];
+    let mut cursor = range.start;
+    for bucket in 0..PATH_RADIX_BUCKETS {
+        starts[bucket] = cursor;
+        cursor = cursor
+            .checked_add(counts[bucket])
+            .ok_or_else(|| Error::invalid_data("animation path radix bucket range overflowed"))?;
+        ends[bucket] = cursor;
+    }
+    Ok((starts, ends))
+}
+
+fn distribute_path_radix_range(
+    indices: &mut [usize],
+    entries: &[ModelPathEntry],
+    name_starts: &[usize],
+    range: PathSortRange,
+    key: PathRadixKey,
+    starts: &[usize; PATH_RADIX_BUCKETS],
+    ends: &[usize; PATH_RADIX_BUCKETS],
+) -> Result<()> {
+    let mut next = *starts;
+    for bucket in 0..PATH_RADIX_BUCKETS {
+        while next[bucket] < ends[bucket] {
+            let position = next[bucket];
+            let current =
+                path_radix_bucket(entries, name_starts, indices[position], range.depth, key);
+            if current == bucket {
+                next[bucket] += 1;
+                continue;
             }
-        }
-        for bucket in (1..BUCKETS).rev() {
-            if ends[bucket] - starts[bucket] > 1 {
-                stack.push(PathSortRange {
-                    start: starts[bucket],
-                    end: ends[bucket],
-                    depth: range.depth.checked_add(1).ok_or_else(|| {
-                        Error::invalid_data("animation path radix depth overflowed")
-                    })?,
-                });
+            let target = next[current];
+            if target >= ends[current] {
+                return Err(Error::invalid_data(
+                    "animation path radix distribution became inconsistent",
+                ));
             }
+            indices.swap(position, target);
+            next[current] += 1;
         }
+    }
+    Ok(())
+}
+
+fn push_path_radix_children(
+    stack: &mut Vec<PathSortRange>,
+    range: PathSortRange,
+    starts: &[usize; PATH_RADIX_BUCKETS],
+    ends: &[usize; PATH_RADIX_BUCKETS],
+) -> Result<()> {
+    for bucket in (1..PATH_RADIX_BUCKETS).rev() {
+        if ends[bucket] - starts[bucket] <= 1 {
+            continue;
+        }
+        stack.push(PathSortRange {
+            start: starts[bucket],
+            end: ends[bucket],
+            depth: range
+                .depth
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_data("animation path radix depth overflowed"))?,
+        });
     }
     Ok(())
 }

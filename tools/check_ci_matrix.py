@@ -133,36 +133,33 @@ def run_commands(block: str) -> list[str]:
     commands: list[str] = []
     index = 0
     while index < len(lines):
-        line = lines[index]
-        prefix = "        run:"
-        if not line.startswith(prefix):
+        if not lines[index].startswith("        run:"):
             index += 1
             continue
-
-        value = line.removeprefix(prefix).strip()
-        if value not in {"|", "|-", "|+", ">", ">-", ">+"}:
-            if value and not value.startswith("#"):
-                commands.append(value)
-            index += 1
-            continue
-
-        folded = value.startswith(">")
-        block_lines: list[str] = []
-        index += 1
-        while index < len(lines):
-            child = lines[index]
-            if child.strip() and len(child) - len(child.lstrip()) <= 8:
-                break
-            command = child.strip()
-            if command and not command.startswith("#"):
-                block_lines.append(command)
-            index += 1
-        if folded:
-            if block_lines:
-                commands.append(" ".join(block_lines))
-        else:
-            commands.extend(block_lines)
+        step_commands, index = run_step_commands(lines, index)
+        commands.extend(step_commands)
     return commands
+
+
+def run_step_commands(lines: list[str], index: int) -> tuple[list[str], int]:
+    value = lines[index].removeprefix("        run:").strip()
+    if value not in {"|", "|-", "|+", ">", ">-", ">+"}:
+        commands = [value] if value and not value.startswith("#") else []
+        return commands, index + 1
+
+    block_lines: list[str] = []
+    index += 1
+    while index < len(lines):
+        child = lines[index]
+        if child.strip() and len(child) - len(child.lstrip()) <= 8:
+            break
+        command = child.strip()
+        if command and not command.startswith("#"):
+            block_lines.append(command)
+        index += 1
+    if value.startswith(">"):
+        return ([" ".join(block_lines)] if block_lines else []), index
+    return block_lines, index
 
 
 def command_matches(command: str, required: str) -> bool:
@@ -205,43 +202,49 @@ def validate_platform_job(workflow: str, job_name: str) -> None:
         "package-node": {"os", "artifact"},
     }[job_name]
     for entry in entries:
-        if set(entry) != required_entry_keys:
-            raise AuditError(
-                f"{job_name} matrix entry has unexpected keys: {sorted(entry)}"
-            )
-        if job_name == "python":
-            # Linux wheels must cross-link against the manylinux_2_28 floor
-            # through zig; every other platform keeps maturin's host audit.
-            # Building Linux wheels on the bare runner tags them with its own
-            # glibc (manylinux_2_35 observed), excluding older distributions.
-            linux = entry["artifact"].startswith("linux-")
-            expected_compatibility = "manylinux_2_28" if linux else "pypi"
-            expected_flags = "--zig" if linux else ""
-            if (
-                entry["wheel_compatibility"].strip('"') != expected_compatibility
-                or entry["wheel_flags"].strip('"') != expected_flags
-            ):
-                raise AuditError(
-                    "python wheels must pin their manylinux posture for "
-                    f"{entry['artifact']}: {entry}"
-                )
-        if job_name == "package-cli":
-            windows = entry["artifact"].startswith("windows-")
-            expected_binary = (
-                "target/release/unity-rs.exe"
-                if windows
-                else "target/release/unity-rs"
-            )
-            expected_smoke = (
-                ".\\target\\release\\artifact\\unity-rs.exe --help"
-                if windows
-                else "./target/release/artifact/unity-rs --help"
-            )
-            if entry["binary"] != expected_binary or entry["smoke"] != expected_smoke:
-                raise AuditError(
-                    "package-cli must smoke-test the staged binary for "
-                    f"{entry['artifact']}: {entry}"
-                )
+        validate_platform_entry(job_name, entry, required_entry_keys)
+
+
+def validate_platform_entry(
+    job_name: str, entry: dict[str, str], required_keys: set[str]
+) -> None:
+    if set(entry) != required_keys:
+        raise AuditError(f"{job_name} matrix entry has unexpected keys: {sorted(entry)}")
+    if job_name == "python":
+        validate_python_entry(entry)
+    elif job_name == "package-cli":
+        validate_cli_entry(entry)
+
+
+def validate_python_entry(entry: dict[str, str]) -> None:
+    # Linux wheels must cross-link against the manylinux_2_28 floor through
+    # zig; every other platform keeps maturin's host audit.
+    linux = entry["artifact"].startswith("linux-")
+    expected_compatibility = "manylinux_2_28" if linux else "pypi"
+    expected_flags = "--zig" if linux else ""
+    if (
+        entry["wheel_compatibility"].strip('"') != expected_compatibility
+        or entry["wheel_flags"].strip('"') != expected_flags
+    ):
+        raise AuditError(
+            "python wheels must pin their manylinux posture for "
+            f"{entry['artifact']}: {entry}"
+        )
+
+
+def validate_cli_entry(entry: dict[str, str]) -> None:
+    windows = entry["artifact"].startswith("windows-")
+    expected_binary = "target/release/unity-rs.exe" if windows else "target/release/unity-rs"
+    expected_smoke = (
+        ".\\target\\release\\artifact\\unity-rs.exe --help"
+        if windows
+        else "./target/release/artifact/unity-rs --help"
+    )
+    if entry["binary"] != expected_binary or entry["smoke"] != expected_smoke:
+        raise AuditError(
+            "package-cli must smoke-test the staged binary for "
+            f"{entry['artifact']}: {entry}"
+        )
 
 
 def validate_workflow(workflow: str) -> None:
