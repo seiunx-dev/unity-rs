@@ -6,7 +6,9 @@ const os = require('node:os')
 const path = require('node:path')
 const addon = require('../index.js')
 
-assert.deepStrictEqual(Object.keys(addon).sort(), ['UnityRs'])
+const compareNames = (left, right) => left.localeCompare(right, 'en')
+
+assert.deepStrictEqual(Object.keys(addon).sort(compareNames), ['UnityRs'])
 
 function u32(value) {
   const output = Buffer.alloc(4)

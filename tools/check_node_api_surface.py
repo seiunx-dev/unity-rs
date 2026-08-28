@@ -211,11 +211,24 @@ def braced_block(source: str, marker: str) -> str:
     raise AuditError(f"source does not close the block after {marker!r}")
 
 
+def associated_type(block: str, name: str) -> str | None:
+    """Return a simple Rust associated type without regex backtracking."""
+    expected = f"type {name}"
+    for line in block.splitlines():
+        left, separator, right = line.strip().partition("=")
+        if not separator or left.strip() != expected:
+            continue
+        value = right.strip()
+        if value.endswith(";"):
+            return value.removesuffix(";").strip()
+    return None
+
+
 def validate_live2d_worker_projection(rust_source: str) -> None:
     """Keep unbounded package-table projection off the Node event loop."""
     task = braced_block(rust_source, "impl Task for Live2dPackagesWithAclTask")
-    output = re.search(r"\btype Output\s*=\s*([^;]+);", task)
-    if output is None or output.group(1).strip() != "Live2dPackageSet":
+    output = associated_type(task, "Output")
+    if output != "Live2dPackageSet":
         raise AuditError(
             "Live2dPackagesWithAclTask must return the projected Live2dPackageSet "
             "from its worker"
@@ -237,8 +250,8 @@ def validate_live2d_worker_projection(rust_source: str) -> None:
 def validate_texture_array_worker_projection(rust_source: str) -> None:
     """Keep the fallible multi-layer result projection off the Node event loop."""
     task = braced_block(rust_source, "impl Task for ReadTextureArrayTask")
-    output = re.search(r"\btype Output\s*=\s*([^;]+);", task)
-    if output is None or output.group(1).strip() != "DisplayRowImages":
+    output = associated_type(task, "Output")
+    if output != "DisplayRowImages":
         raise AuditError(
             "ReadTextureArrayTask must return the worker-projected DisplayRowImages"
         )
@@ -298,8 +311,7 @@ def declaration_symbols(source: str) -> tuple[set[str], set[str], set[str]]:
     properties: set[str] = set()
     for line in class_block.splitlines():
         match = re.match(
-            r"\s*(?:(static|get) )?([A-Za-z_$][A-Za-z0-9_$]*|constructor)\(",
-            line,
+            r"[ \t]*(?:(static|get) )?([A-Za-z_$][A-Za-z0-9_$]*)\(", line
         )
         if match is None:
             continue

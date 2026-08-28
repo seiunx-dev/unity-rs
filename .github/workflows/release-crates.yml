@@ -39,7 +39,7 @@ jobs:
           restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
 
       - name: Validate release input and credential
         shell: bash

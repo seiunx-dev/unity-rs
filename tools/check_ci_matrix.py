@@ -31,6 +31,21 @@ class AuditError(ValueError):
     """The checked workflow no longer proves the documented release shape."""
 
 
+def mapping_member(line: str, prefix: str) -> tuple[str, str] | None:
+    """Parse the small ``key: value`` subset used by matrix entries."""
+    if not line.startswith(prefix):
+        return None
+    key, separator, value = line.removeprefix(prefix).partition(":")
+    value = value.strip()
+    if (
+        not separator
+        or re.fullmatch(r"[A-Za-z0-9_-]+", key) is None
+        or not value
+    ):
+        return None
+    return key, value
+
+
 def job_block(workflow: str, job_name: str) -> str:
     lines = workflow.splitlines()
     start = next(
@@ -62,14 +77,15 @@ def matrix_entries(block: str, job_name: str) -> list[dict[str, str]]:
     for line in lines[include + 1 :]:
         if line == "    steps:":
             break
-        first = re.fullmatch(r"          - ([A-Za-z0-9_-]+):\s*(.+)", line)
-        member = re.fullmatch(r"            ([A-Za-z0-9_-]+):\s*(.+)", line)
-        if first:
+        first = mapping_member(line, "          - ")
+        member = mapping_member(line, "            ")
+        if first is not None:
             if current is not None:
                 entries.append(current)
-            current = {first.group(1): first.group(2)}
-        elif member and current is not None:
-            key, value = member.groups()
+            key, value = first
+            current = {key: value}
+        elif member is not None and current is not None:
+            key, value = member
             if key in current:
                 raise AuditError(f"{job_name} matrix entry repeats key {key!r}")
             current[key] = value
@@ -107,12 +123,12 @@ def run_commands(block: str) -> list[str]:
     index = 0
     while index < len(lines):
         line = lines[index]
-        match = re.fullmatch(r"        run:\s*(.*)", line)
-        if match is None:
+        prefix = "        run:"
+        if not line.startswith(prefix):
             index += 1
             continue
 
-        value = match.group(1).strip()
+        value = line.removeprefix(prefix).strip()
         if value not in {"|", "|-", "|+", ">", ">-", ">+"}:
             if value and not value.startswith("#"):
                 commands.append(value)
@@ -257,6 +273,7 @@ def validate_workflow(workflow: str) -> None:
         node_block,
         "package-node",
         (
+            "npm ci --ignore-scripts",
             "npm run build",
             "npm test",
             "npm run test:package",
@@ -278,7 +295,7 @@ def validate_workflow(workflow: str) -> None:
             "uses: actions/download-artifact@v8",
             "pattern: unity-rs-python-*",
             "merge-multiple: true",
-            "uses: pypa/gh-action-pypi-publish@release/v1",
+            "uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
             "packages-dir: dist/",
         ),
     )
@@ -291,6 +308,11 @@ def validate_workflow(workflow: str) -> None:
         raise AuditError("CI workflow still uses the obsolete upload-artifact@v4")
     if workflow.count("uses: actions/upload-artifact@v7") != 5:
         raise AuditError("CI workflow must upload all five release artifact groups with v7")
+    require_run_commands(
+        job_block(workflow, "node"),
+        "node",
+        ("npm ci --ignore-scripts",),
+    )
     require_run_commands(
         job_block(workflow, "quality"),
         "quality",

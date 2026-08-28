@@ -249,9 +249,18 @@ class CiMatrixAuditTests(unittest.TestCase):
 
     def test_missing_pypi_trusted_publisher_is_rejected(self) -> None:
         altered = self.workflow.replace(
-            "        uses: pypa/gh-action-pypi-publish@release/v1\n",
+            "        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1\n",
             "",
             1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
+    def test_node_installs_must_disable_lifecycle_scripts(self) -> None:
+        altered = self.workflow.replace(
+            "        run: npm ci --ignore-scripts\n",
+            "        run: npm ci\n",
         )
         self.assertNotEqual(altered, self.workflow)
         with self.assertRaises(check_ci_matrix.AuditError):

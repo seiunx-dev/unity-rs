@@ -418,7 +418,7 @@ def groups(interpreter: str) -> list[Group]:
         Group(
             "node",
             [
-                Step("install", ["npm", "ci"], cwd=NODE),
+                Step("install", ["npm", "ci", "--ignore-scripts"], cwd=NODE),
                 Step("build addon", ["npm", "run", "build:debug"], cwd=NODE),
                 Step("addon tests", ["npm", "test"], cwd=NODE),
                 Step("package contents", ["npm", "run", "test:package"], cwd=NODE),
@@ -603,7 +603,8 @@ def linux_node_command(node_architecture: str, addon_architecture: str) -> str:
     archive = f"node-v{LINUX_NODE_VERSION}-linux-{node_architecture}"
     return (
         f"{LINUX_SETUP} && apt-get install -y -qq curl xz-utils >/dev/null"
-        f" && curl -fsSL https://nodejs.org/dist/v{LINUX_NODE_VERSION}"
+        f" && curl --proto '=https' --proto-redir '=https' -fsSL"
+        f" https://nodejs.org/dist/v{LINUX_NODE_VERSION}"
         f"/{archive}.tar.xz -o /tmp/node.tar.xz"
         " && tar -xJf /tmp/node.tar.xz -C /tmp"
         f" && export PATH=/tmp/{archive}/bin:$PATH"
@@ -613,7 +614,7 @@ def linux_node_command(node_architecture: str, addon_architecture: str) -> str:
         " && tar --exclude=.git --exclude=target --exclude=node_modules"
         " --exclude='*.node' -C /src -cf - . | tar -C /tmp/repository -xf -"
         " && cd /tmp/repository/crates/unity-rs-node"
-        " && npm ci --silent && npm run build"
+        " && npm ci --silent --ignore-scripts && npm run build"
         f" && test -f unity-rs-node.linux-{addon_architecture}-gnu.node"
         " && npm test && npm run test:package"
         " && mkdir /tmp/node-pack"

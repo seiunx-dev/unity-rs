@@ -20,6 +20,7 @@ env:
   CARGO_TERM_COLOR: always
   MATURIN_VERSION: "1.13.3"
   MYPY_VERSION: "1.18.2"
+  UNITYPY_VERSION: "1.25.0"
   VGMSTREAM_VERSION: "r2117"
 
 jobs:
@@ -205,7 +206,7 @@ jobs:
           cache: npm
           cache-dependency-path: crates/unity-rs-node/package-lock.json
       - name: Install locked Node build tooling
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Build the native Node-API addon and TypeScript declarations
         run: npm run build:debug
       - name: Run installed-addon API tests
@@ -414,7 +415,7 @@ jobs:
       # its output shows up as a deliberate bump here.
       - name: Install the vgmstream decoder oracle
         run: |
-          curl -fsSL -o vgmstream.zip \
+          curl --proto '=https' --proto-redir '=https' -fsSL -o vgmstream.zip \
             https://github.com/vgmstream/vgmstream/releases/download/${{ env.VGMSTREAM_VERSION }}/vgmstream-linux.zip
           mkdir -p "$HOME/.local/bin"
           unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"
@@ -461,7 +462,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install the wheel builder and the reference implementation
-        run: python -m pip install "maturin==${{ env.MATURIN_VERSION }}" UnityPy
+        run: python -m pip install "maturin==${{ env.MATURIN_VERSION }}" "UnityPy==${{ env.UNITYPY_VERSION }}"
       - name: Build and install this package
         run: |
           maturin build --release --locked --interpreter "${{ steps.build-python.outputs.python-path }}" --out dist
@@ -583,7 +584,7 @@ jobs:
           cache: npm
           cache-dependency-path: crates/unity-rs-node/package-lock.json
       - name: Install locked Node build tooling
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Build release Node-API addon
         run: npm run build
       - name: Test the exact release addon
@@ -666,6 +667,6 @@ jobs:
           PY
 
       - name: Publish distributions with Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist/

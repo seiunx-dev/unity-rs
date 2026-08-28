@@ -33,11 +33,18 @@ OBJECT_TYPE = re.compile(r'^\s*ObjectType:\s*"([^"]+)"\s*\{\s*Count:\s*(\d+)\s*\
 OBJECT_ENTRY = re.compile(r"^\s*([A-Za-z]+):\s*(-?\d+),\s*\"")
 CONNECTION = re.compile(r'^\s*C:\s*"(\w+)",\s*(-?\d+),\s*(-?\d+)')
 ARRAY_HEADER = re.compile(r"^\s*([A-Za-z]+):\s*\*(\d+)\s*\{")
-ARRAY_VALUES = re.compile(r"^\s*a:\s*(.*)$")
 
 
 class Invalid(Exception):
     pass
+
+
+def array_values(line: str) -> str | None:
+    """Return an FBX array payload without an ambiguous whitespace regex."""
+    stripped = line.lstrip()
+    if not stripped.startswith("a:"):
+        return None
+    return stripped.removeprefix("a:").lstrip()
 
 
 def validate(path: Path) -> list[str]:
@@ -92,15 +99,15 @@ def validate(path: Path) -> list[str]:
         if match:
             name, count = match.group(1), int(match.group(2))
             values_line = lines[index + 1] if index + 1 < len(lines) else ""
-            values_match = ARRAY_VALUES.match(values_line)
+            values = array_values(values_line)
             if count == 0:
                 # An empty array may omit its `a:` line entirely.
-                if values_match and values_match.group(1).strip():
+                if values is not None and values.strip():
                     raise Invalid(f"{name} declares *0 but carries values")
             else:
-                if not values_match:
+                if values is None:
                     raise Invalid(f"{name} declares *{count} but has no values line")
-                present = len([v for v in values_match.group(1).split(",") if v.strip()])
+                present = len([value for value in values.split(",") if value.strip()])
                 if present != count:
                     raise Invalid(f"{name} declares *{count} but holds {present} values")
         index += 1

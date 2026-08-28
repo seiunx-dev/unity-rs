@@ -15,6 +15,10 @@ const functionOwnProperties = new Set([
   "prototype",
 ]);
 
+function compareNames(left, right) {
+  return left.localeCompare(right, "en");
+}
+
 function declaredUnityRsSurface(source) {
   const lines = source.split(/\r?\n/u);
   const start = lines.indexOf("export declare class UnityRs {");
@@ -32,16 +36,16 @@ function declaredUnityRsSurface(source) {
     else instanceMethods.push(name);
   }
   return {
-    staticMethods: staticMethods.sort(),
-    instanceMethods: instanceMethods.sort(),
-    getters: getters.sort(),
+    staticMethods: staticMethods.sort(compareNames),
+    instanceMethods: instanceMethods.sort(compareNames),
+    getters: getters.sort(compareNames),
   };
 }
 
 function runtimeUnityRsSurface(unityRs) {
   const staticMethods = Object.getOwnPropertyNames(unityRs)
     .filter((name) => !functionOwnProperties.has(name))
-    .sort();
+    .sort(compareNames);
   const instanceMethods = [];
   const getters = [];
   for (const name of Object.getOwnPropertyNames(unityRs.prototype)) {
@@ -53,8 +57,8 @@ function runtimeUnityRsSurface(unityRs) {
   }
   return {
     staticMethods,
-    instanceMethods: instanceMethods.sort(),
-    getters: getters.sort(),
+    instanceMethods: instanceMethods.sort(compareNames),
+    getters: getters.sort(compareNames),
   };
 }
 
