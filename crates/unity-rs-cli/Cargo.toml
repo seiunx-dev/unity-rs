@@ -13,7 +13,7 @@ name = "unity-rs"
 path = "src/main.rs"
 
 [dependencies]
-unity-rs-core = { version = "0.5.0", path = "../unity-rs-core" }
+unity-rs-core = { version = "0.5.1", path = "../unity-rs-core" }
 
 [lints]
 workspace = true
