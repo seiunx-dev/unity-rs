@@ -400,8 +400,8 @@ def groups(interpreter: str) -> list[Group]:
                         [
                             "docker", "run", "--rm",
                             "--platform", f"linux/{architecture}",
-                            "-v", f"{ROOT}:/src:ro", "-w", "/tmp",
-                            "-e", f"CARGO_TARGET_DIR=/tmp/target-node-{architecture}",
+                            "-v", f"{ROOT}:/src:ro", "-w", "/work",
+                            "-e", f"CARGO_TARGET_DIR=/work/target-node-{architecture}",
                             LINUX_IMAGE,
                             "sh", "-c", linux_node_command(node_architecture, addon_architecture),
                         ],
@@ -605,21 +605,21 @@ def linux_node_command(node_architecture: str, addon_architecture: str) -> str:
         f"{LINUX_SETUP} && apt-get install -y -qq curl xz-utils >/dev/null"
         f" && curl --proto '=https' --proto-redir '=https' -fsSL"
         f" https://nodejs.org/dist/v{LINUX_NODE_VERSION}"
-        f"/{archive}.tar.xz -o /tmp/node.tar.xz"
-        " && tar -xJf /tmp/node.tar.xz -C /tmp"
-        f" && export PATH=/tmp/{archive}/bin:$PATH"
+        f"/{archive}.tar.xz -o /work/node.tar.xz"
+        " && tar -xJf /work/node.tar.xz -C /work"
+        f" && export PATH=/work/{archive}/bin:$PATH"
         # Build from a clean copy: the read-only mounted host tree may already
         # contain its own platform addon, which must not leak into this package.
-        " && mkdir /tmp/repository"
+        " && mkdir /work/repository"
         " && tar --exclude=.git --exclude=target --exclude=node_modules"
-        " --exclude='*.node' -C /src -cf - . | tar -C /tmp/repository -xf -"
-        " && cd /tmp/repository/crates/unity-rs-node"
+        " --exclude='*.node' -C /src -cf - . | tar -C /work/repository -xf -"
+        " && cd /work/repository/crates/unity-rs-node"
         " && npm ci --silent --ignore-scripts && npm run build"
         f" && test -f unity-rs-node.linux-{addon_architecture}-gnu.node"
         " && npm test && npm run test:package"
-        " && mkdir /tmp/node-pack"
-        " && npm pack --silent --pack-destination /tmp/node-pack >/dev/null"
-        " && test \"$(find /tmp/node-pack -maxdepth 1 -name '*.tgz' | wc -l)\" -eq 1"
+        " && mkdir /work/node-pack"
+        " && npm pack --silent --pack-destination /work/node-pack >/dev/null"
+        " && test \"$(find /work/node-pack -maxdepth 1 -name '*.tgz' | wc -l)\" -eq 1"
     )
 
 INSTALL_WHEEL = (

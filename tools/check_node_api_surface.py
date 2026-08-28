@@ -25,6 +25,8 @@ CORE_STUDIO = ROOT / "crates/unity-rs-core/src/studio.rs"
 NODE_RUST = ROOT / "crates/unity-rs-node/src/lib.rs"
 DECLARATIONS = ROOT / "crates/unity-rs-node/index.d.ts"
 CONSUMER = ROOT / "crates/unity-rs-node/tests/types.ts"
+NODE_READ_RESOURCE = "UnityRs.readResource"
+NODE_READ_RAW = "UnityRs.readRaw"
 
 # This table is intentionally independent of the Python mapping. Updating one
 # binding cannot silently classify another. Multiple streaming/materializing
@@ -44,10 +46,10 @@ CORE_TO_NODE = {
     "Studio.files": "UnityRs.filePage",
     "Studio.file": "UnityRs.filePage",
     "Studio.resources": "UnityRs.resourcePage",
-    "Studio.resource": "UnityRs.readResource",
+    "Studio.resource": NODE_READ_RESOURCE,
     "Studio.resource_by_path": "UnityRs.resourceIndexByPath",
     "Studio.objects": "UnityRs.objectPage",
-    "Studio.object": "UnityRs.readRaw",
+    "Studio.object": NODE_READ_RAW,
     "Studio.scene_hierarchy": "UnityRs.sceneWithLimits",
     "Studio.export": "UnityRs.exportWithOptions",
     "Studio.extract": "UnityRs.extract",
@@ -100,9 +102,9 @@ CORE_TO_NODE = {
     "StudioResource.index": "ResourceInfo.index",
     "StudioResource.path": "ResourceInfo.path",
     "StudioResource.byte_size": "ResourceInfo.byteSize",
-    "StudioResource.write": "UnityRs.readResource",
+    "StudioResource.write": NODE_READ_RESOURCE,
     "StudioResource.write_range": "UnityRs.readResourceRange",
-    "StudioResource.read": "UnityRs.readResource",
+    "StudioResource.read": NODE_READ_RESOURCE,
     "StudioResource.read_range": "UnityRs.readResourceRange",
     "StudioObject.file_index": "ObjectInfo.fileIndex",
     "StudioObject.object_index": "ObjectInfo.objectIndex",
@@ -112,8 +114,8 @@ CORE_TO_NODE = {
     "StudioObject.byte_size": "ObjectInfo.byteSize",
     "StudioObject.name": "ObjectInfo.name",
     "StudioObject.container": "ObjectInfo.container",
-    "StudioObject.write_raw": "UnityRs.readRaw",
-    "StudioObject.read_raw": "UnityRs.readRaw",
+    "StudioObject.write_raw": NODE_READ_RAW,
+    "StudioObject.read_raw": NODE_READ_RAW,
     "StudioObject.read_text_bytes": "UnityRs.readText",
     "StudioObject.read_shader_text": "UnityRs.readShader",
     "StudioObject.write_mesh_obj": "UnityRs.readMeshObj",
@@ -286,7 +288,7 @@ def rust_node_symbols(source: str) -> set[str]:
         "\n}\n\nimpl UnityRs {",
     )
     symbols: set[str] = set()
-    for name in re.findall(r"^\s*pub fn ([A-Za-z_][A-Za-z0-9_]*)", implementation, re.M):
+    for name in re.findall(r"^\s*pub fn ([A-Za-z_]\w*)", implementation, re.M | re.ASCII):
         javascript = "constructor" if name == "new" else snake_to_javascript(name)
         symbol = f"UnityRs.{javascript}"
         if symbol in symbols:
@@ -299,7 +301,7 @@ def rust_node_symbols(source: str) -> set[str]:
             f"pub struct {object_name} {{",
             "\n}",
         )
-        for field in re.findall(r"^\s*pub ([A-Za-z_][A-Za-z0-9_]*):", block, re.M):
+        for field in re.findall(r"^\s*pub ([A-Za-z_]\w*):", block, re.M | re.ASCII):
             symbols.add(f"{object_name}.{snake_to_javascript(field)}")
     return symbols
 

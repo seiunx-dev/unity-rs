@@ -1956,11 +1956,11 @@ fn copy_extraction_label(value: &str) -> Result<String> {
 fn extraction_backup_path(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
-        .and_then(|value| value.to_str())
+        .and_then(OsStr::to_str)
         .ok_or_else(|| Error::invalid_data("extraction temporary file name is not valid UTF-8"))?;
     let stem = Path::new(file_name)
         .file_stem()
-        .and_then(|value| value.to_str())
+        .and_then(OsStr::to_str)
         .ok_or_else(|| Error::invalid_data("extraction temporary file stem is not valid UTF-8"))?;
     let length = stem
         .len()

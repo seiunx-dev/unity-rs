@@ -20,6 +20,15 @@ CONSUMER = ROOT / "crates/unity-rs-python/tests/typecheck_api.py"
 CORE_STUDIO = ROOT / "crates/unity-rs-core/src/studio.rs"
 PYTHON_BINDING = ROOT / "crates/unity-rs-python/src/lib.rs"
 
+PY_READ_RESOURCE = "UnityRs.read_resource"
+PY_READ_RAW = "UnityRs.read_raw"
+PY_READ_FBX = "UnityRs.read_fbx"
+PY_READ_FBX_BINARY = "UnityRs.read_fbx_binary"
+PY_READ_GAME_OBJECT_FBX = "UnityRs.read_game_object_fbx"
+PY_READ_LIVE2D_PACKAGES = "UnityRs.read_live2d_packages"
+PY_DETACH = "py.detach"
+PY_BINARY_MATERIALIZATION = "materialize_binary_asset(asset, maximum_bytes)"
+
 # Every public high-level Rust method must either name the Python symbol that
 # represents it or be listed in INTENTIONAL_RUST_ONLY with a concrete ownership
 # reason.  Several Rust streaming ``write_*`` methods intentionally map to one
@@ -40,39 +49,39 @@ CORE_TO_PYTHON = {
     "Studio.files": "UnityRs.files",
     "Studio.file": "UnityRs.file_page",
     "Studio.resources": "UnityRs.resources",
-    "Studio.resource": "UnityRs.read_resource",
+    "Studio.resource": PY_READ_RESOURCE,
     "Studio.resource_by_path": "UnityRs.read_resource_by_path",
     "Studio.objects": "UnityRs.objects",
-    "Studio.object": "UnityRs.read_raw",
+    "Studio.object": PY_READ_RAW,
     "Studio.scene_hierarchy": "UnityRs.scene",
     "Studio.export": "UnityRs.export",
     "Studio.extract": "extract",
     "Studio.write_static_fbx": "UnityRs.read_static_fbx",
     "Studio.read_static_fbx": "UnityRs.read_static_fbx",
-    "Studio.write_fbx": "UnityRs.read_fbx",
-    "Studio.write_fbx_with_acl_decoder": "UnityRs.read_fbx",
+    "Studio.write_fbx": PY_READ_FBX,
+    "Studio.write_fbx_with_acl_decoder": PY_READ_FBX,
     "Studio.write_static_fbx_binary": "UnityRs.read_static_fbx_binary",
     "Studio.read_static_fbx_binary": "UnityRs.read_static_fbx_binary",
-    "Studio.write_fbx_binary": "UnityRs.read_fbx_binary",
-    "Studio.write_fbx_binary_with_acl_decoder": "UnityRs.read_fbx_binary",
-    "Studio.read_fbx_binary": "UnityRs.read_fbx_binary",
-    "Studio.read_fbx_binary_with_acl_decoder": "UnityRs.read_fbx_binary",
+    "Studio.write_fbx_binary": PY_READ_FBX_BINARY,
+    "Studio.write_fbx_binary_with_acl_decoder": PY_READ_FBX_BINARY,
+    "Studio.read_fbx_binary": PY_READ_FBX_BINARY,
+    "Studio.read_fbx_binary_with_acl_decoder": PY_READ_FBX_BINARY,
     "Studio.write_fbx_with_textures": "UnityRs.read_fbx_with_textures",
     "Studio.read_model_obj": "UnityRs.read_model_obj",
-    "Studio.read_fbx": "UnityRs.read_fbx",
-    "Studio.read_fbx_with_acl_decoder": "UnityRs.read_fbx",
+    "Studio.read_fbx": PY_READ_FBX,
+    "Studio.read_fbx_with_acl_decoder": PY_READ_FBX,
     "Studio.split_object_fbx_candidates": "UnityRs.split_object_fbx_candidates",
     "Studio.animator_fbx_candidates": "UnityRs.animator_fbx_candidates",
-    "Studio.write_game_object_fbx": "UnityRs.read_game_object_fbx",
-    "Studio.write_game_object_fbx_with_acl_decoder": "UnityRs.read_game_object_fbx",
-    "Studio.read_game_object_fbx": "UnityRs.read_game_object_fbx",
-    "Studio.read_game_object_fbx_with_acl_decoder": "UnityRs.read_game_object_fbx",
-    "Studio.live2d_packages": "UnityRs.read_live2d_packages",
-    "Studio.live2d_packages_with_schema_provider": "UnityRs.read_live2d_packages",
-    "Studio.live2d_packages_with_adapters": "UnityRs.read_live2d_packages",
-    "Studio.read_live2d_packages": "UnityRs.read_live2d_packages",
-    "Studio.read_live2d_packages_with_schema_provider": "UnityRs.read_live2d_packages",
-    "Studio.read_live2d_packages_with_adapters": "UnityRs.read_live2d_packages",
+    "Studio.write_game_object_fbx": PY_READ_GAME_OBJECT_FBX,
+    "Studio.write_game_object_fbx_with_acl_decoder": PY_READ_GAME_OBJECT_FBX,
+    "Studio.read_game_object_fbx": PY_READ_GAME_OBJECT_FBX,
+    "Studio.read_game_object_fbx_with_acl_decoder": PY_READ_GAME_OBJECT_FBX,
+    "Studio.live2d_packages": PY_READ_LIVE2D_PACKAGES,
+    "Studio.live2d_packages_with_schema_provider": PY_READ_LIVE2D_PACKAGES,
+    "Studio.live2d_packages_with_adapters": PY_READ_LIVE2D_PACKAGES,
+    "Studio.read_live2d_packages": PY_READ_LIVE2D_PACKAGES,
+    "Studio.read_live2d_packages_with_schema_provider": PY_READ_LIVE2D_PACKAGES,
+    "Studio.read_live2d_packages_with_adapters": PY_READ_LIVE2D_PACKAGES,
     "StudioFile.index": "FileInfo.index",
     "StudioFile.path": "FileInfo.path",
     "StudioFile.unity_version": "FileInfo.unity_version",
@@ -80,9 +89,9 @@ CORE_TO_PYTHON = {
     "StudioResource.index": "ResourceInfo.index",
     "StudioResource.path": "ResourceInfo.path",
     "StudioResource.byte_size": "ResourceInfo.byte_size",
-    "StudioResource.write": "UnityRs.read_resource",
+    "StudioResource.write": PY_READ_RESOURCE,
     "StudioResource.write_range": "UnityRs.read_resource_range",
-    "StudioResource.read": "UnityRs.read_resource",
+    "StudioResource.read": PY_READ_RESOURCE,
     "StudioResource.read_range": "UnityRs.read_resource_range",
     "StudioObject.file_index": "ObjectInfo.file_index",
     "StudioObject.object_index": "ObjectInfo.object_index",
@@ -92,8 +101,8 @@ CORE_TO_PYTHON = {
     "StudioObject.byte_size": "ObjectInfo.byte_size",
     "StudioObject.name": "ObjectInfo.name",
     "StudioObject.container": "ObjectInfo.container",
-    "StudioObject.write_raw": "UnityRs.read_raw",
-    "StudioObject.read_raw": "UnityRs.read_raw",
+    "StudioObject.write_raw": PY_READ_RAW,
+    "StudioObject.read_raw": PY_READ_RAW,
     "StudioObject.read_text_bytes": "UnityRs.read_text",
     "StudioObject.read_shader_text": "UnityRs.read_shader",
     "StudioObject.write_mesh_obj": "UnityRs.read_mesh_obj",
@@ -218,10 +227,10 @@ def validate_texture_gil_boundary(source: str) -> None:
     )
     for method_marker, conversion in expectations:
         method = rust_braced_block(source, method_marker)
-        detach_offset = method.find("py.detach")
+        detach_offset = method.find(PY_DETACH)
         if detach_offset < 0:
             raise AuditError(f"{method_marker[:-1]} does not release the GIL")
-        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        detached = rust_braced_block(method[detach_offset:], PY_DETACH)
         if conversion not in detached:
             raise AuditError(
                 f"{method_marker[:-1]} performs display-row conversion outside py.detach"
@@ -236,10 +245,10 @@ def validate_sprite_atlas_gil_boundary(source: str) -> None:
     """Keep input-amplifiable SpriteAtlas table projection outside the GIL."""
     method_marker = "fn read_sprite_atlas("
     method = rust_braced_block(source, method_marker)
-    detach_offset = method.find("py.detach")
+    detach_offset = method.find(PY_DETACH)
     if detach_offset < 0:
         raise AuditError("read_sprite_atlas does not release the GIL")
-    detached = rust_braced_block(method[detach_offset:], "py.detach")
+    detached = rust_braced_block(method[detach_offset:], PY_DETACH)
     preparation = "prepare_sprite_atlas(atlas)"
     if preparation not in detached:
         raise AuditError(
@@ -254,19 +263,19 @@ def validate_sprite_atlas_gil_boundary(source: str) -> None:
 
 PAYLOAD_GIL_EXPECTATIONS = (
     ("fn read_audio_clip(", "materialize_audio_clip(audio, format, maximum_bytes)"),
-    ("fn read_font(", "materialize_binary_asset(asset, maximum_bytes)"),
-    ("fn read_movie_texture(", "materialize_binary_asset(asset, maximum_bytes)"),
-    ("fn read_video_clip(", "materialize_binary_asset(asset, maximum_bytes)"),
+    ("fn read_font(", PY_BINARY_MATERIALIZATION),
+    ("fn read_movie_texture(", PY_BINARY_MATERIALIZATION),
+    ("fn read_video_clip(", PY_BINARY_MATERIALIZATION),
 )
 
 
 def validate_image_encode_gil_boundary(source: str) -> None:
     """Keep pixel-proportional image encoding inside the detached closure."""
     method = rust_braced_block(source, "fn encode<")
-    detach_offset = method.find("py.detach")
+    detach_offset = method.find(PY_DETACH)
     if detach_offset < 0:
         raise AuditError("RgbaImage.encode does not release the GIL")
-    detached = rust_braced_block(method[detach_offset:], "py.detach")
+    detached = rust_braced_block(method[detach_offset:], PY_DETACH)
     if "encode_rgba_image(" not in detached:
         raise AuditError("RgbaImage.encode encodes pixels outside py.detach")
 
@@ -275,10 +284,10 @@ def validate_payload_gil_boundary(source: str) -> None:
     """Keep source-bound byte materialization inside the detached closure."""
     for method_marker, materialization in PAYLOAD_GIL_EXPECTATIONS:
         method = rust_braced_block(source, method_marker)
-        detach_offset = method.find("py.detach")
+        detach_offset = method.find(PY_DETACH)
         if detach_offset < 0:
             raise AuditError(f"{method_marker[:-1]} does not release the GIL")
-        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        detached = rust_braced_block(method[detach_offset:], PY_DETACH)
         if materialization not in detached:
             raise AuditError(
                 f"{method_marker[:-1]} materializes its payload outside py.detach"
@@ -298,10 +307,10 @@ def validate_cubism_json_gil_boundary(source: str) -> None:
     """Keep bounded Cubism JSON production inside the detached closure."""
     for method_marker, preparation in CUBISM_JSON_GIL_EXPECTATIONS:
         method = rust_braced_block(source, method_marker)
-        detach_offset = method.find("py.detach")
+        detach_offset = method.find(PY_DETACH)
         if detach_offset < 0:
             raise AuditError(f"{method_marker[:-1]} does not release the GIL")
-        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        detached = rust_braced_block(method[detach_offset:], PY_DETACH)
         if preparation not in detached:
             raise AuditError(
                 f"{method_marker[:-1]} materializes Cubism JSON outside py.detach"
@@ -326,10 +335,10 @@ def validate_metadata_projection_gil_boundary(source: str) -> None:
     """Keep million-entry pure-Rust metadata projection outside the GIL."""
     for method_marker, preparation in METADATA_PROJECTION_GIL_EXPECTATIONS:
         method = rust_braced_block(source, method_marker)
-        detach_offset = method.find("py.detach")
+        detach_offset = method.find(PY_DETACH)
         if detach_offset < 0:
             raise AuditError(f"{method_marker[:-1]} does not release the GIL")
-        detached = rust_braced_block(method[detach_offset:], "py.detach")
+        detached = rust_braced_block(method[detach_offset:], PY_DETACH)
         if preparation not in detached:
             raise AuditError(
                 f"{method_marker[:-1]} projects metadata outside py.detach"
@@ -359,10 +368,10 @@ def validate_table_projection_gil_boundary(source: str) -> None:
     """Keep collection/report table projection outside the GIL."""
     for method_marker, preparation in TABLE_PROJECTION_GIL_EXPECTATIONS:
         method = rust_braced_block(source, method_marker)
-        detach_offset = method.find("py.detach")
+        detach_offset = method.find(PY_DETACH)
         if detach_offset < 0:
             raise AuditError(f"{method_marker[:-1]} does not release the GIL")
-        detached = rust_parenthesized_call(method[detach_offset:], "py.detach")
+        detached = rust_parenthesized_call(method[detach_offset:], PY_DETACH)
         if preparation not in detached:
             raise AuditError(
                 f"{method_marker[:-1]} projects its result table outside py.detach"

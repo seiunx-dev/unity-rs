@@ -58,7 +58,7 @@ def job_block(workflow: str, job_name: str) -> str:
         (
             index
             for index in range(start + 1, len(lines))
-            if re.fullmatch(r"  [A-Za-z0-9_-]+:", lines[index])
+            if re.fullmatch(r" {2}[A-Za-z0-9_-]+:", lines[index])
         ),
         len(lines),
     )
@@ -316,6 +316,8 @@ def validate_workflow(workflow: str) -> None:
             "python3 -m pip install",
             "cargo llvm-cov --workspace --locked --lcov",
             "python3 -m coverage run tools/test_ci_matrix.py",
+            "tools/test_decode_astc_references.py",
+            "tools/test_extracted_corpus_diff.py",
             "python3 -m coverage xml -o target/sonar-python-coverage.xml",
         ),
     )

@@ -68,10 +68,13 @@ def unfilter(raw: bytes, width: int, height: int) -> bytes:
                     abs(estimate - up),
                     abs(estimate - upper_left),
                 )
-                value = line[index] + (
-                    left if distances[0] <= distances[1] and distances[0] <= distances[2]
-                    else up if distances[1] <= distances[2] else upper_left
-                )
+                if distances[0] <= distances[1] and distances[0] <= distances[2]:
+                    predictor = left
+                elif distances[1] <= distances[2]:
+                    predictor = up
+                else:
+                    predictor = upper_left
+                value = line[index] + predictor
             else:
                 raise Invalid(f"scanline {row} uses filter {kind}, which is not 0-4")
             line[index] = value & 0xFF

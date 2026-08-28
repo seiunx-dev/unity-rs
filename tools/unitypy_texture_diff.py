@@ -126,7 +126,7 @@ def main() -> int:
     limit = int(sys.argv[2]) if len(sys.argv) >= 3 else 0
     unity_version = sys.argv[3] if len(sys.argv) == 4 else None
 
-    import UnityPy  # noqa: PLC0415  -- optional, and only needed here
+    import UnityPy  # noqa: PLC0415
 
     if unity_version:
         UnityPy.config.FALLBACK_UNITY_VERSION = unity_version
@@ -153,7 +153,7 @@ def main() -> int:
                 continue
             try:
                 env = UnityPy.load(str(bundle))
-            except Exception as error:  # noqa: BLE001 -- a corpus file, not our input
+            except Exception as error:  # noqa: BLE001
                 problems.append(f"{bundle.name}: UnityPy could not load it: {error}")
                 continue
             for obj in env.objects:

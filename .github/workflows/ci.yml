@@ -58,11 +58,14 @@ jobs:
           python3 -m coverage run tools/test_ci_matrix.py
           for test in \
             tools/test_delivery_scope.py \
+            tools/test_decode_astc_references.py \
+            tools/test_extracted_corpus_diff.py \
             tools/test_local_ci.py \
             tools/test_node_api_surface.py \
             tools/test_python_api_surface.py \
             tools/test_validate_fbx_ascii.py \
-            tools/test_validate_fbx_binary.py
+            tools/test_validate_fbx_binary.py \
+            tools/test_validate_png_output.py
           do
             python3 -m coverage run --append "$test"
           done

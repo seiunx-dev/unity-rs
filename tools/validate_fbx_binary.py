@@ -226,8 +226,9 @@ def read_node(reader: Reader, depth: int, budget: Budget) -> bool:
     # Anything left before the declared end is a nested list, which must be
     # terminated by its own null record.
     if reader.at < end_offset:
-        while read_node(reader, depth + 1, budget):
-            pass
+        has_child = read_node(reader, depth + 1, budget)
+        while has_child:
+            has_child = read_node(reader, depth + 1, budget)
     if reader.at != end_offset:
         raise Invalid(
             f"node {name!r} ends at {reader.at} but its header says {end_offset}"

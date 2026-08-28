@@ -113,7 +113,8 @@ def entries(document: dict[str, object]) -> list[dict[str, object]]:
     assert document["version"] == 1, document
     assert document["generated_for"] == UNITY_VERSION, document
     value = document["entries"]
-    assert isinstance(value, list) and value, document
+    assert isinstance(value, list), document
+    assert value, document
     assert all(isinstance(entry, dict) for entry in value), document
     return value
 

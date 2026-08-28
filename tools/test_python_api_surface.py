@@ -249,27 +249,23 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
             "impl Studio {\n    pub fn newly_public(&self) {}",
             1,
         )
+        stub = check_python_api_surface.STUB.read_text(encoding="utf-8")
         with self.assertRaisesRegex(
             check_python_api_surface.AuditError,
             r"unclassified Core methods: Studio.newly_public",
         ):
-            check_python_api_surface.validate_core_mapping(
-                altered,
-                check_python_api_surface.STUB.read_text(encoding="utf-8"),
-            )
+            check_python_api_surface.validate_core_mapping(altered, stub)
 
     def test_missing_python_mapping_target_is_rejected(self) -> None:
         stub = check_python_api_surface.STUB.read_text(encoding="utf-8")
         altered = stub.replace("    def read_shader(\n", "    def removed_shader(\n", 1)
         self.assertNotEqual(altered, stub)
+        core = check_python_api_surface.CORE_STUDIO.read_text(encoding="utf-8")
         with self.assertRaisesRegex(
             check_python_api_surface.AuditError,
             r"StudioObject.read_shader_text -> UnityRs.read_shader",
         ):
-            check_python_api_surface.validate_core_mapping(
-                check_python_api_surface.CORE_STUDIO.read_text(encoding="utf-8"),
-                altered,
-            )
+            check_python_api_surface.validate_core_mapping(core, altered)
 
 
 if __name__ == "__main__":

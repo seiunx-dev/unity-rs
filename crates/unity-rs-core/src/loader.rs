@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::mem::size_of;
@@ -2289,13 +2290,13 @@ struct SplitSegmentPath {
 
 fn split_base_path(path: &Path) -> Option<PathBuf> {
     path.extension()
-        .and_then(|value| value.to_str())?
+        .and_then(OsStr::to_str)?
         .strip_prefix("split")?;
     Some(path.with_extension(""))
 }
 
 fn parse_split_segment_path(path: &Path) -> Result<Option<SplitSegmentPath>> {
-    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+    let Some(extension) = path.extension().and_then(OsStr::to_str) else {
         return Ok(None);
     };
     let Some(suffix) = extension.strip_prefix("split") else {
@@ -2335,7 +2336,7 @@ fn prepare_directory_inputs(
     for file in files {
         if file
             .extension()
-            .and_then(|value| value.to_str())
+            .and_then(OsStr::to_str)
             .is_some_and(|extension| extension.starts_with("split"))
         {
             split_files.try_reserve(1).map_err(|error| {
@@ -2440,7 +2441,7 @@ fn companion_resource_inputs(
     limits: &AssetLoadLimits,
     budget: &mut AssetLoadBudget,
 ) -> Result<Vec<(LoadPath, Region)>> {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return Ok(Vec::new());
     };
     let parent = path
@@ -2449,7 +2450,7 @@ fn companion_resource_inputs(
         .unwrap_or_else(|| Path::new("."));
     budget.charge_input_directory(limits)?;
     let prefix = format!("{name}.");
-    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    let stem = path.file_stem().and_then(OsStr::to_str);
     let mut companions = Vec::new();
     for entry in fs::read_dir(parent)? {
         budget.charge_directory_entry(limits)?;
@@ -2470,16 +2471,16 @@ fn companion_resource_inputs(
         }
         if !candidate_name.starts_with(&prefix) {
             let candidate = Path::new(candidate_name);
-            let shares_stem = stem.is_some_and(|stem| {
-                candidate.file_stem().and_then(|value| value.to_str()) == Some(stem)
-            }) && candidate
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    STREAMED_EXTENSIONS
-                        .iter()
-                        .any(|expected| extension.eq_ignore_ascii_case(expected))
-                });
+            let shares_stem = stem
+                .is_some_and(|stem| candidate.file_stem().and_then(OsStr::to_str) == Some(stem))
+                && candidate
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|extension| {
+                        STREAMED_EXTENSIONS
+                            .iter()
+                            .any(|expected| extension.eq_ignore_ascii_case(expected))
+                    });
             if !shares_stem {
                 continue;
             }

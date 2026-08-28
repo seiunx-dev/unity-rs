@@ -1217,7 +1217,7 @@ fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<F
     }
     if positional[1]
         .extension()
-        .and_then(|value| value.to_str())
+        .and_then(OsStr::to_str)
         .is_none_or(|value| !value.eq_ignore_ascii_case(command_name))
     {
         return Err(Error::invalid_data(format!(
@@ -1870,7 +1870,7 @@ fn export_obj(command: &ObjCommand, load: &LoadOptions, output: &mut impl Write)
 fn obj_material_library_name(destination: &Path) -> Result<String> {
     let stem = destination
         .file_stem()
-        .and_then(|value| value.to_str())
+        .and_then(OsStr::to_str)
         .ok_or_else(|| {
             Error::invalid_data(format!(
                 "OBJ output path has no usable file name: {}",

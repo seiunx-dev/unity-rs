@@ -74,7 +74,6 @@ def cargo_metadata() -> dict[str, Any]:
 
 def shipped_dependency_ids(metadata: dict[str, Any]) -> set[str]:
     workspace = set(metadata["workspace_members"])
-    packages = {package["id"]: package for package in metadata["packages"]}
     roots = {
         package["name"]: package["id"]
         for package in metadata["packages"]

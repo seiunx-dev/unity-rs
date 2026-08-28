@@ -147,6 +147,8 @@ class LocalCiResultTests(unittest.TestCase):
         command = local_ci.linux_node_command("x64", "x64")
         self.assertIn("curl --proto '=https' --proto-redir '=https'", command)
         self.assertIn("npm ci --silent --ignore-scripts", command)
+        self.assertIn("/work/repository", command)
+        self.assertNotIn("/tmp/", command)
 
 
 if __name__ == "__main__":

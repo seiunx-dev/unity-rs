@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -1538,11 +1539,11 @@ impl AtomicExportFile {
 fn replace_backup_path(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
-        .and_then(|value| value.to_str())
+        .and_then(OsStr::to_str)
         .ok_or_else(|| Error::invalid_data("export temporary file name is not valid UTF-8"))?;
     let stem = Path::new(file_name)
         .file_stem()
-        .and_then(|value| value.to_str())
+        .and_then(OsStr::to_str)
         .ok_or_else(|| Error::invalid_data("export temporary file stem is not valid UTF-8"))?;
     let backup_name = joined_component(
         &[stem, ".replace-backup"],

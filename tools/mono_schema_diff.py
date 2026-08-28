@@ -131,7 +131,7 @@ def main() -> int:
             for source in always + batch:
                 stage(source, staged / source.name)
 
-            plain, _ = export(staged, root / "plain", None, unity_version)
+            export(staged, root / "plain", None, unity_version)
             with_schema, _ = export(staged, root / "schema", schema, unity_version)
 
             for relative, kind in with_schema.items():

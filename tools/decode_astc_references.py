@@ -23,6 +23,7 @@ Usage, from the repository root:
 
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 import sys
@@ -37,6 +38,21 @@ FIXTURES = (
     / "fixtures"
     / "astc"
 )
+
+
+def trusted_astcenc(argument: str) -> Path:
+    """Resolve an explicitly trusted official astcenc executable."""
+    try:
+        executable = Path(argument).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"astcenc binary cannot be resolved: {argument}: {error}") from error
+    if not executable.is_file():
+        raise ValueError(f"astcenc binary is not a regular file: {executable}")
+    if not executable.name.startswith("astcenc"):
+        raise ValueError(f"astcenc binary has an unexpected name: {executable.name}")
+    if not os.access(executable, os.X_OK):
+        raise ValueError(f"astcenc binary is not executable: {executable}")
+    return executable
 
 # Unity's six ASTC footprints. Only square blocks appear in its texture formats.
 BLOCK_SIZES = (4, 5, 6, 8, 10, 12)
@@ -102,9 +118,10 @@ def read_tga(data: bytes, width: int, height: int) -> bytes:
 def main() -> None:
     if len(sys.argv) != 2:
         sys.exit(__doc__.strip())
-    astcenc = Path(sys.argv[1])
-    if not astcenc.is_file():
-        sys.exit(f"astcenc binary not found: {astcenc}")
+    try:
+        astcenc = trusted_astcenc(sys.argv[1])
+    except ValueError as error:
+        sys.exit(str(error))
 
     with tempfile.TemporaryDirectory() as scratch_name:
         scratch = Path(scratch_name)
@@ -120,6 +137,7 @@ def main() -> None:
                     [str(astcenc), "-dl", str(wrapped), str(decoded)],
                     check=True,
                     capture_output=True,
+                    shell=False,
                 )
                 pixels = read_tga(decoded.read_bytes(), size, size)
                 out = FIXTURES / f"{name}-astcenc.rgba"

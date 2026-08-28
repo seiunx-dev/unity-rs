@@ -121,7 +121,6 @@ only thing watching it. The other 211 are 4,496 mask-edge pixels in total.
 from __future__ import annotations
 
 import collections
-import os
 import re
 import shutil
 import struct
@@ -135,13 +134,24 @@ ROOT = Path(__file__).resolve().parent.parent
 # Export names collide, so this project appends the path ID. The extraction
 # does not, so the suffix comes off before matching.
 PATH_ID_SUFFIX = re.compile(r" @-?\d+$")
+MAXIMUM_UNITY_VERSION_LENGTH = 64
+UNITY_VERSION_CHARACTERS = frozenset(".-_+")
 
 
 def stage(source: Path, target: Path) -> None:
-    try:
-        os.link(source, target)
-    except OSError:
-        shutil.copy2(source, target)
+    shutil.copy2(source, target)
+
+
+def validated_unity_version(value: str) -> str:
+    """Bound a CLI version passed as one literal argument to the native CLI."""
+    if not value or len(value) > MAXIMUM_UNITY_VERSION_LENGTH:
+        raise ValueError("Unity version must contain between 1 and 64 characters")
+    if not value.isascii() or not all(
+        character.isalnum() or character in UNITY_VERSION_CHARACTERS
+        for character in value
+    ):
+        raise ValueError(f"Unity version contains unsupported characters: {value!r}")
+    return value
 
 
 def obj_values(path: Path) -> list[list[object]]:
@@ -194,7 +204,7 @@ def lossy_utf8_reencode(raw: bytes) -> bytes:
 
 
 def image_pixels(path: Path):
-    from PIL import Image  # noqa: PLC0415 -- optional, and only needed here
+    from PIL import Image  # noqa: PLC0415
 
     with Image.open(path) as image:
         return image.convert("RGBA").tobytes(), image.size
@@ -272,11 +282,15 @@ def main() -> int:
     bundles = Path(sys.argv[1])
     extracted = Path(sys.argv[2])
     limit = int(sys.argv[3]) if len(sys.argv) >= 4 else 0
-    unity_version = sys.argv[4] if len(sys.argv) == 5 else None
+    try:
+        unity_version = validated_unity_version(sys.argv[4]) if len(sys.argv) == 5 else None
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
 
     have_pillow = True
     try:
-        image_pixels  # noqa: B018 -- the import happens inside, so probe it
+        image_pixels  # noqa: B018
         from PIL import Image  # noqa: F401, PLC0415
     except ImportError:
         have_pillow = False
@@ -331,7 +345,13 @@ def main() -> int:
                 for class_id in classes:
                     command += ["--class", class_id]
                 command += [str(staged), str(output)]
-                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+                result = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                )
                 if result.returncode not in (0, 3):
                     problems["export"].append(
                         f"{case.name}: export failed: {result.stderr.strip()[:160]}"
