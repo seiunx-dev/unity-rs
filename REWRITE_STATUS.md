@@ -903,6 +903,19 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   复测：`rgba` 8 线程聚合 5385→7542 it/s（+40%，转为正伸缩），他线程 GIL 可用性
   19%→67%（对照上限 85%），阈值边界 63/64 KiB 单线程 2.30 vs 2.32 µs——无竞争 detach
   往返开销不可测。API 面与输出字节均无变化；
+- **自适应 PNG 滤波内核向量化与逐块早弃（2026-08-28）**：0.5.0 把 Auto 改成全档自适应后，
+  fast 档为体积多付的 CPU 主要落在逐行滤波选择上，其中 Paeth 预测器逐字节三分支挡住了
+  自动向量化。现 Paeth 改为字节域 max/min 差形式（左距离 `|above-upper_left|`、上距离
+  `|left-upper_left|`、左上距离按同向取饱和和 / 异向取幅值差；255 饱和不改变与另两个
+  ≤255 距离的比较），新增 `paeth_predictor_reference_agrees` 对全部 2^24 输入穷举证明
+  与规范 `i16` 形式含并列次序完全一致——max/min 拼写是刻意的，等价的 `abs_diff` 写法
+  编译器不向量化。五个求和内核统一改为 4096 字节块内 `u32` 累加（单字节权重 ≤128，
+  块和远低于 `u32::MAX`，折入 `u64` 无损），首个之后的候选逐块早弃：部分和是最终和的
+  下界，达到在位最优即判负，选择结果精确不变。实测（2520×1440 单张，Apple Silicon）：
+  Paeth 求和 2.5→0.9 ms、Paeth 填充 1.7→0.8 ms、up/avg 求和约 3 倍；端到端 fast+adaptive
+  连续色调 23.2→21.9 ms、精灵抠图 9.3→8.3 ms（滤波增量分别 -18%/-24%），五种
+  压缩×滤波配置输出字节逐一比对不变（FNV 哈希回归锚）。default/best 档无感知——
+  耗时由 flate2 主导。纯性能变更，API 面与输出字节均无变化；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

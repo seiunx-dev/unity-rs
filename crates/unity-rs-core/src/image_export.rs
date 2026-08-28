@@ -586,7 +586,10 @@ fn write_png<W: Write>(
         // store-free sum-only passes per filter, lazily: a candidate that
         // reaches the unbeatable score of zero ends the contest, which makes
         // the fully transparent rows that dominate sprite cutouts choose
-        // filter 0 after a single load-only pass.
+        // filter 0 after a single load-only pass. Each later pass also
+        // abandons block by block once its partial sum reaches the standing
+        // best — a partial sum is a lower bound of the final sum, so the
+        // candidate has already lost and the selection stays exact.
         let allocate_scanline = || -> Result<Vec<u8>> {
             let mut buffer = Vec::new();
             buffer
@@ -613,10 +616,10 @@ fn write_png<W: Write>(
                     break;
                 }
                 let sum = match candidate {
-                    1 => sub_filter_magnitude(current),
-                    2 => up_filter_magnitude(current, prior),
-                    3 => average_filter_magnitude(current, prior),
-                    _ => paeth_filter_magnitude(current, prior),
+                    1 => sub_filter_magnitude(current, best),
+                    2 => up_filter_magnitude(current, prior, best),
+                    3 => average_filter_magnitude(current, prior, best),
+                    _ => paeth_filter_magnitude(current, prior, best),
                 };
                 if sum < best {
                     best = sum;
@@ -668,67 +671,141 @@ fn signed_magnitude(byte: u8) -> u64 {
     u64::from(i8::from_le_bytes([byte]).unsigned_abs())
 }
 
+/// Block length of the vectorization-friendly magnitude loops. Each byte
+/// weighs at most 128, so one block's sum stays far below `u32::MAX` and the
+/// blocks fold losslessly into the same `u64` total the byte-at-a-time loops
+/// produced; a `u32` accumulator is what lets the compiler keep the inner
+/// loop in vector registers.
+const MAGNITUDE_BLOCK: usize = 4096;
+
 /// The heuristic sum of an unfiltered scanline (filter type 0).
 fn scanline_magnitude(current: &[u8]) -> u64 {
-    current.iter().map(|&byte| signed_magnitude(byte)).sum()
+    current
+        .chunks(MAGNITUDE_BLOCK)
+        .map(|block| {
+            u64::from(
+                block
+                    .iter()
+                    .map(|&byte| u32::from(i8::from_le_bytes([byte]).unsigned_abs()))
+                    .sum::<u32>(),
+            )
+        })
+        .sum()
 }
 
 /// The Sub-filter heuristic sum of one scanline, computed without storing
 /// the filtered bytes. The first pixel has no left neighbor and passes
 /// through.
-fn sub_filter_magnitude(current: &[u8]) -> u64 {
-    let mut sum = 0_u64;
-    for &raw in current.iter().take(PNG_FILTER_BPP) {
-        sum += signed_magnitude(raw);
-    }
-    for (&raw, &left) in current.iter().skip(PNG_FILTER_BPP).zip(current) {
-        sum += signed_magnitude(raw.wrapping_sub(left));
+///
+/// Like every candidate pass after the first, the sum abandons block by
+/// block once it reaches `limit` — the standing best; the partial sum is a
+/// lower bound of the final sum, so any returned value at or above `limit`
+/// reports the same strict-comparison loss the full sum would.
+fn sub_filter_magnitude(current: &[u8], limit: u64) -> u64 {
+    let offset = PNG_FILTER_BPP.min(current.len());
+    let mut sum = scanline_magnitude(&current[..offset]);
+    let raws = &current[offset..];
+    let lefts = &current[..current.len() - offset];
+    for (raw_block, left_block) in raws
+        .chunks(MAGNITUDE_BLOCK)
+        .zip(lefts.chunks(MAGNITUDE_BLOCK))
+    {
+        if sum >= limit {
+            return sum;
+        }
+        let mut block = 0_u32;
+        for (&raw, &left) in raw_block.iter().zip(left_block) {
+            block += u32::from(i8::from_le_bytes([raw.wrapping_sub(left)]).unsigned_abs());
+        }
+        sum += u64::from(block);
     }
     sum
 }
 
-/// The Up-filter heuristic sum, store-free. Row zero passes an all-zero
-/// prior row, matching the specification's missing-row semantics.
-fn up_filter_magnitude(current: &[u8], prior: &[u8]) -> u64 {
-    current
-        .iter()
-        .zip(prior)
-        .map(|(&raw, &above)| signed_magnitude(raw.wrapping_sub(above)))
-        .sum()
+/// The Up-filter heuristic sum, store-free and abandoning at `limit`. Row
+/// zero passes an all-zero prior row, matching the specification's
+/// missing-row semantics.
+fn up_filter_magnitude(current: &[u8], prior: &[u8], limit: u64) -> u64 {
+    let mut sum = 0_u64;
+    for (raw_block, above_block) in current
+        .chunks(MAGNITUDE_BLOCK)
+        .zip(prior.chunks(MAGNITUDE_BLOCK))
+    {
+        if sum >= limit {
+            return sum;
+        }
+        let mut block = 0_u32;
+        for (&raw, &above) in raw_block.iter().zip(above_block) {
+            block += u32::from(i8::from_le_bytes([raw.wrapping_sub(above)]).unsigned_abs());
+        }
+        sum += u64::from(block);
+    }
+    sum
 }
 
-/// The Average-filter heuristic sum, store-free.
-fn average_filter_magnitude(current: &[u8], prior: &[u8]) -> u64 {
+/// The Average-filter heuristic sum, store-free and abandoning at `limit`.
+fn average_filter_magnitude(current: &[u8], prior: &[u8], limit: u64) -> u64 {
     let mut sum = 0_u64;
     for (&raw, &above) in current.iter().zip(prior).take(PNG_FILTER_BPP) {
         sum += signed_magnitude(raw.wrapping_sub(above >> 1));
     }
-    for ((&raw, &above), &left) in current.iter().zip(prior).skip(PNG_FILTER_BPP).zip(current) {
-        sum += signed_magnitude(
-            raw.wrapping_sub(
-                (left >> 1)
-                    .wrapping_add(above >> 1)
-                    .wrapping_add(left & above & 1),
-            ),
-        );
+    let offset = PNG_FILTER_BPP.min(current.len());
+    let raws = &current[offset..];
+    let aboves = &prior[offset..current.len()];
+    let lefts = &current[..current.len() - offset];
+    for ((raw_block, above_block), left_block) in raws
+        .chunks(MAGNITUDE_BLOCK)
+        .zip(aboves.chunks(MAGNITUDE_BLOCK))
+        .zip(lefts.chunks(MAGNITUDE_BLOCK))
+    {
+        if sum >= limit {
+            return sum;
+        }
+        let mut block = 0_u32;
+        for ((&raw, &above), &left) in raw_block.iter().zip(above_block).zip(left_block) {
+            let prediction = (left >> 1)
+                .wrapping_add(above >> 1)
+                .wrapping_add(left & above & 1);
+            block += u32::from(i8::from_le_bytes([raw.wrapping_sub(prediction)]).unsigned_abs());
+        }
+        sum += u64::from(block);
     }
     sum
 }
 
-/// The Paeth-filter heuristic sum, store-free.
-fn paeth_filter_magnitude(current: &[u8], prior: &[u8]) -> u64 {
+/// The Paeth-filter heuristic sum, store-free and abandoning at `limit`.
+fn paeth_filter_magnitude(current: &[u8], prior: &[u8], limit: u64) -> u64 {
     let mut sum = 0_u64;
     for (&raw, &above) in current.iter().zip(prior).take(PNG_FILTER_BPP) {
         sum += signed_magnitude(raw.wrapping_sub(paeth_predictor(0, above, 0)));
     }
-    for (((&raw, &above), &left), &upper_left) in current
-        .iter()
-        .zip(prior)
-        .skip(PNG_FILTER_BPP)
-        .zip(current)
-        .zip(prior)
+    let offset = PNG_FILTER_BPP.min(current.len());
+    let raws = &current[offset..];
+    let aboves = &prior[offset..current.len()];
+    let lefts = &current[..current.len() - offset];
+    let upper_lefts = &prior[..current.len() - offset];
+    for (((raw_block, above_block), left_block), upper_left_block) in raws
+        .chunks(MAGNITUDE_BLOCK)
+        .zip(aboves.chunks(MAGNITUDE_BLOCK))
+        .zip(lefts.chunks(MAGNITUDE_BLOCK))
+        .zip(upper_lefts.chunks(MAGNITUDE_BLOCK))
     {
-        sum += signed_magnitude(raw.wrapping_sub(paeth_predictor(left, above, upper_left)));
+        if sum >= limit {
+            return sum;
+        }
+        let mut block = 0_u32;
+        for (((&raw, &above), &left), &upper_left) in raw_block
+            .iter()
+            .zip(above_block)
+            .zip(left_block)
+            .zip(upper_left_block)
+        {
+            block += u32::from(
+                i8::from_le_bytes([raw.wrapping_sub(paeth_predictor(left, above, upper_left))])
+                    .unsigned_abs(),
+            );
+        }
+        sum += u64::from(block);
     }
     sum
 }
@@ -793,13 +870,14 @@ fn fill_paeth_filter(current: &[u8], prior: &[u8], output: &mut [u8]) {
     {
         *destination = raw.wrapping_sub(paeth_predictor(0, above, 0));
     }
-    for ((((destination, &raw), &above), &left), &upper_left) in output
+    let offset = PNG_FILTER_BPP.min(current.len());
+    let tail = output.len() - offset;
+    for ((((destination, &raw), &above), &left), &upper_left) in output[offset..]
         .iter_mut()
-        .zip(current)
-        .zip(prior)
-        .skip(PNG_FILTER_BPP)
-        .zip(current)
-        .zip(prior)
+        .zip(&current[offset..])
+        .zip(&prior[offset..current.len()])
+        .zip(&current[..tail])
+        .zip(&prior[..tail])
     {
         *destination = raw.wrapping_sub(paeth_predictor(left, above, upper_left));
     }
@@ -807,11 +885,29 @@ fn fill_paeth_filter(current: &[u8], prior: &[u8], output: &mut [u8]) {
 
 /// The PNG Paeth predictor: whichever of left, above, and upper-left is
 /// closest to `left + above - upper_left`, with ties resolved in that order.
+///
+/// The distances are computed in the byte domain rather than through the
+/// specification's `i16` arithmetic: the left distance is `|above -
+/// upper_left|`, the above distance is `|left - upper_left|`, and the
+/// upper-left distance is the sum of those two deltas when they point the
+/// same way from `upper_left` and the difference of their magnitudes
+/// otherwise. Saturating the sum at 255 preserves every comparison, because
+/// the other two distances never exceed 255. The max/min spelling — not the
+/// equivalent `abs_diff` — is deliberate: it is the shape the compiler
+/// turns into vector min/max/select in the per-scanline loops, which is
+/// where the adaptive filter spends its time.
+/// `paeth_predictor_reference_agrees` proves the whole function equal to
+/// the specification form over all 2^24 inputs, tie order included.
+#[inline]
 fn paeth_predictor(left: u8, above: u8, upper_left: u8) -> u8 {
-    let estimate = i16::from(left) + i16::from(above) - i16::from(upper_left);
-    let distance_left = (estimate - i16::from(left)).abs();
-    let distance_above = (estimate - i16::from(above)).abs();
-    let distance_upper_left = (estimate - i16::from(upper_left)).abs();
+    let distance_left = above.max(upper_left) - above.min(upper_left);
+    let distance_above = left.max(upper_left) - left.min(upper_left);
+    let same_direction = (left >= upper_left) == (above >= upper_left);
+    let distance_upper_left = if same_direction {
+        distance_left.saturating_add(distance_above)
+    } else {
+        distance_left.max(distance_above) - distance_left.min(distance_above)
+    };
     if distance_left <= distance_above && distance_left <= distance_upper_left {
         left
     } else if distance_above <= distance_upper_left {
@@ -1243,8 +1339,8 @@ mod tests {
 
     use super::{
         ImageEncodeOptions, ImageFormat, ImageRowOrder, JpegSampling, PNG_SIGNATURE,
-        PngCompression, PngFilter, encode_rgba_image, flip_rgba_rows, png_crc32, write_rgba_image,
-        write_rgba_image_with_quality,
+        PngCompression, PngFilter, encode_rgba_image, flip_rgba_rows, paeth_predictor, png_crc32,
+        write_rgba_image, write_rgba_image_with_quality,
     };
     use crate::texture::RgbaImage;
 
@@ -1465,6 +1561,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(from_decoded, adaptive);
+    }
+
+    /// The byte-domain Paeth predictor must match the specification's `i16`
+    /// arithmetic — including tie order — over the complete input space, so
+    /// the vectorizable rewrite can never change which bytes an encode
+    /// produces.
+    #[test]
+    fn paeth_predictor_reference_agrees() {
+        fn reference(left: u8, above: u8, upper_left: u8) -> u8 {
+            let estimate = i16::from(left) + i16::from(above) - i16::from(upper_left);
+            let distance_left = (estimate - i16::from(left)).abs();
+            let distance_above = (estimate - i16::from(above)).abs();
+            let distance_upper_left = (estimate - i16::from(upper_left)).abs();
+            if distance_left <= distance_above && distance_left <= distance_upper_left {
+                left
+            } else if distance_above <= distance_upper_left {
+                above
+            } else {
+                upper_left
+            }
+        }
+        for left in 0..=u8::MAX {
+            for above in 0..=u8::MAX {
+                for upper_left in 0..=u8::MAX {
+                    assert_eq!(
+                        paeth_predictor(left, above, upper_left),
+                        reference(left, above, upper_left),
+                        "paeth({left}, {above}, {upper_left})"
+                    );
+                }
+            }
+        }
     }
 
     /// The default `Auto` filter must select adaptive filtering at every
