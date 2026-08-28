@@ -1459,23 +1459,28 @@ fn decode_high_endpoint_mode(endpoints: &mut [i32], mode: usize, v: &mut [i32]) 
             decode_endpoints_hdr11(endpoints, v, v[6], v[7]);
         }
         15 => {
-            let mode = ((v[6] >> 7) & 1) | ((v[7] >> 6) & 2);
-            v[6] &= 0x7f;
-            v[7] &= 0x7f;
-            if mode == 3 {
-                decode_endpoints_hdr11(endpoints, v, v[6] << 5, v[7] << 5);
-            } else {
-                v[6] |= (v[7] << (mode + 1)) & 0x780;
-                v[7] = ((v[7] & (0x3f >> mode)) ^ (0x20 >> mode)) - (0x20 >> mode);
-                v[6] <<= 4 - mode;
-                v[7] <<= 4 - mode;
-                decode_endpoints_hdr11(endpoints, v, v[6], (v[6] + v[7]).clamp(0, 0xfff));
-            }
+            decode_endpoints_hdr15(endpoints, v);
         }
         _ => {
             panic!("Unsupported ASTC format");
         }
     }
+}
+
+fn decode_endpoints_hdr15(endpoints: &mut [i32], v: &mut [i32]) {
+    let mode = ((v[6] >> 7) & 1) | ((v[7] >> 6) & 2);
+    v[6] &= 0x7f;
+    v[7] &= 0x7f;
+    if mode == 3 {
+        decode_endpoints_hdr11(endpoints, v, v[6] << 5, v[7] << 5);
+        return;
+    }
+
+    v[6] |= (v[7] << (mode + 1)) & 0x780;
+    v[7] = ((v[7] & (0x3f >> mode)) ^ (0x20 >> mode)) - (0x20 >> mode);
+    v[6] <<= 4 - mode;
+    v[7] <<= 4 - mode;
+    decode_endpoints_hdr11(endpoints, v, v[6], (v[6] + v[7]).clamp(0, 0xfff));
 }
 
 fn decode_weights(
