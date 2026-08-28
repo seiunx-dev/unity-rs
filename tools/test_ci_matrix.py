@@ -266,6 +266,16 @@ class CiMatrixAuditTests(unittest.TestCase):
         with self.assertRaises(check_ci_matrix.AuditError):
             check_ci_matrix.validate_workflow(altered)
 
+    def test_sonar_scan_requires_coverage_reports(self) -> None:
+        altered = self.workflow.replace(
+            "        run: cargo llvm-cov --workspace --locked --lcov --output-path target/sonar-rust.lcov\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(altered, self.workflow)
+        with self.assertRaises(check_ci_matrix.AuditError):
+            check_ci_matrix.validate_workflow(altered)
+
     def test_missing_pypi_oidc_permission_is_rejected(self) -> None:
         altered = self.workflow.replace("      id-token: write\n", "", 1)
         self.assertNotEqual(altered, self.workflow)

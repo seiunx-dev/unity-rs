@@ -309,6 +309,17 @@ def validate_workflow(workflow: str) -> None:
     if workflow.count("uses: actions/upload-artifact@v7") != 5:
         raise AuditError("CI workflow must upload all five release artifact groups with v7")
     require_run_commands(
+        job_block(workflow, "sonarqube"),
+        "sonarqube",
+        (
+            "cargo install cargo-llvm-cov",
+            "python3 -m pip install",
+            "cargo llvm-cov --workspace --locked --lcov",
+            "python3 -m coverage run tools/test_ci_matrix.py",
+            "python3 -m coverage xml -o target/sonar-python-coverage.xml",
+        ),
+    )
+    require_run_commands(
         job_block(workflow, "node"),
         "node",
         ("npm ci --ignore-scripts",),

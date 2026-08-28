@@ -1,0 +1,7 @@
+[run]
+branch = True
+relative_files = True
+source = tools
+
+[report]
+omit = tools/test_*.py

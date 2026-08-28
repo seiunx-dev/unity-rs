@@ -143,6 +143,11 @@ class LocalCiResultTests(unittest.TestCase):
         )
         self.assertEqual(status, 2)
 
+    def test_linux_node_setup_hardens_download_and_install(self) -> None:
+        command = local_ci.linux_node_command("x64", "x64")
+        self.assertIn("curl --proto '=https' --proto-redir '=https'", command)
+        self.assertIn("npm ci --silent --ignore-scripts", command)
+
 
 if __name__ == "__main__":
     unittest.main()
