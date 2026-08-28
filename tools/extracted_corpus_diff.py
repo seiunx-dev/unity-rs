@@ -345,13 +345,7 @@ def main() -> int:
                 for class_id in classes:
                     command += ["--class", class_id]
                 command += [str(staged), str(output)]
-                result = subprocess.run(
-                    command,
-                    cwd=ROOT,
-                    capture_output=True,
-                    text=True,
-                    shell=False,
-                )
+                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
                 if result.returncode not in (0, 3):
                     problems["export"].append(
                         f"{case.name}: export failed: {result.stderr.strip()[:160]}"
