@@ -927,92 +927,82 @@ impl Extractor {
         desired: &Path,
         mut probe: impl FnMut(),
     ) -> Result<PathBuf> {
-        let component_count = desired.components().count();
-        let mut components = Vec::new();
-        components
-            .try_reserve_exact(component_count)
-            .map_err(|error| {
-                Error::invalid_data(format!("cannot allocate output path components: {error}"))
-            })?;
-        for component in desired.components() {
-            let Component::Normal(value) = component else {
-                return Err(Error::invalid_data("output path is not strictly relative"));
-            };
-            let value = value
-                .to_str()
-                .ok_or_else(|| Error::invalid_data("output path component is not valid UTF-8"))?;
-            components.push(copy_string_fallibly(value, "output path component")?);
-        }
-        if components.is_empty() {
-            return Err(Error::invalid_data("output path is empty"));
-        }
+        let mut components = relative_output_components(desired)?;
         for index in 0..components.len().saturating_sub(1) {
-            let original = copy_string_fallibly(&components[index], "original output component")?;
-            let desired_parent = path_from_components(
-                &components[..=index],
-                self.options.limits.maximum_path_bytes,
-                "desired extraction output parent",
-            )?;
-            let cursor_key =
-                self.collision_cursor_key(&desired_parent, CollisionCursorKind::Parent)?;
-            let mut collision_index = self
-                .collision_cursors
-                .get(&cursor_key)
-                .copied()
-                .unwrap_or(0);
-            loop {
-                probe();
-                if collision_index != 0 {
-                    components[index] = suffixed_component(&original, collision_index)?;
-                }
-                let prefix = path_from_components(
-                    &components[..=index],
-                    self.options.limits.maximum_path_bytes,
-                    "extraction output parent",
-                )?;
-                let absolute = join_relative_path_fallibly(
-                    &self.output_root,
-                    &prefix,
-                    usize::MAX,
-                    "absolute extraction output parent",
-                )?;
-                let claim = self.claim_kind(&prefix)?;
-                match safe_path_kind(&absolute)? {
-                    ExistingKind::Symlink => {
-                        return Err(Error::invalid_data(format!(
-                            "refusing symbolic-link output parent: {}",
-                            absolute.display()
-                        )));
-                    }
-                    ExistingKind::Directory
-                        if claim.is_none() || claim == Some(ClaimKind::Directory) =>
-                    {
-                        if collision_index != 0 {
-                            self.retain_collision_cursor(cursor_key, collision_index)?;
-                        }
-                        break;
-                    }
-                    ExistingKind::Missing if claim != Some(ClaimKind::File) => {
-                        if collision_index != 0 {
-                            self.retain_collision_cursor(cursor_key, collision_index)?;
-                        }
-                        break;
-                    }
-                    ExistingKind::Regular
-                    | ExistingKind::Other
-                    | ExistingKind::Directory
-                    | ExistingKind::Missing => {}
-                }
-                collision_index = collision_index.checked_add(1).ok_or_else(|| {
-                    Error::invalid_data("output parent collision counter overflowed")
-                })?;
-            }
+            self.resolve_parent_component(&mut components, index, &mut probe)?;
         }
         path_from_components(
             &components,
             self.options.limits.maximum_path_bytes,
             "resolved extraction output path",
         )
+    }
+
+    fn resolve_parent_component(
+        &mut self,
+        components: &mut [String],
+        index: usize,
+        probe: &mut impl FnMut(),
+    ) -> Result<()> {
+        let original = copy_string_fallibly(&components[index], "original output component")?;
+        let desired_parent = path_from_components(
+            &components[..=index],
+            self.options.limits.maximum_path_bytes,
+            "desired extraction output parent",
+        )?;
+        let cursor_key = self.collision_cursor_key(&desired_parent, CollisionCursorKind::Parent)?;
+        let mut collision_index = self
+            .collision_cursors
+            .get(&cursor_key)
+            .copied()
+            .unwrap_or(0);
+        loop {
+            probe();
+            if collision_index != 0 {
+                components[index] = suffixed_component(&original, collision_index)?;
+            }
+            let prefix = path_from_components(
+                &components[..=index],
+                self.options.limits.maximum_path_bytes,
+                "extraction output parent",
+            )?;
+            let absolute = join_relative_path_fallibly(
+                &self.output_root,
+                &prefix,
+                usize::MAX,
+                "absolute extraction output parent",
+            )?;
+            let claim = self.claim_kind(&prefix)?;
+            match safe_path_kind(&absolute)? {
+                ExistingKind::Symlink => {
+                    return Err(Error::invalid_data(format!(
+                        "refusing symbolic-link output parent: {}",
+                        absolute.display()
+                    )));
+                }
+                ExistingKind::Directory
+                    if claim.is_none() || claim == Some(ClaimKind::Directory) =>
+                {
+                    if collision_index != 0 {
+                        self.retain_collision_cursor(cursor_key, collision_index)?;
+                    }
+                    return Ok(());
+                }
+                ExistingKind::Missing if claim != Some(ClaimKind::File) => {
+                    if collision_index != 0 {
+                        self.retain_collision_cursor(cursor_key, collision_index)?;
+                    }
+                    return Ok(());
+                }
+                ExistingKind::Regular
+                | ExistingKind::Other
+                | ExistingKind::Directory
+                | ExistingKind::Missing => {}
+            }
+            collision_index = collision_index
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_data("output parent collision counter overflowed"))?;
+        }
     }
 
     fn collision_cursor_key(
@@ -1997,6 +1987,29 @@ fn copy_string_fallibly(value: &str, label: &str) -> Result<String> {
         .map_err(|error| Error::invalid_data(format!("cannot allocate {label}: {error}")))?;
     copy.push_str(value);
     Ok(copy)
+}
+
+fn relative_output_components(path: &Path) -> Result<Vec<String>> {
+    let component_count = path.components().count();
+    let mut components = Vec::new();
+    components
+        .try_reserve_exact(component_count)
+        .map_err(|error| {
+            Error::invalid_data(format!("cannot allocate output path components: {error}"))
+        })?;
+    for component in path.components() {
+        let Component::Normal(value) = component else {
+            return Err(Error::invalid_data("output path is not strictly relative"));
+        };
+        let value = value
+            .to_str()
+            .ok_or_else(|| Error::invalid_data("output path component is not valid UTF-8"))?;
+        components.push(copy_string_fallibly(value, "output path component")?);
+    }
+    if components.is_empty() {
+        return Err(Error::invalid_data("output path is empty"));
+    }
+    Ok(components)
 }
 
 fn path_from_components(

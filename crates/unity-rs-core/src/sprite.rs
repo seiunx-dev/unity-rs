@@ -1366,34 +1366,49 @@ fn apply_tight_mesh_mask(
                 limits.maximum_raster_operations
             )));
         }
-        // `tight_triangle_bounds` clamps the box to the image and `mask` holds
-        // width*height entries, so every index below is in range. Resolving the
-        // row offset once per scanline keeps a fallible conversion -- and the
-        // error path it carries -- out of the per-pixel loop.
-        let edges = TriangleEdges::new(&transformed);
-        for y in top..bottom {
-            let row = usize::try_from(y)
-                .ok()
-                .and_then(|y| y.checked_mul(mask_width))
-                .ok_or_else(|| Error::invalid_data("tight Sprite mask row overflowed"))?;
-            let Some(scanline) = mask.get_mut(row..row + mask_width) else {
-                return Err(Error::invalid_data("tight Sprite mask row is out of range"));
-            };
-            let row_terms = edges.row(f64::from(y) + 0.5);
-            for x in left..right {
-                if edges.contains(f64::from(x) + 0.5, &row_terms) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        scanline[x as usize] = 1;
-                    }
-                }
-            }
-        }
+        rasterize_tight_triangle_mask(
+            &mut mask,
+            mask_width,
+            &transformed,
+            (left, top, right, bottom),
+        )?;
     }
 
     for (pixel, keep) in image.pixels.chunks_exact_mut(4).zip(mask) {
         if keep == 0 {
             pixel.copy_from_slice(&[0, 0, 0, 0]);
+        }
+    }
+    Ok(())
+}
+
+fn rasterize_tight_triangle_mask(
+    mask: &mut [u8],
+    mask_width: usize,
+    triangle: &[(f64, f64); 3],
+    (left, top, right, bottom): (u32, u32, u32, u32),
+) -> Result<()> {
+    // `tight_triangle_bounds` clamps the box to the image and `mask` holds
+    // width*height entries, so every index below is in range. Resolving the
+    // row offset once per scanline keeps a fallible conversion -- and the
+    // error path it carries -- out of the per-pixel loop.
+    let edges = TriangleEdges::new(triangle);
+    for y in top..bottom {
+        let row = usize::try_from(y)
+            .ok()
+            .and_then(|y| y.checked_mul(mask_width))
+            .ok_or_else(|| Error::invalid_data("tight Sprite mask row overflowed"))?;
+        let Some(scanline) = mask.get_mut(row..row + mask_width) else {
+            return Err(Error::invalid_data("tight Sprite mask row is out of range"));
+        };
+        let row_terms = edges.row(f64::from(y) + 0.5);
+        for x in left..right {
+            if edges.contains(f64::from(x) + 0.5, &row_terms) {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    scanline[x as usize] = 1;
+                }
+            }
         }
     }
     Ok(())
@@ -1839,32 +1854,9 @@ impl SpriteObjectReader {
         } else {
             ObjectReference::default()
         };
-        let secondary_textures = if self.version.0 >= 2019 {
-            let count = self.read_count("Sprite secondary texture")?;
-            let mut textures = reserve_vec(count, "Sprite secondary textures")?;
-            for _ in 0..count {
-                textures.push(SecondarySpriteTexture {
-                    texture: self.read_pptr()?,
-                    name: self.read_aligned_string("Sprite secondary texture name")?,
-                });
-            }
-            textures
-        } else {
-            Vec::new()
-        };
-
-        let pending_mesh = if self.version >= (5, 6, 0) {
-            self.read_modern_sprite_mesh()?
-        } else {
-            self.read_legacy_sprite_mesh()?
-        };
-
-        if self.version.0 >= 2018 {
-            self.skip_mesh_records(64, "Sprite bind pose")?;
-            if self.version < (2018, 2, 0) {
-                self.skip_mesh_records(32, "Sprite source skin")?;
-            }
-        }
+        let secondary_textures = self.read_secondary_textures()?;
+        let pending_mesh = self.read_pending_sprite_mesh()?;
+        self.skip_render_mesh_records()?;
 
         let texture_rect = self.read_rect("Sprite texture rect")?;
         let texture_rect_offset = self.read_vector2("Sprite texture rect offset")?;
@@ -1902,6 +1894,40 @@ impl SpriteObjectReader {
             downscale_multiplier,
             mesh_triangles,
         })
+    }
+
+    fn read_secondary_textures(&mut self) -> Result<Vec<SecondarySpriteTexture>> {
+        if self.version.0 < 2019 {
+            return Ok(Vec::new());
+        }
+        let count = self.read_count("Sprite secondary texture")?;
+        let mut textures = reserve_vec(count, "Sprite secondary textures")?;
+        for _ in 0..count {
+            textures.push(SecondarySpriteTexture {
+                texture: self.read_pptr()?,
+                name: self.read_aligned_string("Sprite secondary texture name")?,
+            });
+        }
+        Ok(textures)
+    }
+
+    fn read_pending_sprite_mesh(&mut self) -> Result<PendingSpriteMesh> {
+        if self.version >= (5, 6, 0) {
+            self.read_modern_sprite_mesh()
+        } else {
+            self.read_legacy_sprite_mesh()
+        }
+    }
+
+    fn skip_render_mesh_records(&mut self) -> Result<()> {
+        if self.version.0 < 2018 {
+            return Ok(());
+        }
+        self.skip_mesh_records(64, "Sprite bind pose")?;
+        if self.version < (2018, 2, 0) {
+            self.skip_mesh_records(32, "Sprite source skin")?;
+        }
+        Ok(())
     }
 
     fn read_modern_sprite_mesh(&mut self) -> Result<PendingSpriteMesh> {
