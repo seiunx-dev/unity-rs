@@ -1442,28 +1442,13 @@ impl SpriteAtlasIndex {
                     object_index,
                     is_variant: atlas.is_variant,
                 });
-                for reference in atlas.packed_sprites {
-                    let Some((sprite_file_index, sprite_object_index)) =
-                        collection.resolve_object_location(file_index, reference)
-                    else {
-                        continue;
-                    };
-                    let Some(sprite_object) = collection
-                        .serialized_files
-                        .get(sprite_file_index)
-                        .and_then(|target| target.file.objects.get(sprite_object_index))
-                    else {
-                        continue;
-                    };
-                    if sprite_object.class_id != SPRITE_CLASS_ID {
-                        continue;
-                    }
-                    assignments.push(SpriteAtlasAssignment {
-                        sprite_file: sprite_file_index,
-                        sprite_object: sprite_object_index,
-                        atlas: atlas_index,
-                    });
-                }
+                append_resolved_sprite_assignments(
+                    collection,
+                    file_index,
+                    atlas_index,
+                    atlas.packed_sprites,
+                    &mut assignments,
+                );
                 retained_entries = next_entries;
             }
         }
@@ -1545,6 +1530,36 @@ fn resolved_sprite_count(
                 .is_some_and(|target| target.class_id == SPRITE_CLASS_ID)
         })
         .count()
+}
+
+fn append_resolved_sprite_assignments(
+    collection: &AssetCollection,
+    source_file_index: usize,
+    atlas_index: usize,
+    references: Vec<ObjectReference>,
+    assignments: &mut Vec<SpriteAtlasAssignment>,
+) {
+    for reference in references {
+        let Some((file_index, object_index)) =
+            collection.resolve_object_location(source_file_index, reference)
+        else {
+            continue;
+        };
+        let Some(object) = collection
+            .serialized_files
+            .get(file_index)
+            .and_then(|target| target.file.objects.get(object_index))
+        else {
+            continue;
+        };
+        if object.class_id == SPRITE_CLASS_ID {
+            assignments.push(SpriteAtlasAssignment {
+                sprite_file: file_index,
+                sprite_object: object_index,
+                atlas: atlas_index,
+            });
+        }
+    }
 }
 
 impl AssetResourceIndex {
