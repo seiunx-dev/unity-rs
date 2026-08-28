@@ -2514,9 +2514,22 @@ fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
     metadata.extend_from_slice(b"2019.4.40f1\0");
     push_i32(&mut metadata, 13);
     metadata.push(0);
+    push_versioned_text_asset_type(&mut metadata, version);
+    push_versioned_text_asset_object(&mut metadata, version, object.len());
+    push_i32(&mut metadata, 0);
+    if version >= 20 {
+        push_i32(&mut metadata, 0);
+    }
+    metadata.push(0);
+    if version >= 22 {
+        return finish_v22(&metadata, &object);
+    }
+    finish_legacy_header(version, &metadata, &object, 0)
+}
 
-    push_i32(&mut metadata, 1);
-    push_i32(&mut metadata, 49);
+fn push_versioned_text_asset_type(metadata: &mut Vec<u8>, version: u32) {
+    push_i32(metadata, 1);
+    push_i32(metadata, 49);
     if version >= 16 {
         metadata.push(0);
     }
@@ -2524,15 +2537,17 @@ fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
         metadata.extend_from_slice(&(-1_i16).to_le_bytes());
     }
     metadata.extend_from_slice(&[0x5a; 16]);
+}
 
+fn push_versioned_text_asset_object(metadata: &mut Vec<u8>, version: u32, object_len: usize) {
     if (7..14).contains(&version) {
-        push_i32(&mut metadata, 0);
+        push_i32(metadata, 0);
     }
-    push_i32(&mut metadata, 1);
+    push_i32(metadata, 1);
     if version < 14 {
-        push_i32(&mut metadata, 0x1020_3040);
+        push_i32(metadata, 0x1020_3040);
     } else {
-        align(&mut metadata, 4);
+        align(metadata, 4);
         metadata.extend_from_slice(&0x0102_0304_0506_0708_i64.to_le_bytes());
     }
     // 22 is where large-file support widened the object's byte offset from 32
@@ -2540,10 +2555,10 @@ fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
     if version >= 22 {
         metadata.extend_from_slice(&0_i64.to_le_bytes());
     } else {
-        push_u32(&mut metadata, 0);
+        push_u32(metadata, 0);
     }
-    push_u32(&mut metadata, u32::try_from(object.len()).unwrap());
-    push_i32(&mut metadata, if version < 16 { 49 } else { 0 });
+    push_u32(metadata, u32::try_from(object_len).unwrap());
+    push_i32(metadata, if version < 16 { 49 } else { 0 });
     if version < 16 {
         metadata.extend_from_slice(&49_u16.to_le_bytes());
     }
@@ -2558,19 +2573,8 @@ fn synthetic_versioned_text_asset(version: u32) -> Vec<u8> {
     }
 
     if version >= 11 {
-        push_i32(&mut metadata, 0);
+        push_i32(metadata, 0);
     }
-    push_i32(&mut metadata, 0);
-    if version >= 20 {
-        push_i32(&mut metadata, 0);
-    }
-    metadata.push(0);
-    // 22 moved the header to its own 48-byte layout; the metadata after it is
-    // unchanged from 21.
-    if version >= 22 {
-        return finish_v22(&metadata, &object);
-    }
-    finish_legacy_header(version, &metadata, &object, 0)
 }
 
 fn synthetic_v13_big_endian() -> Vec<u8> {
@@ -3437,48 +3441,7 @@ fn mesh_payload_with_lod(
     }
     align(&mut output, 4);
 
-    if compressed {
-        // Deliberately not readable. A range of 255 at eight bits makes the
-        // dequantization scale exactly 1 and the offset exactly 0, so the
-        // formula degenerates to identity: the packed values come out as
-        // themselves, the fixture is pleasant to read, and dropping `start`
-        // from the decode -- or reading the bits a byte at a time -- changes
-        // nothing anyone can see. These numbers make it show. Twelve bits
-        // straddle byte boundaries, the range is not the maximum a twelve-bit
-        // value can hold, and the offset is negative, so scale, offset and bit
-        // packing each have to be right for the geometry to match.
-        push_packed_float_data(
-            &mut output,
-            9,
-            100.0,
-            -25.0,
-            &[0, 4095, 1, 2048, 4094, 7, 819, 3277, 2],
-            12,
-        );
-        push_empty_packed_float(&mut output); // UVs
-        push_empty_packed_float(&mut output); // normals
-        push_empty_packed_float(&mut output); // tangents
-        push_empty_packed_int(&mut output); // weights
-        push_empty_packed_int(&mut output); // normal signs
-        push_empty_packed_int(&mut output); // tangent signs
-        push_empty_packed_float(&mut output); // float colours
-        push_empty_packed_int(&mut output); // bone indices
-        // Ten bits, so the triangle indices also cross byte boundaries.
-        push_packed_int_data(&mut output, &[0, 1, 2], 10);
-        push_u32(&mut output, 0); // UV info
-    } else {
-        for _ in 0..4 {
-            push_empty_packed_float(&mut output);
-        }
-        for _ in 0..3 {
-            push_empty_packed_int(&mut output);
-        }
-        push_empty_packed_float(&mut output);
-        for _ in 0..2 {
-            push_empty_packed_int(&mut output);
-        }
-        push_u32(&mut output, 0);
-    }
+    push_mesh_compression_data(&mut output, compressed);
 
     output.extend_from_slice(&[0; 24]);
     for _ in 0..4 {
@@ -3496,6 +3459,51 @@ fn mesh_payload_with_lod(
         push_mesh_lod_info(&mut output);
     }
     output
+}
+
+fn push_mesh_compression_data(output: &mut Vec<u8>, compressed: bool) {
+    if compressed {
+        // Deliberately not readable. A range of 255 at eight bits makes the
+        // dequantization scale exactly 1 and the offset exactly 0, so the
+        // formula degenerates to identity: the packed values come out as
+        // themselves, the fixture is pleasant to read, and dropping `start`
+        // from the decode -- or reading the bits a byte at a time -- changes
+        // nothing anyone can see. These numbers make it show. Twelve bits
+        // straddle byte boundaries, the range is not the maximum a twelve-bit
+        // value can hold, and the offset is negative, so scale, offset and bit
+        // packing each have to be right for the geometry to match.
+        push_packed_float_data(
+            output,
+            9,
+            100.0,
+            -25.0,
+            &[0, 4095, 1, 2048, 4094, 7, 819, 3277, 2],
+            12,
+        );
+        push_empty_packed_float(output); // UVs
+        push_empty_packed_float(output); // normals
+        push_empty_packed_float(output); // tangents
+        push_empty_packed_int(output); // weights
+        push_empty_packed_int(output); // normal signs
+        push_empty_packed_int(output); // tangent signs
+        push_empty_packed_float(output); // float colours
+        push_empty_packed_int(output); // bone indices
+        // Ten bits, so the triangle indices also cross byte boundaries.
+        push_packed_int_data(output, &[0, 1, 2], 10);
+        push_u32(output, 0); // UV info
+    } else {
+        for _ in 0..4 {
+            push_empty_packed_float(output);
+        }
+        for _ in 0..3 {
+            push_empty_packed_int(output);
+        }
+        push_empty_packed_float(output);
+        for _ in 0..2 {
+            push_empty_packed_int(output);
+        }
+        push_u32(output, 0);
+    }
 }
 
 fn push_tuanjie_shared_cluster(output: &mut Vec<u8>, revision: u8) {

@@ -529,21 +529,15 @@ fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadO
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         let text = argument.to_str();
-        let (flag, inline) = if text == Some(LoadFlag::UnityVersion.name()) {
-            (LoadFlag::UnityVersion, None)
-        } else if let Some(value) = text.and_then(|text| text.strip_prefix("--unity-version=")) {
-            (LoadFlag::UnityVersion, Some(OsStr::new(value)))
-        } else if text == Some(LoadFlag::MonoSchema.name()) {
-            (LoadFlag::MonoSchema, None)
-        } else if let Some(value) = text.and_then(|text| text.strip_prefix("--mono-schema=")) {
-            (LoadFlag::MonoSchema, Some(OsStr::new(value)))
-        } else if text == Some(MONO_SCHEMA_OVERRIDE_FLAG) {
+        if text == Some(MONO_SCHEMA_OVERRIDE_FLAG) {
             load.mono_schema_override = true;
             continue;
-        } else if text == Some(STRICT_UNITY_VERSIONS_FLAG) {
+        }
+        if text == Some(STRICT_UNITY_VERSIONS_FLAG) {
             load.strict_unity_versions = true;
             continue;
-        } else {
+        }
+        let Some((flag, inline)) = load_flag_argument(argument) else {
             remaining.push(copy_cli_argument(
                 argument,
                 "filtered command-line argument",
@@ -592,6 +586,21 @@ fn split_load_options(arguments: &[OsString]) -> CliResult<(Vec<OsString>, LoadO
         }
     }
     Ok((remaining, load))
+}
+
+fn load_flag_argument(argument: &OsStr) -> Option<(LoadFlag, Option<&OsStr>)> {
+    let text = argument.to_str()?;
+    if text == LoadFlag::UnityVersion.name() {
+        return Some((LoadFlag::UnityVersion, None));
+    }
+    if let Some(value) = text.strip_prefix("--unity-version=") {
+        return Some((LoadFlag::UnityVersion, Some(OsStr::new(value))));
+    }
+    if text == LoadFlag::MonoSchema.name() {
+        return Some((LoadFlag::MonoSchema, None));
+    }
+    text.strip_prefix("--mono-schema=")
+        .map(|value| (LoadFlag::MonoSchema, Some(OsStr::new(value))))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1096,28 +1105,9 @@ fn parse_live2d_arguments(arguments: &[OsString]) -> Result<Live2dMocCommand> {
         if parse_options && argument == "--" {
             parse_options = false;
         } else if parse_options && argument == "--maximum-name-index-bytes" {
-            if saw_name_limit {
-                return Err(Error::invalid_data(
-                    "--maximum-name-index-bytes may only be specified once",
-                ));
-            }
-            index += 1;
-            let value = arguments.get(index).ok_or_else(|| {
-                Error::invalid_data("--maximum-name-index-bytes requires a value")
-            })?;
-            maximum_name_index_bytes = value
-                .to_str()
-                .ok_or_else(|| Error::invalid_data("name-index limit must be UTF-8 digits"))?
-                .parse::<u64>()
-                .map_err(|_| {
-                    Error::invalid_data("name-index limit must be a non-negative integer")
-                })?;
-            if maximum_name_index_bytes > MAX_LIVE2D_NAME_INDEX_BYTES {
-                return Err(Error::invalid_data(format!(
-                    "--maximum-name-index-bytes must not exceed {MAX_LIVE2D_NAME_INDEX_BYTES}"
-                )));
-            }
+            maximum_name_index_bytes = parse_live2d_name_limit(arguments, index, saw_name_limit)?;
             saw_name_limit = true;
+            index += 1;
         } else if parse_options
             && argument
                 .to_str()
@@ -1142,6 +1132,32 @@ fn parse_live2d_arguments(arguments: &[OsString]) -> Result<Live2dMocCommand> {
         output: positional.remove(0),
         maximum_name_index_bytes,
     })
+}
+
+fn parse_live2d_name_limit(
+    arguments: &[OsString],
+    option_index: usize,
+    already_seen: bool,
+) -> Result<u64> {
+    if already_seen {
+        return Err(Error::invalid_data(
+            "--maximum-name-index-bytes may only be specified once",
+        ));
+    }
+    let value = arguments
+        .get(option_index + 1)
+        .ok_or_else(|| Error::invalid_data("--maximum-name-index-bytes requires a value"))?;
+    let value = value
+        .to_str()
+        .ok_or_else(|| Error::invalid_data("name-index limit must be UTF-8 digits"))?
+        .parse::<u64>()
+        .map_err(|_| Error::invalid_data("name-index limit must be a non-negative integer"))?;
+    if value > MAX_LIVE2D_NAME_INDEX_BYTES {
+        return Err(Error::invalid_data(format!(
+            "--maximum-name-index-bytes must not exceed {MAX_LIVE2D_NAME_INDEX_BYTES}"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_model_arguments(arguments: &[OsString], command_name: &str) -> Result<FbxCommand> {

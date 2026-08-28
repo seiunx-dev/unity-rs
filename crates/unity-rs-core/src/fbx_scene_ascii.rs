@@ -1794,33 +1794,7 @@ impl Matrix4 {
             values[4 + row] = 1.0;
         }
         for column in 0..4 {
-            let pivot_row = (column..4)
-                .max_by(|left, right| {
-                    augmented[*left][column]
-                        .abs()
-                        .total_cmp(&augmented[*right][column].abs())
-                })
-                .ok_or_else(|| Error::invalid_data("FBX bind pose has no inverse"))?;
-            let pivot = augmented[pivot_row][column];
-            if pivot.abs() < f64::MIN_POSITIVE || !pivot.is_finite() {
-                return Err(Error::invalid_data(
-                    "FBX bind pose is singular and cannot form a skin cluster",
-                ));
-            }
-            augmented.swap(column, pivot_row);
-            let divisor = augmented[column][column];
-            for value in &mut augmented[column] {
-                *value /= divisor;
-            }
-            for row in 0..4 {
-                if row == column {
-                    continue;
-                }
-                let factor = augmented[row][column];
-                for value_index in 0..8 {
-                    augmented[row][value_index] -= factor * augmented[column][value_index];
-                }
-            }
+            Self::eliminate_inverse_column(&mut augmented, column)?;
         }
         let mut result = Self([0.0; 16]);
         for (row, values) in augmented.iter().enumerate() {
@@ -1830,6 +1804,38 @@ impl Matrix4 {
         }
         result.validate("FBX inverse bind pose")?;
         Ok(result)
+    }
+
+    fn eliminate_inverse_column(augmented: &mut [[f64; 8]; 4], column: usize) -> Result<()> {
+        let pivot_row = (column..4)
+            .max_by(|left, right| {
+                augmented[*left][column]
+                    .abs()
+                    .total_cmp(&augmented[*right][column].abs())
+            })
+            .ok_or_else(|| Error::invalid_data("FBX bind pose has no inverse"))?;
+        let pivot = augmented[pivot_row][column];
+        if pivot.abs() < f64::MIN_POSITIVE || !pivot.is_finite() {
+            return Err(Error::invalid_data(
+                "FBX bind pose is singular and cannot form a skin cluster",
+            ));
+        }
+        augmented.swap(column, pivot_row);
+        let divisor = augmented[column][column];
+        for value in &mut augmented[column] {
+            *value /= divisor;
+        }
+        let pivot_values = augmented[column];
+        for (row, values) in augmented.iter_mut().enumerate() {
+            if row == column {
+                continue;
+            }
+            let factor = values[column];
+            for value_index in 0..8 {
+                values[value_index] -= factor * pivot_values[value_index];
+            }
+        }
+        Ok(())
     }
 
     fn validate(self, field: &str) -> Result<()> {

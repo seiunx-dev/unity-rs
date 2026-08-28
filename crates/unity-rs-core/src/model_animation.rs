@@ -791,36 +791,8 @@ fn append_acl_frames(
             .ok_or_else(|| Error::invalid_data("ACL frame value offset overflowed"))?;
         let mut column = 0_usize;
         while column < curve_count {
-            let global_index = usize::try_from(decoded.binding_indices[column])
-                .map_err(|_| Error::invalid_data("ACL binding index does not fit usize"))?;
-            let span = context.layout.find(global_index).ok_or_else(|| {
-                Error::invalid_data(format!(
-                    "ACL animation curve index {global_index} has no binding"
-                ))
-            })?;
-            if global_index != span.start {
-                return Err(Error::invalid_data(
-                    "ACL samples start inside a bound curve group",
-                ));
-            }
-            let width = span.end - span.start;
-            let column_end = column
-                .checked_add(width)
-                .ok_or_else(|| Error::invalid_data("ACL sample group range overflowed"))?;
-            if column_end > curve_count {
-                return Err(Error::invalid_data(
-                    "ACL samples end inside a bound curve group",
-                ));
-            }
-            for offset in 0..width {
-                let expected = u32::try_from(span.start + offset)
-                    .map_err(|_| Error::invalid_data("ACL binding index exceeds u32"))?;
-                if decoded.binding_indices[column + offset] != expected {
-                    return Err(Error::invalid_data(
-                        "ACL decoder omitted part of a bound curve group",
-                    ));
-                }
-            }
+            let (span, column_end) = acl_sample_span(decoded, context.layout, column)?;
+            let width = column_end - column;
             let value_start = frame_offset
                 .checked_add(column)
                 .ok_or_else(|| Error::invalid_data("ACL frame value range overflowed"))?;
@@ -837,6 +809,46 @@ fn append_acl_frames(
         }
     }
     Ok(())
+}
+
+fn acl_sample_span(
+    decoded: &AclDecodedClip,
+    layout: &BindingLayout,
+    column: usize,
+) -> Result<(BindingSpan, usize)> {
+    let global_index = usize::try_from(decoded.binding_indices[column])
+        .map_err(|_| Error::invalid_data("ACL binding index does not fit usize"))?;
+    let span = layout.find(global_index).ok_or_else(|| {
+        Error::invalid_data(format!(
+            "ACL animation curve index {global_index} has no binding"
+        ))
+    })?;
+    if global_index != span.start {
+        return Err(Error::invalid_data(
+            "ACL samples start inside a bound curve group",
+        ));
+    }
+    let column_end = column
+        .checked_add(span.end - span.start)
+        .ok_or_else(|| Error::invalid_data("ACL sample group range overflowed"))?;
+    if column_end > decoded.binding_indices.len() {
+        return Err(Error::invalid_data(
+            "ACL samples end inside a bound curve group",
+        ));
+    }
+    for (offset, &actual) in decoded.binding_indices[column..column_end]
+        .iter()
+        .enumerate()
+    {
+        let expected = u32::try_from(span.start + offset)
+            .map_err(|_| Error::invalid_data("ACL binding index exceeds u32"))?;
+        if actual != expected {
+            return Err(Error::invalid_data(
+                "ACL decoder omitted part of a bound curve group",
+            ));
+        }
+    }
+    Ok((span, column_end))
 }
 
 #[cfg(test)]

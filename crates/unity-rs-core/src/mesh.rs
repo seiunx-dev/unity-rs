@@ -3337,21 +3337,25 @@ mod tests {
             }
         }
         if options.skinning && options.layout_version >= (2018, 2, 0) {
-            pad_vertex_stream(&mut vertex_data);
-            for weights in [
-                [1.0_f32, 0.0, 0.0, 0.0],
-                [0.25, 0.75, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-            ] {
-                for weight in weights {
-                    vertex_data.extend_from_slice(&weight.to_le_bytes());
-                }
-            }
-            for indices in [[0_u8, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0]] {
-                vertex_data.extend_from_slice(&indices);
-            }
+            push_resident_skinning(&mut vertex_data);
         }
         vertex_data
+    }
+
+    fn push_resident_skinning(vertex_data: &mut Vec<u8>) {
+        pad_vertex_stream(vertex_data);
+        for weights in [
+            [1.0_f32, 0.0, 0.0, 0.0],
+            [0.25, 0.75, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ] {
+            for weight in weights {
+                vertex_data.extend_from_slice(&weight.to_le_bytes());
+            }
+        }
+        for indices in [[0_u8, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0]] {
+            vertex_data.extend_from_slice(&indices);
+        }
     }
 
     fn push_blend_shapes(output: &mut Vec<u8>, enabled: bool) {

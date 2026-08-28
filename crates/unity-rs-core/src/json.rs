@@ -416,10 +416,7 @@ mod tests {
         let value = match if depth == 0 { 0 } else { rng.below(11) } {
             0..=7 => sample_leaf(rng, seen),
             8 => {
-                let length = rng.below(4);
-                if length == 0 {
-                    seen.empty_containers += 1;
-                }
+                let length = sample_container_length(rng, seen);
                 TypeValue::Array(
                     (0..length)
                         .map(|_| sample(rng, depth - 1, seen))
@@ -427,10 +424,7 @@ mod tests {
                 )
             }
             9 => {
-                let length = rng.below(4);
-                if length == 0 {
-                    seen.empty_containers += 1;
-                }
+                let length = sample_container_length(rng, seen);
                 TypeValue::Object(
                     (0..length)
                         .map(|index| TypeField {
@@ -445,10 +439,7 @@ mod tests {
                 )
             }
             _ => {
-                let length = rng.below(4);
-                if length == 0 {
-                    seen.empty_containers += 1;
-                }
+                let length = sample_container_length(rng, seen);
                 TypeValue::Map(
                     (0..length)
                         .map(|_| TypeMapEntry {
@@ -491,6 +482,14 @@ mod tests {
             }
         });
         value
+    }
+
+    fn sample_container_length(rng: &mut Rng, seen: &mut Seen) -> usize {
+        let length = rng.below(4);
+        if length == 0 {
+            seen.empty_containers += 1;
+        }
+        length
     }
 
     fn is_container(value: &TypeValue) -> bool {

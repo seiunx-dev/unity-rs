@@ -1792,6 +1792,7 @@ struct SpriteVertexChannel {
     dimension: u8,
 }
 
+#[derive(Clone, Copy)]
 struct SpriteVertexStream {
     offset: usize,
     stride: usize,
@@ -2272,22 +2273,9 @@ fn modern_sprite_triangles(
     vertex_data: &SpriteVertexData,
     limits: SpriteReadLimits,
 ) -> Result<Vec<[Vector2; 3]>> {
-    let streams = build_sprite_vertex_streams(
-        &vertex_data.channels,
-        vertex_data.vertex_count,
-        vertex_data.version,
-    )?;
-    let Some(position_channel) = vertex_data.channels.first().copied() else {
+    let Some((position_channel, position_stream)) = sprite_position_layout(vertex_data)? else {
         return Ok(Vec::new());
     };
-    let Some(position_stream) = streams.get(usize::from(position_channel.stream)) else {
-        return Ok(Vec::new());
-    };
-    if position_stream.stride < 12
-        || usize::from(position_channel.offset) + 12 > position_stream.stride
-    {
-        return Ok(Vec::new());
-    }
 
     let total_triangles = submeshes.iter().try_fold(0_usize, |total, submesh| {
         total
@@ -2367,6 +2355,28 @@ fn modern_sprite_triangles(
         }
     }
     Ok(triangles)
+}
+
+fn sprite_position_layout(
+    vertex_data: &SpriteVertexData,
+) -> Result<Option<(SpriteVertexChannel, SpriteVertexStream)>> {
+    let streams = build_sprite_vertex_streams(
+        &vertex_data.channels,
+        vertex_data.vertex_count,
+        vertex_data.version,
+    )?;
+    let Some(position_channel) = vertex_data.channels.first().copied() else {
+        return Ok(None);
+    };
+    let Some(position_stream) = streams.get(usize::from(position_channel.stream)).copied() else {
+        return Ok(None);
+    };
+    if position_stream.stride < 12
+        || usize::from(position_channel.offset) + 12 > position_stream.stride
+    {
+        return Ok(None);
+    }
+    Ok(Some((position_channel, position_stream)))
 }
 
 fn reserve_sprite_triangles(

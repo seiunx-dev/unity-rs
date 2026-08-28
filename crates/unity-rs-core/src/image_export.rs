@@ -1872,27 +1872,31 @@ mod tests {
         }
     }
 
+    fn png_filter_neighbors(
+        output: &[u8],
+        row_start: usize,
+        index: usize,
+        stride: usize,
+    ) -> (u8, u8, u8) {
+        let left = index.checked_sub(4).map_or(0, |at| output[row_start + at]);
+        let above = row_start
+            .checked_sub(stride)
+            .map_or(0, |at| output[at + index]);
+        let upper_left = row_start
+            .checked_sub(stride)
+            .zip(index.checked_sub(4))
+            .map_or(0, |(row, column)| output[row + column]);
+        (left, above, upper_left)
+    }
+
     fn unfilter_png_scanlines(scanlines: &[u8], stride: usize) -> Vec<u8> {
         let mut output: Vec<u8> = Vec::new();
         for line in scanlines.chunks_exact(stride + 1) {
             let filter = line[0];
             let row_start = output.len();
             for (index, &byte) in line[1..].iter().enumerate() {
-                let left = if index >= 4 {
-                    output[row_start + index - 4]
-                } else {
-                    0
-                };
-                let above = if row_start >= stride {
-                    output[row_start + index - stride]
-                } else {
-                    0
-                };
-                let upper_left = if row_start >= stride && index >= 4 {
-                    output[row_start + index - stride - 4]
-                } else {
-                    0
-                };
+                let (left, above, upper_left) =
+                    png_filter_neighbors(&output, row_start, index, stride);
                 output.push(restore_png_byte(filter, byte, left, above, upper_left));
             }
         }

@@ -1822,25 +1822,14 @@ fn decode_vag_channel_frame(
     let flag = frame[1];
     let (coefficient_1, coefficient_2) = COEFFICIENTS[predictor];
     for (sample_index, destination) in output.iter_mut().enumerate() {
-        let decoded = if flag < 7 {
-            let byte = frame[2 + sample_index / 2];
-            let nibble = if sample_index.is_multiple_of(2) {
-                byte & 0x0f
-            } else {
-                byte >> 4
-            };
-            let signed = if nibble >= 8 {
-                i64::from(nibble) - 16
-            } else {
-                i64::from(nibble)
-            };
-            let scaled = signed << (20 - shift);
-            let prediction =
-                4 * (coefficient_1 * i64::from(*history_1) + coefficient_2 * i64::from(*history_2));
-            (scaled + prediction) >> 8
-        } else {
-            0
-        };
+        let decoded = decode_vag_sample(
+            &frame,
+            sample_index,
+            flag,
+            shift,
+            (coefficient_1, coefficient_2),
+            (*history_1, *history_2),
+        );
         let history = decoded.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
         let history = i32::try_from(history).expect("VAG history was clamped to i32");
         let sample = history.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
@@ -1848,6 +1837,34 @@ fn decode_vag_channel_frame(
         *history_2 = *history_1;
         *history_1 = history;
     }
+}
+
+fn decode_vag_sample(
+    frame: &[u8; 16],
+    sample_index: usize,
+    flag: u8,
+    shift: u32,
+    coefficients: (i64, i64),
+    history: (i32, i32),
+) -> i64 {
+    if flag >= 7 {
+        return 0;
+    }
+    let byte = frame[2 + sample_index / 2];
+    let nibble = if sample_index.is_multiple_of(2) {
+        byte & 0x0f
+    } else {
+        byte >> 4
+    };
+    let signed = if nibble >= 8 {
+        i64::from(nibble) - 16
+    } else {
+        i64::from(nibble)
+    };
+    let scaled = signed << (20 - shift);
+    let prediction =
+        4 * (coefficients.0 * i64::from(history.0) + coefficients.1 * i64::from(history.1));
+    (scaled + prediction) >> 8
 }
 
 fn hevag_wave_output_size(payload: &Region, stream: Fsb5HevagStream) -> Result<u64> {

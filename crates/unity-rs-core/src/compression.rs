@@ -81,28 +81,7 @@ impl ZipContainer {
         let bytes: Arc<[u8]> = region.read_to_vec(limits.maximum_input_bytes)?.into();
         let mut archive = zip::ZipArchive::new(Cursor::new(Arc::clone(&bytes)))
             .map_err(|error| invalid_zip("cannot read ZIP central directory", &error))?;
-        if archive.len() > limits.maximum_zip_entries {
-            return Err(Error::invalid_data(format!(
-                "ZIP contains {} records, exceeding limit {}",
-                archive.len(),
-                limits.maximum_zip_entries
-            )));
-        }
-        if archive
-            .decompressed_size()
-            .is_some_and(|size| size > u128::from(limits.maximum_zip_total_bytes))
-        {
-            return Err(Error::invalid_data(format!(
-                "ZIP declared output exceeds the {} byte total limit",
-                limits.maximum_zip_total_bytes
-            )));
-        }
-        if archive
-            .has_overlapping_files()
-            .map_err(|error| invalid_zip("cannot validate ZIP record ranges", &error))?
-        {
-            return Err(Error::invalid_data("ZIP contains overlapping file records"));
-        }
+        validate_zip_archive(&mut archive, limits)?;
 
         let mut entries = Vec::new();
         entries.try_reserve_exact(archive.len()).map_err(|error| {
@@ -201,6 +180,35 @@ impl ZipContainer {
         }
         Ok(Region::from_bytes(output))
     }
+}
+
+fn validate_zip_archive<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    limits: CompressionLimits,
+) -> Result<()> {
+    if archive.len() > limits.maximum_zip_entries {
+        return Err(Error::invalid_data(format!(
+            "ZIP contains {} records, exceeding limit {}",
+            archive.len(),
+            limits.maximum_zip_entries
+        )));
+    }
+    if archive
+        .decompressed_size()
+        .is_some_and(|size| size > u128::from(limits.maximum_zip_total_bytes))
+    {
+        return Err(Error::invalid_data(format!(
+            "ZIP declared output exceeds the {} byte total limit",
+            limits.maximum_zip_total_bytes
+        )));
+    }
+    if archive
+        .has_overlapping_files()
+        .map_err(|error| invalid_zip("cannot validate ZIP record ranges", &error))?
+    {
+        return Err(Error::invalid_data("ZIP contains overlapping file records"));
+    }
+    Ok(())
 }
 
 fn portable_zip_path(path: &Path) -> Result<String> {

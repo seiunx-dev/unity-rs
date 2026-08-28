@@ -1086,41 +1086,13 @@ fn decode_endpoints_hdr11(endpoints: &mut [i32], v: &[i32], alpha1: i32, alpha2:
     let mut vb0 = v[2] & 0x3f;
     let mut vb1 = v[3] & 0x3f;
     let mut vc = v[1] & 0x3f;
-    let mut vd0: i32;
-    let mut vd1: i32;
-
-    match mode {
-        0 | 2 => {
-            vd0 = v[4] & 0x7f;
-            if vd0 & 0x40 != 0 {
-                vd0 |= 0xff80;
-            }
-            vd1 = v[5] & 0x7f;
-            if vd1 & 0x40 != 0 {
-                vd1 |= 0xff80;
-            }
-        }
-        1 | 3 | 5 | 7 => {
-            vd0 = v[4] & 0x3f;
-            if vd0 & 0x20 != 0 {
-                vd0 |= 0xffc0;
-            }
-            vd1 = v[5] & 0x3f;
-            if vd1 & 0x20 != 0 {
-                vd1 |= 0xffc0;
-            }
-        }
-        _ => {
-            vd0 = v[4] & 0x1f;
-            if vd0 & 0x10 != 0 {
-                vd0 |= 0xffe0;
-            }
-            vd1 = v[5] & 0x1f;
-            if vd1 & 0x10 != 0 {
-                vd1 |= 0xffe0;
-            }
-        }
-    }
+    let delta_bits = match mode {
+        0 | 2 => 7,
+        1 | 3 | 5 | 7 => 6,
+        _ => 5,
+    };
+    let mut vd0 = sign_extend(v[4], delta_bits);
+    let mut vd1 = sign_extend(v[5], delta_bits);
 
     match mode {
         0 => {
@@ -1224,6 +1196,11 @@ fn decode_endpoints_hdr11(endpoints: &mut [i32], v: &[i32], alpha1: i32, alpha2:
             );
         }
     }
+}
+
+fn sign_extend(value: i32, bits: u32) -> i32 {
+    let shift = i32::BITS - bits;
+    (value << shift) >> shift
 }
 
 fn decode_endpoints(block: &Block, data: &mut BlockData) {
@@ -2025,49 +2002,69 @@ fn decode_astc_block(
     state: &mut AstcState,
     outbuf: &mut [u32],
 ) -> Result<(), ()> {
-    if block.bytes[0] == 0xfc && (block.bytes[1] & 1) == 1 {
-        let c: u32 = if block.bytes[1] & 2 != 0 {
-            color(
-                f16ptr_to_u8(&block.bytes[8..]),
-                f16ptr_to_u8(&block.bytes[10..]),
-                f16ptr_to_u8(&block.bytes[12..]),
-                f16ptr_to_u8(&block.bytes[14..]),
-            )
-        } else {
-            color(
-                block.bytes[9],
-                block.bytes[11],
-                block.bytes[13],
-                block.bytes[15],
-            )
-        };
-        outbuf[0..(block_width * block_height)].fill(c);
-    } else if ((block.bytes[0] & 0xc3) == 0xc0 && (block.bytes[1] & 1) == 1)
-        || (block.bytes[0] & 0xf) == 0
-    {
-        let c: u32 = color(255, 0, 255, 255);
-        outbuf[0..(block_width * block_height)].fill(c);
-    } else {
-        let AstcState {
-            data: block_data,
-            scratch,
-            cache,
-        } = state;
-        block_data.bw = block_width;
-        block_data.bh = block_height;
-        decode_block_params(block, block_data);
-        let planes = if block_data.dual_plane { 2 } else { 1 };
-        let grid = block_data.width * block_data.height;
-        if (grid + block_data.width) * planes + planes > 128 {
-            return Err(());
-        }
-        decode_endpoints(block, block_data);
-        decode_weights(block, block_data, scratch, cache);
-        if block_data.part_num > 1 {
-            select_partition(block, block_data);
-        }
-        applicate_color(block_data, outbuf);
+    let pixel_count = block_width * block_height;
+    if let Some(color) = astc_void_extent_color(block) {
+        outbuf[..pixel_count].fill(color);
+        return Ok(());
     }
+    if is_invalid_astc_block(block) {
+        outbuf[..pixel_count].fill(color(255, 0, 255, 255));
+        return Ok(());
+    }
+    decode_regular_astc_block(block, block_width, block_height, state, outbuf)
+}
+
+fn astc_void_extent_color(block: &Block) -> Option<u32> {
+    if block.bytes[0] != 0xfc || (block.bytes[1] & 1) != 1 {
+        return None;
+    }
+    Some(if block.bytes[1] & 2 != 0 {
+        color(
+            f16ptr_to_u8(&block.bytes[8..]),
+            f16ptr_to_u8(&block.bytes[10..]),
+            f16ptr_to_u8(&block.bytes[12..]),
+            f16ptr_to_u8(&block.bytes[14..]),
+        )
+    } else {
+        color(
+            block.bytes[9],
+            block.bytes[11],
+            block.bytes[13],
+            block.bytes[15],
+        )
+    })
+}
+
+fn is_invalid_astc_block(block: &Block) -> bool {
+    ((block.bytes[0] & 0xc3) == 0xc0 && (block.bytes[1] & 1) == 1) || (block.bytes[0] & 0xf) == 0
+}
+
+fn decode_regular_astc_block(
+    block: &Block,
+    block_width: usize,
+    block_height: usize,
+    state: &mut AstcState,
+    outbuf: &mut [u32],
+) -> Result<(), ()> {
+    let AstcState {
+        data: block_data,
+        scratch,
+        cache,
+    } = state;
+    block_data.bw = block_width;
+    block_data.bh = block_height;
+    decode_block_params(block, block_data);
+    let planes = if block_data.dual_plane { 2 } else { 1 };
+    let grid = block_data.width * block_data.height;
+    if (grid + block_data.width) * planes + planes > 128 {
+        return Err(());
+    }
+    decode_endpoints(block, block_data);
+    decode_weights(block, block_data, scratch, cache);
+    if block_data.part_num > 1 {
+        select_partition(block, block_data);
+    }
+    applicate_color(block_data, outbuf);
     Ok(())
 }
 
