@@ -30,7 +30,7 @@ use unity_rs_core::image_export::{
 };
 use unity_rs_core::live2d_package::{Live2dPackage, Live2dPackageLimits, build_live2d_packages};
 use unity_rs_core::loader::{
-    AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy,
+    AssetCollection, AssetLoadLimits, AssetLoadOptions, LoadFailurePolicy, LoadedSerializedFile,
 };
 use unity_rs_core::model_animation::{
     ModelAnimationLimits, ModelAnimationSet, build_model_animations,
@@ -808,15 +808,7 @@ fn dispatch_legacy_mode(
     if mode.eq_ignore_ascii_case("animator") || mode.eq_ignore_ascii_case("splitobjects") {
         return parse_legacy_fbx_batch(input, output, mode);
     }
-    let export_mode = if mode.eq_ignore_ascii_case("export") {
-        Some(ExportMode::Auto)
-    } else if mode.eq_ignore_ascii_case("raw") || mode.eq_ignore_ascii_case("exportraw") {
-        Some(ExportMode::Raw)
-    } else if mode.eq_ignore_ascii_case("dump") {
-        Some(ExportMode::DumpText)
-    } else {
-        None
-    };
+    let export_mode = legacy_export_mode(mode);
     if let Some(export_mode) = export_mode {
         let output = output.ok_or_else(|| {
             CliError::Usage(
@@ -843,6 +835,17 @@ fn dispatch_legacy_mode(
         "legacy mode {} is not implemented by the native CLI",
         CliArgumentDisplay(OsStr::new(mode))
     )))
+}
+
+fn legacy_export_mode(mode: &str) -> Option<ExportMode> {
+    if mode.eq_ignore_ascii_case("export") {
+        return Some(ExportMode::Auto);
+    }
+    if mode.eq_ignore_ascii_case("raw") || mode.eq_ignore_ascii_case("exportraw") {
+        return Some(ExportMode::Raw);
+    }
+    mode.eq_ignore_ascii_case("dump")
+        .then_some(ExportMode::DumpText)
 }
 
 fn parse_legacy_live2d(
@@ -3610,8 +3613,7 @@ fn report_collection(
     output: &mut impl Write,
 ) -> CliResult<()> {
     let collection = load_asset_collection(path, load, output)?;
-    let mut total_objects = 0_usize;
-    let mut total_object_bytes = 0_u64;
+    let mut summary = CollectionSummary::default();
     let mut class_counts = HashMap::<i32, usize>::new();
     let mut unity_versions = HashMap::<String, usize>::new();
 
@@ -3624,55 +3626,18 @@ fn report_collection(
     writeln!(output, "  resources: {}", collection.resources().len())?;
 
     for loaded in collection.serialized_files() {
-        total_objects = total_objects
-            .checked_add(loaded.file.objects.len())
-            .ok_or_else(|| Error::invalid_data("serialized object count overflowed"))?;
-        increment_string_count(
+        report_loaded_file(
+            loaded,
+            include_objects,
+            &mut summary,
+            &mut class_counts,
             &mut unity_versions,
-            &loaded.file.unity_version_string,
-            "Unity version",
+            output,
         )?;
-
-        if include_objects {
-            writeln!(output, "  {}", escape_text(&loaded.path))?;
-            writeln!(
-                output,
-                "    Unity version: {}",
-                escape_text(&loaded.file.unity_version_string)
-            )?;
-            // A stripped or pre-v7 file is parsed against a version it does not
-            // declare, whether that came from --unity-version or the enclosing
-            // bundle. Report which one the version gates actually used.
-            let effective = loaded.file.unity_version.to_string();
-            if effective != loaded.file.unity_version_string {
-                writeln!(
-                    output,
-                    "    effective Unity version: {}",
-                    escape_text(&effective)
-                )?;
-            }
-        }
-        for object in &loaded.file.objects {
-            total_object_bytes = total_object_bytes
-                .checked_add(object.byte_size)
-                .ok_or_else(|| Error::invalid_data("serialized object byte total overflowed"))?;
-            increment_class_count(&mut class_counts, object.class_id)?;
-            if include_objects {
-                writeln!(
-                    output,
-                    "    path ID {}: class {}{}, type {}, {} bytes",
-                    object.path_id,
-                    object.class_id,
-                    class_name_suffix(object.class_id),
-                    object.type_id,
-                    object.byte_size
-                )?;
-            }
-        }
     }
 
-    writeln!(output, "  objects: {total_objects}")?;
-    writeln!(output, "  object bytes: {total_object_bytes}")?;
+    writeln!(output, "  objects: {}", summary.objects)?;
+    writeln!(output, "  object bytes: {}", summary.object_bytes)?;
     writeln!(output, "  Unity versions:")?;
     if unity_versions.is_empty() {
         writeln!(output, "    none")?;
@@ -3694,6 +3659,66 @@ fn report_collection(
         }
     }
     skipped_input_result("info/list", &collection)
+}
+
+#[derive(Default)]
+struct CollectionSummary {
+    objects: usize,
+    object_bytes: u64,
+}
+
+fn report_loaded_file(
+    loaded: &LoadedSerializedFile,
+    include_objects: bool,
+    summary: &mut CollectionSummary,
+    class_counts: &mut HashMap<i32, usize>,
+    unity_versions: &mut HashMap<String, usize>,
+    output: &mut impl Write,
+) -> CliResult<()> {
+    summary.objects = summary
+        .objects
+        .checked_add(loaded.file.objects.len())
+        .ok_or_else(|| Error::invalid_data("serialized object count overflowed"))?;
+    increment_string_count(
+        unity_versions,
+        &loaded.file.unity_version_string,
+        "Unity version",
+    )?;
+    if include_objects {
+        writeln!(output, "  {}", escape_text(&loaded.path))?;
+        writeln!(
+            output,
+            "    Unity version: {}",
+            escape_text(&loaded.file.unity_version_string)
+        )?;
+        let effective = loaded.file.unity_version.to_string();
+        if effective != loaded.file.unity_version_string {
+            writeln!(
+                output,
+                "    effective Unity version: {}",
+                escape_text(&effective)
+            )?;
+        }
+    }
+    for object in &loaded.file.objects {
+        summary.object_bytes = summary
+            .object_bytes
+            .checked_add(object.byte_size)
+            .ok_or_else(|| Error::invalid_data("serialized object byte total overflowed"))?;
+        increment_class_count(class_counts, object.class_id)?;
+        if include_objects {
+            writeln!(
+                output,
+                "    path ID {}: class {}{}, type {}, {} bytes",
+                object.path_id,
+                object.class_id,
+                class_name_suffix(object.class_id),
+                object.type_id,
+                object.byte_size
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn increment_class_count(counts: &mut HashMap<i32, usize>, class_id: i32) -> Result<()> {

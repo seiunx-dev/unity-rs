@@ -1343,18 +1343,7 @@ fn apply_tight_mesh_mask(
     if mesh_covers_every_pixel(sprite, triangles, texture_rect_offset, image) {
         return Ok(());
     }
-    let pixel_count = u64::from(image.width)
-        .checked_mul(u64::from(image.height))
-        .ok_or_else(|| Error::invalid_data("tight Sprite mask size overflowed"))?;
-    let mask_length = usize::try_from(pixel_count)
-        .map_err(|_| Error::invalid_data("tight Sprite mask is too large for this platform"))?;
-    let mask_width = usize::try_from(image.width)
-        .map_err(|_| Error::invalid_data("tight Sprite width is too large for this platform"))?;
-    let mut mask = Vec::new();
-    mask.try_reserve_exact(mask_length).map_err(|error| {
-        Error::invalid_data(format!("cannot allocate tight Sprite mask: {error}"))
-    })?;
-    mask.resize(mask_length, 0_u8);
+    let (mut mask, mask_width) = allocate_tight_sprite_mask(image)?;
 
     let mut operations = 0_u64;
     for triangle in triangles {
@@ -1408,6 +1397,22 @@ fn apply_tight_mesh_mask(
         }
     }
     Ok(())
+}
+
+fn allocate_tight_sprite_mask(image: &RgbaImage) -> Result<(Vec<u8>, usize)> {
+    let pixel_count = u64::from(image.width)
+        .checked_mul(u64::from(image.height))
+        .ok_or_else(|| Error::invalid_data("tight Sprite mask size overflowed"))?;
+    let mask_length = usize::try_from(pixel_count)
+        .map_err(|_| Error::invalid_data("tight Sprite mask is too large for this platform"))?;
+    let mask_width = usize::try_from(image.width)
+        .map_err(|_| Error::invalid_data("tight Sprite width is too large for this platform"))?;
+    let mut mask = Vec::new();
+    mask.try_reserve_exact(mask_length).map_err(|error| {
+        Error::invalid_data(format!("cannot allocate tight Sprite mask: {error}"))
+    })?;
+    mask.resize(mask_length, 0_u8);
+    Ok((mask, mask_width))
 }
 
 fn transform_sprite_triangle(

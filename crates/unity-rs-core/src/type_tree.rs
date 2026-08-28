@@ -602,16 +602,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         let root = self.nodes.get(index).ok_or_else(|| {
             Error::invalid_data(format!("type tree node index {index} is out of range"))
         })?;
-        let is_class = matches!(ValueKind::from_type_name(&root.type_name), ValueKind::Other)
-            || matches!(
-                ValueKind::from_type_name(&root.type_name),
-                ValueKind::String
-            ) && !is_array_parent(self.nodes, index);
-        if !is_class {
-            return Err(Error::invalid_data(
-                "type tree root-field projection requires a record root",
-            ));
-        }
+        require_projectable_root(self.nodes, index, root)?;
 
         let root_level = root.level;
         let align = root.meta_flags & ALIGN_BYTES_FLAG != 0;
@@ -1232,6 +1223,22 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         }
         self.reader.set_position(target)
     }
+}
+
+fn require_projectable_root(
+    nodes: &[TypeTreeNode],
+    index: usize,
+    root: &TypeTreeNode,
+) -> Result<()> {
+    let kind = ValueKind::from_type_name(&root.type_name);
+    let is_class = matches!(kind, ValueKind::Other)
+        || matches!(kind, ValueKind::String) && !is_array_parent(nodes, index);
+    if is_class {
+        return Ok(());
+    }
+    Err(Error::invalid_data(
+        "type tree root-field projection requires a record root",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

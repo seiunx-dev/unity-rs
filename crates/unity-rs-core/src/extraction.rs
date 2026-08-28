@@ -1576,31 +1576,8 @@ fn collect_regular_files(
     let mut files = Vec::new();
     let mut entry_count = 0_usize;
     while let Some(directory) = directories.pop() {
-        let mut children = Vec::new();
-        for child in fs::read_dir(&directory)? {
-            entry_count = entry_count.checked_add(1).ok_or_else(|| {
-                Error::invalid_data("extraction directory entry count overflowed")
-            })?;
-            if entry_count > limits.maximum_entries {
-                return Err(Error::invalid_data(format!(
-                    "extraction directory traversal exceeds {} entries",
-                    limits.maximum_entries
-                )));
-            }
-            let child = child?;
-            let file_type = child.file_type()?;
-            if !file_type.is_dir() && !file_type.is_file() {
-                continue;
-            }
-            let path = join_filesystem_path(&directory, &child.file_name(), limits, path_budget)?;
-            children.try_reserve(1).map_err(|error| {
-                Error::invalid_data(format!(
-                    "cannot allocate extraction directory entries: {error}"
-                ))
-            })?;
-            children.push((path, file_type));
-        }
-        children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let children =
+            extraction_directory_children(&directory, limits, path_budget, &mut entry_count)?;
         for (path, file_type) in children.into_iter().rev() {
             if file_type.is_dir() {
                 directories.try_reserve(1).map_err(|error| {
@@ -1623,6 +1600,40 @@ fn collect_regular_files(
     }
     files.sort_unstable();
     Ok(files)
+}
+
+fn extraction_directory_children(
+    directory: &Path,
+    limits: ExtractionLimits,
+    path_budget: &mut ExtractionPathBudget,
+    entry_count: &mut usize,
+) -> Result<Vec<(PathBuf, fs::FileType)>> {
+    let mut children = Vec::new();
+    for child in fs::read_dir(directory)? {
+        *entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_data("extraction directory entry count overflowed"))?;
+        if *entry_count > limits.maximum_entries {
+            return Err(Error::invalid_data(format!(
+                "extraction directory traversal exceeds {} entries",
+                limits.maximum_entries
+            )));
+        }
+        let child = child?;
+        let file_type = child.file_type()?;
+        if !file_type.is_dir() && !file_type.is_file() {
+            continue;
+        }
+        let path = join_filesystem_path(directory, &child.file_name(), limits, path_budget)?;
+        children.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!(
+                "cannot allocate extraction directory entries: {error}"
+            ))
+        })?;
+        children.push((path, file_type));
+    }
+    children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(children)
 }
 
 fn detect_region(region: &Region) -> Result<FileDetection> {

@@ -16,7 +16,7 @@
 use std::io::Write;
 
 use crate::fbx_binary::{FbxNode, FbxProperty};
-use crate::fbx_scene_ascii::{MaterialProperties, StaticScene, polygon_end};
+use crate::fbx_scene_ascii::{GeometryPlan, MaterialProperties, StaticScene, polygon_end};
 use crate::model_ir::ModelIr;
 use crate::{Error, Result};
 
@@ -1061,20 +1061,28 @@ fn append_object_connections(scene: &StaticScene<'_>, records: &mut Vec<FbxNode>
         push_connection(records, "OO", texture.video_id, texture.id, None)?;
     }
     for geometry in &scene.geometries {
-        if let Some(skin) = &geometry.skin {
-            push_connection(records, "OO", skin.id, geometry.id, None)?;
-            for cluster in &skin.clusters {
-                push_connection(records, "OO", cluster.id, skin.id, None)?;
-                push_connection(records, "OO", cluster.bone_model_id, cluster.id, None)?;
-            }
+        append_geometry_deformer_connections(geometry, records)?;
+    }
+    Ok(())
+}
+
+fn append_geometry_deformer_connections(
+    geometry: &GeometryPlan<'_>,
+    records: &mut Vec<FbxNode>,
+) -> Result<()> {
+    if let Some(skin) = &geometry.skin {
+        push_connection(records, "OO", skin.id, geometry.id, None)?;
+        for cluster in &skin.clusters {
+            push_connection(records, "OO", cluster.id, skin.id, None)?;
+            push_connection(records, "OO", cluster.bone_model_id, cluster.id, None)?;
         }
-        if let Some(morph) = &geometry.morph {
-            push_connection(records, "OO", morph.id, geometry.id, None)?;
-            for channel in &morph.channels {
-                push_connection(records, "OO", channel.id, morph.id, None)?;
-                for shape in &channel.shapes {
-                    push_connection(records, "OO", shape.id, channel.id, None)?;
-                }
+    }
+    if let Some(morph) = &geometry.morph {
+        push_connection(records, "OO", morph.id, geometry.id, None)?;
+        for channel in &morph.channels {
+            push_connection(records, "OO", channel.id, morph.id, None)?;
+            for shape in &channel.shapes {
+                push_connection(records, "OO", shape.id, channel.id, None)?;
             }
         }
     }

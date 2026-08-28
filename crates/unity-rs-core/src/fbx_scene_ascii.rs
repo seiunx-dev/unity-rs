@@ -2284,52 +2284,13 @@ fn write_shape_geometry(
 fn write_geometry_layers(geometry: &GeometryPlan<'_>, output: &mut impl Write) -> io::Result<()> {
     let mesh = geometry.mesh;
     if let Some(normals) = &mesh.normals {
-        writeln!(output, "        LayerElementNormal: 0 {{")?;
-        output.write_all(
-            b"            Version: 101\n            Name: \"\"\n            MappingInformationType: \"ByVertice\"\n            ReferenceInformationType: \"Direct\"\n",
-        )?;
-        writeln!(output, "            Normals: *{} {{", normals.len() * 3)?;
-        output.write_all(b"                a: ")?;
-        let mut first = true;
-        for normal in normals {
-            for value in [-normal[0], normal[1], normal[2]] {
-                write_array_value(output, &mut first, FbxFloat(value))?;
-            }
-        }
-        output.write_all(b"\n            }\n        }\n")?;
+        write_normal_layer(normals, output)?;
     }
     if let Some(uv) = &mesh.uv0 {
-        writeln!(output, "        LayerElementUV: 0 {{")?;
-        output.write_all(
-            b"            Version: 101\n            Name: \"UV0\"\n            MappingInformationType: \"ByVertice\"\n            ReferenceInformationType: \"Direct\"\n",
-        )?;
-        writeln!(output, "            UV: *{} {{", uv.len() * 2)?;
-        output.write_all(b"                a: ")?;
-        let mut first = true;
-        for uv in uv {
-            write_array_value(output, &mut first, FbxFloat(uv[0]))?;
-            write_array_value(output, &mut first, FbxFloat(uv[1]))?;
-        }
-        output.write_all(b"\n            }\n        }\n")?;
+        write_uv_layer(uv, output)?;
     }
     if !geometry.material_ids.is_empty() {
-        let polygon_count = mesh
-            .sub_meshes
-            .iter()
-            .map(|submesh| submesh.indices.len() / 3)
-            .sum::<usize>();
-        output.write_all(
-            b"        LayerElementMaterial: 0 {\n            Version: 101\n            Name: \"\"\n            MappingInformationType: \"ByPolygon\"\n            ReferenceInformationType: \"IndexToDirect\"\n",
-        )?;
-        writeln!(output, "            Materials: *{polygon_count} {{")?;
-        output.write_all(b"                a: ")?;
-        let mut first = true;
-        for (submesh, slot) in mesh.sub_meshes.iter().zip(&geometry.submesh_material_slots) {
-            for _ in 0..submesh.indices.len() / 3 {
-                write_array_value(output, &mut first, *slot)?;
-            }
-        }
-        output.write_all(b"\n            }\n        }\n")?;
+        write_material_layer(geometry, output)?;
     }
     output.write_all(b"        Layer: 0 {\n            Version: 100\n")?;
     if mesh.normals.is_some() {
@@ -2348,6 +2309,63 @@ fn write_geometry_layers(geometry: &GeometryPlan<'_>, output: &mut impl Write) -
         )?;
     }
     output.write_all(b"        }\n")
+}
+
+fn write_normal_layer(normals: &[[f32; 3]], output: &mut impl Write) -> io::Result<()> {
+    writeln!(output, "        LayerElementNormal: 0 {{")?;
+    output.write_all(
+        b"            Version: 101\n            Name: \"\"\n            MappingInformationType: \"ByVertice\"\n            ReferenceInformationType: \"Direct\"\n",
+    )?;
+    writeln!(output, "            Normals: *{} {{", normals.len() * 3)?;
+    output.write_all(b"                a: ")?;
+    let mut first = true;
+    for normal in normals {
+        for value in [-normal[0], normal[1], normal[2]] {
+            write_array_value(output, &mut first, FbxFloat(value))?;
+        }
+    }
+    output.write_all(b"\n            }\n        }\n")
+}
+
+fn write_uv_layer(uvs: &[[f32; 2]], output: &mut impl Write) -> io::Result<()> {
+    writeln!(output, "        LayerElementUV: 0 {{")?;
+    output.write_all(
+        b"            Version: 101\n            Name: \"UV0\"\n            MappingInformationType: \"ByVertice\"\n            ReferenceInformationType: \"Direct\"\n",
+    )?;
+    writeln!(output, "            UV: *{} {{", uvs.len() * 2)?;
+    output.write_all(b"                a: ")?;
+    let mut first = true;
+    for uv in uvs {
+        write_array_value(output, &mut first, FbxFloat(uv[0]))?;
+        write_array_value(output, &mut first, FbxFloat(uv[1]))?;
+    }
+    output.write_all(b"\n            }\n        }\n")
+}
+
+fn write_material_layer(geometry: &GeometryPlan<'_>, output: &mut impl Write) -> io::Result<()> {
+    let polygon_count = geometry
+        .mesh
+        .sub_meshes
+        .iter()
+        .map(|submesh| submesh.indices.len() / 3)
+        .sum::<usize>();
+    output.write_all(
+        b"        LayerElementMaterial: 0 {\n            Version: 101\n            Name: \"\"\n            MappingInformationType: \"ByPolygon\"\n            ReferenceInformationType: \"IndexToDirect\"\n",
+    )?;
+    writeln!(output, "            Materials: *{polygon_count} {{")?;
+    output.write_all(b"                a: ")?;
+    let mut first = true;
+    for (submesh, slot) in geometry
+        .mesh
+        .sub_meshes
+        .iter()
+        .zip(&geometry.submesh_material_slots)
+    {
+        for _ in 0..submesh.indices.len() / 3 {
+            write_array_value(output, &mut first, *slot)?;
+        }
+    }
+    output.write_all(b"\n            }\n        }\n")
 }
 
 fn write_material(material: &MaterialPlan<'_>, output: &mut impl Write) -> io::Result<()> {

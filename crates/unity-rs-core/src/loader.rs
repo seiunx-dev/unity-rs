@@ -2240,23 +2240,7 @@ fn collect_regular_files(
     pending_directories.push(copy_filesystem_path(root, limits, budget)?);
     let mut files = Vec::new();
     while let Some(directory) = pending_directories.pop() {
-        let mut children = Vec::new();
-        for child in fs::read_dir(&directory)? {
-            budget.charge_directory_entry(limits)?;
-            let child = child?;
-            let file_type = child.file_type()?;
-            if !file_type.is_dir() && !file_type.is_file() {
-                continue;
-            }
-            children.try_reserve(1).map_err(|error| {
-                Error::invalid_data(format!("cannot allocate directory entries: {error}"))
-            })?;
-            children.push((
-                join_filesystem_path(&directory, &child.file_name(), limits, budget)?,
-                file_type,
-            ));
-        }
-        children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let children = load_directory_children(&directory, limits, budget)?;
         for (child, file_type) in children.into_iter().rev() {
             if file_type.is_dir() {
                 budget.charge_input_directory(limits)?;
@@ -2280,6 +2264,31 @@ fn collect_regular_files(
     }
     files.sort_unstable();
     Ok(files)
+}
+
+fn load_directory_children(
+    directory: &Path,
+    limits: &AssetLoadLimits,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<(PathBuf, fs::FileType)>> {
+    let mut children = Vec::new();
+    for child in fs::read_dir(directory)? {
+        budget.charge_directory_entry(limits)?;
+        let child = child?;
+        let file_type = child.file_type()?;
+        if !file_type.is_dir() && !file_type.is_file() {
+            continue;
+        }
+        children.try_reserve(1).map_err(|error| {
+            Error::invalid_data(format!("cannot allocate directory entries: {error}"))
+        })?;
+        children.push((
+            join_filesystem_path(directory, &child.file_name(), limits, budget)?,
+            file_type,
+        ));
+    }
+    children.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(children)
 }
 
 #[derive(Debug)]
