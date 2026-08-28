@@ -47,26 +47,12 @@ impl WebFile {
         let mut reader = EndianReader::new(region.cursor(), Endian::Little);
         reader.set_endian(Endian::Little);
         let signature = reader.read_c_string_required(32_767, "WebData signature")?;
-        if signature != "UnityWebData1.0" && signature != "TuanjieWebData1.0" {
-            return Err(Error::invalid_data(format!(
-                "unsupported WebData signature: {signature:?}"
-            )));
-        }
+        validate_signature(&signature)?;
 
         let header_length = checked_u64(reader.read_i32()?, "WebData header length")?;
         let stream_length = reader.len()?;
         let directory_start = reader.position()?;
-        if header_length < directory_start || header_length > stream_length {
-            return Err(Error::invalid_data(format!(
-                "WebData header length {header_length} is outside the stream"
-            )));
-        }
-        if header_length > limits.max_header_size {
-            return Err(Error::invalid_data(format!(
-                "WebData header length {header_length} exceeds configured limit {}",
-                limits.max_header_size
-            )));
-        }
+        validate_header_length(header_length, directory_start, stream_length, limits)?;
 
         let mut entries = Vec::new();
         while reader.position()? < header_length {
@@ -76,51 +62,17 @@ impl WebFile {
                     limits.max_entries
                 )));
             }
-            let bytes_left = header_length - reader.position()?;
-            if bytes_left < 12 {
-                return Err(Error::invalid_data(
-                    "truncated WebData directory record header",
-                ));
-            }
-
-            let data_offset = checked_u64(reader.read_i32()?, "WebData entry offset")?;
-            let data_length = checked_u64(reader.read_i32()?, "WebData entry length")?;
-            let path_length = checked_length(reader.read_i32()?, "WebData path")?;
-            if path_length > limits.max_path_length {
-                return Err(Error::invalid_data(format!(
-                    "WebData path length {path_length} exceeds configured limit {}",
-                    limits.max_path_length
-                )));
-            }
-            let path_length_u64 = u64::try_from(path_length)
-                .map_err(|_| Error::invalid_data("WebData path length does not fit in u64"))?;
-            if path_length_u64 > header_length - reader.position()? {
-                return Err(Error::invalid_data(
-                    "WebData path extends past the end of its directory",
-                ));
-            }
-            let path = reader.read_utf8(path_length)?;
-            let data_end = data_offset
-                .checked_add(data_length)
-                .ok_or_else(|| Error::invalid_data("WebData entry range overflowed"))?;
-            if data_offset < header_length || data_end > stream_length {
-                return Err(Error::invalid_data(format!(
-                    "WebData entry {path:?} range {data_offset}..{data_end} is outside payload area {header_length}..{stream_length}"
-                )));
-            }
-
-            let file_name = copy_portable_file_name(&path, "WebData file name")?;
             if entries.len() == entries.capacity() {
                 entries.try_reserve(1).map_err(|error| {
                     Error::invalid_data(format!("cannot allocate WebData entry table: {error}"))
                 })?;
             }
-            entries.push(WebFileEntry {
-                path,
-                file_name,
-                data_offset,
-                data_length,
-            });
+            entries.push(read_entry(
+                &mut reader,
+                header_length,
+                stream_length,
+                limits.max_path_length,
+            )?);
         }
 
         if reader.position()? != header_length {
@@ -156,6 +108,78 @@ impl WebFile {
         }
         self.entry_region(index)?.read_to_vec(self.entry_read_limit)
     }
+}
+
+fn validate_signature(signature: &str) -> Result<()> {
+    if matches!(signature, "UnityWebData1.0" | "TuanjieWebData1.0") {
+        return Ok(());
+    }
+    Err(Error::invalid_data(format!(
+        "unsupported WebData signature: {signature:?}"
+    )))
+}
+
+fn validate_header_length(
+    header_length: u64,
+    directory_start: u64,
+    stream_length: u64,
+    limits: WebParseLimits,
+) -> Result<()> {
+    if header_length < directory_start || header_length > stream_length {
+        return Err(Error::invalid_data(format!(
+            "WebData header length {header_length} is outside the stream"
+        )));
+    }
+    if header_length > limits.max_header_size {
+        return Err(Error::invalid_data(format!(
+            "WebData header length {header_length} exceeds configured limit {}",
+            limits.max_header_size
+        )));
+    }
+    Ok(())
+}
+
+fn read_entry(
+    reader: &mut EndianReader<impl std::io::Read + std::io::Seek>,
+    header_length: u64,
+    stream_length: u64,
+    max_path_length: usize,
+) -> Result<WebFileEntry> {
+    if header_length - reader.position()? < 12 {
+        return Err(Error::invalid_data(
+            "truncated WebData directory record header",
+        ));
+    }
+    let data_offset = checked_u64(reader.read_i32()?, "WebData entry offset")?;
+    let data_length = checked_u64(reader.read_i32()?, "WebData entry length")?;
+    let path_length = checked_length(reader.read_i32()?, "WebData path")?;
+    if path_length > max_path_length {
+        return Err(Error::invalid_data(format!(
+            "WebData path length {path_length} exceeds configured limit {max_path_length}"
+        )));
+    }
+    let path_length_u64 = u64::try_from(path_length)
+        .map_err(|_| Error::invalid_data("WebData path length does not fit in u64"))?;
+    if path_length_u64 > header_length - reader.position()? {
+        return Err(Error::invalid_data(
+            "WebData path extends past the end of its directory",
+        ));
+    }
+    let path = reader.read_utf8(path_length)?;
+    let data_end = data_offset
+        .checked_add(data_length)
+        .ok_or_else(|| Error::invalid_data("WebData entry range overflowed"))?;
+    if data_offset < header_length || data_end > stream_length {
+        return Err(Error::invalid_data(format!(
+            "WebData entry {path:?} range {data_offset}..{data_end} is outside payload area {header_length}..{stream_length}"
+        )));
+    }
+    Ok(WebFileEntry {
+        file_name: copy_portable_file_name(&path, "WebData file name")?,
+        path,
+        data_offset,
+        data_length,
+    })
 }
 
 fn checked_u64(value: i32, field: &str) -> Result<u64> {

@@ -461,6 +461,14 @@ impl Texture2D {
             return self.decode_crunched_mip0_rgba8(mip_level, limits);
         }
 
+        self.decode_linear_mip_rgba8(mip_level, limits)
+    }
+
+    fn decode_linear_mip_rgba8(
+        &self,
+        mip_level: u32,
+        limits: TextureReadLimits,
+    ) -> Result<RgbaImage> {
         let (width, height) = self.mip_dimensions(mip_level)?;
         validate_dimensions(width, height, &limits)?;
         validate_pvrtc_decode_dimensions(self.format, width, height)?;
@@ -486,15 +494,7 @@ impl Texture2D {
             }
         }
         let mut input_bytes = input.read_to_vec(limits.maximum_payload_bytes)?;
-        if self.target_platform == XBOX_360_TARGET_PLATFORM
-            && matches!(
-                self.format,
-                TextureFormat::ARGB4444
-                    | TextureFormat::RGB565
-                    | TextureFormat::DXT1
-                    | TextureFormat::DXT5
-            )
-        {
+        if self.needs_xbox_byte_swap() {
             swap_adjacent_bytes(&mut input_bytes)?;
         }
         let output_length = usize::try_from(output_length)
@@ -511,6 +511,17 @@ impl Texture2D {
             height,
             pixels,
         })
+    }
+
+    fn needs_xbox_byte_swap(&self) -> bool {
+        self.target_platform == XBOX_360_TARGET_PLATFORM
+            && matches!(
+                self.format,
+                TextureFormat::ARGB4444
+                    | TextureFormat::RGB565
+                    | TextureFormat::DXT1
+                    | TextureFormat::DXT5
+            )
     }
 
     fn validate_surface_mip(&self, mip_level: u32) -> Result<bool> {

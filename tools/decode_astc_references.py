@@ -72,6 +72,36 @@ def wrap_astc(payload: bytes, block: int, width: int, height: int) -> bytes:
     )
 
 
+def decode_tga_payload(payload: bytes, kind: int, want: int) -> bytes:
+    """Decode the raw or RLE-compressed TGA pixel payload."""
+    if kind == 2:
+        return payload[:want]
+    out = bytearray()
+    offset = 0
+    while len(out) < want:
+        packet = payload[offset]
+        offset += 1
+        count = (packet & 0x7F) + 1
+        if packet & 0x80:
+            out += payload[offset : offset + 4] * count
+            offset += 4
+        else:
+            out += payload[offset : offset + count * 4]
+            offset += count * 4
+    return bytes(out[:want])
+
+
+def bgra_rows_to_rgba(rows: list[bytes], width: int) -> bytes:
+    """Convert top-down BGRA rows to a contiguous RGBA image."""
+    pixels = bytearray(len(rows) * width * 4)
+    for y, row in enumerate(rows):
+        for x in range(width):
+            b, g, r, a = row[x * 4 : x * 4 + 4]
+            start = (y * width + x) * 4
+            pixels[start : start + 4] = bytes((r, g, b, a))
+    return bytes(pixels)
+
+
 def read_tga(data: bytes, width: int, height: int) -> bytes:
     """Normalize a 32-bit truecolor TGA to top-down RGBA."""
     if data[0] != 0 or data[1] != 0:
@@ -88,31 +118,11 @@ def read_tga(data: bytes, width: int, height: int) -> bytes:
     top_down = bool(data[17] & 0x20)
     payload = data[18:]
     want = width * height * 4
-    if kind == 2:
-        decoded = payload[:want]
-    else:
-        out = bytearray()
-        offset = 0
-        while len(out) < want:
-            packet = payload[offset]
-            offset += 1
-            count = (packet & 0x7F) + 1
-            if packet & 0x80:
-                out += payload[offset : offset + 4] * count
-                offset += 4
-            else:
-                out += payload[offset : offset + count * 4]
-                offset += count * 4
-        decoded = bytes(out[:want])
+    decoded = decode_tga_payload(payload, kind, want)
     rows = [decoded[y * width * 4 : (y + 1) * width * 4] for y in range(height)]
     if not top_down:
         rows.reverse()
-    pixels = bytearray(want)
-    for y, row in enumerate(rows):
-        for x in range(width):
-            b, g, r, a = row[x * 4 : x * 4 + 4]
-            pixels[(y * width + x) * 4 : (y * width + x) * 4 + 4] = bytes((r, g, b, a))
-    return bytes(pixels)
+    return bgra_rows_to_rgba(rows, width)
 
 
 def main() -> None:

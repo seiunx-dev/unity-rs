@@ -200,23 +200,34 @@ def rust_parenthesized_call(source: str, marker: str) -> str:
     escaped = False
     for offset in range(opening, len(source)):
         character = source[offset]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
+        in_string, escaped, handled = rust_string_state(
+            character, in_string, escaped
+        )
+        if handled:
             continue
-        if character == '"':
-            in_string = True
-        elif character == "(":
+        if character == "(":
             depth += 1
         elif character == ")":
             depth -= 1
             if depth == 0:
                 return source[opening + 1 : offset]
     raise AuditError(f"Python binding has an unterminated call after {marker!r}")
+
+
+def rust_string_state(
+    character: str, in_string: bool, escaped: bool
+) -> tuple[bool, bool, bool]:
+    """Advance the minimal Rust string state used by source audits."""
+    if not in_string:
+        starts_string = character == '"'
+        return starts_string, False, starts_string
+    if escaped:
+        return True, False, True
+    if character == "\\":
+        return True, True, True
+    if character == '"':
+        return False, False, True
+    return True, False, True
 
 
 def validate_texture_gil_boundary(source: str) -> None:
@@ -427,33 +438,42 @@ def core_studio_methods(source: str) -> set[str]:
     """Extract public methods from the four high-level impl blocks."""
     methods: set[str] = set()
     for type_name, start_marker, end_marker in CORE_IMPL_RANGES:
-        start = source.find(start_marker)
-        if start < 0:
-            raise AuditError(f"Core source does not contain {start_marker!r}")
-        end = source.find(end_marker, start + len(start_marker))
-        if end < 0:
-            raise AuditError(
-                f"Core source does not contain {end_marker!r} after {start_marker!r}"
-            )
-        block = source[start + len(start_marker) : end]
+        block = source_between_markers(source, start_marker, end_marker)
         for line in block.splitlines():
-            stripped = line.strip()
-            prefix = "pub fn "
-            const_prefix = "pub const fn "
-            if stripped.startswith(prefix):
-                remainder = stripped[len(prefix) :]
-            elif stripped.startswith(const_prefix):
-                remainder = stripped[len(const_prefix) :]
-            else:
+            name = public_rust_method_name(line)
+            if name is None:
                 continue
-            name = remainder.split("(", 1)[0]
-            if not name.isidentifier():
-                raise AuditError(f"could not parse Core method declaration: {line!r}")
             qualified = f"{type_name}.{name}"
             if qualified in methods:
                 raise AuditError(f"Core method is declared twice: {qualified}")
             methods.add(qualified)
     return methods
+
+
+def source_between_markers(source: str, start_marker: str, end_marker: str) -> str:
+    """Return source bounded by two required ordered markers."""
+    start = source.find(start_marker)
+    if start < 0:
+        raise AuditError(f"Core source does not contain {start_marker!r}")
+    end = source.find(end_marker, start + len(start_marker))
+    if end < 0:
+        raise AuditError(
+            f"Core source does not contain {end_marker!r} after {start_marker!r}"
+        )
+    return source[start + len(start_marker) : end]
+
+
+def public_rust_method_name(line: str) -> str | None:
+    """Extract a public ordinary or const Rust method declaration."""
+    stripped = line.strip()
+    prefixes = ("pub fn ", "pub const fn ")
+    prefix = next((candidate for candidate in prefixes if stripped.startswith(candidate)), None)
+    if prefix is None:
+        return None
+    name = stripped[len(prefix) :].split("(", 1)[0]
+    if not name.isidentifier():
+        raise AuditError(f"could not parse Core method declaration: {line!r}")
+    return name
 
 
 def validate_core_mapping(core_source: str, stub_source: str) -> tuple[int, int]:
@@ -497,31 +517,45 @@ def consumed_members(source: str) -> tuple[set[str], set[str]]:
         raise AuditError("strict consumer does not define consume_public_api")
     receivers = {"studio"}
     for node in ast.walk(consumer):
-        if (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and isinstance(node.annotation, ast.Name)
-            and node.annotation.id == "UnityRs"
-        ):
-            receivers.add(node.target.id)
+        receiver = unity_rs_receiver(node)
+        if receiver is not None:
+            receivers.add(receiver)
 
     calls: set[str] = set()
     attributes: set[str] = set()
     for node in ast.walk(consumer):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id in receivers or node.value.id == "UnityRs":
-                attributes.add(node.attr)
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and (
-                node.func.value.id in receivers
-                or node.func.value.id == "UnityRs"
-            )
-        ):
-            calls.add(node.func.attr)
+        attribute = receiver_attribute(node, receivers)
+        if attribute is not None:
+            attributes.add(attribute)
+        call = receiver_call(node, receivers)
+        if call is not None:
+            calls.add(call)
     return calls, attributes
+
+
+def unity_rs_receiver(node: ast.AST) -> str | None:
+    """Return a variable explicitly annotated as the public UnityRs type."""
+    if not isinstance(node, ast.AnnAssign):
+        return None
+    if not isinstance(node.target, ast.Name) or not isinstance(node.annotation, ast.Name):
+        return None
+    return node.target.id if node.annotation.id == "UnityRs" else None
+
+
+def receiver_attribute(node: ast.AST, receivers: set[str]) -> str | None:
+    """Return an attribute read from a tracked instance or the UnityRs class."""
+    if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+        return None
+    return node.attr if node.value.id in receivers | {"UnityRs"} else None
+
+
+def receiver_call(node: ast.AST, receivers: set[str]) -> str | None:
+    """Return a method called directly on a tracked public receiver."""
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    if not isinstance(node.func.value, ast.Name):
+        return None
+    return node.func.attr if node.func.value.id in receivers | {"UnityRs"} else None
 
 
 def validate_surface(stub_source: str, consumer_source: str) -> tuple[int, int]:

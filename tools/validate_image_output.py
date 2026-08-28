@@ -47,7 +47,8 @@ def shift_and_max(mask: int) -> tuple[int, int]:
     return shift, (1 << width) - 1
 
 
-def decode_bmp(data: bytes) -> tuple[int, int, bytes, list[str]]:
+def bmp_pixel_offset(data: bytes) -> int:
+    """Validate the BMP file header and return its pixel offset."""
     if len(data) < BMP_FILE_HEADER + BMP_V4_HEADER:
         raise Invalid(f"the file is {len(data)} bytes, shorter than a V4 BMP header")
     magic, file_size, _, _, pixel_offset = struct.unpack_from("<2sIHHI", data, 0)
@@ -55,7 +56,11 @@ def decode_bmp(data: bytes) -> tuple[int, int, bytes, list[str]]:
         raise Invalid("the file does not start with BM")
     if file_size != len(data):
         raise Invalid(f"the header declares {file_size} bytes; the file is {len(data)}")
+    return pixel_offset
 
+
+def bmp_dimensions(data: bytes, pixel_offset: int) -> tuple[int, int, bool, int]:
+    """Validate the V4 DIB fields and return normalized dimensions."""
     (
         header_size,
         width,
@@ -79,20 +84,23 @@ def decode_bmp(data: bytes) -> tuple[int, int, bytes, list[str]]:
     if width <= 0:
         raise Invalid(f"width {width} is not positive")
 
-    # A negative height means the rows are stored top-down.
     top_down = height < 0
     height = abs(height)
     stride = width * 4
     if image_size != stride * height:
         raise Invalid(f"the image size field is {image_size}, not {stride * height}")
+    return width, height, top_down, image_size
 
-    masks = struct.unpack_from("<IIII", data, BMP_FILE_HEADER + 40)
-    pixels = data[pixel_offset : pixel_offset + image_size]
-    if len(pixels) != image_size:
-        raise Invalid(f"{len(pixels)} bytes of pixels are present, {image_size} declared")
 
-    # Read the channels the masks describe rather than assuming a layout.
-    channels = [shift_and_max(mask) for mask in masks]
+def decode_masked_bmp_rows(
+    pixels: bytes,
+    width: int,
+    height: int,
+    top_down: bool,
+    channels: list[tuple[int, int]],
+) -> bytes:
+    """Decode BMP rows using their declared channel masks and orientation."""
+    stride = width * 4
     out = bytearray()
     for row in range(height):
         source = row if top_down else height - 1 - row
@@ -101,14 +109,30 @@ def decode_bmp(data: bytes) -> tuple[int, int, bytes, list[str]]:
             (value,) = struct.unpack_from("<I", line, at)
             for shift, maximum in channels:
                 out.append((value >> shift) & maximum)
+    return bytes(out)
+
+
+def decode_bmp(data: bytes) -> tuple[int, int, bytes, list[str]]:
+    pixel_offset = bmp_pixel_offset(data)
+    width, height, top_down, image_size = bmp_dimensions(data, pixel_offset)
+
+    masks = struct.unpack_from("<IIII", data, BMP_FILE_HEADER + 40)
+    pixels = data[pixel_offset : pixel_offset + image_size]
+    if len(pixels) != image_size:
+        raise Invalid(f"{len(pixels)} bytes of pixels are present, {image_size} declared")
+
+    # Read the channels the masks describe rather than assuming a layout.
+    channels = [shift_and_max(mask) for mask in masks]
+    out = decode_masked_bmp_rows(pixels, width, height, top_down, channels)
     notes = [
         f"{width}x{height} BMP, {'top-down' if top_down else 'bottom-up'}, "
         f"masks {'/'.join(f'{mask:#010x}' for mask in masks)}"
     ]
-    return width, height, bytes(out), notes
+    return width, height, out, notes
 
 
-def decode_tga(data: bytes) -> tuple[int, int, bytes, list[str]]:
+def tga_header(data: bytes) -> tuple[int, int, int, int, bool]:
+    """Validate a TGA header and return its pixel layout."""
     if len(data) < 18:
         raise Invalid(f"the file is {len(data)} bytes, shorter than a TGA header")
     (
@@ -140,7 +164,26 @@ def decode_tga(data: bytes) -> tuple[int, int, bytes, list[str]]:
     top_down = bool(descriptor & 0x20)
     if descriptor & 0x10:
         raise Invalid("the descriptor declares a right-to-left image")
+    return id_length, width, height, width * 4, top_down
+
+
+def decode_bgra_rows(
+    pixels: bytes, width: int, height: int, top_down: bool
+) -> bytes:
+    """Normalize oriented BGRA rows to top-down RGBA."""
     stride = width * 4
+    out = bytearray()
+    for row in range(height):
+        source = row if top_down else height - 1 - row
+        line = pixels[source * stride : (source + 1) * stride]
+        for at in range(0, stride, 4):
+            blue, green, red, alpha = line[at : at + 4]
+            out += bytes((red, green, blue, alpha))
+    return bytes(out)
+
+
+def decode_tga(data: bytes) -> tuple[int, int, bytes, list[str]]:
+    id_length, width, height, stride, top_down = tga_header(data)
     start = 18 + id_length
     pixels = data[start : start + stride * height]
     if len(pixels) != stride * height:
@@ -150,15 +193,9 @@ def decode_tga(data: bytes) -> tuple[int, int, bytes, list[str]]:
     if start + len(pixels) != len(data):
         raise Invalid(f"{len(data) - start - len(pixels)} bytes follow the pixel data")
 
-    out = bytearray()
-    for row in range(height):
-        source = row if top_down else height - 1 - row
-        line = pixels[source * stride : (source + 1) * stride]
-        for at in range(0, stride, 4):
-            blue, green, red, alpha = line[at : at + 4]
-            out += bytes((red, green, blue, alpha))
+    out = decode_bgra_rows(pixels, width, height, top_down)
     notes = [f"{width}x{height} TGA, {'top-down' if top_down else 'bottom-up'}"]
-    return width, height, bytes(out), notes
+    return width, height, out, notes
 
 
 DECODERS = {".bmp": decode_bmp, ".tga": decode_tga}

@@ -79,6 +79,8 @@ PYTHON = ROOT / "crates" / "unity-rs-python"
 VENV = PYTHON / ".ci-venv"
 VENV_314 = PYTHON / ".ci-venv-314"
 MYPY_VERSION = "1.18.2"
+INSTALLED_WHEEL_TEST = "tests/installed_wheel.py"
+PYTHON_API_TEST = "tests/python_api.py"
 CLI_BINARY = ROOT / "target" / "release" / (
     "unity-rs.exe" if os.name == "nt" else "unity-rs"
 )
@@ -489,21 +491,21 @@ def groups(interpreter: str) -> list[Group]:
                 ),
                 Step(
                     "source-distribution wheel surface",
-                    [venv_interpreter(), "-I", "tests/installed_wheel.py"],
+                    [venv_interpreter(), "-I", INSTALLED_WHEEL_TEST],
                     cwd=PYTHON,
                 ),
                 Step(
                     "source-distribution Python API",
-                    [venv_interpreter(), "-I", "tests/python_api.py"],
+                    [venv_interpreter(), "-I", PYTHON_API_TEST],
                     cwd=PYTHON,
                 ),
                 Step("install wheel", [venv_interpreter(), "-c", INSTALL_WHEEL], cwd=PYTHON),
                 Step(
                     "wheel surface",
-                    [venv_interpreter(), "-I", "tests/installed_wheel.py"],
+                    [venv_interpreter(), "-I", INSTALLED_WHEEL_TEST],
                     cwd=PYTHON,
                 ),
-                Step("python api", [venv_interpreter(), "-I", "tests/python_api.py"], cwd=PYTHON),
+                Step("python api", [venv_interpreter(), "-I", PYTHON_API_TEST], cwd=PYTHON),
             ],
             requires="maturin",
             reason="the Python wheel and source distribution need maturin",
@@ -522,12 +524,12 @@ def groups(interpreter: str) -> list[Group]:
                 ),
                 Step(
                     "Python 3.14 wheel surface",
-                    [python314_interpreter(), "-I", "tests/installed_wheel.py"],
+                    [python314_interpreter(), "-I", INSTALLED_WHEEL_TEST],
                     cwd=PYTHON,
                 ),
                 Step(
                     "Python 3.14 API",
-                    [python314_interpreter(), "-I", "tests/python_api.py"],
+                    [python314_interpreter(), "-I", PYTHON_API_TEST],
                     cwd=PYTHON,
                 ),
             ],

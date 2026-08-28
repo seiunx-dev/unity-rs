@@ -251,12 +251,6 @@ pub fn validate_decoded_clip(
     validate_decode_request(request, limits)?;
     let expected_frames = usize::try_from(request.frame_count)
         .map_err(|_| Error::invalid_data("ACL frame count does not fit this platform"))?;
-    if expected_frames > limits.maximum_frames {
-        return Err(Error::invalid_data(format!(
-            "ACL frame count {expected_frames} exceeds limit {}",
-            limits.maximum_frames
-        )));
-    }
     if decoded.times.len() != expected_frames {
         return Err(Error::invalid_data(format!(
             "ACL decoder returned {} times for {expected_frames} declared frames",
@@ -279,6 +273,26 @@ pub fn validate_decoded_clip(
             )));
         }
     }
+    validate_binding_indices(decoded)?;
+    let expected_values = expected_frames
+        .checked_mul(curve_count)
+        .ok_or_else(|| Error::invalid_data("ACL decoded value count overflowed"))?;
+    if expected_values > limits.maximum_values {
+        return Err(Error::invalid_data(format!(
+            "ACL decoder output requires {expected_values} values, exceeding limit {}",
+            limits.maximum_values
+        )));
+    }
+    if decoded.values.len() != expected_values {
+        return Err(Error::invalid_data(format!(
+            "ACL decoder returned {} values; {expected_values} are required",
+            decoded.values.len()
+        )));
+    }
+    validate_decoded_numbers(decoded)
+}
+
+fn validate_binding_indices(decoded: &AclDecodedClip) -> Result<()> {
     for pair in decoded.binding_indices.windows(2) {
         if pair[0] >= pair[1] {
             return Err(Error::invalid_data(
@@ -295,21 +309,10 @@ pub fn validate_decoded_clip(
             "ACL decoder following-curve offset does not follow every decoded binding index",
         ));
     }
-    let expected_values = expected_frames
-        .checked_mul(curve_count)
-        .ok_or_else(|| Error::invalid_data("ACL decoded value count overflowed"))?;
-    if expected_values > limits.maximum_values {
-        return Err(Error::invalid_data(format!(
-            "ACL decoder output requires {expected_values} values, exceeding limit {}",
-            limits.maximum_values
-        )));
-    }
-    if decoded.values.len() != expected_values {
-        return Err(Error::invalid_data(format!(
-            "ACL decoder returned {} values; {expected_values} are required",
-            decoded.values.len()
-        )));
-    }
+    Ok(())
+}
+
+fn validate_decoded_numbers(decoded: &AclDecodedClip) -> Result<()> {
     let mut previous_time = None;
     for &time in &decoded.times {
         if !time.is_finite() || previous_time.is_some_and(|previous| time < previous) {

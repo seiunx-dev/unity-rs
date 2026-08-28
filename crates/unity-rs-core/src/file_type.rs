@@ -93,41 +93,16 @@ pub fn is_serialized_file(header: &[u8], file_size: u64) -> bool {
     if file_size < 20 || header.len() < 20 {
         return false;
     }
-
-    let mut metadata_size = u64::from(read_u32_be(header, 0).unwrap_or(u32::MAX));
-    let mut declared_file_size = u64::from(read_u32_be(header, 4).unwrap_or(0));
     let version = read_u32_be(header, 8).unwrap_or(0);
-    let mut data_offset = u64::from(read_u32_be(header, 12).unwrap_or(u32::MAX));
-    let mut header_size = 16_u64;
-    if version >= 9 {
-        if header[16] > 1 {
-            return false;
-        }
-        header_size = 20;
-    }
-
-    if version >= 22 {
-        if file_size < 48 || header.len() < 40 {
-            return false;
-        }
-        metadata_size = u64::from(read_u32_be(header, 20).unwrap_or(u32::MAX));
-        let Some(extended_file_size) = read_i64_be(header, 24) else {
-            return false;
-        };
-        let Some(extended_data_offset) = read_i64_be(header, 32) else {
-            return false;
-        };
-        let (Ok(size), Ok(offset)) = (
-            u64::try_from(extended_file_size),
-            u64::try_from(extended_data_offset),
-        ) else {
-            return false;
-        };
-        declared_file_size = size;
-        data_offset = offset;
-        header_size = 48;
-    }
-
+    let Some(fields) = serialized_header_fields(header, file_size, version) else {
+        return false;
+    };
+    let SerializedHeaderFields {
+        metadata_size,
+        declared_file_size,
+        data_offset,
+        header_size,
+    } = fields;
     if declared_file_size != file_size
         || metadata_size > file_size
         || data_offset < header_size
@@ -149,6 +124,48 @@ pub fn is_serialized_file(header: &[u8], file_size: u64) -> bool {
         }
     }
     true
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SerializedHeaderFields {
+    metadata_size: u64,
+    declared_file_size: u64,
+    data_offset: u64,
+    header_size: u64,
+}
+
+fn serialized_header_fields(
+    header: &[u8],
+    file_size: u64,
+    version: u32,
+) -> Option<SerializedHeaderFields> {
+    if version >= 22 {
+        return extended_serialized_header_fields(header, file_size);
+    }
+    if version >= 9 && header[16] > 1 {
+        return None;
+    }
+    Some(SerializedHeaderFields {
+        metadata_size: u64::from(read_u32_be(header, 0).unwrap_or(u32::MAX)),
+        declared_file_size: u64::from(read_u32_be(header, 4).unwrap_or(0)),
+        data_offset: u64::from(read_u32_be(header, 12).unwrap_or(u32::MAX)),
+        header_size: if version >= 9 { 20 } else { 16 },
+    })
+}
+
+fn extended_serialized_header_fields(
+    header: &[u8],
+    file_size: u64,
+) -> Option<SerializedHeaderFields> {
+    if file_size < 48 || header.len() < 40 || header[16] > 1 {
+        return None;
+    }
+    Some(SerializedHeaderFields {
+        metadata_size: u64::from(read_u32_be(header, 20).unwrap_or(u32::MAX)),
+        declared_file_size: u64::try_from(read_i64_be(header, 24)?).ok()?,
+        data_offset: u64::try_from(read_i64_be(header, 32)?).ok()?,
+        header_size: 48,
+    })
 }
 
 fn bundle_data_offset(header: &[u8], file_size: u64) -> Option<usize> {

@@ -84,16 +84,27 @@ def matrix_entries(block: str, job_name: str) -> list[dict[str, str]]:
                 entries.append(current)
             key, value = first
             current = {key: value}
-        elif member is not None and current is not None:
-            key, value = member
-            if key in current:
-                raise AuditError(f"{job_name} matrix entry repeats key {key!r}")
-            current[key] = value
+        elif member is not None:
+            add_matrix_member(current, member, job_name)
     if current is not None:
         entries.append(current)
     if not entries:
         raise AuditError(f"{job_name} matrix include list is empty")
     return entries
+
+
+def add_matrix_member(
+    current: dict[str, str] | None,
+    member: tuple[str, str],
+    job_name: str,
+) -> None:
+    """Add a continuation mapping to the active matrix entry."""
+    if current is None:
+        return
+    key, value = member
+    if key in current:
+        raise AuditError(f"{job_name} matrix entry repeats key {key!r}")
+    current[key] = value
 
 
 def require_fragments(block: str, job_name: str, fragments: tuple[str, ...]) -> None:

@@ -65,25 +65,25 @@ if not __debug__:
     )
 
 
-def check_retired_surfaces(root: Path = ROOT) -> None:
-    for relative in FORBIDDEN_REPOSITORY_PATHS:
+def assert_paths_absent(root: Path, paths: tuple[str, ...], message: str) -> None:
+    """Require a collection of retired repository paths to remain absent."""
+    for relative in paths:
         retired_path = root / relative
-        assert not retired_path.exists(), (
-            "the retired custom C ABI directory must be absent, including ignored caches",
-            relative,
-        )
-    for relative in FORBIDDEN_SOURCE_FILES:
-        source = root / relative
-        assert not source.exists(), (
-            "the retired custom C ABI/context source must not be kept in the delivery repository",
-            relative,
-        )
+        assert not retired_path.exists(), (message, relative)
+
+
+def check_delivery_configuration(root: Path) -> None:
+    """Require manifests and ignore rules to omit the retired FFI crate."""
     for relative in DELIVERY_CONFIGURATION_FILES:
         configuration = (root / relative).read_text(encoding="utf-8")
         assert "unity-rs-ffi" not in configuration.casefold(), (
             "the retired custom C ABI crate must not remain as a workspace or ignore rule",
             relative,
         )
+
+
+def check_public_api_files(root: Path) -> None:
+    """Require shipped APIs to omit retired context-handle names."""
     for relative in PUBLIC_API_FILES:
         public_api = root / relative
         source = public_api.read_text(encoding="utf-8")
@@ -94,30 +94,54 @@ def check_retired_surfaces(root: Path = ROOT) -> None:
             relative,
             match.group(0) if match else None,
         )
+
+
+def check_rust_sources(
+    root: Path, source_roots: tuple[Path, ...], pattern: re.Pattern[str], message: str
+) -> None:
+    """Require every first-party Rust source to omit a forbidden declaration."""
+    for source_root in source_roots:
+        for rust_source in source_root.rglob("*.rs"):
+            source = rust_source.read_text(encoding="utf-8")
+            match = pattern.search(source)
+            assert match is None, (
+                message,
+                rust_source.relative_to(root),
+                match.group(0) if match else None,
+            )
+
+
+def check_retired_surfaces(root: Path = ROOT) -> None:
+    assert_paths_absent(
+        root,
+        FORBIDDEN_REPOSITORY_PATHS,
+        "the retired custom C ABI directory must be absent, including ignored caches",
+    )
+    assert_paths_absent(
+        root,
+        FORBIDDEN_SOURCE_FILES,
+        "the retired custom C ABI/context source must not be kept in the delivery repository",
+    )
+    check_delivery_configuration(root)
+    check_public_api_files(root)
     rust_source_roots = (
         root / "crates/unity-rs-core/src",
         root / "crates/unity-rs-python/src",
         root / "crates/unity-rs-node/src",
     )
-    for source_root in rust_source_roots:
-        for rust_source in source_root.rglob("*.rs"):
-            source = rust_source.read_text(encoding="utf-8")
-            match = FORBIDDEN_PUBLIC_RUST_DECLARATION_PATTERN.search(source)
-            assert match is None, (
-                "public Rust declarations must not expose context handles",
-                rust_source.relative_to(root),
-                match.group(0) if match else None,
-            )
+    check_rust_sources(
+        root,
+        rust_source_roots,
+        FORBIDDEN_PUBLIC_RUST_DECLARATION_PATTERN,
+        "public Rust declarations must not expose context handles",
+    )
     first_party_rust_roots = (*rust_source_roots, root / "crates/unity-rs-cli/src")
-    for source_root in first_party_rust_roots:
-        for rust_source in source_root.rglob("*.rs"):
-            source = rust_source.read_text(encoding="utf-8")
-            match = FORBIDDEN_CUSTOM_C_ABI_PATTERN.search(source)
-            assert match is None, (
-                "first-party Rust code must not reintroduce a custom exported C ABI",
-                rust_source.relative_to(root),
-                match.group(0) if match else None,
-            )
+    check_rust_sources(
+        root,
+        first_party_rust_roots,
+        FORBIDDEN_CUSTOM_C_ABI_PATTERN,
+        "first-party Rust code must not reintroduce a custom exported C ABI",
+    )
 
 
 def check_package_targets(name: str, package: dict[str, Any]) -> None:

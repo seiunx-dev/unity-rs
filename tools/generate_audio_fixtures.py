@@ -248,91 +248,102 @@ def mpeg_layer3_frames(data: bytes) -> list[bytes]:
     return frames
 
 
+def encode_mpeg_stream(
+    work: Path, stem: str, periods: tuple[int, ...], mode: str
+) -> list[bytes]:
+    """Encode one deterministic wave stream and return its MPEG frames."""
+    raw = work / f"{stem}.wav"
+    encoded = work / f"{stem}.mp3"
+    write_triangle_wave(
+        raw,
+        MPEG_MULTISTREAM_FRAMES,
+        MPEG_MULTISTREAM_SAMPLE_RATE,
+        periods,
+    )
+    run(
+        [
+            "lame", "--quiet", "-b", "128", "--cbr", "-m", mode,
+            "--nores", "-t", str(raw), str(encoded),
+        ]
+    )
+    return mpeg_layer3_frames(encoded.read_bytes())
+
+
+def interleave_mpeg_frames(streams: list[list[bytes]], channels: int) -> tuple[int, bytes]:
+    """Interleave equally sized MPEG frame spans for one FSB5 sample."""
+    frame_count = len(streams[0])
+    if frame_count == 0 or any(len(stream) != frame_count for stream in streams):
+        raise ValueError(
+            f"{channels}-channel MPEG encoders produced different frame counts"
+        )
+    data = bytearray()
+    for frames in zip(*streams):
+        interleave = (len(frames[0]) + 15) & ~15
+        for frame in frames:
+            if (len(frame) + 15) & ~15 != interleave:
+                raise ValueError(
+                    f"{channels}-channel MPEG frames have different padded spans"
+                )
+            data.extend(frame)
+            data.extend(b"\0" * (interleave - len(frame)))
+    return frame_count, bytes(data)
+
+
+def write_multistream_mpeg(channels: int, streams: list[list[bytes]]) -> None:
+    """Write one multi-stream MPEG FSB5 fixture."""
+    frame_count, data = interleave_mpeg_frames(streams, channels)
+    channel_code = {6: 2, 8: 3}.get(channels, 0)
+    has_channel_metadata = channels not in (1, 2, 6, 8)
+    sample_mode = (
+        (frame_count * 1152 << 34)
+        | (channel_code << 5)
+        | (8 << 1)
+        | int(has_channel_metadata)
+    )
+    metadata = bytearray()
+    if has_channel_metadata:
+        channel_header = (1 << 25) | (1 << 1)
+        metadata.extend(channel_header.to_bytes(4, "little"))
+        metadata.append(channels)
+    sample_headers = sample_mode.to_bytes(8, "little") + metadata
+    header = bytearray(0x3C)
+    header[:4] = b"FSB5"
+    header[4:8] = (1).to_bytes(4, "little")
+    header[8:12] = (1).to_bytes(4, "little")
+    header[12:16] = len(sample_headers).to_bytes(4, "little")
+    header[20:24] = len(data).to_bytes(4, "little")
+    header[24:28] = (11).to_bytes(4, "little")
+    name = f"fsb5-mpeg-layer3-{channels}ch.fsb"
+    output = header + sample_headers + data
+    (FIXTURES / name).write_bytes(output)
+    print(f"wrote {name}: {frame_count} frames per stream, {len(output)} bytes")
+
+
 def generate_multistream_mpeg(work: Path) -> None:
     """Builds 3-16 channel FSB5 files from independent mono/stereo streams."""
-    stereo_streams: list[list[bytes]] = []
-    for index in range(8):
-        raw = work / f"mpeg-pair-{index}.wav"
-        encoded = work / f"mpeg-pair-{index}.mp3"
-        write_triangle_wave(
-            raw,
-            MPEG_MULTISTREAM_FRAMES,
-            MPEG_MULTISTREAM_SAMPLE_RATE,
+    stereo_streams = [
+        encode_mpeg_stream(
+            work,
+            f"mpeg-pair-{index}",
             MPEG_MULTISTREAM_PERIODS[index * 2 : index * 2 + 2],
+            "s",
         )
-        run(
-            [
-                "lame", "--quiet", "-b", "128", "--cbr", "-m", "s",
-                "--nores", "-t", str(raw), str(encoded),
-            ]
-        )
-        stereo_streams.append(mpeg_layer3_frames(encoded.read_bytes()))
-
-    mono_streams: dict[int, list[bytes]] = {}
-    for channel in range(2, 16, 2):
-        raw = work / f"mpeg-mono-{channel}.wav"
-        encoded = work / f"mpeg-mono-{channel}.mp3"
-        write_triangle_wave(
-            raw,
-            MPEG_MULTISTREAM_FRAMES,
-            MPEG_MULTISTREAM_SAMPLE_RATE,
+        for index in range(8)
+    ]
+    mono_streams = {
+        channel: encode_mpeg_stream(
+            work,
+            f"mpeg-mono-{channel}",
             (MPEG_MULTISTREAM_PERIODS[channel],),
+            "m",
         )
-        run(
-            [
-                "lame", "--quiet", "-b", "128", "--cbr", "-m", "m",
-                "--nores", "-t", str(raw), str(encoded),
-            ]
-        )
-        mono_streams[channel] = mpeg_layer3_frames(encoded.read_bytes())
-
+        for channel in range(2, 16, 2)
+    }
     for channels in MPEG_MULTISTREAM_CHANNEL_COUNTS:
         streams = list(stereo_streams[: channels // 2])
         if channels % 2:
             streams.append(mono_streams[channels - 1])
-        frame_count = len(streams[0])
-        if frame_count == 0 or any(len(stream) != frame_count for stream in streams):
-            raise ValueError(
-                f"{channels}-channel MPEG encoders produced different frame counts"
-            )
-        data = bytearray()
-        for frames in zip(*streams):
-            interleave = (len(frames[0]) + 15) & ~15
-            for frame in frames:
-                if (len(frame) + 15) & ~15 != interleave:
-                    raise ValueError(
-                        f"{channels}-channel MPEG frames have different padded spans"
-                    )
-                data.extend(frame)
-                data.extend(b"\0" * (interleave - len(frame)))
-
-        channel_code = {6: 2, 8: 3}.get(channels, 0)
-        has_channel_metadata = channels not in (1, 2, 6, 8)
-        sample_mode = (
-            (frame_count * 1152 << 34)
-            | (channel_code << 5)
-            | (8 << 1)
-            | int(has_channel_metadata)
-        )
-        metadata = bytearray()
-        if has_channel_metadata:
-            channel_header = (1 << 25) | (1 << 1)
-            metadata.extend(channel_header.to_bytes(4, "little"))
-            metadata.append(channels)
-        sample_headers = sample_mode.to_bytes(8, "little") + metadata
-        header = bytearray(0x3C)
-        header[:4] = b"FSB5"
-        header[4:8] = (1).to_bytes(4, "little")
-        header[8:12] = (1).to_bytes(4, "little")
-        header[12:16] = len(sample_headers).to_bytes(4, "little")
-        header[20:24] = len(data).to_bytes(4, "little")
-        header[24:28] = (11).to_bytes(4, "little")
-        name = f"fsb5-mpeg-layer3-{channels}ch.fsb"
-        output = header + sample_headers + data
-        (FIXTURES / name).write_bytes(output)
-        print(
-            f"wrote {name}: {frame_count} frames per stream, {len(output)} bytes"
-        )
+        write_multistream_mpeg(channels, streams)
 
 
 def generate_surround_opus(work: Path) -> None:

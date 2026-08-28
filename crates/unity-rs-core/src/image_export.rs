@@ -1857,6 +1857,21 @@ mod tests {
 
     /// Reverses the standard PNG filters, mirroring the specification's
     /// reconstruction functions independently of the encoder's helpers.
+    fn restore_png_byte(filter: u8, byte: u8, left: u8, above: u8, upper_left: u8) -> u8 {
+        match filter {
+            0 => byte,
+            1 => byte.wrapping_add(left),
+            2 => byte.wrapping_add(above),
+            3 => byte.wrapping_add(
+                u16::midpoint(u16::from(left), u16::from(above))
+                    .try_into()
+                    .expect("average of two u8 fits u8"),
+            ),
+            4 => byte.wrapping_add(super::paeth_predictor(left, above, upper_left)),
+            _ => panic!("unexpected PNG filter {filter}"),
+        }
+    }
+
     fn unfilter_png_scanlines(scanlines: &[u8], stride: usize) -> Vec<u8> {
         let mut output: Vec<u8> = Vec::new();
         for line in scanlines.chunks_exact(stride + 1) {
@@ -1878,19 +1893,7 @@ mod tests {
                 } else {
                     0
                 };
-                let restored = match filter {
-                    0 => byte,
-                    1 => byte.wrapping_add(left),
-                    2 => byte.wrapping_add(above),
-                    3 => byte.wrapping_add(
-                        u16::midpoint(u16::from(left), u16::from(above))
-                            .try_into()
-                            .expect("average of two u8 fits u8"),
-                    ),
-                    4 => byte.wrapping_add(super::paeth_predictor(left, above, upper_left)),
-                    _ => panic!("unexpected PNG filter {filter}"),
-                };
-                output.push(restored);
+                output.push(restore_png_byte(filter, byte, left, above, upper_left));
             }
         }
         output

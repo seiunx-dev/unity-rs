@@ -129,24 +129,28 @@ impl ManagedNumber {
         if exponent > -5 && exponent < precision {
             out.push_fixed(digits, exponent)?;
         } else {
-            out.push_str(digits.get(..1)?)?;
-            if let Some(rest) = digits.get(1..)
-                && !rest.is_empty()
-            {
-                out.push(b'.')?;
-                out.push_str(rest)?;
-            }
-            out.push(b'E')?;
-            out.push(if exponent < 0 { b'-' } else { b'+' })?;
-            let magnitude = exponent.unsigned_abs();
-            if magnitude < 10 {
-                out.push(b'0')?;
-            }
-            let mut digits_out = Self::empty();
-            write!(digits_out, "{magnitude}").ok()?;
-            out.push_str(digits_out.as_str())?;
+            out.push_scientific(digits, exponent)?;
         }
         Some(out)
+    }
+
+    fn push_scientific(&mut self, digits: &str, exponent: i32) -> Option<()> {
+        self.push_str(digits.get(..1)?)?;
+        if let Some(rest) = digits.get(1..)
+            && !rest.is_empty()
+        {
+            self.push(b'.')?;
+            self.push_str(rest)?;
+        }
+        self.push(b'E')?;
+        self.push(if exponent < 0 { b'-' } else { b'+' })?;
+        let magnitude = exponent.unsigned_abs();
+        if magnitude < 10 {
+            self.push(b'0')?;
+        }
+        let mut digits_out = Self::empty();
+        write!(digits_out, "{magnitude}").ok()?;
+        self.push_str(digits_out.as_str())
     }
 
     fn push_fixed(&mut self, digits: &str, exponent: i32) -> Option<()> {

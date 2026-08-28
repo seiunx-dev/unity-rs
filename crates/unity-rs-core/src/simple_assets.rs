@@ -79,59 +79,13 @@ pub fn read_font(
     let version = file.unity_version.components();
 
     if version >= (5, 5, 0) {
-        reader.skip(4, "Font line spacing")?;
-        reader.read_pptr()?;
-        reader.skip(4, "Font size")?;
-        reader.read_pptr()?;
-        reader.skip(20, "Font scalar fields")?;
-        reader.skip_counted_records(44, "Font character rectangles")?;
-        reader.skip_counted_records(8, "Font kerning values")?;
-        reader.skip(4, "Font pixel scale")?;
+        skip_modern_font_fields(&mut reader)?;
     } else {
-        reader.skip(4, "Font ASCII start offset")?;
-        if file.unity_version.major <= 3 {
-            reader.skip(8, "Font grid dimensions")?;
-        }
-        reader.skip(8, "Font kerning and line spacing")?;
-        if file.unity_version.major <= 3 {
-            reader.skip_counted_records(8, "Font per-character kerning")?;
-        } else {
-            reader.skip(8, "Font character spacing and padding")?;
-        }
-        reader.skip(4, "Font case conversion")?;
-        reader.read_pptr()?;
-
-        let character_count = reader.read_count("Font character rectangle")?;
-        for _ in 0..character_count {
-            reader.skip(40, "Font character rectangle")?;
-            if file.unity_version.major >= 4 {
-                reader.skip(1, "Font flipped flag")?;
-                reader.align(4)?;
-            }
-        }
-
-        reader.read_pptr()?;
-        reader.skip_counted_records(8, "Font kerning values")?;
-        if file.unity_version.major <= 3 {
-            reader.skip(1, "Font grid flag")?;
-            reader.align(4)?;
-        } else {
-            reader.skip(4, "Font pixel scale")?;
-        }
+        skip_legacy_font_fields(&mut reader, file.unity_version.major)?;
     }
 
     let payload = reader.read_counted_payload("Font data")?;
-    let extension = if payload.len() >= 4 {
-        let mut signature = [0_u8; 4];
-        payload.read_exact_at(0, &mut signature)?;
-        if signature == *b"OTTO" {
-            ".otf"
-        } else {
-            ".ttf"
-        }
-    } else {
-        ".ttf"
-    };
+    let extension = font_extension(&payload)?;
 
     Ok(SimpleBinaryAsset {
         path_id: reader.path_id,
@@ -139,6 +93,63 @@ pub fn read_font(
         payload,
         payload_kind: "font",
         suggested_extension: copy_simple_string(extension, "Font extension")?,
+    })
+}
+
+fn skip_modern_font_fields(reader: &mut ObjectPayloadReader) -> Result<()> {
+    reader.skip(4, "Font line spacing")?;
+    reader.read_pptr()?;
+    reader.skip(4, "Font size")?;
+    reader.read_pptr()?;
+    reader.skip(20, "Font scalar fields")?;
+    reader.skip_counted_records(44, "Font character rectangles")?;
+    reader.skip_counted_records(8, "Font kerning values")?;
+    reader.skip(4, "Font pixel scale")
+}
+
+fn skip_legacy_font_fields(reader: &mut ObjectPayloadReader, major: u32) -> Result<()> {
+    reader.skip(4, "Font ASCII start offset")?;
+    if major <= 3 {
+        reader.skip(8, "Font grid dimensions")?;
+    }
+    reader.skip(8, "Font kerning and line spacing")?;
+    if major <= 3 {
+        reader.skip_counted_records(8, "Font per-character kerning")?;
+    } else {
+        reader.skip(8, "Font character spacing and padding")?;
+    }
+    reader.skip(4, "Font case conversion")?;
+    reader.read_pptr()?;
+
+    let character_count = reader.read_count("Font character rectangle")?;
+    for _ in 0..character_count {
+        reader.skip(40, "Font character rectangle")?;
+        if major >= 4 {
+            reader.skip(1, "Font flipped flag")?;
+            reader.align(4)?;
+        }
+    }
+
+    reader.read_pptr()?;
+    reader.skip_counted_records(8, "Font kerning values")?;
+    if major <= 3 {
+        reader.skip(1, "Font grid flag")?;
+        reader.align(4)
+    } else {
+        reader.skip(4, "Font pixel scale")
+    }
+}
+
+fn font_extension(payload: &Region) -> Result<&'static str> {
+    if payload.len() < 4 {
+        return Ok(".ttf");
+    }
+    let mut signature = [0_u8; 4];
+    payload.read_exact_at(0, &mut signature)?;
+    Ok(if signature == *b"OTTO" {
+        ".otf"
+    } else {
+        ".ttf"
     })
 }
 
