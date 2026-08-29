@@ -17,6 +17,9 @@ that every UnityPy implementation detail or generated class is reproduced.
 ## Implemented read contract
 
 - `load` / `Environment` and the legacy `AssetsManager` alias;
+- `UnityPy.config.FALLBACK_UNITY_VERSION` for files whose serialized and
+  enclosing-bundle versions are both missing, including UnityPy-compatible
+  error and warning categories; an explicit `unity_version=` still wins;
 - path, directory, bytes-like, bounded binary-stream and multiple-source input;
 - read-only fsspec-style `fs=` file and recursive-directory input through
   `isfile`, `isdir`, `walk`, and `open`, without a mandatory fsspec dependency;
@@ -63,6 +66,12 @@ than weakening validation.
   to the same file-count and byte budgets as local inputs.
 - The loader currently exposes discovered serialized files rather than exact
   UnityPy `BundleFile` / `WebFile` provenance objects for nested containers.
+- A collection mixing valid and versionless serialized files cannot apply the
+  global fallback without corrupting the valid files through the native global
+  override. The facade rejects that ambiguous case and asks the caller to load
+  the roots separately or use an intentional `unity_version=` override.
+  Versionless non-seekable streams likewise need an explicit override because
+  fallback detection requires a bounded first read before reopening.
 - `set_raw_data`, `patch`, `save_typetree`, parsed-object `save`, serialized
   file `save`, environment `save`, and bundle repacking all raise
   `NotImplementedError`. Implementing them requires a bounded serialized-file

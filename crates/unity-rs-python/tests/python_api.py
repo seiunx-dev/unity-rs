@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import threading
+import warnings
 import zlib
 from collections.abc import Callable
 from pathlib import Path
@@ -106,13 +107,18 @@ def align(output: bytearray, alignment: int) -> None:
         output.append(0)
 
 
-def synthetic_text_asset(external_path: Optional[str] = None) -> bytes:
+def synthetic_text_asset(
+    external_path: Optional[str] = None,
+    unity_version: str = "2022.3.62f1",
+) -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "python")
     push_i32(payload, 12)
     payload.extend(b"hello python")
 
-    return finish_v22_asset(49, payload, external_path=external_path)
+    return finish_v22_asset(
+        49, payload, unity_version=unity_version, external_path=external_path
+    )
 
 
 class MemoryFileSystem:
@@ -153,6 +159,19 @@ class MissingReadStream:
 
     def close(self) -> None:
         self.closed = True
+
+
+class NonSeekableBinaryStream:
+    name = "versionless.assets"
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.position = 0
+
+    def read(self, size: int) -> bytes:
+        output = self.data[self.position : self.position + size]
+        self.position += len(output)
+        return output
 
 
 class InvalidStreamFileSystem(MemoryFileSystem):
@@ -2269,6 +2288,73 @@ def main() -> None:
         path.write_bytes(synthetic_text_asset())
 
         studio = UnityRs(path)
+        stripped_version_asset = synthetic_text_asset(unity_version="0.0.0")
+        previous_fallback = UnityPyCompat.config.FALLBACK_UNITY_VERSION
+        try:
+            UnityPyCompat.config.FALLBACK_UNITY_VERSION = None
+            try:
+                UnityPyCompat.load(stripped_version_asset)
+            except UnityPyCompat.UnityVersionFallbackError as error:
+                assert "FALLBACK_UNITY_VERSION" in str(error)
+            else:
+                raise AssertionError(
+                    "versionless compatibility inputs must require a configured fallback"
+                )
+
+            UnityPyCompat.config.FALLBACK_UNITY_VERSION = "2022.3.21f1"
+            with warnings.catch_warnings(record=True) as fallback_warnings:
+                warnings.simplefilter("always")
+                fallback_compat = UnityPyCompat.load(stripped_version_asset)
+            assert fallback_compat.file.unity_version == "2022.3.21f1"
+            assert len(fallback_warnings) == 1
+            assert issubclass(
+                fallback_warnings[0].category,
+                UnityPyCompat.UnityVersionFallbackWarning,
+            )
+
+            fallback_stream = io.BytesIO(stripped_version_asset)
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("ignore")
+                fallback_stream_compat = UnityPyCompat.load(fallback_stream)
+            assert fallback_stream_compat.file.unity_version == "2022.3.21f1"
+
+            with warnings.catch_warnings(record=True) as non_seekable_warnings:
+                warnings.simplefilter("always")
+                try:
+                    UnityPyCompat.load(NonSeekableBinaryStream(stripped_version_asset))
+                except UnityPyCompat.UnityVersionFallbackError as error:
+                    assert "provide a seekable stream" in str(error)
+                else:
+                    raise AssertionError(
+                        "versionless non-seekable streams must request an explicit override"
+                    )
+            assert non_seekable_warnings == []
+
+            with warnings.catch_warnings(record=True) as declared_warnings:
+                warnings.simplefilter("always")
+                declared_compat = UnityPyCompat.load(synthetic_text_asset())
+            assert declared_compat.file.unity_version == "2022.3.62f1"
+            assert declared_warnings == []
+
+            explicit_compat = UnityPyCompat.load(
+                stripped_version_asset, unity_version="2021.3.0f1"
+            )
+            assert explicit_compat.file.unity_version == "2021.3.0f1"
+
+            try:
+                UnityPyCompat.load(
+                    stripped_version_asset,
+                    synthetic_text_asset(),
+                )
+            except UnityPyCompat.UnityVersionFallbackError as error:
+                assert "mixes valid and missing Unity versions" in str(error)
+            else:
+                raise AssertionError(
+                    "a global fallback must not override valid files in a mixed collection"
+                )
+        finally:
+            UnityPyCompat.config.FALLBACK_UNITY_VERSION = previous_fallback
+
         compat = UnityPyCompat.load(path)
         assert UnityPyCompat.load is UnityPyCompat.Environment
         assert UnityPyCompat.AssetsManager is UnityPyCompat.Environment

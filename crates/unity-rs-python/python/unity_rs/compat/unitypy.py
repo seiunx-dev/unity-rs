@@ -11,6 +11,7 @@ from __future__ import annotations
 import ntpath
 import os
 import re
+import warnings
 from collections.abc import Iterator, Mapping
 from enum import IntEnum
 from importlib import import_module
@@ -50,6 +51,40 @@ class UnityVersionFallbackError(ValueError):
 
 class UnityVersionFallbackWarning(UserWarning):
     """Compatibility warning for an explicitly configured fallback version."""
+
+
+class _UnityPyConfig:
+    """Mutable subset of :mod:`UnityPy.config` used by read migrations."""
+
+    def __init__(self) -> None:
+        self.FALLBACK_UNITY_VERSION: Optional[str] = None
+
+    def _validated_fallback_version(self) -> str:
+        fallback = self.FALLBACK_UNITY_VERSION
+        if not isinstance(fallback, str):
+            raise UnityVersionFallbackError(
+                "No valid Unity version found, and the fallback version is not correctly configured. "
+                "Please explicitly set the value of UnityPy.config.FALLBACK_UNITY_VERSION."
+            )
+        return fallback
+
+    @staticmethod
+    def _warn_fallback_version(fallback: str) -> None:
+        warnings.warn(
+            "No valid Unity version found, defaulting to UnityPy.config.FALLBACK_UNITY_VERSION ({})".format(
+                fallback
+            ),
+            category=UnityVersionFallbackWarning,
+            stacklevel=3,
+        )
+
+    def get_fallback_version(self) -> str:
+        fallback = self._validated_fallback_version()
+        self._warn_fallback_version(fallback)
+        return fallback
+
+
+config = _UnityPyConfig()
 
 
 class ClassIDType(IntEnum):
@@ -164,6 +199,9 @@ class Environment:
         self.maximum_type_tree_materialized_bytes = maximum_type_tree_materialized_bytes
         self.fs = fs
         self.path = _environment_base_path(sources, fs)
+        stream_positions = (
+            _capture_stream_positions(sources) if unity_version is None else {}
+        )
         self._native = self._open_native(
             sources,
             fs=fs,
@@ -176,6 +214,36 @@ class Environment:
             unity_cn_key=unity_cn_key,
             strict_unity_versions=strict_unity_versions,
         )
+        if unity_version is None:
+            file_infos = self._native.files()
+            missing_versions = [
+                info
+                for info in file_infos
+                if _needs_unity_version_fallback(info.effective_unity_version)
+            ]
+            if missing_versions:
+                if len(missing_versions) != len(file_infos):
+                    raise UnityVersionFallbackError(
+                        "the loaded collection mixes valid and missing Unity versions; "
+                        "UnityPy.config.FALLBACK_UNITY_VERSION cannot be applied without "
+                        "overriding valid files, so load the inputs separately or pass an "
+                        "explicit unity_version= override"
+                    )
+                fallback_version = config._validated_fallback_version()
+                _rewind_stream_sources(sources, stream_positions)
+                config._warn_fallback_version(fallback_version)
+                self._native = self._open_native(
+                    sources,
+                    fs=fs,
+                    unity_version=fallback_version,
+                    maximum_files=maximum_files,
+                    maximum_file_bytes=maximum_file_bytes,
+                    maximum_total_bytes=maximum_total_bytes,
+                    oodle_decoder=oodle_decoder,
+                    skip_unreadable_inputs=skip_unreadable_inputs,
+                    unity_cn_key=unity_cn_key,
+                    strict_unity_versions=strict_unity_versions,
+                )
         self._readers: Dict[Tuple[int, int], ObjectReader] = {}
         self.assets = [SerializedFile(self, info) for info in self._native.files()]
         self.files = {asset.path: asset for asset in self.assets}
@@ -1283,6 +1351,55 @@ class _DynamicRecord:
     pass
 
 
+def _needs_unity_version_fallback(version: str) -> bool:
+    return not version or version == "0.0.0"
+
+
+def _capture_stream_positions(sources: Sequence[object]) -> Dict[int, int]:
+    positions: Dict[int, int] = {}
+    for index, source in enumerate(sources):
+        if isinstance(source, (bytes, bytearray, memoryview, str, os.PathLike)):
+            continue
+        if not hasattr(source, "read"):
+            continue
+        tell = getattr(source, "tell", None)
+        seek = getattr(source, "seek", None)
+        if not callable(tell) or not callable(seek):
+            continue
+        try:
+            position = tell()
+        except (OSError, ValueError):
+            continue
+        if isinstance(position, int) and position >= 0:
+            positions[index] = position
+    return positions
+
+
+def _rewind_stream_sources(
+    sources: Sequence[object], positions: Dict[int, int]
+) -> None:
+    for index, source in enumerate(sources):
+        if isinstance(source, (bytes, bytearray, memoryview, str, os.PathLike)):
+            continue
+        if not hasattr(source, "read"):
+            continue
+        position = positions.get(index)
+        seek = getattr(source, "seek", None)
+        if position is None or not callable(seek):
+            raise UnityVersionFallbackError(
+                "UnityPy.config.FALLBACK_UNITY_VERSION requires a second bounded "
+                "read for a versionless binary stream; pass unity_version= explicitly "
+                "or provide a seekable stream"
+            )
+        try:
+            seek(position)
+        except (OSError, ValueError) as error:
+            raise UnityVersionFallbackError(
+                "could not rewind a versionless binary stream for "
+                "UnityPy.config.FALLBACK_UNITY_VERSION"
+            ) from error
+
+
 def _read_source(source: object, index: int, maximum_bytes: int) -> Tuple[str, bytes]:
     if maximum_bytes < 0:
         raise ValueError("maximum_file_bytes must be non-negative")
@@ -1486,6 +1603,7 @@ __all__ = [
     "UnityVersionFallbackError",
     "UnityVersionFallbackWarning",
     "UnknownObject",
+    "config",
     "load",
     "set_assetbundle_decrypt_key",
 ]

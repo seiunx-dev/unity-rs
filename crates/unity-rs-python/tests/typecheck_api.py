@@ -126,6 +126,8 @@ def consume_public_api(
         oodle_decoder=oodle_decoder,
     )
     compat: UnityPyCompat.Environment = UnityPyCompat.load(Path("fixture.assets"))
+    UnityPyCompat.config.FALLBACK_UNITY_VERSION = "2022.3.21f1"
+    compat_fallback: Optional[str] = UnityPyCompat.config.FALLBACK_UNITY_VERSION
     compat_assets: list[UnityPyCompat.SerializedFile] = compat.assets
     compat_objects: list[UnityPyCompat.ObjectReader] = compat.objects
     compat_cab: Optional[UnityPyCompat.SerializedFile] = compat.get_cab(

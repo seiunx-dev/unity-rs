@@ -60,6 +60,14 @@ Core；外部 PPtr 仍可按文件名解析。虚拟文件系统返回的路径�
 返回属性对象，默认仍返回字典；reader 与 TypeTree node 也补齐 `get`、结构转储和字典化
 辅助方法。没有可变 cursor 的原生 reader 仍不伪造 `Position` / `reset` 语义。
 
+**UnityPy 全局版本回退已接入（2026-08-29）**：兼容命名空间公开可赋值的
+`config.FALLBACK_UNITY_VERSION`；它不会被偷换成现有 `unity_version=` 全局覆盖，而是先按
+文件声明与 bundle hint 正常加载，只在两者都没有有效版本时发出
+`UnityVersionFallbackWarning` 并以回退版本重新打开。显式 `unity_version=` 仍优先且不告警。
+同一集合若同时包含有效与缺失版本，原生全局 override 无法只改后一部分，因此明确抛
+`UnityVersionFallbackError`，要求拆开加载或由调用方有意选择全局覆盖；不可回卷的流也要求
+直接传 override，避免为了兼容而无界缓存第二份输入。
+
 | 交付面 | 当前状态 | 说明 |
 | --- | --- | --- |
 | Rust Core | Beta，主流程可用 | 主要容器、SerializedFile、常见资产、场景、动画和导出链路已实现；长尾格式继续补齐 |
