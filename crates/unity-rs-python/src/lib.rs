@@ -86,6 +86,18 @@ type PyResourceManagerContainerEntry = (String, PyObjectReference);
 type PySpriteTriangle = ((f32, f32), (f32, f32), (f32, f32));
 type PyMonoBehaviourSchemaNode = (String, String, u32, bool);
 type PyTypeTreeNodeInfo = (String, String, i32, i32, i32, i32, i32, u32, u64);
+type PySerializedTypeInfo = (
+    usize,
+    i32,
+    bool,
+    i16,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Vec<i32>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 struct PythonOodleDecoder {
     callback: Py<PyAny>,
@@ -3790,39 +3802,99 @@ impl PyUnityRs {
                 .file
                 .object_type_tree(object.object_index())
                 .map_err(core_error)?;
-            if tree.nodes.len() > maximum_nodes {
-                return Err(PyValueError::new_err(format!(
-                    "TypeTree has {} nodes, exceeding limit {maximum_nodes}",
-                    tree.nodes.len()
-                )));
-            }
-            let mut string_bytes = 0_usize;
-            let mut output = reserve_metadata(tree.nodes.len(), "Python TypeTree nodes")?;
-            for node in &tree.nodes {
-                string_bytes = string_bytes
-                    .checked_add(node.type_name.len())
-                    .and_then(|length| length.checked_add(node.field_name.len()))
-                    .ok_or_else(|| {
-                        PyValueError::new_err("TypeTree node string byte count overflowed")
-                    })?;
-                if string_bytes > maximum_string_bytes {
-                    return Err(PyValueError::new_err(format!(
-                        "TypeTree node strings use {string_bytes} bytes, exceeding limit {maximum_string_bytes}"
-                    )));
-                }
-                output.push((
-                    try_copy_string(&node.type_name, "TypeTree node type")?,
-                    try_copy_string(&node.field_name, "TypeTree node field")?,
-                    node.byte_size,
-                    node.index,
-                    node.type_flags,
-                    node.version,
-                    node.meta_flags,
-                    node.level,
-                    node.reference_type_hash,
-                ));
-            }
-            Ok(output)
+            materialize_type_tree_nodes(tree, maximum_nodes, maximum_string_bytes)
+        })
+    }
+
+    /// Returns one bounded page of serialized type-table metadata.
+    #[pyo3(signature = (
+        file_index,
+        *,
+        reference_types=false,
+        offset=0,
+        limit=4096,
+        maximum_dependencies=1_000_000,
+        maximum_string_bytes=67_108_864
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn serialized_type_page(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        reference_types: bool,
+        offset: usize,
+        limit: usize,
+        maximum_dependencies: usize,
+        maximum_string_bytes: usize,
+    ) -> PyResult<Vec<PySerializedTypeInfo>> {
+        check_metadata_page_limit(limit)?;
+        py.detach(|| {
+            let loaded = self
+                .studio
+                .collection()
+                .serialized_files()
+                .get(file_index)
+                .ok_or_else(|| {
+                    PyKeyError::new_err(format!("file index {file_index} was not found"))
+                })?;
+            let types = if reference_types {
+                &loaded.file.reference_types
+            } else {
+                &loaded.file.types
+            };
+            let end = offset
+                .checked_add(limit)
+                .ok_or_else(|| PyValueError::new_err("serialized type page overflowed"))?
+                .min(types.len());
+            let page = types.get(offset..end).unwrap_or_default();
+            materialize_serialized_types(page, offset, maximum_dependencies, maximum_string_bytes)
+        })
+    }
+
+    /// Returns one serialized type record's TypeTree nodes.
+    #[pyo3(signature = (
+        file_index,
+        type_index,
+        *,
+        reference_type=false,
+        maximum_nodes=1_000_000,
+        maximum_string_bytes=67_108_864
+    ))]
+    fn serialized_type_tree_nodes(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        type_index: usize,
+        reference_type: bool,
+        maximum_nodes: usize,
+        maximum_string_bytes: usize,
+    ) -> PyResult<Vec<PyTypeTreeNodeInfo>> {
+        check_metadata_page_limit(maximum_nodes)?;
+        py.detach(|| {
+            let loaded = self
+                .studio
+                .collection()
+                .serialized_files()
+                .get(file_index)
+                .ok_or_else(|| {
+                    PyKeyError::new_err(format!("file index {file_index} was not found"))
+                })?;
+            let types = if reference_type {
+                &loaded.file.reference_types
+            } else {
+                &loaded.file.types
+            };
+            let serialized_type = types.get(type_index).ok_or_else(|| {
+                PyKeyError::new_err(format!(
+                    "serialized type index {type_index} was not found in file index {file_index}"
+                ))
+            })?;
+            let tree = serialized_type.type_tree.as_ref().ok_or_else(|| {
+                PyNotImplementedError::new_err(format!(
+                    "serialized type index {type_index} has no type tree"
+                ))
+            })?;
+            materialize_type_tree_nodes(tree, maximum_nodes, maximum_string_bytes)
         })
     }
 
@@ -5926,6 +5998,138 @@ fn extract_type_tree_nodes(nodes: &Bound<'_, PyList>) -> PyResult<Vec<TypeTreeNo
         });
     }
     Ok(extracted)
+}
+
+fn materialize_type_tree_nodes(
+    tree: &TypeTree,
+    maximum_nodes: usize,
+    maximum_string_bytes: usize,
+) -> PyResult<Vec<PyTypeTreeNodeInfo>> {
+    if tree.nodes.len() > maximum_nodes {
+        return Err(PyValueError::new_err(format!(
+            "TypeTree has {} nodes, exceeding limit {maximum_nodes}",
+            tree.nodes.len()
+        )));
+    }
+    let mut string_bytes = 0_usize;
+    let mut output = reserve_metadata(tree.nodes.len(), "Python TypeTree nodes")?;
+    for node in &tree.nodes {
+        string_bytes = string_bytes
+            .checked_add(node.type_name.len())
+            .and_then(|length| length.checked_add(node.field_name.len()))
+            .ok_or_else(|| PyValueError::new_err("TypeTree node string byte count overflowed"))?;
+        if string_bytes > maximum_string_bytes {
+            return Err(PyValueError::new_err(format!(
+                "TypeTree node strings use {string_bytes} bytes, exceeding limit {maximum_string_bytes}"
+            )));
+        }
+        output.push((
+            try_copy_string(&node.type_name, "TypeTree node type")?,
+            try_copy_string(&node.field_name, "TypeTree node field")?,
+            node.byte_size,
+            node.index,
+            node.type_flags,
+            node.version,
+            node.meta_flags,
+            node.level,
+            node.reference_type_hash,
+        ));
+    }
+    Ok(output)
+}
+
+fn materialize_serialized_types(
+    types: &[unity_rs_core::serialized::SerializedType],
+    offset: usize,
+    maximum_dependencies: usize,
+    maximum_string_bytes: usize,
+) -> PyResult<Vec<PySerializedTypeInfo>> {
+    let mut dependency_count = 0_usize;
+    let mut string_bytes = 0_usize;
+    let mut output = reserve_metadata(types.len(), "Python serialized types")?;
+    for (page_index, serialized_type) in types.iter().enumerate() {
+        dependency_count = dependency_count
+            .checked_add(serialized_type.type_dependencies.len())
+            .ok_or_else(|| PyValueError::new_err("serialized type dependencies overflowed"))?;
+        if dependency_count > maximum_dependencies {
+            return Err(PyValueError::new_err(format!(
+                "serialized type page has {dependency_count} dependencies, exceeding limit {maximum_dependencies}"
+            )));
+        }
+        for value in [
+            serialized_type.class_name.as_deref(),
+            serialized_type.namespace.as_deref(),
+            serialized_type.assembly_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            string_bytes = string_bytes
+                .checked_add(value.len())
+                .ok_or_else(|| PyValueError::new_err("serialized type string bytes overflowed"))?;
+        }
+        if string_bytes > maximum_string_bytes {
+            return Err(PyValueError::new_err(format!(
+                "serialized type strings use {string_bytes} bytes, exceeding limit {maximum_string_bytes}"
+            )));
+        }
+        let index = offset
+            .checked_add(page_index)
+            .ok_or_else(|| PyValueError::new_err("serialized type index overflowed"))?;
+        output.push((
+            index,
+            serialized_type.class_id,
+            serialized_type.is_stripped_type,
+            serialized_type.script_type_index,
+            copy_optional_hash(
+                serialized_type.script_id.as_ref(),
+                "serialized type script ID",
+            )?,
+            copy_optional_hash(
+                serialized_type.old_type_hash.as_ref(),
+                "serialized type old hash",
+            )?,
+            try_copy_i32s(
+                &serialized_type.type_dependencies,
+                "serialized type dependencies",
+            )?,
+            try_copy_optional_string(
+                serialized_type.class_name.as_deref(),
+                "serialized type class name",
+            )?,
+            try_copy_optional_string(
+                serialized_type.namespace.as_deref(),
+                "serialized type namespace",
+            )?,
+            try_copy_optional_string(
+                serialized_type.assembly_name.as_deref(),
+                "serialized type assembly name",
+            )?,
+        ));
+    }
+    Ok(output)
+}
+
+fn copy_optional_hash(value: Option<&[u8; 16]>, field: &'static str) -> PyResult<Option<Vec<u8>>> {
+    value
+        .map(|value| {
+            let mut output = Vec::new();
+            output.try_reserve_exact(value.len()).map_err(|error| {
+                PyMemoryError::new_err(format!("cannot allocate {field}: {error}"))
+            })?;
+            output.extend_from_slice(value);
+            Ok(output)
+        })
+        .transpose()
+}
+
+fn try_copy_i32s(values: &[i32], field: &'static str) -> PyResult<Vec<i32>> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(values.len())
+        .map_err(|error| PyMemoryError::new_err(format!("cannot allocate {field}: {error}")))?;
+    output.extend_from_slice(values);
+    Ok(output)
 }
 
 fn copy_python_string_list(

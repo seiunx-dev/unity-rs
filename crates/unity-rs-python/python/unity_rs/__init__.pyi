@@ -1315,6 +1315,38 @@ class UnityRs:
         maximum_nodes: int = 1_000_000,
         maximum_string_bytes: int = 67_108_864,
     ) -> list[tuple[str, str, int, int, int, int, int, int, int]]: ...
+    def serialized_type_page(
+        self,
+        file_index: int,
+        *,
+        reference_types: bool = False,
+        offset: int = 0,
+        limit: int = 4096,
+        maximum_dependencies: int = 1_000_000,
+        maximum_string_bytes: int = 67_108_864,
+    ) -> list[
+        tuple[
+            int,
+            int,
+            bool,
+            int,
+            Optional[list[int]],
+            Optional[list[int]],
+            list[int],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+        ]
+    ]: ...
+    def serialized_type_tree_nodes(
+        self,
+        file_index: int,
+        type_index: int,
+        *,
+        reference_type: bool = False,
+        maximum_nodes: int = 1_000_000,
+        maximum_string_bytes: int = 67_108_864,
+    ) -> list[tuple[str, str, int, int, int, int, int, int, int]]: ...
     def read_type_tree_dump(
         self,
         file_index: int,

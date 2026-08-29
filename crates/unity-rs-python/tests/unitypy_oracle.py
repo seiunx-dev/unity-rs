@@ -130,6 +130,11 @@ def unitypy_manifest(path: Path) -> dict[str, Any]:
             {
                 "Path": portable_file_name(name),
                 "UnityVersion": str(serialized.unity_version),
+                "Types": [serialized_type_manifest(value) for value in serialized.types],
+                "RefTypes": [
+                    serialized_type_manifest(value)
+                    for value in (getattr(serialized, "ref_types", None) or [])
+                ],
                 "Objects": objects,
             }
         )
@@ -175,10 +180,63 @@ def wheel_manifest(path: Path) -> dict[str, Any]:
             {
                 "Path": portable_file_name(info.path),
                 "UnityVersion": info.unity_version,
+                "Types": wheel_serialized_types(
+                    studio, info.index, info.format_version, False
+                ),
+                "RefTypes": wheel_serialized_types(
+                    studio, info.index, info.format_version, True
+                ),
                 "Objects": objects,
             }
         )
     return {"Files": files}
+
+
+def wheel_serialized_types(
+    studio: Any, file_index: int, format_version: int, reference_types: bool
+) -> list[dict[str, Any]]:
+    type_tree_enabled = studio.files()[file_index].type_tree_enabled
+    output: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        rows = studio.serialized_type_page(
+            file_index,
+            reference_types=reference_types,
+            offset=offset,
+            limit=4096,
+        )
+        if not rows:
+            return output
+        for row in rows:
+            try:
+                nodes = studio.serialized_type_tree_nodes(
+                    file_index, row[0], reference_type=reference_types
+                )
+            except NotImplementedError:
+                node_count = None
+            else:
+                node_count = len(nodes)
+            output.append(
+                {
+                    "ClassId": row[1],
+                    "IsStripped": row[2],
+                    "ScriptTypeIndex": row[3],
+                    "ScriptId": None if row[4] is None else bytes(row[4]).hex(),
+                    "OldTypeHash": None
+                    if row[5] is None
+                    else bytes(row[5]).hex(),
+                    "Dependencies": list(row[6])
+                    if type_tree_enabled
+                    and format_version >= 21
+                    and not reference_types
+                    else None,
+                    "ClassName": row[7],
+                    "Namespace": row[8],
+                    "AssemblyName": row[9],
+                    "NodeCount": node_count,
+                }
+            )
+        offset += len(rows)
 
 
 def compatibility_manifest(path: Path) -> dict[str, Any]:
@@ -207,10 +265,37 @@ def compatibility_manifest(path: Path) -> dict[str, Any]:
             {
                 "Path": portable_file_name(name),
                 "UnityVersion": str(serialized.unity_version),
+                "Types": [serialized_type_manifest(value) for value in serialized.types],
+                "RefTypes": [
+                    serialized_type_manifest(value)
+                    for value in (serialized.ref_types or [])
+                ],
                 "Objects": objects,
             }
         )
     return {"Files": files}
+
+
+def serialized_type_manifest(value: Any) -> dict[str, Any]:
+    node = getattr(value, "node", None)
+    return {
+        "ClassId": value.class_id,
+        "IsStripped": value.is_stripped_type,
+        "ScriptTypeIndex": value.script_type_index,
+        "ScriptId": None
+        if value.script_id is None
+        else bytes(value.script_id).hex(),
+        "OldTypeHash": None
+        if value.old_type_hash is None
+        else bytes(value.old_type_hash).hex(),
+        "Dependencies": None
+        if value.type_dependencies is None
+        else list(value.type_dependencies),
+        "ClassName": value.m_ClassName,
+        "Namespace": value.m_NameSpace,
+        "AssemblyName": value.m_AssemblyName,
+        "NodeCount": None if node is None else sum(1 for _ in node.traverse()),
+    }
 
 
 def wheel_tree(studio: Any, obj: Any) -> Any:

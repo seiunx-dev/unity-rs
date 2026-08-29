@@ -132,6 +132,15 @@ def consume_public_api(
         compat_file_objects: dict[int, UnityPyCompat.ObjectReader] = (
             compat_assets[0].objects
         )
+        compat_types: list[UnityPyCompat.SerializedType] = compat_assets[0].types
+        compat_ref_types: Optional[list[UnityPyCompat.SerializedType]] = (
+            compat_assets[0].ref_types
+        )
+        if compat_types:
+            compat_root: Optional[UnityPyCompat.TypeTreeNode] = compat_types[0].node
+            compat_dependencies: Optional[tuple[int, ...]] = (
+                compat_types[0].type_dependencies
+            )
     if compat_objects:
         compat_reader = compat_objects[0]
         compat_class: UnityPyCompat.ClassIDType = compat_reader.type
@@ -282,6 +291,23 @@ def consume_public_api(
     type_tree_nodes: list[
         tuple[str, str, int, int, int, int, int, int, int]
     ] = studio.type_tree_nodes(0, 1)
+    serialized_types: list[
+        tuple[
+            int,
+            int,
+            bool,
+            int,
+            Optional[list[int]],
+            Optional[list[int]],
+            list[int],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+        ]
+    ] = studio.serialized_type_page(0)
+    serialized_type_nodes: list[
+        tuple[str, str, int, int, int, int, int, int, int]
+    ] = studio.serialized_type_tree_nodes(0, 0)
     type_tree_dump: str = studio.read_type_tree_dump(0, 1)
 
     expression: CubismExpression = studio.read_cubism_expression(0, 1)

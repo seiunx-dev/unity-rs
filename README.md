@@ -166,8 +166,9 @@ for reader in environment.objects:
 ```
 
 The facade implements the bounded `Environment` / `SerializedFile` /
-`ObjectReader` / `PPtr` read graph, embedded TypeTree dictionaries and common
-TextAsset, Texture2D, Sprite, AudioClip, Mesh, Shader and Font conveniences.
+`SerializedType` / `ObjectReader` / `PPtr` read graph, lazily materialized type
+tables, embedded TypeTree dictionaries and common TextAsset, Texture2D, Sprite,
+AudioClip, Mesh, Shader and Font conveniences.
 Caller-supplied UnityPy TypeTree roots and flat node/dictionary lists are also
 accepted for files without embedded trees. Read-only fsspec-style `fs=` loading
 is supported without making fsspec a runtime dependency. Object patching,

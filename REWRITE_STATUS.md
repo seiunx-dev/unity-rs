@@ -46,6 +46,13 @@ Core；外部 PPtr 仍可按文件名解析。虚拟文件系统返回的路径�
 文件数、单文件大小和总输入大小继续使用同一组调用方预算，打开的流在成功与失败路径均
 关闭。写回、加载后再懒发现依赖和其它可变 filesystem 操作仍明确不在本阶段范围。
 
+**UnityPy 序列化类型表已接入（2026-08-29）**：`SerializedFile.types` 与 20+
+格式的 `ref_types` 现在按页、按调用方总量预算物化，公开 class ID、stripped/script
+索引、两个 128 位 hash、type dependencies，以及引用类型的 class/namespace/assembly
+身份。每条树仍延迟到 `.nodes` / `.node` 才复制；`.nodes` 保留序列化平铺顺序，`.node`
+建立 `m_Children` 后可按 UnityPy 的 `traverse()` 顺序遍历。同一 type record 被该文件的
+所有对象共享，不再为每个 `ObjectReader` 复制一份伪元数据。
+
 | 交付面 | 当前状态 | 说明 |
 | --- | --- | --- |
 | Rust Core | Beta，主流程可用 | 主要容器、SerializedFile、常见资产、场景、动画和导出链路已实现；长尾格式继续补齐 |

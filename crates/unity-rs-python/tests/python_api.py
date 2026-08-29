@@ -2277,8 +2277,18 @@ def main() -> None:
         assert compat.file.version == 22
         assert compat.file.target_platform == 13
         assert compat.file.unity_version == "2022.3.62f1"
+        assert len(compat.file.types) == 1
+        text_serialized_type = compat.file.types[0]
+        assert text_serialized_type.class_id == int(UnityPyCompat.ClassIDType.TextAsset)
+        assert text_serialized_type.script_type_index == -1
+        assert text_serialized_type.script_id is None
+        assert text_serialized_type.old_type_hash == bytes(16)
+        assert text_serialized_type.type_dependencies is None
+        assert text_serialized_type.node is None
+        assert compat.file.ref_types == []
         assert list(compat.file.objects) == [7]
         compat_reader = compat.file.objects[7]
+        assert compat_reader.serialized_type is text_serialized_type
         assert compat_reader.type is UnityPyCompat.ClassIDType.TextAsset
         assert compat_reader.type_id == 0
         assert compat_reader.serialized_type.nodes is None
@@ -2354,6 +2364,13 @@ def main() -> None:
             assert "maximum_file_bytes 1" in str(error)
         else:
             raise AssertionError("compatibility path inputs must obey byte limits")
+        limited_types = UnityPyCompat.load(path, maximum_compat_types=0)
+        try:
+            _ = limited_types.file.types
+        except MemoryError as error:
+            assert "maximum_compat_types 0" in str(error)
+        else:
+            raise AssertionError("serialized type materialization must obey limits")
 
         compat_memory = UnityPyCompat.load(synthetic_text_asset())
         assert compat_memory.file.objects[7].read().m_Script == "hello python"
@@ -2430,6 +2447,11 @@ def main() -> None:
         tree_reader = tree_compat.file.objects[7]
         tree_nodes = tree_reader.serialized_type.nodes
         assert tree_nodes is not None
+        assert tree_reader.serialized_type is tree_compat.file.types[0]
+        assert tree_reader.serialized_type.script_id == bytes(16)
+        assert tree_reader.serialized_type.old_type_hash == bytes(16)
+        assert tree_reader.serialized_type.node is tree_nodes[0]
+        assert list(tree_reader.serialized_type.node.traverse()) == tree_nodes
         assert tree_nodes[0].m_Type == "MonoBehaviour"
         assert tree_nodes[0].m_Name == "Base"
         try:

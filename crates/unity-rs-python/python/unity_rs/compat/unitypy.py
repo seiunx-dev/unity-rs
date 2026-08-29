@@ -121,6 +121,8 @@ class Environment:
         maximum_file_bytes: int = _DEFAULT_MAXIMUM_FILE_BYTES,
         maximum_total_bytes: int = _DEFAULT_MAXIMUM_TOTAL_BYTES,
         maximum_compat_objects: int = _DEFAULT_MAXIMUM_COMPAT_OBJECTS,
+        maximum_compat_types: int = 1_000_000,
+        maximum_type_dependencies: int = 1_000_000,
         maximum_type_tree_values: int = 1_000_000,
         maximum_type_tree_array_elements: int = 1_000_000,
         maximum_type_tree_materialized_bytes: int = _DEFAULT_MAXIMUM_FILE_BYTES,
@@ -138,6 +140,8 @@ class Environment:
         if maximum_compat_objects < 0:
             raise ValueError("maximum_compat_objects must be non-negative")
         for name, value in (
+            ("maximum_compat_types", maximum_compat_types),
+            ("maximum_type_dependencies", maximum_type_dependencies),
             ("maximum_type_tree_values", maximum_type_tree_values),
             ("maximum_type_tree_array_elements", maximum_type_tree_array_elements),
             (
@@ -149,6 +153,8 @@ class Environment:
                 raise ValueError("{} must be non-negative".format(name))
 
         self.maximum_compat_objects = maximum_compat_objects
+        self.maximum_compat_types = maximum_compat_types
+        self.maximum_type_dependencies = maximum_type_dependencies
         self.maximum_object_bytes = maximum_file_bytes
         self.maximum_type_tree_values = maximum_type_tree_values
         self.maximum_type_tree_array_elements = maximum_type_tree_array_elements
@@ -329,6 +335,8 @@ class SerializedFile:
         self.enable_type_tree = info.type_tree_enabled
         self.externals = [ExternalFile(path) for path in info.external_paths]
         self._objects: Optional[Dict[int, ObjectReader]] = None
+        self._types: Optional[List[SerializedType]] = None
+        self._ref_types: Optional[List[SerializedType]] = None
         self.container = ContainerHelper(self._container_entries())
 
     @property
@@ -346,10 +354,47 @@ class SerializedFile:
         return self.objects
 
     @property
-    def types(self) -> object:
-        raise NotImplementedError(
-            "serialized type-table records are not exposed by this compatibility phase"
-        )
+    def types(self) -> List[SerializedType]:
+        if self._types is None:
+            self._types = self._load_serialized_types(reference_types=False)
+        return self._types
+
+    @property
+    def ref_types(self) -> Optional[List[SerializedType]]:
+        if self.version < 20:
+            return None
+        if self._ref_types is None:
+            self._ref_types = self._load_serialized_types(reference_types=True)
+        return self._ref_types
+
+    def _load_serialized_types(self, reference_types: bool) -> List[SerializedType]:
+        output: List[SerializedType] = []
+        dependencies = 0
+        while True:
+            remaining_types = self.environment.maximum_compat_types - len(output)
+            limit = min(_OBJECT_PAGE_SIZE, remaining_types + 1)
+            remaining_dependencies = (
+                self.environment.maximum_type_dependencies - dependencies
+            )
+            rows = self.environment._native.serialized_type_page(
+                self._info.index,
+                reference_types=reference_types,
+                offset=len(output),
+                limit=limit,
+                maximum_dependencies=remaining_dependencies,
+                maximum_string_bytes=self.environment.maximum_type_tree_materialized_bytes,
+            )
+            if not rows:
+                return output
+            if len(output) + len(rows) > self.environment.maximum_compat_types:
+                raise MemoryError(
+                    "UnityPy compatibility would materialize more than maximum_compat_types {} serialized types".format(
+                        self.environment.maximum_compat_types
+                    )
+                )
+            for row in rows:
+                dependencies += len(row[6])
+                output.append(SerializedType(self, row, reference_types))
 
     def _iter_object_infos(self) -> Iterator[ObjectInfo]:
         offset = 0
@@ -407,33 +452,127 @@ class TypeTreeNode:
         self.m_MetaFlag = meta_flags
         self.m_Level = level
         self.m_RefTypeHash = reference_type_hash
+        self.m_Children: List[TypeTreeNode] = []
+
+    def traverse(self) -> Iterator[TypeTreeNode]:
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            yield node
+            stack.extend(reversed(node.m_Children))
 
 
 class SerializedType:
-    """Lazy object type metadata attached to an :class:`ObjectReader`."""
+    """Lazy UnityPy-compatible serialized type-table record."""
 
-    def __init__(self, object_reader: ObjectReader) -> None:
-        self.class_id = object_reader.class_id
-        self.is_stripped_type = bool(object_reader.stripped)
-        self.script_type_index = object_reader.script_type_index
-        self._object_reader = object_reader
+    index: int
+    script_type_index: int
+
+    def __init__(
+        self,
+        assets_file: SerializedFile,
+        row: Tuple[
+            int,
+            int,
+            bool,
+            int,
+            Optional[List[int]],
+            Optional[List[int]],
+            List[int],
+            Optional[str],
+            Optional[str],
+            Optional[str],
+        ],
+        reference_type: bool = False,
+    ) -> None:
+        self.assets_file = assets_file
+        self.index = row[0]
+        self.class_id = row[1]
+        self.is_stripped_type = row[2]
+        self.script_type_index = row[3]
+        self.script_id = None if row[4] is None else bytes(row[4])
+        self.old_type_hash = None if row[5] is None else bytes(row[5])
+        self.type_dependencies = (
+            tuple(row[6])
+            if assets_file.enable_type_tree
+            and assets_file.version >= 21
+            and not reference_type
+            else None
+        )
+        self.m_ClassName = row[7]
+        self.m_NameSpace = row[8]
+        self.m_AssemblyName = row[9]
+        self._reference_type = reference_type
+        self._object_reader: Optional[ObjectReader] = None
         self._nodes_loaded = False
         self._nodes: Optional[List[TypeTreeNode]] = None
+
+    @classmethod
+    def from_object(cls, object_reader: ObjectReader) -> SerializedType:
+        output = cls.__new__(cls)
+        output.assets_file = object_reader.assets_file
+        output.index = (
+            -1
+            if object_reader.serialized_type_index is None
+            else object_reader.serialized_type_index
+        )
+        output.class_id = object_reader.class_id
+        output.is_stripped_type = bool(object_reader.stripped)
+        output.script_type_index = (
+            -1
+            if object_reader.script_type_index is None
+            else object_reader.script_type_index
+        )
+        output.script_id = None
+        output.old_type_hash = None
+        output.type_dependencies = None
+        output.m_ClassName = None
+        output.m_NameSpace = None
+        output.m_AssemblyName = None
+        output._reference_type = False
+        output._object_reader = object_reader
+        output._nodes_loaded = False
+        output._nodes = None
+        return output
 
     @property
     def nodes(self) -> Optional[List[TypeTreeNode]]:
         if not self._nodes_loaded:
             try:
-                rows = self._object_reader.environment._native.type_tree_nodes(
-                    self._object_reader._info.file_index,
-                    self._object_reader.path_id,
-                )
+                if self._object_reader is not None:
+                    rows = self._object_reader.environment._native.type_tree_nodes(
+                        self._object_reader._info.file_index,
+                        self._object_reader.path_id,
+                    )
+                else:
+                    rows = self.assets_file.environment._native.serialized_type_tree_nodes(
+                        self.assets_file._info.index,
+                        self.index,
+                        reference_type=self._reference_type,
+                    )
             except NotImplementedError:
                 self._nodes = None
             else:
                 self._nodes = [TypeTreeNode(*row) for row in rows]
+                _link_type_tree_nodes(self._nodes)
             self._nodes_loaded = True
         return self._nodes
+
+    @property
+    def node(self) -> Optional[TypeTreeNode]:
+        nodes = self.nodes
+        return None if not nodes else nodes[0]
+
+
+def _link_type_tree_nodes(nodes: List[TypeTreeNode]) -> None:
+    stack: List[TypeTreeNode] = []
+    for node in nodes:
+        node.m_Children.clear()
+        while stack and stack[-1].m_Level >= node.m_Level:
+            stack.pop()
+        if stack:
+            stack[-1].m_Children.append(node)
+        stack.append(node)
 
 
 class ObjectReader:
@@ -455,7 +594,7 @@ class ObjectReader:
         self.destroyed = info.destroyed
         self.stripped = info.stripped
         self.script_type_index = info.script_type_index
-        self.serialized_type = SerializedType(self)
+        self._serialized_type: Optional[SerializedType] = None
         self.container = info.container
         self.platform = assets_file.target_platform
 
@@ -465,6 +604,16 @@ class ObjectReader:
             self.path_id,
             maximum_bytes=maximum_bytes,
         )
+
+    @property
+    def serialized_type(self) -> SerializedType:
+        if self._serialized_type is None:
+            index = self.serialized_type_index
+            if index is not None and index < len(self.assets_file.types):
+                self._serialized_type = self.assets_file.types[index]
+            else:
+                self._serialized_type = SerializedType.from_object(self)
+        return self._serialized_type
 
     def peek_name(self) -> str:
         return self._info.name or ""

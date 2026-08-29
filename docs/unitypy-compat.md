@@ -24,6 +24,9 @@ that every UnityPy implementation detail or generated class is reproduced.
   `.file`;
 - `SerializedFile.objects` keyed by PathID, `.files` legacy alias, external
   paths, platform/version metadata and a read-only container view;
+- paged, bounded `SerializedFile.types` / `.ref_types` records with hashes,
+  dependency metadata, reference-type identities, lazy flat `.nodes`, and a
+  linked `.node` root compatible with UnityPy traversal;
 - lazy `ObjectReader` metadata, `get_raw_data`, `peek_name`,
   `parse_as_dict` / `read_typetree`, and `parse_as_object` / `read`;
 - lazy `serialized_type.nodes` metadata for objects with embedded TypeTrees;
