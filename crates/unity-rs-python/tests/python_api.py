@@ -2274,6 +2274,16 @@ def main() -> None:
         assert UnityPyCompat.AssetsManager is UnityPyCompat.Environment
         assert len(compat.assets) == 1
         assert compat.file is compat.assets[0]
+        assert compat.get("assets") is compat.assets
+        assert compat.get("missing", "fallback") == "fallback"
+        assert compat.get_cab("FIXTURE.ASSETS") is compat.file
+        assert compat.find_file("fixture.assets") is compat.file
+        try:
+            compat.find_file("missing.assets")
+        except FileNotFoundError as error:
+            assert "missing.assets" in str(error)
+        else:
+            raise AssertionError("missing compatibility files must remain explicit")
         assert compat.file.version == 22
         assert compat.file.target_platform == 13
         assert compat.file.unity_version == "2022.3.62f1"
@@ -2293,6 +2303,9 @@ def main() -> None:
         assert compat_reader.type_id == 0
         assert compat_reader.serialized_type.nodes is None
         assert compat_reader.byte_start >= 0
+        assert compat_reader.get("path_id") == 7
+        assert compat_reader.get("missing", "fallback") == "fallback"
+        assert repr(compat_reader) == "<ObjectReader TextAsset>"
         assert compat_reader.get_raw_data().endswith(b"hello python")
         compat_text = compat_reader.parse_as_object()
         assert isinstance(compat_text, UnityPyCompat.TextAsset)
@@ -2346,6 +2359,19 @@ def main() -> None:
         ]
         supplied_text = compat_reader.read_typetree(supplied_text_tree)
         assert supplied_text == {"m_Name": "python", "m_Script": b"hello python"}
+        supplied_text_object = compat_reader.read_typetree(
+            supplied_text_tree, wrap=True
+        )
+        assert supplied_text_object.__class__.__name__ == "TextAsset"
+        assert supplied_text_object.m_Name == "python"
+        assert supplied_text_object.m_Script == b"hello python"
+        supplied_structure = compat_reader.dump_typetree_structure(
+            supplied_text_tree, indent=""
+        )
+        assert supplied_structure.startswith(
+            "TextAsset Base // ByteSize{0}, Index{0}, Version{0}"
+        )
+        assert "  string m_Name" in supplied_structure
         try:
             compat_reader.read_typetree(supplied_text_tree[:1])
         except UnityPyCompat.TypeTreeError as error:
@@ -2388,6 +2414,8 @@ def main() -> None:
             compat_source_path, compat_target_path
         )
         assert compat_external.assets[0].externals[0].path == "target.assets"
+        assert compat_external.get_cab("folder\\TARGET.ASSETS") is compat_external.assets[1]
+        assert compat_external.find_file("target.assets") is compat_external.assets[1]
         external_reader = UnityPyCompat.PPtr(
             compat_external.assets[0], 1, 7
         ).deref()
@@ -2452,8 +2480,30 @@ def main() -> None:
         assert tree_reader.serialized_type.old_type_hash == bytes(16)
         assert tree_reader.serialized_type.node is tree_nodes[0]
         assert list(tree_reader.serialized_type.node.traverse()) == tree_nodes
+        assert tree_reader.serialized_type.node.to_dict_list() == [
+            node.to_dict() for node in tree_nodes
+        ]
+        assert (
+            tree_reader.serialized_type.node.to_dict()["m_Children"]
+            is tree_reader.serialized_type.node.m_Children
+        )
         assert tree_nodes[0].m_Type == "MonoBehaviour"
         assert tree_nodes[0].m_Name == "Base"
+        caller_node = UnityPyCompat.TypeTreeNode(0, "int", "pass", 4, 1)
+        assert caller_node._clean_name == "pass_"
+        assert caller_node.to_dict()["m_Children"] == []
+        caller_node.m_Children.append(caller_node)
+        try:
+            caller_node.to_dict_list()
+        except ValueError as error:
+            assert "cycle or shared node" in str(error)
+        else:
+            raise AssertionError("TypeTree helpers must reject cyclic caller nodes")
+        tree_structure = tree_reader.dump_typetree_structure()
+        assert tree_structure.startswith(
+            "  MonoBehaviour Base // ByteSize{-1}, Index{0}, Version{1}"
+        )
+        assert "    string m_Name" in tree_structure
         try:
             tree_compat._native.type_tree_nodes(0, 7, maximum_nodes=1)
         except ValueError as error:

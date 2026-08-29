@@ -171,9 +171,11 @@ tables, embedded TypeTree dictionaries and common TextAsset, Texture2D, Sprite,
 AudioClip, Mesh, Shader and Font conveniences.
 Caller-supplied UnityPy TypeTree roots and flat node/dictionary lists are also
 accepted for files without embedded trees. Read-only fsspec-style `fs=` loading
-is supported without making fsspec a runtime dependency. Object patching,
-serialized-file writing and bundle repacking still fail explicitly instead of
-being silently ignored. See
+is supported without making fsspec a runtime dependency. Already-loaded files
+can be found through UnityPy-style CAB lookup, and `read_typetree(wrap=True)`
+plus TypeTree structure helpers cover common inspection migrations. Object
+patching, serialized-file writing and bundle repacking still fail explicitly
+instead of being silently ignored. See
 [`docs/unitypy-compat.md`](docs/unitypy-compat.md) for the exact contract.
 
 ### Node.js

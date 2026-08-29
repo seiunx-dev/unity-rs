@@ -8,7 +8,9 @@ native ``unity-rs`` implementation.
 
 from __future__ import annotations
 
+import ntpath
 import os
+import re
 from collections.abc import Iterator, Mapping
 from enum import IntEnum
 from importlib import import_module
@@ -34,6 +36,7 @@ __version__ = UNITYPY_COMPAT_VERSION
 _DEFAULT_MAXIMUM_FILE_BYTES = 536_870_912
 _DEFAULT_MAXIMUM_TOTAL_BYTES = 4_294_967_296
 _DEFAULT_MAXIMUM_COMPAT_OBJECTS = 1_000_000
+_DEFAULT_MAXIMUM_TYPE_TREE_NODES = 1_000_000
 _OBJECT_PAGE_SIZE = 4_096
 
 
@@ -176,6 +179,9 @@ class Environment:
         self._readers: Dict[Tuple[int, int], ObjectReader] = {}
         self.assets = [SerializedFile(self, info) for info in self._native.files()]
         self.files = {asset.path: asset for asset in self.assets}
+        self.cabs: Dict[str, SerializedFile] = {}
+        for asset in self.assets:
+            self.register_cab(asset.path, asset)
         if len(self.assets) == 1:
             self.file = self.assets[0]
         self.container = ContainerHelper(self._container_entries())
@@ -278,6 +284,38 @@ class Environment:
         for asset in self.assets:
             output.extend(asset.objects.values())
         return output
+
+    def get(self, key: str, default: object = None) -> object:
+        return getattr(self, key, default)
+
+    def get_cab(self, name: str) -> Optional[SerializedFile]:
+        return self.cabs.get(_simplify_name(name))
+
+    def register_cab(self, name: str, item: SerializedFile) -> None:
+        if not isinstance(item, SerializedFile):
+            raise TypeError("item must be a SerializedFile")
+        if item.environment is not self:
+            raise ValueError("cannot register a SerializedFile from another Environment")
+        self.cabs[_simplify_name(name)] = item
+
+    def find_file(
+        self, name: str, is_dependency: bool = True
+    ) -> Optional[SerializedFile]:
+        del is_dependency
+        item = self.get_cab(name)
+        if item is not None:
+            return item
+
+        normalized_name = name.replace("\\", "/").lower()
+        for path, asset in self.files.items():
+            normalized_path = path.replace("\\", "/").lower()
+            if normalized_path == normalized_name or normalized_path.endswith(
+                "/" + normalized_name
+            ):
+                return asset
+        raise FileNotFoundError(
+            "File {} not found in {}".format(name, self.path or "loaded inputs")
+        )
 
     def _check_object_materialization(self, count: int) -> None:
         if count > self.maximum_compat_objects:
@@ -433,33 +471,131 @@ class TypeTreeNode:
 
     def __init__(
         self,
-        type_name: str,
-        field_name: str,
-        byte_size: int,
-        index: int,
-        type_flags: int,
-        version: int,
-        meta_flags: int,
-        level: int,
-        reference_type_hash: int,
+        m_Level: int,
+        m_Type: str,
+        m_Name: str,
+        m_ByteSize: int,
+        m_Version: int,
+        m_Children: Optional[List[TypeTreeNode]] = None,
+        m_TypeFlags: Optional[int] = None,
+        m_VariableCount: Optional[int] = None,
+        m_Index: Optional[int] = None,
+        m_MetaFlag: Optional[int] = None,
+        m_RefTypeHash: Optional[int] = None,
     ) -> None:
-        self.m_Type = type_name
-        self.m_Name = field_name
-        self.m_ByteSize = byte_size
-        self.m_Index = index
-        self.m_TypeFlags = type_flags
-        self.m_Version = version
-        self.m_MetaFlag = meta_flags
-        self.m_Level = level
-        self.m_RefTypeHash = reference_type_hash
-        self.m_Children: List[TypeTreeNode] = []
+        self.m_Level = m_Level
+        self.m_Type = m_Type
+        self.m_Name = m_Name
+        self.m_ByteSize = m_ByteSize
+        self.m_Version = m_Version
+        self.m_Children = [] if m_Children is None else m_Children
+        self.m_TypeFlags = m_TypeFlags
+        self.m_VariableCount = m_VariableCount
+        self.m_Index = m_Index
+        self.m_MetaFlag = m_MetaFlag
+        self.m_RefTypeHash = m_RefTypeHash
+        self._clean_name = _clean_type_tree_name(m_Name)
 
-    def traverse(self) -> Iterator[TypeTreeNode]:
+    def traverse(
+        self, maximum_nodes: int = _DEFAULT_MAXIMUM_TYPE_TREE_NODES
+    ) -> Iterator[TypeTreeNode]:
+        if maximum_nodes < 0:
+            raise ValueError("maximum_nodes must be non-negative")
         stack = [self]
+        seen: set[int] = set()
         while stack:
             node = stack.pop()
+            identity = id(node)
+            if identity in seen:
+                raise ValueError("TypeTree contains a cycle or shared node")
+            if len(seen) >= maximum_nodes:
+                raise MemoryError(
+                    "TypeTree exceeds maximum_nodes {}".format(maximum_nodes)
+                )
+            seen.add(identity)
             yield node
             stack.extend(reversed(node.m_Children))
+
+    def dump_structure(
+        self,
+        indent: str = "  ",
+        maximum_nodes: int = _DEFAULT_MAXIMUM_TYPE_TREE_NODES,
+        maximum_bytes: int = _DEFAULT_MAXIMUM_FILE_BYTES,
+    ) -> str:
+        if maximum_nodes < 0:
+            raise ValueError("maximum_nodes must be non-negative")
+        if maximum_bytes < 0:
+            raise ValueError("maximum_bytes must be non-negative")
+        lines: List[str] = []
+        stack: List[Tuple[TypeTreeNode, str]] = [(self, indent)]
+        seen: set[int] = set()
+        materialized_bytes = 0
+        while stack:
+            node, node_indent = stack.pop()
+            identity = id(node)
+            if identity in seen:
+                raise ValueError("TypeTree contains a cycle or shared node")
+            if len(seen) >= maximum_nodes:
+                raise MemoryError(
+                    "TypeTree exceeds maximum_nodes {}".format(maximum_nodes)
+                )
+            seen.add(identity)
+            line = (
+                "{}{} {} // ByteSize{{{:X}}}, Index{{{}}}, Version{{{}}}, TypeFlags{{{}}}, MetaFlag{{{}}}".format(
+                    node_indent,
+                    node.m_Type,
+                    node.m_Name,
+                    node.m_ByteSize,
+                    node.m_Index,
+                    node.m_Version,
+                    node.m_TypeFlags,
+                    node.m_MetaFlag,
+                )
+            )
+            materialized_bytes += len(line.encode("utf-8"))
+            if lines:
+                materialized_bytes += 1
+            if materialized_bytes > maximum_bytes:
+                raise MemoryError(
+                    "TypeTree structure exceeds maximum_bytes {}".format(
+                        maximum_bytes
+                    )
+                )
+            lines.append(line)
+            child_indent = node_indent + "  "
+            stack.extend(
+                (child, child_indent) for child in reversed(node.m_Children)
+            )
+        return "\n".join(lines)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            key: value
+            for key, value in (
+                ("m_Level", self.m_Level),
+                ("m_Type", self.m_Type),
+                ("m_Name", self.m_Name),
+                ("m_ByteSize", self.m_ByteSize),
+                ("m_Version", self.m_Version),
+                ("m_Children", self.m_Children),
+                ("m_TypeFlags", self.m_TypeFlags),
+                ("m_VariableCount", self.m_VariableCount),
+                ("m_Index", self.m_Index),
+                ("m_MetaFlag", self.m_MetaFlag),
+                ("m_RefTypeHash", self.m_RefTypeHash),
+            )
+            if value is not None
+        }
+
+    def to_dict_list(
+        self, maximum_nodes: int = _DEFAULT_MAXIMUM_TYPE_TREE_NODES
+    ) -> List[Dict[str, Any]]:
+        return [node.to_dict() for node in self.traverse(maximum_nodes)]
+
+    def __repr__(self) -> str:
+        return "TypeTreeNode(m_Level={}, m_Type={!r}, m_Name={!r}, m_MetaFlag={})".format(
+            self.m_Level, self.m_Type, self.m_Name, self.m_MetaFlag
+        )
 
 
 class SerializedType:
@@ -553,7 +689,7 @@ class SerializedType:
             except NotImplementedError:
                 self._nodes = None
             else:
-                self._nodes = [TypeTreeNode(*row) for row in rows]
+                self._nodes = [_type_tree_node_from_row(row) for row in rows]
                 _link_type_tree_nodes(self._nodes)
             self._nodes_loaded = True
         return self._nodes
@@ -618,6 +754,9 @@ class ObjectReader:
     def peek_name(self) -> str:
         return self._info.name or ""
 
+    def get(self, key: str, default: object = None) -> object:
+        return getattr(self, key, default)
+
     def parse_as_dict(
         self,
         nodes: Optional[object] = None,
@@ -678,9 +817,39 @@ class ObjectReader:
     def read_typetree(
         self,
         nodes: Optional[object] = None,
+        wrap: bool = False,
         check_read: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], Object]:
+        if wrap:
+            return self.parse_as_object(nodes=nodes, check_read=check_read)
         return self.parse_as_dict(nodes=nodes, check_read=check_read)
+
+    def dump_typetree_structure(
+        self,
+        nodes: Optional[object] = None,
+        indent: str = "  ",
+    ) -> str:
+        if nodes is None:
+            root = self.serialized_type.node
+            if root is None:
+                raise TypeTreeError("the object has no type tree")
+        else:
+            rows = _caller_type_tree_rows(
+                nodes,
+                maximum_nodes=self.environment.maximum_type_tree_values,
+                maximum_string_bytes=self.environment.maximum_type_tree_materialized_bytes,
+            )
+            normalized_nodes = [_type_tree_node_from_row(row) for row in rows]
+            _link_type_tree_nodes(normalized_nodes)
+            root = normalized_nodes[0]
+        return root.dump_structure(
+            indent=indent,
+            maximum_nodes=self.environment.maximum_type_tree_values,
+            maximum_bytes=self.environment.maximum_type_tree_materialized_bytes,
+        )
+
+    def __repr__(self) -> str:
+        return "<{} {}>".format(self.__class__.__name__, self.type.name)
 
     def set_raw_data(self, data: bytes) -> None:
         del data
@@ -699,6 +868,43 @@ class ObjectReader:
 
 
 _MISSING = object()
+
+
+def _simplify_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise TypeError("name must be a string")
+    return ntpath.basename(name).lower()
+
+
+def _clean_type_tree_name(name: str) -> str:
+    if not name:
+        return name
+    if name.startswith("(int&)"):
+        name = name[6:]
+    if name.endswith("?"):
+        name = name[:-1]
+    name = re.sub(r"[ .:\-\[\]]", "_", name)
+    if name in ("pass", "from"):
+        name += "_"
+    if name[0].isdigit():
+        name = "x" + name
+    return name
+
+
+def _type_tree_node_from_row(
+    row: Tuple[str, str, int, int, int, int, int, int, int]
+) -> TypeTreeNode:
+    return TypeTreeNode(
+        m_Level=row[7],
+        m_Type=row[0],
+        m_Name=row[1],
+        m_ByteSize=row[2],
+        m_Version=row[5],
+        m_TypeFlags=row[4],
+        m_Index=row[3],
+        m_MetaFlag=row[6],
+        m_RefTypeHash=row[8],
+    )
 
 
 def _caller_type_tree_rows(

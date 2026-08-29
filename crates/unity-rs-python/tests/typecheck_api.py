@@ -6,7 +6,7 @@ used by an ordinary strict Python 3.9 caller, including the decoder aliases.
 """
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from unity_rs import (
     AclCompressedTracks,
@@ -128,6 +128,13 @@ def consume_public_api(
     compat: UnityPyCompat.Environment = UnityPyCompat.load(Path("fixture.assets"))
     compat_assets: list[UnityPyCompat.SerializedFile] = compat.assets
     compat_objects: list[UnityPyCompat.ObjectReader] = compat.objects
+    compat_cab: Optional[UnityPyCompat.SerializedFile] = compat.get_cab(
+        "fixture.assets"
+    )
+    compat_found: Optional[UnityPyCompat.SerializedFile] = compat.find_file(
+        "fixture.assets"
+    )
+    compat_lookup: object = compat.get("assets")
     if compat_assets:
         compat_file_objects: dict[int, UnityPyCompat.ObjectReader] = (
             compat_assets[0].objects
@@ -141,12 +148,23 @@ def consume_public_api(
             compat_dependencies: Optional[tuple[int, ...]] = (
                 compat_types[0].type_dependencies
             )
+            if compat_root is not None:
+                compat_structure: str = compat_root.dump_structure()
+                compat_node_dict: dict[str, Any] = compat_root.to_dict()
+                compat_node_list: list[dict[str, Any]] = (
+                    compat_root.to_dict_list()
+                )
     if compat_objects:
         compat_reader = compat_objects[0]
         compat_class: UnityPyCompat.ClassIDType = compat_reader.type
         compat_raw: bytes = compat_reader.get_raw_data()
         compat_dict: dict[str, Any] = compat_reader.parse_as_dict()
         compat_object: UnityPyCompat.Object = compat_reader.parse_as_object()
+        compat_wrapped: Union[dict[str, Any], UnityPyCompat.Object] = (
+            compat_reader.read_typetree(wrap=True)
+        )
+        compat_tree_structure: str = compat_reader.dump_typetree_structure()
+        compat_reader_lookup: object = compat_reader.get("path_id")
         compat_nodes: Optional[list[UnityPyCompat.TypeTreeNode]] = (
             compat_reader.serialized_type.nodes
         )

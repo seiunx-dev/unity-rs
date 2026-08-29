@@ -53,6 +53,13 @@ Core；外部 PPtr 仍可按文件名解析。虚拟文件系统返回的路径�
 建立 `m_Children` 后可按 UnityPy 的 `traverse()` 顺序遍历。同一 type record 被该文件的
 所有对象共享，不再为每个 `ObjectReader` 复制一份伪元数据。
 
+**UnityPy 查找与 TypeTree 检视语义已接入（2026-08-29）**：`Environment`
+现在按 UnityPy 的小写 basename 规则注册 `.cabs`，并提供 `get`、`get_cab`、
+`register_cab` 与 `find_file`；后者只查构造时已经过预算并进入原生集合的文件，不假装能在
+加载后无界扫描并修改集合。`ObjectReader.read_typetree` 补齐 `wrap` 参数，`wrap=True`
+返回属性对象，默认仍返回字典；reader 与 TypeTree node 也补齐 `get`、结构转储和字典化
+辅助方法。没有可变 cursor 的原生 reader 仍不伪造 `Position` / `reset` 语义。
+
 | 交付面 | 当前状态 | 说明 |
 | --- | --- | --- |
 | Rust Core | Beta，主流程可用 | 主要容器、SerializedFile、常见资产、场景、动画和导出链路已实现；长尾格式继续补齐 |
@@ -188,7 +195,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   完整构造 lossy 路径再转义；成功根路径和递归 gzip/ZIP 标签也通过组合式 `Display` 直接
   写入，不再为每层 `display().to_string()` 或 `format!` 复制完整前缀；
 - Python 提供惰性/分页枚举、资源读取、主要专用 reader、schema/ACL/Oodle 适配器、导出和解包；`SceneLimits` 可独立收紧 GameObject、组件、Transform 子项、材质、骨骼和层级边预算；Core 的 I/O、无效数据和未支持功能分别保留为标准 `OSError` 子类、`ValueError` 和 `NotImplementedError`，所有 Rust→Python 字节复制以及可能很大的场景、候选、图片层和报告转换都使用可失败分配，并以 `MemoryError` 报告内存不足；
-- Python 的 `unity_rs.compat.unitypy` 以 UnityPy 1.25.3 为固定契约基线，提供 `Environment`、`SerializedFile`、`ObjectReader`、`PPtr`、`ClassIDType`、container multidict、直接 Python TypeTree 值以及 TextAsset/图片/音频/Mesh/Shader/Font 常用读取代理；兼容集合仍受显式物化预算约束，主 wheel 不安装顶层 `UnityPy` 包，缺失 TypeTree、`fs=`、宽松尾部读取以及全部编辑/重打包调用都会明确失败；
+- Python 的 `unity_rs.compat.unitypy` 以 UnityPy 1.25.3 为固定契约基线，提供 `Environment`、`SerializedFile`、`ObjectReader`、`PPtr`、`ClassIDType`、container multidict、直接 Python TypeTree 值以及 TextAsset/图片/音频/Mesh/Shader/Font 常用读取代理；兼容集合仍受显式物化预算约束，主 wheel 不安装顶层 `UnityPy` 包；缺失内嵌/调用方 TypeTree、加载后懒发现文件、宽松尾部读取以及全部编辑/重打包调用都会明确失败；
 - Python wheel 使用 `cp39-abi3`，CI 构建 Linux、Windows、macOS 的 x86-64/ARM64 组合，并在构建解释器和 Python 3.14 上安装测试；
 - Python sdist 会被重新构建成 wheel 并执行完整 API 测试；
 - `AssetCollection` 的 SerializedFile/资源表通过只读 slice 公开；低层调用方以
