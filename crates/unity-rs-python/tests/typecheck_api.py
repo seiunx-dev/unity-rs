@@ -6,7 +6,7 @@ used by an ordinary strict Python 3.9 caller, including the decoder aliases.
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from unity_rs import (
     AclCompressedTracks,
@@ -65,6 +65,7 @@ from unity_rs import (
     TexturedFbx,
     extract,
 )
+from unity_rs.compat import unitypy as UnityPyCompat
 
 
 def decode_oodle(data: bytes, expected: int) -> bytes:
@@ -107,6 +108,8 @@ def consume_public_api(
         maximum_path_bytes=1_048_576,
         maximum_total_path_bytes=67_108_864,
         maximum_diagnostic_bytes=268_435_456,
+        maximum_expanded_bytes=4_294_967_296,
+        maximum_single_entry_bytes=536_870_912,
         oodle_decoder=oodle_decoder,
     )
     memory: UnityRs = UnityRs.from_bytes(
@@ -122,6 +125,26 @@ def consume_public_api(
         maximum_diagnostic_bytes=268_435_456,
         oodle_decoder=oodle_decoder,
     )
+    compat: UnityPyCompat.Environment = UnityPyCompat.load(Path("fixture.assets"))
+    compat_assets: list[UnityPyCompat.SerializedFile] = compat.assets
+    compat_objects: list[UnityPyCompat.ObjectReader] = compat.objects
+    if compat_assets:
+        compat_file_objects: dict[int, UnityPyCompat.ObjectReader] = (
+            compat_assets[0].objects
+        )
+    if compat_objects:
+        compat_reader = compat_objects[0]
+        compat_class: UnityPyCompat.ClassIDType = compat_reader.type
+        compat_raw: bytes = compat_reader.get_raw_data()
+        compat_dict: dict[str, Any] = compat_reader.parse_as_dict()
+        compat_object: UnityPyCompat.Object = compat_reader.parse_as_object()
+        compat_nodes: Optional[list[UnityPyCompat.TypeTreeNode]] = (
+            compat_reader.serialized_type.nodes
+        )
+        compat_ptr = UnityPyCompat.PPtr(
+            compat_reader.assets_file, 0, compat_reader.path_id
+        )
+        compat_resolved: Optional[UnityPyCompat.ObjectReader] = compat_ptr.deref()
 
     file_count: int = studio.file_count
     object_count: int = studio.object_count
@@ -138,6 +161,22 @@ def consume_public_api(
     file_page: list[FileInfo] = studio.file_page()
     object_page: list[ObjectInfo] = studio.object_page(0)
     resource_page: list[ResourceInfo] = studio.resource_page()
+    if files:
+        file_info = files[0]
+        file_effective_version: str = file_info.effective_unity_version
+        file_format_version: int = file_info.format_version
+        file_target_platform: int = file_info.target_platform
+        file_endianness: int = file_info.endianness
+        file_type_tree_enabled: bool = file_info.type_tree_enabled
+        file_external_paths: list[str] = file_info.external_paths
+    if objects:
+        object_info = objects[0]
+        object_byte_start: int = object_info.byte_start
+        object_type_id: int = object_info.type_id
+        object_serialized_type_index: Optional[int] = object_info.serialized_type_index
+        object_destroyed: int = object_info.destroyed
+        object_stripped: int = object_info.stripped
+        object_script_type_index: Optional[int] = object_info.script_type_index
     scene_limits = SceneLimits(
         maximum_game_objects=100_000,
         maximum_index_bytes=64 * 1024 * 1024,
@@ -233,6 +272,11 @@ def consume_public_api(
         0, 1, schemas
     )
     type_tree_json: str = studio.read_type_tree_json(0, 1)
+    type_tree: Any = studio.read_type_tree(0, 1)
+    resolved_pptr: Optional[tuple[int, int, int]] = studio.resolve_pptr(0, 0, 1)
+    type_tree_nodes: list[
+        tuple[str, str, int, int, int, int, int, int, int]
+    ] = studio.type_tree_nodes(0, 1)
     type_tree_dump: str = studio.read_type_tree_dump(0, 1)
 
     expression: CubismExpression = studio.read_cubism_expression(0, 1)

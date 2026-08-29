@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import struct
@@ -58,6 +59,7 @@ from unity_rs import (
     SpriteSettings,
     extract,
 )
+from unity_rs.compat import unitypy as UnityPyCompat
 
 # Every check here is an `assert`, and `-O` or `PYTHONOPTIMIZE` deletes those
 # outright rather than skipping them: this suite would import the package,
@@ -104,13 +106,13 @@ def align(output: bytearray, alignment: int) -> None:
         output.append(0)
 
 
-def synthetic_text_asset() -> bytes:
+def synthetic_text_asset(external_path: Optional[str] = None) -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "python")
     push_i32(payload, 12)
     payload.extend(b"hello python")
 
-    return finish_v22_asset(49, payload)
+    return finish_v22_asset(49, payload, external_path=external_path)
 
 
 def synthetic_unity6_shader(unity_version: str = "6000.2.0f1") -> bytes:
@@ -1933,6 +1935,30 @@ def synthetic_type_tree_object() -> bytes:
     return finish_v22_tree_asset(114, type_tree_probe_tree(), payload)
 
 
+def synthetic_unitypy_type_tree_shapes() -> bytes:
+    """A tree that distinguishes UnityPy values from the JSON projection."""
+    tree = TreeBuilder()
+    tree.push("UnityPyShapeProbe", "Base", -1, 0)
+    tree.push("char", "Character", 2, 1)
+    tree.push("TypelessData", "Blob", -1, 1)
+    tree.push("int", "size", 4, 2)
+    tree.push("UInt8", "data", 1, 2)
+    tree.push("map", "Pairs", -1, 1)
+    tree.push("Array", "Array", -1, 2, is_array=1)
+    tree.push("int", "size", 4, 3)
+    tree.push("pair", "data", -1, 3)
+    tree.push("int", "first", 4, 4)
+    tree.push("UInt8", "second", 1, 4)
+
+    payload = bytearray(struct.pack("<H", 0x263A))
+    payload.extend(struct.pack("<i", 3))
+    payload.extend(b"\x00\xff\x7f")
+    payload.extend(struct.pack("<i", 2))
+    payload.extend(struct.pack("<iB", 1, 2))
+    payload.extend(struct.pack("<iB", 3, 4))
+    return finish_v22_tree_asset(9999, tree.nodes, payload)
+
+
 def push_blob_type_tree(metadata: bytearray, nodes: list[dict[str, int | str]]) -> None:
     """The format 19+ blob encoding: 32-byte nodes, then the string buffer."""
     buffer = bytearray()
@@ -2009,6 +2035,7 @@ def finish_v22_asset(
     payload: bytearray,
     unity_version: str = "2022.3.62f1",
     target_platform: int = 13,
+    external_path: Optional[str] = None,
 ) -> bytes:
 
     metadata = bytearray(unity_version.encode("ascii") + b"\0")
@@ -2025,8 +2052,14 @@ def finish_v22_asset(
     metadata.extend(struct.pack("<q", 0))
     metadata.extend(struct.pack("<I", len(payload)))
     push_i32(metadata, 0)
-    for _ in range(3):
-        push_i32(metadata, 0)
+    push_i32(metadata, 0)  # script types
+    push_i32(metadata, int(external_path is not None))
+    if external_path is not None:
+        metadata.append(0)  # empty prefix
+        metadata.extend(bytes(16))  # GUID
+        push_i32(metadata, 0)  # kind
+        metadata.extend(external_path.encode("utf-8") + b"\0")
+    push_i32(metadata, 0)  # reference types
     metadata.append(0)
 
     metadata_size = len(metadata)
@@ -2185,6 +2218,118 @@ def main() -> None:
         path.write_bytes(synthetic_text_asset())
 
         studio = UnityRs(path)
+        compat = UnityPyCompat.load(path)
+        assert UnityPyCompat.load is UnityPyCompat.Environment
+        assert UnityPyCompat.AssetsManager is UnityPyCompat.Environment
+        assert len(compat.assets) == 1
+        assert compat.file is compat.assets[0]
+        assert compat.file.version == 22
+        assert compat.file.target_platform == 13
+        assert compat.file.unity_version == "2022.3.62f1"
+        assert list(compat.file.objects) == [7]
+        compat_reader = compat.file.objects[7]
+        assert compat_reader.type is UnityPyCompat.ClassIDType.TextAsset
+        assert compat_reader.type_id == 0
+        assert compat_reader.serialized_type.nodes is None
+        assert compat_reader.byte_start >= 0
+        assert compat_reader.get_raw_data().endswith(b"hello python")
+        compat_text = compat_reader.parse_as_object()
+        assert isinstance(compat_text, UnityPyCompat.TextAsset)
+        assert compat_text.m_Name == "python"
+        assert compat_text.m_Script == "hello python"
+        assert compat.objects == [compat_reader]
+        try:
+            compat_reader.parse_as_object(check_read=False)
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError("compatibility parsing must not weaken layout validation")
+        assert not UnityPyCompat.PPtr(compat.file, 0, 0)
+        assert UnityPyCompat.PPtr(compat.file, 0, 7).deref() is compat_reader
+        try:
+            UnityPyCompat.PPtr(compat.file, 1, 7).deref()
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("missing PPtr externals must remain FileNotFoundError")
+        try:
+            compat_reader.parse_as_dict()
+        except UnityPyCompat.TypeTreeError as error:
+            assert "no type tree" in str(error)
+        else:
+            raise AssertionError("stripped TypeTree reads must fail explicitly")
+        try:
+            compat.save()
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError("read-only compatibility save must fail explicitly")
+        try:
+            UnityPyCompat.load(path, maximum_file_bytes=1)
+        except ValueError as error:
+            assert "maximum_file_bytes 1" in str(error)
+        else:
+            raise AssertionError("compatibility path inputs must obey byte limits")
+
+        compat_memory = UnityPyCompat.load(synthetic_text_asset())
+        assert compat_memory.file.objects[7].read().m_Script == "hello python"
+        compat_stream = UnityPyCompat.load(
+            io.BytesIO(synthetic_text_asset()), maximum_file_bytes=1024 * 1024
+        )
+        assert compat_stream.file.objects[7].peek_name() == "python"
+        compat_source_path = Path(directory) / "source.assets"
+        compat_target_path = Path(directory) / "target.assets"
+        compat_source_path.write_bytes(
+            synthetic_text_asset(external_path="target.assets")
+        )
+        compat_target_path.write_bytes(synthetic_text_asset())
+        compat_external = UnityPyCompat.load(
+            compat_source_path, compat_target_path
+        )
+        assert compat_external.assets[0].externals[0].path == "target.assets"
+        external_reader = UnityPyCompat.PPtr(
+            compat_external.assets[0], 1, 7
+        ).deref()
+        assert external_reader is compat_external.assets[1].objects[7]
+        first_pointer = UnityPyCompat.PPtr(compat.file, 0, 7)
+        second_pointer = UnityPyCompat.PPtr(compat.file, 0, 8)
+        duplicate_container = UnityPyCompat.ContainerHelper(
+            [("assets/shared", first_pointer), ("assets/shared", second_pointer)]
+        )
+        assert len(duplicate_container) == 2
+        assert list(duplicate_container.items()) == [
+            ("assets/shared", first_pointer),
+            ("assets/shared", second_pointer),
+        ]
+        assert duplicate_container["assets/shared"] is second_pointer
+
+        tree_compat = UnityPyCompat.load(synthetic_type_tree_object())
+        tree_reader = tree_compat.file.objects[7]
+        tree_nodes = tree_reader.serialized_type.nodes
+        assert tree_nodes is not None
+        assert tree_nodes[0].m_Type == "MonoBehaviour"
+        assert tree_nodes[0].m_Name == "Base"
+        try:
+            tree_compat._native.type_tree_nodes(0, 7, maximum_nodes=1)
+        except ValueError as error:
+            assert "exceeding limit 1" in str(error)
+        else:
+            raise AssertionError("TypeTree node materialization limit must be enforced")
+        tree_dict = tree_reader.parse_as_dict()
+        assert tree_dict["m_Name"] == "tree-probe"
+        assert tree_dict["Signed8"] == -7
+        assert tree_dict["Unsigned16"] == 65000
+        assert tree_dict["Numbers"] == [5, -6, 7]
+        tree_object = tree_reader.parse_as_object()
+        assert tree_object.__class__.__name__ == "MonoBehaviour"
+        assert tree_object.m_Name == "tree-probe"
+        assert isinstance(tree_object.m_GameObject, UnityPyCompat.PPtr)
+        assert not tree_object.m_GameObject
+        shape_compat = UnityPyCompat.load(synthetic_unitypy_type_tree_shapes())
+        shape_dict = shape_compat.file.objects[7].parse_as_dict()
+        assert shape_dict["Character"] == 0x263A
+        assert shape_dict["Blob"] == b"\x00\xff\x7f"
+        assert shape_dict["Pairs"] == [(1, 2), (3, 4)]
         memory_studio = UnityRs.from_bytes(
             synthetic_text_asset(), name="memory-fixture.assets"
         )

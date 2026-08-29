@@ -54,6 +54,8 @@ def main() -> None:
         "/crates/unity-rs-python/src/lib.rs",
         "/python/unity_rs/__init__.py",
         "/python/unity_rs/__init__.pyi",
+        "/python/unity_rs/compat/__init__.py",
+        "/python/unity_rs/compat/unitypy.py",
         "/python/unity_rs/LICENSE",
         "/python/unity_rs/THIRD_PARTY_NOTICES.md",
         "/python/unity_rs/THIRD_PARTY_LICENSES.txt",

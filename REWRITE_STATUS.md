@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-08-28（Asia/Shanghai）
+最后更新：2026-08-29（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -36,7 +36,7 @@
 | 交付面 | 当前状态 | 说明 |
 | --- | --- | --- |
 | Rust Core | Beta，主流程可用 | 主要容器、SerializedFile、常见资产、场景、动画和导出链路已实现；长尾格式继续补齐 |
-| Python | Beta，主要目标接口 | 直接绑定 Core，覆盖加载、枚举、资源读取、主要资产读取、FBX、Live2D、导出和解包 |
+| Python | Beta，主要目标接口 | 直接绑定 Core，覆盖加载、枚举、资源读取、主要资产读取、FBX、Live2D、导出和解包；另提供命名空间隔离的 UnityPy 1.25.x 只读兼容层 |
 | CLI | Beta | inspect/info/list/scene、export/extract、FBX、Animator/SplitObjects、Live2D 已接入 |
 | Node.js | 可选 Beta | 同步与 Promise worker API 已覆盖加载、枚举及主要读取路径；保留 `scene(maximumGameObjects?)`，并通过 `sceneWithLimits` 暴露与 Core/Python 相同的六类场景预算；路径与单/多内存输入都可组合传入加载选项（Unity 版本、UnityCN 密钥、失败容忍策略、输入上限），Live2D 包连同 diagnostics 一起返回，外部 schema 可恢复 stripped 包，Promise worker 可在同一次调用中再注入 Tuanjie ACL decoder；模型导出（场景 OBJ 与带贴图的 FBX）与 Python 等价；Core→Node 映射、Rust addon、生成声明和严格 TypeScript 消费均有机器审计 |
 | .NET 运行时退役 | 已完成 | 默认构建、安装和用户工作流完全不需要 .NET；C# 只用于显式差分 oracle 和格式核验 |
@@ -168,6 +168,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   完整构造 lossy 路径再转义；成功根路径和递归 gzip/ZIP 标签也通过组合式 `Display` 直接
   写入，不再为每层 `display().to_string()` 或 `format!` 复制完整前缀；
 - Python 提供惰性/分页枚举、资源读取、主要专用 reader、schema/ACL/Oodle 适配器、导出和解包；`SceneLimits` 可独立收紧 GameObject、组件、Transform 子项、材质、骨骼和层级边预算；Core 的 I/O、无效数据和未支持功能分别保留为标准 `OSError` 子类、`ValueError` 和 `NotImplementedError`，所有 Rust→Python 字节复制以及可能很大的场景、候选、图片层和报告转换都使用可失败分配，并以 `MemoryError` 报告内存不足；
+- Python 的 `unity_rs.compat.unitypy` 以 UnityPy 1.25.3 为固定契约基线，提供 `Environment`、`SerializedFile`、`ObjectReader`、`PPtr`、`ClassIDType`、container multidict、直接 Python TypeTree 值以及 TextAsset/图片/音频/Mesh/Shader/Font 常用读取代理；兼容集合仍受显式物化预算约束，主 wheel 不安装顶层 `UnityPy` 包，缺失 TypeTree、`fs=`、宽松尾部读取以及全部编辑/重打包调用都会明确失败；
 - Python wheel 使用 `cp39-abi3`，CI 构建 Linux、Windows、macOS 的 x86-64/ARM64 组合，并在构建解释器和 Python 3.14 上安装测试；
 - Python sdist 会被重新构建成 wheel 并执行完整 API 测试；
 - `AssetCollection` 的 SerializedFile/资源表通过只读 slice 公开；低层调用方以

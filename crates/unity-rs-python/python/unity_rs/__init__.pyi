@@ -1,5 +1,5 @@
 from os import PathLike
-from typing import Callable, Iterator, Optional, Union
+from typing import Any, Callable, Iterator, Optional, Union
 
 OodleDecoder = Callable[[bytes, int], bytes]
 AclDecoder = Callable[
@@ -17,6 +17,18 @@ class FileInfo:
     @property
     def unity_version(self) -> str: ...
     @property
+    def effective_unity_version(self) -> str: ...
+    @property
+    def format_version(self) -> int: ...
+    @property
+    def target_platform(self) -> int: ...
+    @property
+    def endianness(self) -> int: ...
+    @property
+    def type_tree_enabled(self) -> bool: ...
+    @property
+    def external_paths(self) -> list[str]: ...
+    @property
     def object_count(self) -> int: ...
 
 class ObjectInfo:
@@ -31,7 +43,19 @@ class ObjectInfo:
     @property
     def class_id(self) -> int: ...
     @property
+    def byte_start(self) -> int: ...
+    @property
     def byte_size(self) -> int: ...
+    @property
+    def type_id(self) -> int: ...
+    @property
+    def serialized_type_index(self) -> Optional[int]: ...
+    @property
+    def destroyed(self) -> int: ...
+    @property
+    def stripped(self) -> int: ...
+    @property
+    def script_type_index(self) -> Optional[int]: ...
     @property
     def name(self) -> Optional[str]: ...
     @property
@@ -972,6 +996,8 @@ class UnityRs:
         maximum_path_bytes: int = 1_048_576,
         maximum_total_path_bytes: int = 67_108_864,
         maximum_diagnostic_bytes: int = 268_435_456,
+        maximum_expanded_bytes: int = 4_294_967_296,
+        maximum_single_entry_bytes: int = 536_870_912,
         oodle_decoder: Optional[OodleDecoder] = None,
         skip_unreadable_inputs: bool = False,
         unity_cn_key: Union[bytes, str, None] = None,
@@ -1248,6 +1274,33 @@ class UnityRs:
         pretty: bool = False,
         maximum_bytes: int = 268_435_456,
     ) -> str: ...
+    def read_type_tree(
+        self,
+        file_index: int,
+        path_id: int,
+        *,
+        maximum_object_bytes: int = 536_870_912,
+        maximum_depth: int = 128,
+        maximum_values: int = 1_000_000,
+        maximum_array_elements: int = 1_000_000,
+        maximum_string_bytes: int = 16_777_216,
+        maximum_typeless_bytes: int = 268_435_456,
+        maximum_materialized_bytes: int = 536_870_912,
+    ) -> Any: ...
+    def resolve_pptr(
+        self,
+        source_file_index: int,
+        file_id: int,
+        path_id: int,
+    ) -> Optional[tuple[int, int, int]]: ...
+    def type_tree_nodes(
+        self,
+        file_index: int,
+        path_id: int,
+        *,
+        maximum_nodes: int = 1_000_000,
+        maximum_string_bytes: int = 67_108_864,
+    ) -> list[tuple[str, str, int, int, int, int, int, int, int]]: ...
     def read_type_tree_dump(
         self,
         file_index: int,

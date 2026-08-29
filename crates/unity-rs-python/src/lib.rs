@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use pyo3::exceptions::{
-    PyKeyError, PyMemoryError, PyNotImplementedError, PyTypeError, PyValueError,
+    PyFileNotFoundError, PyKeyError, PyMemoryError, PyNotImplementedError, PyTypeError,
+    PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use unity_rs_core::Error;
 use unity_rs_core::acl::{
     AclCompressedTracksLimits, AclDecodeLimits, AclDecodeRequest, AclDecodedClip, AclDecoder,
@@ -52,11 +53,12 @@ use unity_rs_core::mono_schema::{
 };
 use unity_rs_core::monobehaviour::{MonoBehaviourReadLimits, MonoScript};
 use unity_rs_core::project_settings::ProjectSettingsReadLimits;
+use unity_rs_core::scene::resolve_object_reference;
 use unity_rs_core::scene_hierarchy::{SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey};
 use unity_rs_core::scene_textures::{SceneTexture, SceneTextureLimits, SceneTextureSkip};
 use unity_rs_core::serialized::{
-    AssetBundleMetadata, ContainerMetadataReadLimits, PreloadDataMetadata, ResourceManagerMetadata,
-    TypeTree, TypeTreeNode,
+    AssetBundleMetadata, ContainerMetadataReadLimits, ObjectReference, PreloadDataMetadata,
+    ResourceManagerMetadata, TypeTree, TypeTreeNode,
 };
 use unity_rs_core::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
@@ -68,6 +70,7 @@ use unity_rs_core::sprite_atlas::{SpriteAtlas, SpriteAtlasReadLimits};
 use unity_rs_core::studio::{Studio, StudioFile, StudioObject, StudioResource};
 use unity_rs_core::texture::TextureReadLimits;
 use unity_rs_core::texture_array::TextureArrayReadLimits;
+use unity_rs_core::type_tree::{TypeTreeReadLimits, TypeValue};
 use unity_rs_core::unity_cn::UnityCnKey;
 use unity_rs_core::unity_version::UnityVersion;
 
@@ -82,6 +85,7 @@ type PyAssetBundleContainerEntry = (String, usize, usize, PyObjectReference);
 type PyResourceManagerContainerEntry = (String, PyObjectReference);
 type PySpriteTriangle = ((f32, f32), (f32, f32), (f32, f32));
 type PyMonoBehaviourSchemaNode = (String, String, u32, bool);
+type PyTypeTreeNodeInfo = (String, String, i32, i32, i32, i32, i32, u32, u64);
 
 struct PythonOodleDecoder {
     callback: Py<PyAny>,
@@ -247,6 +251,12 @@ struct PyFileInfo {
     index: usize,
     path: String,
     unity_version: String,
+    effective_unity_version: String,
+    format_version: u32,
+    target_platform: i32,
+    endianness: u8,
+    type_tree_enabled: bool,
+    external_paths: Vec<String>,
     object_count: usize,
 }
 
@@ -258,7 +268,13 @@ struct PyObjectInfo {
     source_path: String,
     path_id: i64,
     class_id: i32,
+    byte_start: u64,
     byte_size: u64,
+    type_id: i32,
+    serialized_type_index: Option<usize>,
+    destroyed: u16,
+    stripped: u8,
+    script_type_index: Option<i16>,
     name: Option<String>,
     container: Option<String>,
 }
@@ -2354,7 +2370,7 @@ impl PyFileIterator {
             owner
                 .studio
                 .file(self.index)
-                .map(python_file_info)
+                .map(|file| python_file_info(&owner.studio, file))
                 .transpose()?
         };
         if item.is_some() {
@@ -2399,7 +2415,7 @@ impl PyObjectIterator {
                                 "object iterator could not resolve a validated object index",
                             )
                         })?;
-                    Some(python_object_info(object)?)
+                    Some(python_object_info(&owner.studio, object)?)
                 }
             };
             if let Some(item) = item {
@@ -2463,6 +2479,8 @@ impl PyUnityRs {
         maximum_path_bytes=1_048_576,
         maximum_total_path_bytes=67_108_864,
         maximum_diagnostic_bytes=268_435_456,
+        maximum_expanded_bytes=4_294_967_296,
+        maximum_single_entry_bytes=536_870_912,
         oodle_decoder=None,
         skip_unreadable_inputs=false,
         unity_cn_key=None,
@@ -2481,6 +2499,8 @@ impl PyUnityRs {
         maximum_path_bytes: usize,
         maximum_total_path_bytes: usize,
         maximum_diagnostic_bytes: usize,
+        maximum_expanded_bytes: u64,
+        maximum_single_entry_bytes: u64,
         oodle_decoder: Option<Py<PyAny>>,
         skip_unreadable_inputs: bool,
         unity_cn_key: Option<Py<PyAny>>,
@@ -2496,6 +2516,8 @@ impl PyUnityRs {
                 maximum_path_bytes,
                 maximum_total_path_bytes,
                 maximum_diagnostic_bytes,
+                maximum_expanded_bytes,
+                maximum_single_entry_bytes,
                 ..AssetLoadLimits::default()
             },
             unity_version_override,
@@ -3591,6 +3613,162 @@ impl PyUnityRs {
             .map_err(|error| PyValueError::new_err(format!("JSON is not UTF-8: {error}")))
     }
 
+    /// Reads an embedded `TypeTree` directly into Python values without the
+    /// lossy JSON projection. `char` remains an integer, `TypelessData`
+    /// becomes bytes, and Unity maps remain ordered lists of key/value tuples.
+    #[pyo3(signature = (
+        file_index,
+        path_id,
+        *,
+        maximum_object_bytes=536_870_912,
+        maximum_depth=128,
+        maximum_values=1_000_000,
+        maximum_array_elements=1_000_000,
+        maximum_string_bytes=16_777_216,
+        maximum_typeless_bytes=268_435_456,
+        maximum_materialized_bytes=536_870_912
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn read_type_tree(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_object_bytes: u64,
+        maximum_depth: usize,
+        maximum_values: usize,
+        maximum_array_elements: usize,
+        maximum_string_bytes: usize,
+        maximum_typeless_bytes: usize,
+        maximum_materialized_bytes: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let limits = TypeTreeReadLimits {
+            maximum_depth,
+            maximum_values,
+            maximum_array_elements,
+            maximum_string_bytes,
+            maximum_typeless_bytes,
+            maximum_materialized_bytes,
+        };
+        let (value, raw) = py.detach(|| {
+            let object = self.object(file_index, path_id)?;
+            let loaded = self
+                .studio
+                .collection()
+                .serialized_files()
+                .get(file_index)
+                .ok_or_else(|| {
+                    PyKeyError::new_err(format!("file index {file_index} was not found"))
+                })?;
+            let value = loaded
+                .file
+                .read_type_tree_value_with_limits(object.object_index(), limits)
+                .map_err(core_error)?;
+            let raw = if type_value_has_typeless_data(&value) {
+                Some(object.read_raw(maximum_object_bytes).map_err(core_error)?)
+            } else {
+                None
+            };
+            Ok::<_, PyErr>((value, raw))
+        })?;
+        python_type_value(py, value, raw.as_deref())
+    }
+
+    /// Resolves a local or external Unity `PPtr` to
+    /// `(file_index, object_index, path_id)`. Null pointers return `None`.
+    fn resolve_pptr(
+        &self,
+        py: Python<'_>,
+        source_file_index: usize,
+        file_id: i32,
+        path_id: i64,
+    ) -> PyResult<Option<(usize, usize, i64)>> {
+        py.detach(|| {
+            resolve_object_reference(
+                self.studio.collection(),
+                source_file_index,
+                ObjectReference { file_id, path_id },
+            )
+            .map(|resolved| {
+                resolved.map(|object| {
+                    (
+                        object.file_index,
+                        object.object_index,
+                        object.object.path_id,
+                    )
+                })
+            })
+            .map_err(|error| PyFileNotFoundError::new_err(error.to_string()))
+        })
+    }
+
+    /// Returns one object's embedded TypeTree nodes in serialized order.
+    #[pyo3(signature = (
+        file_index,
+        path_id,
+        *,
+        maximum_nodes=1_000_000,
+        maximum_string_bytes=67_108_864
+    ))]
+    fn type_tree_nodes(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_nodes: usize,
+        maximum_string_bytes: usize,
+    ) -> PyResult<Vec<PyTypeTreeNodeInfo>> {
+        check_metadata_page_limit(maximum_nodes)?;
+        py.detach(|| {
+            let object = self.object(file_index, path_id)?;
+            let loaded = self
+                .studio
+                .collection()
+                .serialized_files()
+                .get(file_index)
+                .ok_or_else(|| {
+                    PyKeyError::new_err(format!("file index {file_index} was not found"))
+                })?;
+            let tree = loaded
+                .file
+                .object_type_tree(object.object_index())
+                .map_err(core_error)?;
+            if tree.nodes.len() > maximum_nodes {
+                return Err(PyValueError::new_err(format!(
+                    "TypeTree has {} nodes, exceeding limit {maximum_nodes}",
+                    tree.nodes.len()
+                )));
+            }
+            let mut string_bytes = 0_usize;
+            let mut output = reserve_metadata(tree.nodes.len(), "Python TypeTree nodes")?;
+            for node in &tree.nodes {
+                string_bytes = string_bytes
+                    .checked_add(node.type_name.len())
+                    .and_then(|length| length.checked_add(node.field_name.len()))
+                    .ok_or_else(|| {
+                        PyValueError::new_err("TypeTree node string byte count overflowed")
+                    })?;
+                if string_bytes > maximum_string_bytes {
+                    return Err(PyValueError::new_err(format!(
+                        "TypeTree node strings use {string_bytes} bytes, exceeding limit {maximum_string_bytes}"
+                    )));
+                }
+                output.push((
+                    try_copy_string(&node.type_name, "TypeTree node type")?,
+                    try_copy_string(&node.field_name, "TypeTree node field")?,
+                    node.byte_size,
+                    node.index,
+                    node.type_flags,
+                    node.version,
+                    node.meta_flags,
+                    node.level,
+                    node.reference_type_hash,
+                ));
+            }
+            Ok(output)
+        })
+    }
+
     /// Reads the managed-compatible, tab-indented CRLF `TypeTree` dump.
     #[pyo3(signature = (file_index, path_id, *, maximum_bytes=268_435_456))]
     fn read_type_tree_dump(
@@ -4443,6 +4621,89 @@ impl PyUnityRs {
     }
 }
 
+fn type_value_has_typeless_data(value: &TypeValue) -> bool {
+    match value {
+        TypeValue::TypelessData { .. } => true,
+        TypeValue::Array(values) => values.iter().any(type_value_has_typeless_data),
+        TypeValue::Object(fields) => fields
+            .iter()
+            .any(|field| type_value_has_typeless_data(&field.value)),
+        TypeValue::Map(entries) => entries.iter().any(|entry| {
+            type_value_has_typeless_data(&entry.key) || type_value_has_typeless_data(&entry.value)
+        }),
+        TypeValue::Signed(_)
+        | TypeValue::Unsigned(_)
+        | TypeValue::Character(_)
+        | TypeValue::Float32(_)
+        | TypeValue::Float(_)
+        | TypeValue::Boolean(_)
+        | TypeValue::String(_) => false,
+    }
+}
+
+fn python_type_value(
+    py: Python<'_>,
+    value: TypeValue,
+    raw_object: Option<&[u8]>,
+) -> PyResult<Py<PyAny>> {
+    match value {
+        TypeValue::Signed(value) => Ok(PyInt::new(py, value).unbind().into_any()),
+        TypeValue::Unsigned(value) => Ok(PyInt::new(py, value).unbind().into_any()),
+        TypeValue::Character(value) => Ok(PyInt::new(py, value).unbind().into_any()),
+        TypeValue::Float32(value) => Ok(PyFloat::new(py, f64::from(value)).unbind().into_any()),
+        TypeValue::Float(value) => Ok(PyFloat::new(py, value).unbind().into_any()),
+        TypeValue::Boolean(value) => Ok(PyBool::new(py, value).to_owned().unbind().into_any()),
+        TypeValue::String(value) => Ok(PyString::new(py, &value).unbind().into_any()),
+        TypeValue::TypelessData { offset, size } => {
+            let raw = raw_object.ok_or_else(|| {
+                PyValueError::new_err("TypelessData requires the serialized object bytes")
+            })?;
+            let start = usize::try_from(offset).map_err(|_| {
+                PyValueError::new_err("TypelessData offset does not fit this platform")
+            })?;
+            let length = usize::try_from(size).map_err(|_| {
+                PyValueError::new_err("TypelessData size does not fit this platform")
+            })?;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| PyValueError::new_err("TypelessData byte range overflowed"))?;
+            let bytes = raw.get(start..end).ok_or_else(|| {
+                PyValueError::new_err("TypelessData byte range is outside the object")
+            })?;
+            Ok(python_bytes(py, bytes)?.unbind().into_any())
+        }
+        TypeValue::Array(values) => {
+            let mut converted = Vec::new();
+            converted.try_reserve(values.len()).map_err(|error| {
+                PyMemoryError::new_err(format!("cannot allocate Python TypeTree array: {error}"))
+            })?;
+            for value in values {
+                converted.push(python_type_value(py, value, raw_object)?);
+            }
+            Ok(PyList::new(py, converted)?.unbind().into_any())
+        }
+        TypeValue::Object(fields) => {
+            let output = PyDict::new(py);
+            for field in fields {
+                output.set_item(field.name, python_type_value(py, field.value, raw_object)?)?;
+            }
+            Ok(output.unbind().into_any())
+        }
+        TypeValue::Map(entries) => {
+            let mut converted = Vec::new();
+            converted.try_reserve(entries.len()).map_err(|error| {
+                PyMemoryError::new_err(format!("cannot allocate Python TypeTree map: {error}"))
+            })?;
+            for entry in entries {
+                let key = python_type_value(py, entry.key, raw_object)?;
+                let value = python_type_value(py, entry.value, raw_object)?;
+                converted.push(PyTuple::new(py, [key, value])?.unbind());
+            }
+            Ok(PyList::new(py, converted)?.unbind().into_any())
+        }
+    }
+}
+
 fn prepare_legacy_animation(animation: LegacyAnimationComponent) -> PyResult<PyLegacyAnimation> {
     let mut clips = reserve_metadata(
         animation.clips.len(),
@@ -4737,7 +4998,7 @@ fn prepare_files(studio: &Studio) -> PyResult<Vec<PyFileInfo>> {
     checked_convenience_list(studio.file_count(), "files", "iter_files")?;
     let mut output = reserve_metadata(studio.file_count(), "Python file metadata")?;
     for file in studio.files() {
-        output.push(python_file_info(file)?);
+        output.push(python_file_info(studio, file)?);
     }
     Ok(output)
 }
@@ -4746,7 +5007,7 @@ fn prepare_objects(studio: &Studio) -> PyResult<Vec<PyObjectInfo>> {
     checked_convenience_list(studio.object_count(), "objects", "iter_objects")?;
     let mut output = reserve_metadata(studio.object_count(), "Python object metadata")?;
     for object in studio.objects() {
-        output.push(python_object_info(object)?);
+        output.push(python_object_info(studio, object)?);
     }
     Ok(output)
 }
@@ -4767,7 +5028,7 @@ fn prepare_file_page(studio: &Studio, offset: usize, limit: usize) -> PyResult<V
     let count = available.min(limit);
     let mut output = reserve_metadata(count, "Python file metadata page")?;
     for file in studio.files().skip(offset).take(count) {
-        output.push(python_file_info(file)?);
+        output.push(python_file_info(studio, file)?);
     }
     Ok(output)
 }
@@ -4791,7 +5052,7 @@ fn prepare_object_page(
             .ok_or_else(|| {
                 PyValueError::new_err("object page could not resolve a validated object index")
             })?;
-        output.push(python_object_info(object)?);
+        output.push(python_object_info(studio, object)?);
     }
     Ok(output)
 }
@@ -4811,23 +5072,60 @@ fn prepare_resource_page(
     Ok(output)
 }
 
-fn python_file_info(file: StudioFile<'_>) -> PyResult<PyFileInfo> {
+fn python_file_info(studio: &Studio, file: StudioFile<'_>) -> PyResult<PyFileInfo> {
+    let loaded = studio
+        .collection()
+        .serialized_files()
+        .get(file.index())
+        .ok_or_else(|| PyValueError::new_err("validated file index was not found"))?;
+    let mut external_paths = reserve_metadata(
+        loaded.file.externals.len(),
+        "Python serialized external paths",
+    )?;
+    for external in &loaded.file.externals {
+        external_paths.push(try_copy_string(&external.path, "serialized external path")?);
+    }
     Ok(PyFileInfo {
         index: file.index(),
         path: try_copy_string(file.path(), "file path")?,
         unity_version: try_copy_string(file.unity_version(), "Unity version")?,
+        effective_unity_version: try_copy_string(
+            &loaded.file.unity_version.full_version,
+            "effective Unity version",
+        )?,
+        format_version: loaded.file.header.version.0,
+        target_platform: loaded.file.target_platform,
+        endianness: loaded.file.header.endianness,
+        type_tree_enabled: loaded.file.type_tree_enabled,
+        external_paths,
         object_count: file.object_count(),
     })
 }
 
-fn python_object_info(object: StudioObject<'_>) -> PyResult<PyObjectInfo> {
+fn python_object_info(studio: &Studio, object: StudioObject<'_>) -> PyResult<PyObjectInfo> {
+    let loaded = studio
+        .collection()
+        .serialized_files()
+        .get(object.file_index())
+        .ok_or_else(|| PyValueError::new_err("validated object file index was not found"))?;
+    let info = loaded
+        .file
+        .objects
+        .get(object.object_index())
+        .ok_or_else(|| PyValueError::new_err("validated object index was not found"))?;
     Ok(PyObjectInfo {
         file_index: object.file_index(),
         object_index: object.object_index(),
         source_path: try_copy_string(object.source_path(), "object source path")?,
         path_id: object.path_id(),
         class_id: object.class_id(),
+        byte_start: info.byte_start,
         byte_size: object.byte_size(),
+        type_id: info.type_id,
+        serialized_type_index: info.serialized_type_index,
+        destroyed: info.destroyed,
+        stripped: info.stripped,
+        script_type_index: info.script_type_index,
         name: try_copy_optional_string(object.name(), "object name")?,
         container: try_copy_optional_string(object.container(), "object container")?,
     })

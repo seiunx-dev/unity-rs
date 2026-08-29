@@ -21,6 +21,7 @@ Run with the wheel and UnityPy installed in the same interpreter:
 
 from __future__ import annotations
 
+import copy
 import json
 import struct
 import sys
@@ -34,6 +35,7 @@ import python_api as fixtures  # noqa: E402
 import UnityPy  # noqa: E402
 
 from unity_rs import UnityRs  # noqa: E402
+from unity_rs.compat import unitypy as UnityPyCompat  # noqa: E402
 
 FNV64_OFFSET = 0xCBF29CE484222325
 FNV64_PRIME = 0x00000100000001B3
@@ -179,6 +181,38 @@ def wheel_manifest(path: Path) -> dict[str, Any]:
     return {"Files": files}
 
 
+def compatibility_manifest(path: Path) -> dict[str, Any]:
+    """The same rows through the public UnityPy compatibility object graph."""
+    environment = UnityPyCompat.load(path)
+    files = []
+    for name, serialized in environment.files.items():
+        objects = []
+        for object_reader in serialized.objects.values():
+            raw = object_reader.get_raw_data()
+            try:
+                tree = narrow_floats(object_reader.parse_as_dict())
+            except UnityPyCompat.TypeTreeError:
+                tree = None
+            objects.append(
+                {
+                    "PathId": object_reader.path_id,
+                    "ClassId": int(object_reader.class_id),
+                    "ByteSize": object_reader.byte_size,
+                    "Name": object_reader.peek_name(),
+                    "Raw": bytes_manifest(bytes(raw)),
+                    "Tree": tree,
+                }
+            )
+        files.append(
+            {
+                "Path": portable_file_name(name),
+                "UnityVersion": str(serialized.unity_version),
+                "Objects": objects,
+            }
+        )
+    return {"Files": files}
+
+
 def wheel_tree(studio: Any, obj: Any) -> Any:
     """The same values from this project, or None when there is no tree."""
     try:
@@ -272,6 +306,7 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, in
 
     expected = unitypy_manifest(path)
     actual = wheel_manifest(path)
+    compatibility = compatibility_manifest(path)
     compared_doubles = assert_double_precision(path)
     # A tree row that is None on both sides compares equal while proving
     # nothing, so the run reports how many were really compared and main()
@@ -282,12 +317,19 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, in
         for entry in file["Objects"]
         if entry.get("Tree") is not None
     )
+    compatibility_expected = copy.deepcopy(expected)
     skipped = drop_undetermined_names(expected, actual)
-    if expected == actual:
+    compatibility_skipped = drop_undetermined_names(
+        compatibility_expected, compatibility
+    )
+    if expected == actual and compatibility_expected == compatibility:
         return ([], skipped, compared_trees, compared_doubles)
     return (
-        [f"{name}:\n  UnityPy: {expected}\n  wheel:   {actual}"],
-        skipped,
+        [
+            f"{name}:\n  UnityPy: {expected}\n  wheel:   {actual}"
+            f"\n  compat:  {compatibility}"
+        ],
+        max(skipped, compatibility_skipped),
         compared_trees,
         compared_doubles,
     )

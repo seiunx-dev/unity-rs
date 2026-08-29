@@ -152,6 +152,27 @@ The wheel targets Python 3.9+ through `cp39-abi3`. The runtime module and its
 `.pyi` are checked in both directions, and a strict Python 3.9 consumer is
 type-checked in CI.
 
+For read-focused migration from UnityPy 1.25.x, use the namespaced compatibility
+facade so the wheel never shadows a real `UnityPy` installation:
+
+```python
+from unity_rs.compat import unitypy as UnityPy
+
+environment = UnityPy.load("game_Data")
+for reader in environment.objects:
+    if reader.type is UnityPy.ClassIDType.TextAsset:
+        text = reader.parse_as_object()
+        print(text.m_Name, text.m_Script)
+```
+
+The facade implements the bounded `Environment` / `SerializedFile` /
+`ObjectReader` / `PPtr` read graph, embedded TypeTree dictionaries and common
+TextAsset, Texture2D, Sprite, AudioClip, Mesh, Shader and Font conveniences.
+It does not yet implement caller-supplied UnityPy TypeTree nodes, `fs=`, object
+patching, serialized-file writing or bundle repacking; those calls fail
+explicitly instead of being silently ignored. See
+[`docs/unitypy-compat.md`](docs/unitypy-compat.md) for the exact contract.
+
 ### Node.js
 
 Build the optional addon from the checkout:
