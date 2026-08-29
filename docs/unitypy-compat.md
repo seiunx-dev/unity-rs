@@ -29,6 +29,8 @@ that every UnityPy implementation detail or generated class is reproduced.
   aliases;
 - direct embedded-TypeTree conversion with UnityPy value shapes: `char` is an
   integer, `TypelessData` is `bytes`, and maps are ordered lists of tuples;
+- caller-supplied UnityPy `TypeTreeNode` roots and flat lists of UnityPy nodes
+  or node dictionaries, including reads of files without embedded trees;
 - common `TextAsset`, `Texture2D`, `Sprite`, `AudioClip`, `Mesh`, `Shader` and
   `Font` conveniences. Pillow is imported only when `.image` is requested.
 
@@ -39,9 +41,11 @@ than weakening validation.
 
 ## Explicit boundaries
 
-- Generic TypeTree reads require a tree embedded in the serialized file.
-  UnityPy's bundled TPK database is not redistributed. Caller-supplied UnityPy
-  node lists and a validated external TypeTree provider remain future work.
+- UnityPy's bundled TPK database is not redistributed. Applications may pass a
+  complete tree obtained from their own trusted provider to `read_typetree` or
+  `parse_as_dict`; malformed, partial, oversized, or non-consuming trees are
+  rejected. Automatic external TypeTree-provider registration remains future
+  work.
 - `fs=` is not accepted yet. Passing it raises `NotImplementedError`.
 - The loader currently exposes discovered serialized files rather than exact
   UnityPy `BundleFile` / `WebFile` provenance objects for nested containers.

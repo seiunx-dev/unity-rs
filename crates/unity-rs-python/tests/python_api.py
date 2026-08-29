@@ -2258,6 +2258,39 @@ def main() -> None:
             assert "no type tree" in str(error)
         else:
             raise AssertionError("stripped TypeTree reads must fail explicitly")
+        supplied_text_tree = [
+            {"m_Level": 0, "m_Type": "TextAsset", "m_Name": "Base"},
+            {
+                "m_Level": 1,
+                "m_Type": "string",
+                "m_Name": "m_Name",
+                "m_MetaFlag": ALIGN,
+            },
+            {
+                "m_Level": 2,
+                "m_Type": "Array",
+                "m_Name": "Array",
+                "m_TypeFlags": 1,
+                "m_MetaFlag": ALIGN,
+            },
+            {"m_Level": 3, "m_Type": "int", "m_Name": "size"},
+            {"m_Level": 3, "m_Type": "char", "m_Name": "data"},
+            {
+                "m_Level": 1,
+                "m_Type": "TypelessData",
+                "m_Name": "m_Script",
+            },
+            {"m_Level": 2, "m_Type": "int", "m_Name": "size"},
+            {"m_Level": 2, "m_Type": "UInt8", "m_Name": "data"},
+        ]
+        supplied_text = compat_reader.read_typetree(supplied_text_tree)
+        assert supplied_text == {"m_Name": "python", "m_Script": b"hello python"}
+        try:
+            compat_reader.read_typetree(supplied_text_tree[:1])
+        except UnityPyCompat.TypeTreeError as error:
+            assert "does not match this object" in str(error)
+        else:
+            raise AssertionError("partial caller TypeTrees must not produce partial output")
         try:
             compat.save()
         except NotImplementedError:
@@ -2320,6 +2353,27 @@ def main() -> None:
         assert tree_dict["Signed8"] == -7
         assert tree_dict["Unsigned16"] == 65000
         assert tree_dict["Numbers"] == [5, -6, 7]
+        supplied_tree_dict = tree_reader.parse_as_dict(tree_nodes)
+        assert supplied_tree_dict == tree_dict
+        renamed_tree = [
+            {
+                "m_Level": node.m_Level,
+                "m_Type": node.m_Type,
+                "m_Name": "CustomSigned8"
+                if node.m_Name == "Signed8"
+                else node.m_Name,
+                "m_ByteSize": node.m_ByteSize,
+                "m_Index": node.m_Index,
+                "m_TypeFlags": node.m_TypeFlags,
+                "m_Version": node.m_Version,
+                "m_MetaFlag": node.m_MetaFlag,
+                "m_RefTypeHash": node.m_RefTypeHash,
+            }
+            for node in tree_nodes
+        ]
+        renamed_tree_dict = tree_reader.read_typetree(renamed_tree)
+        assert renamed_tree_dict["CustomSigned8"] == -7
+        assert "Signed8" not in renamed_tree_dict
         tree_object = tree_reader.parse_as_object()
         assert tree_object.__class__.__name__ == "MonoBehaviour"
         assert tree_object.m_Name == "tree-probe"

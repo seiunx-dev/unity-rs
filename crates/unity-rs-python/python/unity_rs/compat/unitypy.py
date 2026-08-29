@@ -9,7 +9,7 @@ native ``unity-rs`` implementation.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from enum import IntEnum
 from importlib import import_module
 from pathlib import Path
@@ -455,23 +455,35 @@ class ObjectReader:
         nodes: Optional[object] = None,
         check_read: bool = True,
     ) -> Dict[str, Any]:
-        if nodes is not None:
-            raise NotImplementedError(
-                "caller-supplied UnityPy TypeTreeNode values are not implemented yet"
-            )
         if not check_read:
             raise NotImplementedError(
                 "check_read=False is incompatible with unity-rs complete-layout validation"
             )
         try:
-            value = self.environment._native.read_type_tree(
-                self._info.file_index,
-                self.path_id,
-                maximum_object_bytes=self.environment.maximum_object_bytes,
-                maximum_values=self.environment.maximum_type_tree_values,
-                maximum_array_elements=self.environment.maximum_type_tree_array_elements,
-                maximum_materialized_bytes=self.environment.maximum_type_tree_materialized_bytes,
-            )
+            if nodes is None:
+                value = self.environment._native.read_type_tree(
+                    self._info.file_index,
+                    self.path_id,
+                    maximum_object_bytes=self.environment.maximum_object_bytes,
+                    maximum_values=self.environment.maximum_type_tree_values,
+                    maximum_array_elements=self.environment.maximum_type_tree_array_elements,
+                    maximum_materialized_bytes=self.environment.maximum_type_tree_materialized_bytes,
+                )
+            else:
+                rows = _caller_type_tree_rows(
+                    nodes,
+                    maximum_nodes=self.environment.maximum_type_tree_values,
+                    maximum_string_bytes=self.environment.maximum_type_tree_materialized_bytes,
+                )
+                value = self.environment._native.read_type_tree_with_nodes(
+                    self._info.file_index,
+                    self.path_id,
+                    rows,
+                    maximum_object_bytes=self.environment.maximum_object_bytes,
+                    maximum_values=self.environment.maximum_type_tree_values,
+                    maximum_array_elements=self.environment.maximum_type_tree_array_elements,
+                    maximum_materialized_bytes=self.environment.maximum_type_tree_materialized_bytes,
+                )
         except (NotImplementedError, ValueError) as error:
             raise TypeTreeError(str(error)) from error
         if not isinstance(value, dict):
@@ -516,6 +528,97 @@ class ObjectReader:
 
     def save_typetree(self, data: object) -> bytes:
         return self.patch(data)
+
+
+_MISSING = object()
+
+
+def _caller_type_tree_rows(
+    nodes: object,
+    *,
+    maximum_nodes: int,
+    maximum_string_bytes: int,
+) -> List[Tuple[str, str, int, int, int, int, int, int, int]]:
+    """Flatten UnityPy nodes without trusting their size or field types."""
+
+    if isinstance(nodes, list):
+        iterator = iter(nodes)
+    else:
+        traverse = getattr(nodes, "traverse", None)
+        if not callable(traverse):
+            raise TypeError("nodes must be a list[dict or TypeTreeNode] or TypeTreeNode")
+        iterator = iter(traverse())
+
+    rows: List[Tuple[str, str, int, int, int, int, int, int, int]] = []
+    string_bytes = 0
+    for index, node in enumerate(iterator):
+        if index >= maximum_nodes:
+            raise MemoryError(
+                "caller-supplied TypeTree exceeds maximum_type_tree_values {}".format(
+                    maximum_nodes
+                )
+            )
+        type_name = _caller_node_value(node, "m_Type")
+        field_name = _caller_node_value(node, "m_Name")
+        if not isinstance(type_name, str) or not isinstance(field_name, str):
+            raise TypeError(
+                "caller-supplied TypeTree node {} names must be strings".format(index)
+            )
+        string_bytes += len(type_name.encode("utf-8")) + len(
+            field_name.encode("utf-8")
+        )
+        if string_bytes > maximum_string_bytes:
+            raise MemoryError(
+                "caller-supplied TypeTree strings exceed maximum_type_tree_materialized_bytes {}".format(
+                    maximum_string_bytes
+                )
+            )
+        rows.append(
+            (
+                type_name,
+                field_name,
+                _caller_node_int(node, "m_ByteSize", index, 0),
+                _caller_node_int(node, "m_Index", index, index),
+                _caller_node_int(node, "m_TypeFlags", index, 0),
+                _caller_node_int(node, "m_Version", index, 0),
+                _caller_node_int(node, "m_MetaFlag", index, 0),
+                _caller_node_int(node, "m_Level", index),
+                _caller_node_int(node, "m_RefTypeHash", index, 0),
+            )
+        )
+    if not rows:
+        raise ValueError("caller-supplied TypeTree must contain a root node")
+    return rows
+
+
+def _caller_node_value(
+    node: object, name: str, default: object = _MISSING
+) -> object:
+    if isinstance(node, Mapping):
+        value = node.get(name, default)
+    else:
+        value = getattr(node, name, default)
+    if value is _MISSING:
+        raise ValueError("caller-supplied TypeTree node is missing {}".format(name))
+    return value
+
+
+def _caller_node_int(
+    node: object,
+    name: str,
+    index: int,
+    default: object = _MISSING,
+) -> int:
+    value = _caller_node_value(node, name, default)
+    if value is None and default is not _MISSING:
+        value = default
+    if not isinstance(value, int):
+        raise TypeError(
+            "caller-supplied TypeTree node {} field {} must be an integer".format(
+                index, name
+            )
+        )
+    return value
 
 
 class PPtr:

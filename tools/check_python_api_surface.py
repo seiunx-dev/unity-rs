@@ -124,6 +124,7 @@ CORE_TO_PYTHON = {
     "StudioObject.read_material": "UnityRs.read_material",
     "StudioObject.read_mono_script": "UnityRs.read_mono_script",
     "StudioObject.read_type_tree_json": "UnityRs.read_type_tree_json",
+    "StudioObject.read_type_tree_value_with_tree": "UnityRs.read_type_tree_with_nodes",
     "StudioObject.write_type_tree_dump": "UnityRs.read_type_tree_dump",
     "StudioObject.read_type_tree_dump": "UnityRs.read_type_tree_dump",
     "StudioObject.read_mono_behaviour_json": "UnityRs.read_mono_behaviour_json",

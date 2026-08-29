@@ -166,6 +166,10 @@ INTENTIONAL_RUST_ONLY = {
         "returns a borrowed Rust StudioObject; Node reads use the stable "
         "file/path key and expose objectIndex as metadata"
     ),
+    "StudioObject.read_type_tree_value_with_tree": (
+        "accepts a caller-owned Rust TypeTree for the Python UnityPy facade; "
+        "Node has no public TypeTree-node input contract"
+    ),
 }
 
 MAPPED_OBJECTS = ("FileInfo", "ObjectInfo", "ResourceInfo")

@@ -33,6 +33,13 @@
 无头 Rust/Python 运行时重写已经完成；项目仍处于 **Rust/Python Beta** 阶段，因为还不能
 宣称覆盖全部 Unity/Tuanjie 版本长尾，也尚未达到可以删除托管 oracle 的证据强度。
 
+**UnityPy 调用方 TypeTree 已接入（2026-08-29）**：兼容层的
+`read_typetree(nodes=...)` / `parse_as_dict(nodes=...)` 现在接受 UnityPy
+`TypeTreeNode` 根节点、平铺节点列表或 UnityPy 字段命名的字典列表，因此未内嵌树的文件
+可以使用调用方自己的 TPK/类型数据库。节点先在 Python 边界按数量、字符串和可分配内存
+上限收口，再交给 Core 的同一套树形、深度、数组、取值与完整对象消费校验；部分树不会
+返回看似合理的半截结果。仓库仍不复制 UnityPy 的 TPK，也不自动信任外部 provider。
+
 | 交付面 | 当前状态 | 说明 |
 | --- | --- | --- |
 | Rust Core | Beta，主流程可用 | 主要容器、SerializedFile、常见资产、场景、动画和导出链路已实现；长尾格式继续补齐 |

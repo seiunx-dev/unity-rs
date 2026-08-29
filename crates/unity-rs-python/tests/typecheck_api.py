@@ -273,6 +273,11 @@ def consume_public_api(
     )
     type_tree_json: str = studio.read_type_tree_json(0, 1)
     type_tree: Any = studio.read_type_tree(0, 1)
+    supplied_type_tree: Any = studio.read_type_tree_with_nodes(
+        0,
+        1,
+        [("TextAsset", "Base", -1, 0, 0, 1, 0, 0, 0)],
+    )
     resolved_pptr: Optional[tuple[int, int, int]] = studio.resolve_pptr(0, 0, 1)
     type_tree_nodes: list[
         tuple[str, str, int, int, int, int, int, int, int]

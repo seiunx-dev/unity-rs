@@ -258,6 +258,26 @@ impl SerializedFile {
                     object.path_id
                 ))
             })?;
+        self.read_type_tree_value_with_tree_and_limits(object_index, tree, limits)
+    }
+
+    /// Reads one object with a complete caller-supplied `TypeTree`.
+    ///
+    /// The supplied layout is treated as untrusted input: its shape and every
+    /// value are checked under `limits`, and the tree must consume the complete
+    /// object. Reference types still come from the serialized file because a
+    /// supplied root tree cannot describe their registry entries by itself.
+    pub fn read_type_tree_value_with_tree_and_limits(
+        &self,
+        object_index: usize,
+        tree: &TypeTree,
+        limits: TypeTreeReadLimits,
+    ) -> Result<TypeValue> {
+        let object = self.objects.get(object_index).ok_or_else(|| {
+            Error::invalid_data(format!(
+                "serialized object index {object_index} is out of range"
+            ))
+        })?;
         let payload = self.object_region(object_index)?;
         let endian = if self.header.endianness == 0 {
             Endian::Little

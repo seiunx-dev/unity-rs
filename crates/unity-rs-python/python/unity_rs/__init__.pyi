@@ -1287,6 +1287,20 @@ class UnityRs:
         maximum_typeless_bytes: int = 268_435_456,
         maximum_materialized_bytes: int = 536_870_912,
     ) -> Any: ...
+    def read_type_tree_with_nodes(
+        self,
+        file_index: int,
+        path_id: int,
+        nodes: list[tuple[str, str, int, int, int, int, int, int, int]],
+        *,
+        maximum_object_bytes: int = 536_870_912,
+        maximum_depth: int = 128,
+        maximum_values: int = 1_000_000,
+        maximum_array_elements: int = 1_000_000,
+        maximum_string_bytes: int = 16_777_216,
+        maximum_typeless_bytes: int = 268_435_456,
+        maximum_materialized_bytes: int = 536_870_912,
+    ) -> Any: ...
     def resolve_pptr(
         self,
         source_file_index: int,

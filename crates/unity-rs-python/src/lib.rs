@@ -3674,6 +3674,63 @@ impl PyUnityRs {
         python_type_value(py, value, raw.as_deref())
     }
 
+    /// Reads an object with a complete caller-supplied TypeTree node list.
+    #[pyo3(signature = (
+        file_index,
+        path_id,
+        nodes,
+        *,
+        maximum_object_bytes=536_870_912,
+        maximum_depth=128,
+        maximum_values=1_000_000,
+        maximum_array_elements=1_000_000,
+        maximum_string_bytes=16_777_216,
+        maximum_typeless_bytes=268_435_456,
+        maximum_materialized_bytes=536_870_912
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn read_type_tree_with_nodes(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        nodes: &Bound<'_, PyList>,
+        maximum_object_bytes: u64,
+        maximum_depth: usize,
+        maximum_values: usize,
+        maximum_array_elements: usize,
+        maximum_string_bytes: usize,
+        maximum_typeless_bytes: usize,
+        maximum_materialized_bytes: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let nodes = extract_type_tree_nodes(nodes)?;
+        let limits = TypeTreeReadLimits {
+            maximum_depth,
+            maximum_values,
+            maximum_array_elements,
+            maximum_string_bytes,
+            maximum_typeless_bytes,
+            maximum_materialized_bytes,
+        };
+        let tree = TypeTree {
+            nodes,
+            string_buffer: Vec::new(),
+        };
+        let (value, raw) = py.detach(|| {
+            let object = self.object(file_index, path_id)?;
+            let value = object
+                .read_type_tree_value_with_tree(&tree, limits)
+                .map_err(core_error)?;
+            let raw = if type_value_has_typeless_data(&value) {
+                Some(object.read_raw(maximum_object_bytes).map_err(core_error)?)
+            } else {
+                None
+            };
+            Ok::<_, PyErr>((value, raw))
+        })?;
+        python_type_value(py, value, raw.as_deref())
+    }
+
     /// Resolves a local or external Unity `PPtr` to
     /// `(file_index, object_index, path_id)`. Null pointers return `None`.
     fn resolve_pptr(
@@ -5811,6 +5868,62 @@ fn extract_schema_nodes(
             tuple.get_item(2)?.extract()?,
             tuple.get_item(3)?.extract()?,
         ));
+    }
+    Ok(extracted)
+}
+
+fn extract_type_tree_nodes(nodes: &Bound<'_, PyList>) -> PyResult<Vec<TypeTreeNode>> {
+    let node_count = nodes.len();
+    if node_count == 0 {
+        return Err(PyValueError::new_err(
+            "caller-supplied TypeTree must contain a root node",
+        ));
+    }
+    if node_count > MAXIMUM_SCHEMA_NODES {
+        return Err(PyValueError::new_err(format!(
+            "caller-supplied TypeTree has {node_count} nodes; maximum is {MAXIMUM_SCHEMA_NODES}"
+        )));
+    }
+
+    let mut total_string_bytes = 0_usize;
+    let mut extracted = reserve_metadata(node_count, "caller-supplied TypeTree nodes")?;
+    for (index, node) in nodes.iter().enumerate() {
+        let tuple = node.cast::<PyTuple>().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "caller-supplied TypeTree node {index} must be a tuple"
+            ))
+        })?;
+        if tuple.len() != 9 {
+            return Err(PyTypeError::new_err(format!(
+                "caller-supplied TypeTree node {index} must contain nine values"
+            )));
+        }
+        let type_name_object = tuple.get_item(0)?.cast_into::<PyString>()?;
+        let field_name_object = tuple.get_item(1)?.cast_into::<PyString>()?;
+        let type_name = type_name_object.to_cow()?;
+        let field_name = field_name_object.to_cow()?;
+        total_string_bytes = total_string_bytes
+            .checked_add(type_name.len())
+            .and_then(|value| value.checked_add(field_name.len()))
+            .ok_or_else(|| PyValueError::new_err("TypeTree node strings overflowed"))?;
+        if total_string_bytes > MAXIMUM_SCHEMA_STRING_BYTES {
+            return Err(PyValueError::new_err(format!(
+                "TypeTree node strings exceed {MAXIMUM_SCHEMA_STRING_BYTES} bytes"
+            )));
+        }
+        extracted.push(TypeTreeNode {
+            type_name: try_copy_string(type_name.as_ref(), "TypeTree node type name")?,
+            field_name: try_copy_string(field_name.as_ref(), "TypeTree node field name")?,
+            byte_size: tuple.get_item(2)?.extract()?,
+            index: tuple.get_item(3)?.extract()?,
+            type_flags: tuple.get_item(4)?.extract()?,
+            version: tuple.get_item(5)?.extract()?,
+            meta_flags: tuple.get_item(6)?.extract()?,
+            level: tuple.get_item(7)?.extract()?,
+            type_string_offset: None,
+            name_string_offset: None,
+            reference_type_hash: tuple.get_item(8)?.extract()?,
+        });
     }
     Ok(extracted)
 }

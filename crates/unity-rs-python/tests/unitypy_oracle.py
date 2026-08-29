@@ -289,7 +289,45 @@ def drop_undetermined_names(expected: dict[str, Any], actual: dict[str, Any]) ->
     return skipped
 
 
-def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, int, int]:
+def compare_supplied_unitypy_roots(path: Path) -> tuple[list[str], int]:
+    """Feed UnityPy's own root-node objects through the compatibility facade."""
+
+    expected_environment = UnityPy.load(str(path))
+    compatibility_environment = UnityPyCompat.load(path)
+    failures: list[str] = []
+    compared = 0
+    for expected_file, compatibility_file in zip(
+        expected_environment.files.values(), compatibility_environment.assets
+    ):
+        for path_id, expected_reader in expected_file.objects.items():
+            node = getattr(getattr(expected_reader, "serialized_type", None), "node", None)
+            if node is None:
+                continue
+            try:
+                expected = narrow_floats(expected_reader.read_typetree(nodes=node))
+            except Exception:
+                continue
+            compared += 1
+            try:
+                actual = narrow_floats(
+                    compatibility_file.objects[path_id].read_typetree(node)
+                )
+            except Exception as error:
+                failures.append(
+                    f"{path.name} PathID {path_id}: supplied UnityPy root failed: {error}"
+                )
+                continue
+            if actual != expected:
+                failures.append(
+                    f"{path.name} PathID {path_id}: supplied UnityPy root differs:\n"
+                    f"  UnityPy: {expected}\n  compat:  {actual}"
+                )
+    return failures, compared
+
+
+def compare(
+    name: str, data: bytes, directory: Path
+) -> tuple[list[str], int, int, int, int]:
     if len(data) < UNITYPY_MINIMUM_SNIFF_BYTES:
         return (
             [
@@ -300,6 +338,7 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, in
             0,
             0,
             0,
+            0,
         )
     path = directory / name
     path.write_bytes(data)
@@ -307,6 +346,7 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, in
     expected = unitypy_manifest(path)
     actual = wheel_manifest(path)
     compatibility = compatibility_manifest(path)
+    supplied_failures, supplied_roots = compare_supplied_unitypy_roots(path)
     compared_doubles = assert_double_precision(path)
     # A tree row that is None on both sides compares equal while proving
     # nothing, so the run reports how many were really compared and main()
@@ -322,16 +362,22 @@ def compare(name: str, data: bytes, directory: Path) -> tuple[list[str], int, in
     compatibility_skipped = drop_undetermined_names(
         compatibility_expected, compatibility
     )
-    if expected == actual and compatibility_expected == compatibility:
-        return ([], skipped, compared_trees, compared_doubles)
+    if (
+        expected == actual
+        and compatibility_expected == compatibility
+        and not supplied_failures
+    ):
+        return ([], skipped, compared_trees, compared_doubles, supplied_roots)
     return (
-        [
+        supplied_failures
+        + [
             f"{name}:\n  UnityPy: {expected}\n  wheel:   {actual}"
             f"\n  compat:  {compatibility}"
         ],
         max(skipped, compatibility_skipped),
         compared_trees,
         compared_doubles,
+        supplied_roots,
     )
 
 
@@ -341,15 +387,21 @@ def main() -> None:
     skipped_names = 0
     compared_trees = 0
     compared_doubles = 0
+    compared_supplied_roots = 0
     with tempfile.TemporaryDirectory(prefix="unity-rs-unitypy-oracle-") as directory:
         for name, data in cases():
-            case_failures, case_skipped, case_trees, case_doubles = compare(
-                name, data, Path(directory)
-            )
+            (
+                case_failures,
+                case_skipped,
+                case_trees,
+                case_doubles,
+                case_supplied_roots,
+            ) = compare(name, data, Path(directory))
             failures.extend(case_failures)
             skipped_names += case_skipped
             compared_trees += case_trees
             compared_doubles += case_doubles
+            compared_supplied_roots += case_supplied_roots
             checked += 1
 
     if failures:
@@ -374,10 +426,16 @@ def main() -> None:
             "narrowing check proved nothing; a fixture carrying a non-float "
             "double is required"
         )
+    if compared_supplied_roots == 0:
+        raise SystemExit(
+            "UnityPy differential: no UnityPy TypeTreeNode root was supplied to "
+            "the compatibility facade; a tree-bearing fixture is required"
+        )
     summary = (
         f"UnityPy differential: {checked} fixtures agree"
         f" ({compared_trees} TypeTree object(s) compared,"
-        f" {compared_doubles} double field(s) compared)"
+        f" {compared_doubles} double field(s) compared,"
+        f" {compared_supplied_roots} supplied UnityPy root(s) compared)"
     )
     if skipped_names:
         summary += (

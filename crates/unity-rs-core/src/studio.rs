@@ -61,7 +61,7 @@ use crate::scene_hierarchy::{
 };
 use crate::serialized::{
     AssetBundleMetadata, ContainerMetadataReadLimits, ObjectInfo, PreloadDataMetadata,
-    ResourceManagerMetadata,
+    ResourceManagerMetadata, TypeTree,
 };
 use crate::shader::{ShaderReadLimits, read_shader};
 use crate::simple_assets::{
@@ -73,6 +73,7 @@ use crate::sprite::{Sprite, SpriteReadLimits, decode_sprite_rgba8_by_file_index,
 use crate::sprite_atlas::{SpriteAtlas, SpriteAtlasReadLimits, read_sprite_atlas};
 use crate::texture::{RgbaImage, TextureReadLimits, read_texture2d};
 use crate::texture_array::{TextureArrayReadLimits, read_texture2d_array};
+use crate::type_tree::{TypeTreeReadLimits, TypeValue};
 
 /// A scene written as Wavefront OBJ, with the files it names.
 ///
@@ -1079,6 +1080,17 @@ impl StudioObject<'_> {
         let write_result = crate::json::write_type_value_json(&value, &mut output, pretty);
         output.finish(write_result)?;
         Ok(output.bytes)
+    }
+
+    /// Reads one object using a complete caller-supplied `TypeTree`.
+    pub fn read_type_tree_value_with_tree(
+        &self,
+        tree: &TypeTree,
+        limits: TypeTreeReadLimits,
+    ) -> Result<TypeValue> {
+        self.loaded()
+            .file
+            .read_type_tree_value_with_tree_and_limits(self.object_index, tree, limits)
     }
 
     /// Streams the managed-compatible, tab-indented `TypeTree` text dump.
