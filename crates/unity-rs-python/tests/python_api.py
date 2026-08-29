@@ -115,6 +115,57 @@ def synthetic_text_asset(external_path: Optional[str] = None) -> bytes:
     return finish_v22_asset(49, payload, external_path=external_path)
 
 
+class MemoryFileSystem:
+    """Small fsspec-shaped filesystem used without a runtime dependency."""
+
+    sep = "/"
+
+    def __init__(self, files: dict[str, bytes]) -> None:
+        self.files = files
+        self.opened: list[io.BytesIO] = []
+
+    def isfile(self, path: str) -> bool:
+        return path in self.files
+
+    def isdir(self, path: str) -> bool:
+        prefix = path.rstrip(self.sep) + self.sep
+        return any(name.startswith(prefix) for name in self.files)
+
+    def walk(self, path: str) -> list[tuple[str, list[str], list[str]]]:
+        prefix = path.rstrip(self.sep) + self.sep
+        files = [
+            name[len(prefix) :]
+            for name in self.files
+            if name.startswith(prefix) and self.sep not in name[len(prefix) :]
+        ]
+        return [(path, [], files)]
+
+    def open(self, path: str, mode: str) -> io.BytesIO:
+        assert mode == "rb"
+        stream = io.BytesIO(self.files[path])
+        self.opened.append(stream)
+        return stream
+
+
+class MissingReadStream:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class InvalidStreamFileSystem(MemoryFileSystem):
+    def __init__(self) -> None:
+        super().__init__({"invalid.assets": b"unused"})
+        self.invalid_stream = MissingReadStream()
+
+    def open(self, path: str, mode: str) -> MissingReadStream:
+        assert path == "invalid.assets"
+        assert mode == "rb"
+        return self.invalid_stream
+
+
 def synthetic_unity6_shader(unity_version: str = "6000.2.0f1") -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "Unity6Object")
@@ -2324,6 +2375,45 @@ def main() -> None:
             compat_external.assets[0], 1, 7
         ).deref()
         assert external_reader is compat_external.assets[1].objects[7]
+        virtual_fs = MemoryFileSystem(
+            {
+                "virtual/source.assets": synthetic_text_asset(
+                    external_path="target.assets"
+                ),
+                "virtual/target.assets": synthetic_text_asset(),
+            }
+        )
+        compat_virtual = UnityPyCompat.load("virtual", fs=virtual_fs)
+        assert compat_virtual.fs is virtual_fs
+        assert compat_virtual.path == "virtual"
+        assert len(compat_virtual.assets) == 2
+        virtual_external = UnityPyCompat.PPtr(
+            compat_virtual.assets[0], 1, 7
+        ).deref()
+        assert virtual_external is compat_virtual.assets[1].objects[7]
+        assert virtual_fs.opened and all(stream.closed for stream in virtual_fs.opened)
+        try:
+            UnityPyCompat.load("virtual", fs=virtual_fs, maximum_files=1)
+        except ValueError as error:
+            assert "maximum_files 1" in str(error)
+        else:
+            raise AssertionError("virtual filesystem enumeration must obey file limits")
+        try:
+            UnityPyCompat.load(
+                "virtual/source.assets", fs=virtual_fs, maximum_file_bytes=1
+            )
+        except ValueError as error:
+            assert "maximum_file_bytes 1" in str(error)
+        else:
+            raise AssertionError("virtual filesystem reads must obey byte limits")
+        invalid_fs = InvalidStreamFileSystem()
+        try:
+            UnityPyCompat.load("invalid.assets", fs=invalid_fs)
+        except TypeError as error:
+            assert "binary stream" in str(error)
+        else:
+            raise AssertionError("virtual filesystem streams must be validated")
+        assert invalid_fs.invalid_stream.closed
         first_pointer = UnityPyCompat.PPtr(compat.file, 0, 7)
         second_pointer = UnityPyCompat.PPtr(compat.file, 0, 8)
         duplicate_container = UnityPyCompat.ContainerHelper(

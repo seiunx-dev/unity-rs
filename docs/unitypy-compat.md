@@ -18,6 +18,8 @@ that every UnityPy implementation detail or generated class is reproduced.
 
 - `load` / `Environment` and the legacy `AssetsManager` alias;
 - path, directory, bytes-like, bounded binary-stream and multiple-source input;
+- read-only fsspec-style `fs=` file and recursive-directory input through
+  `isfile`, `isdir`, `walk`, and `open`, without a mandatory fsspec dependency;
 - `Environment.files`, `.assets`, `.objects`, `.container`, and single-file
   `.file`;
 - `SerializedFile.objects` keyed by PathID, `.files` legacy alias, external
@@ -46,7 +48,10 @@ than weakening validation.
   `parse_as_dict`; malformed, partial, oversized, or non-consuming trees are
   rejected. Automatic external TypeTree-provider registration remains future
   work.
-- `fs=` is not accepted yet. Passing it raises `NotImplementedError`.
+- `fs=` is a read-only loading adapter. Mutating filesystem methods, lazy
+  dependency discovery after load, and writing through the filesystem are not
+  part of this phase. Virtual file enumeration and callback results remain
+  subject to the same file-count and byte budgets as local inputs.
 - The loader currently exposes discovered serialized files rather than exact
   UnityPy `BundleFile` / `WebFile` provenance objects for nested containers.
 - `set_raw_data`, `patch`, `save_typetree`, parsed-object `save`, serialized

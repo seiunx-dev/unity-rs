@@ -129,10 +129,6 @@ class Environment:
         unity_cn_key: Optional[Union[bytes, str]] = None,
         strict_unity_versions: bool = False,
     ) -> None:
-        if fs is not None:
-            raise NotImplementedError(
-                "UnityPy fs= integration is not implemented by the unity-rs compatibility facade"
-            )
         if path is not None:
             if sources:
                 raise TypeError("path= cannot be combined with positional sources")
@@ -157,8 +153,11 @@ class Environment:
         self.maximum_type_tree_values = maximum_type_tree_values
         self.maximum_type_tree_array_elements = maximum_type_tree_array_elements
         self.maximum_type_tree_materialized_bytes = maximum_type_tree_materialized_bytes
+        self.fs = fs
+        self.path = _environment_base_path(sources, fs)
         self._native = self._open_native(
             sources,
+            fs=fs,
             unity_version=unity_version,
             maximum_files=maximum_files,
             maximum_file_bytes=maximum_file_bytes,
@@ -179,6 +178,7 @@ class Environment:
     def _open_native(
         sources: Sequence[object],
         *,
+        fs: Optional[object],
         unity_version: Optional[str],
         maximum_files: int,
         maximum_file_bytes: int,
@@ -188,6 +188,25 @@ class Environment:
         unity_cn_key: Optional[Union[bytes, str]],
         strict_unity_versions: bool,
     ) -> UnityRs:
+        if fs is not None:
+            fs_memory_files = _read_fs_sources(
+                fs,
+                sources,
+                maximum_files=maximum_files,
+                maximum_file_bytes=maximum_file_bytes,
+                maximum_total_bytes=maximum_total_bytes,
+            )
+            return UnityRs.from_memory_files(
+                fs_memory_files,
+                unity_version=unity_version,
+                maximum_files=maximum_files,
+                maximum_file_bytes=maximum_file_bytes,
+                maximum_total_bytes=maximum_total_bytes,
+                oodle_decoder=oodle_decoder,
+                skip_unreadable_inputs=skip_unreadable_inputs,
+                unity_cn_key=unity_cn_key,
+                strict_unity_versions=strict_unity_versions,
+            )
         if len(sources) == 1 and isinstance(sources[0], (str, os.PathLike)):
             source_path = Path(sources[0])
             if source_path.is_file():
@@ -942,6 +961,129 @@ def _read_source(source: object, index: int, maximum_bytes: int) -> Tuple[str, b
             )
         )
     return name, data
+
+
+def _environment_base_path(sources: Sequence[object], fs: Optional[object]) -> str:
+    if len(sources) != 1 or not isinstance(sources[0], (str, os.PathLike)):
+        return "" if fs is not None else os.getcwd()
+    source = os.fspath(sources[0])
+    if not isinstance(source, str):
+        raise TypeError("UnityPy paths must resolve to strings")
+    if fs is not None:
+        isdir = getattr(fs, "isdir", None)
+        if callable(isdir) and bool(isdir(source)):
+            return source
+        separator = getattr(fs, "sep", "/")
+        if isinstance(separator, str) and separator and separator in source:
+            return source.rsplit(separator, 1)[0] or separator
+        return "."
+    path = Path(source)
+    return os.fspath(path if path.is_dir() else path.parent)
+
+
+def _read_fs_sources(
+    fs: object,
+    sources: Sequence[object],
+    *,
+    maximum_files: int,
+    maximum_file_bytes: int,
+    maximum_total_bytes: int,
+) -> List[Tuple[str, bytes]]:
+    if maximum_files < 0:
+        raise ValueError("maximum_files must be non-negative")
+    for name, value in (
+        ("maximum_file_bytes", maximum_file_bytes),
+        ("maximum_total_bytes", maximum_total_bytes),
+    ):
+        if value < 0:
+            raise ValueError("{} must be non-negative".format(name))
+    isfile = getattr(fs, "isfile", None)
+    isdir = getattr(fs, "isdir", None)
+    open_file = getattr(fs, "open", None)
+    if not callable(isfile) or not callable(isdir) or not callable(open_file):
+        raise TypeError("fs must provide callable isfile(), isdir(), and open() methods")
+
+    paths: List[str] = []
+    for source in sources:
+        if not isinstance(source, (str, os.PathLike)):
+            raise TypeError("fs= sources must be string or path-like paths")
+        path = os.fspath(source)
+        if not isinstance(path, str):
+            raise TypeError("fs= paths must resolve to strings")
+        if bool(isfile(path)):
+            _append_fs_path(paths, path, maximum_files)
+        elif bool(isdir(path)):
+            _append_fs_directory(fs, path, paths, maximum_files)
+        else:
+            raise FileNotFoundError("virtual filesystem path was not found: {}".format(path))
+
+    output: List[Tuple[str, bytes]] = []
+    total = 0
+    for path in paths:
+        stream = open_file(path, "rb")
+        try:
+            if not hasattr(stream, "read"):
+                raise TypeError("fs.open() must return a binary stream")
+            data = _read_stream_bounded(cast(BinaryIO, stream), maximum_file_bytes)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        total += len(data)
+        if total > maximum_total_bytes:
+            raise ValueError(
+                "virtual filesystem inputs exceed maximum_total_bytes {}".format(
+                    maximum_total_bytes
+                )
+            )
+        output.append((path, data))
+    return output
+
+
+def _append_fs_path(paths: List[str], path: str, maximum_files: int) -> None:
+    if len(paths) >= maximum_files:
+        raise ValueError(
+            "virtual filesystem input count exceeds maximum_files {}".format(
+                maximum_files
+            )
+        )
+    paths.append(path)
+
+
+def _append_fs_directory(
+    fs: object,
+    path: str,
+    paths: List[str],
+    maximum_files: int,
+) -> None:
+    walk = getattr(fs, "walk", None)
+    if not callable(walk):
+        raise TypeError("fs must provide walk() for directory sources")
+    separator = getattr(fs, "sep", "/")
+    if not isinstance(separator, str) or not separator:
+        raise TypeError("fs.sep must be a non-empty string")
+    for entry in walk(path):
+        if not isinstance(entry, (tuple, list)) or len(entry) != 3:
+            raise TypeError("fs.walk() must yield (root, directories, files) triples")
+        root, _directories, files = entry
+        if not isinstance(root, (str, os.PathLike)):
+            raise TypeError("fs.walk() roots must be string or path-like values")
+        try:
+            iterator = iter(files)
+        except TypeError as error:
+            raise TypeError("fs.walk() files must be iterable") from error
+        raw_root = os.fspath(root)
+        if not isinstance(raw_root, str):
+            raise TypeError("fs.walk() roots must resolve to strings")
+        root_name = raw_root.rstrip(separator)
+        for file_name in iterator:
+            if not isinstance(file_name, (str, os.PathLike)):
+                raise TypeError("fs.walk() file names must be string or path-like values")
+            leaf = os.fspath(file_name)
+            if not isinstance(leaf, str):
+                raise TypeError("fs.walk() file names must resolve to strings")
+            full_path = separator.join(part for part in (root_name, leaf) if part)
+            _append_fs_path(paths, full_path, maximum_files)
 
 
 def _read_stream_bounded(stream: BinaryIO, maximum_bytes: int) -> bytes:

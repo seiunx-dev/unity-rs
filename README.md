@@ -169,9 +169,10 @@ The facade implements the bounded `Environment` / `SerializedFile` /
 `ObjectReader` / `PPtr` read graph, embedded TypeTree dictionaries and common
 TextAsset, Texture2D, Sprite, AudioClip, Mesh, Shader and Font conveniences.
 Caller-supplied UnityPy TypeTree roots and flat node/dictionary lists are also
-accepted for files without embedded trees. It does not yet implement `fs=`,
-object patching, serialized-file writing or bundle repacking; those calls fail
-explicitly instead of being silently ignored. See
+accepted for files without embedded trees. Read-only fsspec-style `fs=` loading
+is supported without making fsspec a runtime dependency. Object patching,
+serialized-file writing and bundle repacking still fail explicitly instead of
+being silently ignored. See
 [`docs/unitypy-compat.md`](docs/unitypy-compat.md) for the exact contract.
 
 ### Node.js
