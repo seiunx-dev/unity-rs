@@ -1319,7 +1319,9 @@ def stripped_mono_schema_nodes() -> list[tuple[str, str, int, bool]]:
     return list(mono_behaviour_nodes()) + [("SInt32", "score", 1, False)]
 
 
-def synthetic_stripped_mono_behaviour() -> bytes:
+def synthetic_stripped_mono_behaviour(
+    unity_version: str = "2022.3.62f1",
+) -> bytes:
     behaviour = bytearray()
     push_pptr(behaviour, 0)
     behaviour.append(1)
@@ -1335,7 +1337,10 @@ def synthetic_stripped_mono_behaviour() -> bytes:
     push_aligned_string(script, "Stats")
     push_aligned_string(script, "Game")
     push_aligned_string(script, "Assembly-CSharp.dll")
-    return finish_v22_objects(((114, 7, behaviour), (115, 8, script)))
+    return finish_v22_objects(
+        ((114, 7, behaviour), (115, 8, script)),
+        unity_version=unity_version,
+    )
 
 
 def mono_behaviour_nodes() -> tuple[tuple[str, str, int, bool], ...]:
@@ -2311,6 +2316,24 @@ def main() -> None:
                 fallback_warnings[0].category,
                 UnityPyCompat.UnityVersionFallbackWarning,
             )
+
+            stripped_mono_asset = synthetic_stripped_mono_behaviour(
+                unity_version="0.0.0"
+            )
+            with warnings.catch_warnings(record=True) as early_fallback_warnings:
+                warnings.simplefilter("always")
+                early_fallback_compat = UnityPyCompat.load(stripped_mono_asset)
+            assert early_fallback_compat.file.unity_version == "2022.3.21f1"
+            assert len(early_fallback_warnings) == 1
+            assert early_fallback_compat.file.objects[8].type.name == "MonoScript"
+            try:
+                UnityPyCompat.load(stripped_mono_asset, synthetic_text_asset())
+            except UnityPyCompat.UnityVersionFallbackError as error:
+                assert "mixes valid and missing Unity versions" in str(error)
+            else:
+                raise AssertionError(
+                    "an early fallback must not override valid files in a mixed collection"
+                )
 
             fallback_stream = io.BytesIO(stripped_version_asset)
             with warnings.catch_warnings(record=True):

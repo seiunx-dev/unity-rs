@@ -202,19 +202,52 @@ class Environment:
         stream_positions = (
             _capture_stream_positions(sources) if unity_version is None else {}
         )
-        self._native = self._open_native(
-            sources,
-            fs=fs,
-            unity_version=unity_version,
-            maximum_files=maximum_files,
-            maximum_file_bytes=maximum_file_bytes,
-            maximum_total_bytes=maximum_total_bytes,
-            oodle_decoder=oodle_decoder,
-            skip_unreadable_inputs=skip_unreadable_inputs,
-            unity_cn_key=unity_cn_key,
-            strict_unity_versions=strict_unity_versions,
-        )
-        if unity_version is None:
+        fallback_applied_during_open = False
+        try:
+            self._native = self._open_native(
+                sources,
+                fs=fs,
+                unity_version=unity_version,
+                maximum_files=maximum_files,
+                maximum_file_bytes=maximum_file_bytes,
+                maximum_total_bytes=maximum_total_bytes,
+                oodle_decoder=oodle_decoder,
+                skip_unreadable_inputs=skip_unreadable_inputs,
+                unity_cn_key=unity_cn_key,
+                strict_unity_versions=strict_unity_versions,
+            )
+        except NotImplementedError as error:
+            if unity_version is not None or not _is_missing_unity_version_error(error):
+                raise
+            fallback_version = config._validated_fallback_version()
+            _rewind_stream_sources(sources, stream_positions)
+            fallback_native = self._open_native(
+                sources,
+                fs=fs,
+                unity_version=fallback_version,
+                maximum_files=maximum_files,
+                maximum_file_bytes=maximum_file_bytes,
+                maximum_total_bytes=maximum_total_bytes,
+                oodle_decoder=oodle_decoder,
+                skip_unreadable_inputs=skip_unreadable_inputs,
+                unity_cn_key=unity_cn_key,
+                strict_unity_versions=strict_unity_versions,
+            )
+            file_infos = fallback_native.files()
+            missing_versions = [
+                info for info in file_infos if _needs_unity_version_fallback(info.unity_version)
+            ]
+            if len(missing_versions) != len(file_infos):
+                raise UnityVersionFallbackError(
+                    "the loaded collection mixes valid and missing Unity versions; "
+                    "UnityPy.config.FALLBACK_UNITY_VERSION cannot be applied without "
+                    "overriding valid files, so load the inputs separately or pass an "
+                    "explicit unity_version= override"
+                ) from error
+            config._warn_fallback_version(fallback_version)
+            self._native = fallback_native
+            fallback_applied_during_open = True
+        if unity_version is None and not fallback_applied_during_open:
             file_infos = self._native.files()
             missing_versions = [
                 info
@@ -1353,6 +1386,10 @@ class _DynamicRecord:
 
 def _needs_unity_version_fallback(version: str) -> bool:
     return not version or version == "0.0.0"
+
+
+def _is_missing_unity_version_error(error: NotImplementedError) -> bool:
+    return "requires a Unity version" in str(error)
 
 
 def _capture_stream_positions(sources: Sequence[object]) -> Dict[int, int]:
