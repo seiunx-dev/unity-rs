@@ -46,6 +46,29 @@ that every UnityPy implementation detail or generated class is reproduced.
 - common `TextAsset`, `Texture2D`, `Sprite`, `AudioClip`, `Mesh`, `Shader` and
   `Font` conveniences. Pillow is imported only when `.image` is requested.
 
+The specialized export-facing objects keep UnityPy's usual call shapes:
+
+| Unity object | Compatibility surface | Native work performed by `unity-rs` |
+| --- | --- | --- |
+| `Texture2D`, `Sprite` | `.image` | Bounded RGBA decode, exposed as a Pillow image on demand |
+| `AudioClip` | `.samples` | Bounded embedded or streamed payload resolution |
+| `Mesh` | `.export()` | Bounded OBJ materialization |
+| `Shader` | `.export()` | Bounded shader-text materialization |
+| `Font` | `.m_FontData` | Bounded embedded or streamed font payload resolution |
+
+For example:
+
+```python
+from pathlib import Path
+from unity_rs.compat import unitypy as UnityPy
+
+environment = UnityPy.load("model.bundle")
+for reader in environment.objects:
+    if reader.type is UnityPy.ClassIDType.Mesh:
+        mesh = reader.read()
+        Path(mesh.m_Name + ".obj").write_text(mesh.export(), encoding="utf-8")
+```
+
 Compatibility properties that materialize Python lists, dictionaries or
 TypeTree values have explicit caller-adjustable limits. Native parsing remains
 strict about complete known layouts; `check_read=False` is rejected rather

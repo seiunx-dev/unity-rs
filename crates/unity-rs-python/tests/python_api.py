@@ -3044,6 +3044,13 @@ def main() -> None:
             b"g tri:mesh_0\r\n"
             b"f 3/3/3 2/2/2 1/1/1\r\n"
         )
+        compat_mesh_environment = UnityPyCompat.load(mesh_path)
+        compat_mesh_reader = compat_mesh_environment.file.objects[7]
+        assert compat_mesh_reader.type is UnityPyCompat.ClassIDType.Mesh
+        compat_mesh = compat_mesh_reader.read()
+        assert isinstance(compat_mesh, UnityPyCompat.Mesh)
+        assert compat_mesh.m_Name == "tri:mesh"
+        assert compat_mesh.export().encode("utf-8") == mesh_obj
         tuanjie_mesh_path = Path(directory) / "mesh-tuanjie.assets"
         tuanjie_mesh_path.write_bytes(synthetic_mesh(tuanjie=True))
         assert UnityRs(tuanjie_mesh_path).read_mesh_obj(0, 7) == mesh_obj

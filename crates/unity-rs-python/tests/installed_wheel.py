@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Union
 
 import unity_rs
+from unity_rs.compat import unitypy as unitypy_compat
 
 
 FORBIDDEN_COMPONENTS = {"unity-rs-ffi", "unity-rs-gui", "unity-rsgui"}
@@ -51,6 +52,17 @@ def main() -> None:
     stub = package.joinpath("__init__.pyi")
     assert stub.is_file()
     assert package.joinpath("py.typed").is_file()
+    assert package.joinpath("compat", "__init__.py").is_file()
+    assert package.joinpath("compat", "unitypy.py").is_file()
+    assert len(unitypy_compat.__all__) == len(set(unitypy_compat.__all__))
+    for name in unitypy_compat.__all__:
+        assert hasattr(unitypy_compat, name), name
+    assert callable(unitypy_compat.Mesh.export)
+    assert callable(unitypy_compat.Shader.export)
+    assert isinstance(unitypy_compat.Texture2D.image, property)
+    assert isinstance(unitypy_compat.Sprite.image, property)
+    assert isinstance(unitypy_compat.AudioClip.samples, property)
+    assert hasattr(unitypy_compat.Font, "__init__")
     repository = Path(__file__).resolve().parents[3]
     for legal_file in ("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.txt"):
         packaged = package.joinpath(legal_file)
