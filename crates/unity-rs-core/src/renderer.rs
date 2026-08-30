@@ -73,6 +73,7 @@ pub struct Renderer {
     pub sorting_layer_id: i32,
     pub sorting_layer: i16,
     pub sorting_order: i16,
+    pub mask_interaction: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +138,9 @@ pub fn read_skinned_mesh_renderer(
         let renderer = reader.read_renderer()?;
         let quality = reader.reader.read_i32()?;
         let update_when_offscreen = reader.reader.read_bool()?;
+        // The second bool was `m_SkinNormals` through Unity 5.x and is
+        // `m_SkinnedMotionVectors` from 2017.1 onward; the byte layout is
+        // identical, so the historical field name is preserved unchanged.
         let skin_normals = reader.reader.read_bool()?;
         reader.align(4)?;
         let mesh = reader.read_pptr("SkinnedMeshRenderer mesh")?;
@@ -329,6 +333,13 @@ impl RendererObjectReader {
         let sorting_layer = self.reader.read_i16()?;
         let sorting_order = self.reader.read_i16()?;
         self.align(4)?;
+        // Unity 6000.3 added m_MaskInteraction between the sorting fields and
+        // the renderer-specific tail; older versions do not serialize it.
+        let mask_interaction = if self.version >= (6000, 3, 0) {
+            self.reader.read_i32()?
+        } else {
+            0
+        };
         Ok(Renderer {
             component,
             enabled,
@@ -346,6 +357,7 @@ impl RendererObjectReader {
             sorting_layer_id,
             sorting_layer,
             sorting_order,
+            mask_interaction,
         })
     }
 
@@ -531,6 +543,7 @@ mod tests {
         assert_eq!(renderer.renderer.sorting_layer_id, 41);
         assert_eq!(renderer.renderer.sorting_layer, 42);
         assert_eq!(renderer.renderer.sorting_order, 43);
+        assert_eq!(renderer.renderer.mask_interaction, 0);
         assert_eq!(renderer.trailing_bytes, 0);
     }
 
@@ -555,6 +568,7 @@ mod tests {
         assert_eq!(renderer.quality, 5);
         assert!(renderer.update_when_offscreen);
         assert!(!renderer.skin_normals);
+        assert_eq!(renderer.renderer.mask_interaction, 0);
         assert_eq!(renderer.mesh.path_id, 50);
         assert_eq!(renderer.bones[0].path_id, 61);
         assert_eq!(renderer.bones[1].file_id, 1);
@@ -603,7 +617,7 @@ mod tests {
         // newest known layout is attempted, a layout mismatch is reported as
         // `Unsupported`, and only `strict_unity_versions` restores the
         // historical rejection.
-        let newest = renderer_prefix("6000.2.0f1");
+        let newest = renderer_prefix("6000.3.0f1");
         let lenient = parse_asset(MESH_RENDERER_CLASS_ID, "6000.4.0f1", &newest);
         let renderer = read_mesh_renderer(&lenient, 0, RendererReadLimits::default()).unwrap();
         assert_eq!(renderer.renderer.materials[0].path_id, 21);
@@ -651,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn locks_renderer_flag_gates_from_2018_through_unity_6000_2() {
+    fn locks_renderer_flag_gates_from_2018_through_unity_6000_3() {
         for version in [
             "2018.1.0f1",
             "2018.3.0f1",
@@ -663,11 +677,17 @@ mod tests {
             "2023.3.0f1",
             "6000.0.0f1",
             "6000.2.0f1",
+            "6000.3.0f1",
         ] {
             let object = renderer_prefix(version);
             let file = parse_asset(MESH_RENDERER_CLASS_ID, version, &object);
             let renderer = read_mesh_renderer(&file, 0, RendererReadLimits::default()).unwrap();
             assert_eq!(renderer.renderer.materials[0].path_id, 21, "{version}");
+            assert_eq!(
+                renderer.renderer.mask_interaction,
+                if version.starts_with("6000.3") { 2 } else { 0 },
+                "{version}",
+            );
             assert_eq!(renderer.trailing_bytes, 0, "{version}");
         }
     }
@@ -747,6 +767,9 @@ mod tests {
         object.extend_from_slice(&42_i16.to_le_bytes());
         object.extend_from_slice(&43_i16.to_le_bytes());
         align(&mut object, 4);
+        if (major, minor) >= (6000, 3) {
+            object.extend_from_slice(&2_i32.to_le_bytes());
+        }
         object
     }
 
