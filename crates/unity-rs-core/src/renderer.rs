@@ -333,9 +333,9 @@ impl RendererObjectReader {
         let sorting_layer = self.reader.read_i16()?;
         let sorting_order = self.reader.read_i16()?;
         self.align(4)?;
-        // Unity 6000.3 added m_MaskInteraction between the sorting fields and
-        // the renderer-specific tail; older versions do not serialize it.
-        let mask_interaction = if self.version >= (6000, 3, 0) {
+        // Unity 2024.x and 6000.3+ serialize m_MaskInteraction between the
+        // sorting fields and the renderer-specific tail.
+        let mask_interaction = if self.version.0 == 2024 || self.version >= (6000, 3, 0) {
             self.reader.read_i32()?
         } else {
             0
@@ -584,6 +584,39 @@ mod tests {
     }
 
     #[test]
+    fn reads_2024_skinned_renderer_tail_after_mask_interaction() {
+        let mut object = renderer_prefix("2024.0.0f1");
+        object.extend_from_slice(&5_i32.to_le_bytes());
+        object.push(1);
+        object.push(0);
+        align(&mut object, 4);
+        push_pptr(&mut object, 0, 50);
+        object.extend_from_slice(&2_i32.to_le_bytes());
+        push_pptr(&mut object, 0, 61);
+        push_pptr(&mut object, 1, 62);
+        object.extend_from_slice(&2_i32.to_le_bytes());
+        object.extend_from_slice(&0.25_f32.to_le_bytes());
+        object.extend_from_slice(&0.75_f32.to_le_bytes());
+        let file = parse_asset(SKINNED_MESH_RENDERER_CLASS_ID, "2024.0.0f1", &object);
+
+        let renderer = read_skinned_mesh_renderer(&file, 0, RendererReadLimits::default()).unwrap();
+
+        assert_eq!(renderer.renderer.mask_interaction, 2);
+        assert_eq!(renderer.mesh.path_id, 50);
+        assert_eq!(renderer.bones[0].path_id, 61);
+        assert_eq!(renderer.bones[1].file_id, 1);
+        assert_eq!(
+            renderer
+                .blend_shape_weights
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [0.25_f32.to_bits(), 0.75_f32.to_bits()]
+        );
+        assert_eq!(renderer.trailing_bytes, 0);
+    }
+
+    #[test]
     fn enforces_version_class_object_count_and_cumulative_reference_limits() {
         let object = renderer_prefix("2022.3.62f1");
         let file = parse_asset(MESH_RENDERER_CLASS_ID, "2022.3.62f1", &object);
@@ -767,7 +800,7 @@ mod tests {
         object.extend_from_slice(&42_i16.to_le_bytes());
         object.extend_from_slice(&43_i16.to_le_bytes());
         align(&mut object, 4);
-        if (major, minor) >= (6000, 3) {
+        if major == 2024 || (major, minor) >= (6000, 3) {
             object.extend_from_slice(&2_i32.to_le_bytes());
         }
         object
