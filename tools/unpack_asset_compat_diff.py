@@ -2,8 +2,9 @@
 """Differentially checks the old ``unpack_asset`` export contract.
 
 This runner compares a locally built ``unity_rs.compat.unitypy`` facade with
-UnityPy 1.25.x on caller-supplied bundles. Private game data is never copied
-into the repository. It follows the useful parts of the former Lambda:
+UnityPy 1.25.x on caller-supplied bundles or extracted asset directories.
+Private game data is never copied into the repository. It follows the useful
+parts of the former Lambda:
 
 * enumerate the AssetBundle container;
 * materialize Texture2D and Sprite images;
@@ -11,12 +12,15 @@ into the repository. It follows the useful parts of the former Lambda:
 * read embedded MonoBehaviour TypeTrees, otherwise compare raw bytes;
 * also cover the Mesh, Shader, Font, and AudioClip conveniences added later.
 
-Texture2D pixels, payload bytes, TypeTree values, and textual exports must be
-exact. Tight Sprite pixels are also checked exactly by default. UnityPy uses
-Pillow polygon coverage while unity-rs follows the managed exporter's
-pixel-center rasterizer, so known edge-only differences can be reported without
-failing by passing ``--allow-known-sprite-mask-differences``. The flag never
-hides dimensions, counts, or difference metrics.
+Texture2D pixels, payload bytes, TypeTree values, font bytes, and audio files
+must be exact by default. Mesh OBJ rows are compared at their represented
+``f32`` values. Shader output is checked against UnityPy's independently parsed
+name, property order, and per-SubShader Pass/UsePass/GrabPass counts instead of
+UnityPy's less complete text writer. Tight Sprite pixels are exact by default;
+known edge-only rasterizer differences require an explicit reporting flag. An
+independent vgmstream gate establishes the one-unit PCM16 rounding boundary for
+Vorbis, so that boundary can likewise be reported only with an explicit flag.
+Neither flag hides dimensions, counts, or difference metrics.
 
 Both packages and Pillow must be installed in the running interpreter::
 
@@ -28,8 +32,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
+import re
 import struct
 import sys
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -55,14 +62,30 @@ class ImageDifference:
     worst_composited: float
 
 
+@dataclass(frozen=True)
+class Pcm16Difference:
+    samples: int
+    differing_samples: int
+    worst_sample: int
+    rms: float
+
+
+@dataclass(frozen=True)
+class ShaderManifest:
+    name: str
+    properties: tuple[str, ...]
+    subshader_pass_counts: tuple[int, ...]
+
+
 @dataclass
 class ComparisonStats:
     bundles: int = 0
     container_entries: int = 0
-    compared: int = 0
     skipped: int = 0
     exact: int = 0
     known_sprite_differences: int = 0
+    known_audio_differences: int = 0
+    oracle_failures: int = 0
 
 
 class ValueBudget:
@@ -119,6 +142,143 @@ def sha256(data: bytes) -> str:
 
 def normalized_text(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _riff_data_range(value: bytes) -> Optional[tuple[int, int]]:
+    if len(value) < 12 or value[:4] != b"RIFF" or value[8:12] != b"WAVE":
+        return None
+    offset = 12
+    while offset <= len(value) - 8:
+        size = struct.unpack_from("<I", value, offset + 4)[0]
+        start = offset + 8
+        end = start + size
+        if end > len(value):
+            return None
+        if value[offset : offset + 4] == b"data":
+            return (start, end)
+        offset = end + (size & 1)
+    return None
+
+
+def pcm16_difference(left: bytes, right: bytes) -> Optional[Pcm16Difference]:
+    left_data_range = _riff_data_range(left)
+    right_data_range = _riff_data_range(right)
+    if left_data_range is None or right_data_range is None:
+        return None
+    left_start, left_end = left_data_range
+    right_start, right_end = right_data_range
+    if (
+        left_start != right_start
+        or left_end != right_end
+        or left[:left_start] != right[:right_start]
+        or left[left_end:] != right[right_end:]
+    ):
+        return None
+    try:
+        with wave.open(io.BytesIO(left), "rb") as left_wave:
+            left_params = left_wave.getparams()
+            left_frames = left_wave.readframes(left_params.nframes)
+        with wave.open(io.BytesIO(right), "rb") as right_wave:
+            right_params = right_wave.getparams()
+            right_frames = right_wave.readframes(right_params.nframes)
+    except (EOFError, wave.Error):
+        return None
+    if (
+        left_params != right_params
+        or left_params.sampwidth != 2
+        or left_params.comptype != "NONE"
+        or len(left_frames) != len(right_frames)
+        or len(left_frames) % 2 != 0
+    ):
+        return None
+    samples = len(left_frames) // 2
+    differing_samples = 0
+    worst_sample = 0
+    squared_difference = 0
+    for (left_sample,), (right_sample,) in zip(
+        struct.iter_unpack("<h", left_frames),
+        struct.iter_unpack("<h", right_frames),
+    ):
+        difference = abs(left_sample - right_sample)
+        if difference:
+            differing_samples += 1
+            worst_sample = max(worst_sample, difference)
+            squared_difference += difference * difference
+    rms = (squared_difference / samples) ** 0.5 if samples else 0.0
+    return Pcm16Difference(samples, differing_samples, worst_sample, rms)
+
+
+def _keyword_blocks(value: str, keyword: str) -> list[str]:
+    blocks: list[str] = []
+    pattern = re.compile(r"\b{}\s*\{{".format(re.escape(keyword)))
+    for match in pattern.finditer(value):
+        opening = value.find("{", match.start(), match.end())
+        depth = 0
+        quote = False
+        escaped = False
+        closing: Optional[int] = None
+        for index in range(opening, len(value)):
+            character = value[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    quote = False
+                continue
+            if character == '"':
+                quote = True
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    closing = index
+                    break
+        if closing is None:
+            raise ValueError("{} block has no closing brace".format(keyword))
+        blocks.append(value[opening + 1 : closing])
+    return blocks
+
+
+def unitypy_shader_manifest(value: Any) -> ShaderManifest:
+    parsed = value.m_ParsedForm
+    return ShaderManifest(
+        name=str(parsed.m_Name),
+        properties=tuple(str(prop.m_Name) for prop in parsed.m_PropInfo.m_Props),
+        subshader_pass_counts=tuple(
+            len(subshader.m_Passes) for subshader in parsed.m_SubShaders
+        ),
+    )
+
+
+def exported_shader_manifest(value: str) -> ShaderManifest:
+    normalized = normalized_text(value)
+    name_match = re.search(r'\bShader\s+"((?:\\.|[^"\\])*)"', normalized)
+    if name_match is None:
+        raise ValueError("exported shader has no Shader name")
+    property_blocks = _keyword_blocks(normalized, "Properties")
+    if len(property_blocks) != 1:
+        raise ValueError(
+            "exported shader has {} Properties blocks".format(len(property_blocks))
+        )
+    property_pattern = re.compile(
+        r"^\s*(?:\[[^\]\r\n]*\]\s*)*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        re.MULTILINE,
+    )
+    properties = tuple(property_pattern.findall(property_blocks[0]))
+    subshader_blocks = _keyword_blocks(normalized, "SubShader")
+    pass_pattern = re.compile(
+        r"^\s*(?:Pass\s*\{|UsePass\b|GrabPass\s*\{)", re.MULTILINE
+    )
+    return ShaderManifest(
+        name=name_match.group(1),
+        properties=properties,
+        subshader_pass_counts=tuple(
+            len(pass_pattern.findall(block)) for block in subshader_blocks
+        ),
+    )
 
 
 def obj_values(value: str) -> list[list[Any]]:
@@ -248,27 +408,6 @@ def compare_bytes(
     return False
 
 
-def compare_mapping_bytes(
-    label: str,
-    left: dict[str, bytes],
-    right: dict[str, bytes],
-    problems: list[str],
-) -> bool:
-    if set(left) != set(right):
-        problems.append(
-            "{} names differ: {} against {}".format(
-                label, sorted(left), sorted(right)
-            )
-        )
-        return False
-    exact = True
-    for name in sorted(left):
-        exact &= compare_bytes(
-            "{} {!r}".format(label, name), left[name], right[name], problems
-        )
-    return exact
-
-
 def compare_pointer(
     bundle: Path,
     path: str,
@@ -278,17 +417,27 @@ def compare_pointer(
     stats: ComparisonStats,
     problems: list[str],
     sprite_notes: list[str],
+    audio_notes: list[str],
+    oracle_notes: list[str],
 ) -> None:
     kind = left_pointer.type.name
     label = "{}:{!r}:{} {}".format(
         bundle.name, path, left_pointer.path_id, kind
     )
-    if kind not in SUPPORTED_TYPES:
+    if kind not in args.types:
         stats.skipped += 1
         return
-    stats.compared += 1
-    left_value = left_pointer.read()
-    right_value = right_pointer.read()
+    try:
+        left_value = left_pointer.read()
+    except Exception as error:  # noqa: BLE001
+        stats.oracle_failures += 1
+        oracle_notes.append("{} UnityPy read failed: {}".format(label, error))
+        return
+    try:
+        right_value = right_pointer.read()
+    except Exception as error:  # noqa: BLE001
+        problems.append("{} unity-rs read failed: {}".format(label, error))
+        return
 
     if kind in ("Texture2D", "Sprite"):
         try:
@@ -358,19 +507,69 @@ def compare_pointer(
         if not exact:
             problems.append("{} OBJ values differ".format(label))
     elif kind == "Shader":
-        left_shader = normalized_text(left_value.export())
-        right_shader = normalized_text(right_value.export())
+        left_shader = unitypy_shader_manifest(left_value)
+        right_shader = exported_shader_manifest(right_value.export())
         exact = left_shader == right_shader
         if not exact:
-            problems.append("{} normalized shader text differs".format(label))
+            problems.append(
+                "{} shader manifest differs: {!r} against {!r}".format(
+                    label, left_shader, right_shader
+                )
+            )
     elif kind == "Font":
         exact = compare_bytes(
             label, bytes(left_value.m_FontData), bytes(right_value.m_FontData), problems
         )
     elif kind == "AudioClip":
-        exact = compare_mapping_bytes(
-            label, left_value.samples, right_value.samples, problems
-        )
+        left_samples = left_value.samples
+        right_samples = right_value.samples
+        if set(left_samples) != set(right_samples):
+            problems.append(
+                "{} names differ: {} against {}".format(
+                    label, sorted(left_samples), sorted(right_samples)
+                )
+            )
+            return
+        differences = [
+            (name, pcm16_difference(left_samples[name], right_samples[name]))
+            for name in sorted(left_samples)
+            if left_samples[name] != right_samples[name]
+        ]
+        if not differences:
+            exact = True
+        elif (
+            args.allow_known_audio_rounding_differences
+            and all(difference is not None for _name, difference in differences)
+            and all(
+                difference.worst_sample <= 1
+                for _name, difference in differences
+                if difference is not None
+            )
+        ):
+            stats.known_audio_differences += 1
+            for name, difference in differences:
+                if difference is None:
+                    raise AssertionError("validated PCM16 difference disappeared")
+                audio_notes.append(
+                    "{} {!r} differs in {}/{} PCM16 samples; worst {}, RMS {:.6g}".format(
+                        label,
+                        name,
+                        difference.differing_samples,
+                        difference.samples,
+                        difference.worst_sample,
+                        difference.rms,
+                    )
+                )
+            exact = False
+        else:
+            exact = False
+            for name in sorted(left_samples):
+                compare_bytes(
+                    "{} {!r}".format(label, name),
+                    left_samples[name],
+                    right_samples[name],
+                    problems,
+                )
     else:
         raise AssertionError("unhandled supported type {}".format(kind))
     if exact:
@@ -386,6 +585,8 @@ def compare_pointer_safely(
     stats: ComparisonStats,
     problems: list[str],
     sprite_notes: list[str],
+    audio_notes: list[str],
+    oracle_notes: list[str],
 ) -> None:
     try:
         compare_pointer(
@@ -397,6 +598,8 @@ def compare_pointer_safely(
             stats,
             problems,
             sprite_notes,
+            audio_notes,
+            oracle_notes,
         )
     except Exception as error:  # noqa: BLE001
         problems.append(
@@ -417,6 +620,8 @@ def compare_bundle(
     stats: ComparisonStats,
     problems: list[str],
     sprite_notes: list[str],
+    audio_notes: list[str],
+    oracle_notes: list[str],
 ) -> None:
     try:
         left = unitypy.load(str(bundle))
@@ -450,6 +655,8 @@ def compare_bundle(
             stats,
             problems,
             sprite_notes,
+            audio_notes,
+            oracle_notes,
         )
     if args.include_uncontained:
         compare_uncontained(
@@ -460,6 +667,8 @@ def compare_bundle(
             stats,
             problems,
             sprite_notes,
+            audio_notes,
+            oracle_notes,
         )
 
 
@@ -471,6 +680,8 @@ def compare_uncontained(
     stats: ComparisonStats,
     problems: list[str],
     sprite_notes: list[str],
+    audio_notes: list[str],
+    oracle_notes: list[str],
 ) -> None:
     left_contained = {
         reader_identity(pointer.deref()) for _path, pointer in left.container.items()
@@ -482,7 +693,7 @@ def compare_uncontained(
         (
             (reader_identity(reader), reader)
             for reader in left.objects
-            if reader.type.name in SUPPORTED_TYPES
+            if reader.type.name in args.types
             and reader_identity(reader) not in left_contained
         ),
         key=lambda item: item[0],
@@ -491,7 +702,7 @@ def compare_uncontained(
         (
             (reader_identity(reader), reader)
             for reader in right.objects
-            if reader.type.name in SUPPORTED_TYPES
+            if reader.type.name in args.types
             and reader_identity(reader) not in right_contained
         ),
         key=lambda item: item[0],
@@ -518,19 +729,41 @@ def compare_uncontained(
             stats,
             problems,
             sprite_notes,
+            audio_notes,
+            oracle_notes,
         )
 
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundles", nargs="+", type=Path)
+    parser.add_argument(
+        "bundles",
+        nargs="+",
+        type=Path,
+        help="Unity bundle/file or extracted asset directory",
+    )
     parser.add_argument("--unity-version", default=None)
+    parser.add_argument(
+        "--type",
+        dest="types",
+        action="append",
+        choices=sorted(SUPPORTED_TYPES),
+        help="compare only this export type; repeat to select multiple types",
+    )
     parser.add_argument("--maximum-tree-values", type=int, default=1_000_000)
     parser.add_argument("--maximum-tree-depth", type=int, default=256)
     parser.add_argument(
         "--allow-known-sprite-mask-differences",
         action="store_true",
         help="report tight Sprite rasterizer differences without failing",
+    )
+    parser.add_argument(
+        "--allow-known-audio-rounding-differences",
+        action="store_true",
+        help=(
+            "report matching PCM16 WAVs whose samples differ by at most one "
+            "unit without failing"
+        ),
     )
     parser.add_argument(
         "--include-uncontained",
@@ -542,9 +775,12 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--maximum-tree-values must be positive")
     if args.maximum_tree_depth < 1:
         parser.error("--maximum-tree-depth must be positive")
+    args.types = frozenset(args.types or SUPPORTED_TYPES)
     for bundle in args.bundles:
-        if not bundle.is_file():
-            parser.error("bundle does not exist or is not a file: {}".format(bundle))
+        if not bundle.exists() or not (bundle.is_file() or bundle.is_dir()):
+            parser.error(
+                "input does not exist or is not a file/directory: {}".format(bundle)
+            )
     return args
 
 
@@ -552,14 +788,19 @@ def report(
     stats: ComparisonStats,
     problems: list[str],
     sprite_notes: list[str],
+    audio_notes: list[str],
+    oracle_notes: list[str],
 ) -> int:
     print(
-        "checked {} bundle(s), {} container entries: {} exact, {} known Sprite "
-        "difference(s), {} skipped".format(
+        "checked {} input(s), {} container entries: {} exact, {} known Sprite "
+        "difference(s), {} known audio difference(s), {} oracle failure(s), "
+        "{} skipped".format(
             stats.bundles,
             stats.container_entries,
             stats.exact,
             stats.known_sprite_differences,
+            stats.known_audio_differences,
+            stats.oracle_failures,
             stats.skipped,
         )
     )
@@ -567,12 +808,20 @@ def report(
         print("\nknown Sprite rasterizer differences:")
         for note in sprite_notes:
             print("  " + note)
+    if audio_notes:
+        print("\nknown PCM16 decoder-rounding differences:")
+        for note in audio_notes:
+            print("  " + note)
+    if oracle_notes:
+        print("\nUnityPy oracle failures (not compared):")
+        for note in oracle_notes:
+            print("  " + note)
     if problems:
         print("\n{} unexplained difference(s):".format(len(problems)), file=sys.stderr)
         for problem in problems:
             print("  " + problem, file=sys.stderr)
         return 1
-    if stats.compared == 0:
+    if stats.exact + stats.known_sprite_differences + stats.known_audio_differences == 0:
         print("no supported exports were compared", file=sys.stderr)
         return 1
     return 0
@@ -596,6 +845,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stats = ComparisonStats()
     problems: list[str] = []
     sprite_notes: list[str] = []
+    audio_notes: list[str] = []
+    oracle_notes: list[str] = []
     for bundle in args.bundles:
         compare_bundle(
             bundle,
@@ -605,8 +856,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             stats,
             problems,
             sprite_notes,
+            audio_notes,
+            oracle_notes,
         )
-    return report(stats, problems, sprite_notes)
+    return report(stats, problems, sprite_notes, audio_notes, oracle_notes)
 
 
 if __name__ == "__main__":

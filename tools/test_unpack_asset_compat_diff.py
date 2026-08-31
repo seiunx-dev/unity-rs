@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import io
+import struct
 import unittest
+import wave
+from pathlib import Path
 
 import unpack_asset_compat_diff as diff
 
@@ -66,6 +70,66 @@ class UnpackAssetCompatDiffTests(unittest.TestCase):
         left = "v 1.000000000 0 -0\nf 1/1/1 2/2/2 3/3/3\n"
         right = "v 1 0 -0\r\nf 1/1/1 2/2/2 3/3/3\r\n"
         self.assertEqual(diff.obj_values(left), diff.obj_values(right))
+
+    def test_pcm16_comparison_reports_one_unit_rounding(self) -> None:
+        def make_wav(samples: tuple[int, ...]) -> bytes:
+            output = io.BytesIO()
+            with wave.open(output, "wb") as writer:
+                writer.setnchannels(1)
+                writer.setsampwidth(2)
+                writer.setframerate(44_100)
+                writer.writeframes(struct.pack("<{}h".format(len(samples)), *samples))
+            return output.getvalue()
+
+        difference = diff.pcm16_difference(
+            make_wav((0, 1, -1, 32_767)),
+            make_wav((0, 2, -2, 32_767)),
+        )
+        self.assertIsNotNone(difference)
+        assert difference is not None
+        self.assertEqual(difference.samples, 4)
+        self.assertEqual(difference.differing_samples, 2)
+        self.assertEqual(difference.worst_sample, 1)
+
+        larger = diff.pcm16_difference(make_wav((0,)), make_wav((2,)))
+        self.assertIsNotNone(larger)
+        assert larger is not None
+        self.assertEqual(larger.worst_sample, 2)
+
+        changed_header = bytearray(make_wav((0,)))
+        changed_header[4] ^= 1
+        self.assertIsNone(
+            diff.pcm16_difference(bytes(changed_header), make_wav((0,)))
+        )
+
+    def test_extracts_shader_export_manifest(self) -> None:
+        shader = '''Shader "Example/Shader" {
+Properties {
+[Toggle(_FLAG)] _Enabled ("Enabled", Float) = 1.0
+_MainTex ("Texture", 2D) = "white" { }
+}
+SubShader {
+ Pass { }
+ UsePass "Example/Other/PASS"
+ GrabPass { }
+}
+SubShader {
+}
+}'''
+        self.assertEqual(
+            diff.exported_shader_manifest(shader),
+            diff.ShaderManifest(
+                name="Example/Shader",
+                properties=("_Enabled", "_MainTex"),
+                subshader_pass_counts=(3, 0),
+            ),
+        )
+
+    def test_arguments_accept_directories_and_repeated_type_filters(self) -> None:
+        arguments = diff.parse_arguments(
+            ["--type", "Mesh", "--type", "Shader", str(Path.cwd())]
+        )
+        self.assertEqual(arguments.types, frozenset({"Mesh", "Shader"}))
 
     def test_rejects_type_tree_values_beyond_the_budget(self) -> None:
         with self.assertRaisesRegex(ValueError, "maximum_tree_values"):

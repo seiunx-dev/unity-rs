@@ -39,9 +39,13 @@
 注解误当成 UnityPy 容器成员。以 19 个 CN UnityFS bundle（角色、音乐、视频）对
 UnityPy 1.25.3 差分，113 个容器项中 99 个 Texture2D、TextAsset 与
 MonoBehaviour 导出完全一致，14 个 Sprite 差异均完整报告为两种已知 mask
-光栅化规则的边缘像素差；另以独立合成 Mesh 验证 OBJ 几何值一致。真实私有文件未进入
-仓库。`unity_rs.compat` 尚未包含在当前 PyPI `0.5.1` 产物中，本阶段继续只用本地源码
-构建 wheel 验证，不提前发布或复用 `0.5.1` 作为新产物版本。
+光栅化规则的边缘像素差。第二阶段再对完整的 Unity 2022.3.62f2 播放器目录差分：54 个
+Mesh 的 OBJ 几何值、9 个 Font 载荷，以及 379 个 Shader 的名称、属性序列和逐
+SubShader 的 Pass/UsePass/GrabPass 数全部一致；2 个 Vorbis AudioClip 的 WAV
+参数与帧数一致，分别只有 442/168192 与 2517/46080 个 PCM16 样本相差，最大均为 1，
+落在既有固定 vgmstream oracle 证明的舍入边界内并由显式开关逐项报告。真实私有文件未
+进入仓库。`unity_rs.compat` 尚未包含在当前 PyPI `0.5.1` 产物中，本阶段继续只用本地
+源码构建 wheel 验证，不提前发布或复用 `0.5.1` 作为新产物版本。
 
 **UnityPy 调用方 TypeTree 已接入（2026-08-29）**：兼容层的
 `read_typetree(nodes=...)` / `parse_as_dict(nodes=...)` 现在接受 UnityPy

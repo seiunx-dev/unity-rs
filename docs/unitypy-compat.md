@@ -135,13 +135,28 @@ python3 tools/unpack_asset_compat_diff.py \
 ```
 
 The runner requires exact container identities, Texture2D pixels, TextAsset
-bytes, MonoBehaviour values, normalized Shader text, fonts and audio samples;
-Mesh OBJ rows are compared after narrowing numeric tokens to the `f32` values
-both exporters represent, so newline and float spelling are not mistaken for
-geometry differences. Tight Sprite differences are failures unless the
-explicit flag is supplied; with the flag they remain fully counted and reported
-because UnityPy rasterizes the mask
-with Pillow while unity-rs follows the managed exporter's pixel-center rule.
+bytes, MonoBehaviour values and font payloads. Mesh OBJ rows are compared after
+narrowing numeric tokens to the `f32` values both exporters represent, so
+newline and float spelling are not mistaken for geometry differences. Shader
+exports are compared to UnityPy's parsed name, property sequence and each
+SubShader's Pass/UsePass/GrabPass count; its text writer is not used as a
+full-text oracle because it omits render-state content emitted by the managed
+writer. Tight Sprite differences are failures unless the explicit flag is
+supplied; with the flag they remain fully counted and reported because UnityPy
+rasterizes the mask with Pillow while unity-rs follows the managed exporter's
+pixel-center rule.
+
+Audio files are byte-exact by default. The separate vgmstream gate proves that
+Vorbis decoder rounding can differ by one PCM16 unit, so
+`--allow-known-audio-rounding-differences` accepts only equal-parameter PCM16
+WAV files with identical frame counts and a worst sample delta of one. Every
+affected sample count, maximum delta and RMS delta remains visible in the
+report; larger differences and non-PCM16 outputs still fail.
+
 `--include-uncontained` extends the old container-driven Lambda contract to
 supported objects that are present in a serialized file but absent from its
 AssetBundle container, which is useful for Mesh and other direct fixtures.
+Bundle paths and extracted asset directories are both accepted. Repeat
+`--type Mesh`, `--type Shader`, `--type Font`, or `--type AudioClip` to limit
+an uncontained scan to selected exporters when a directory contains many
+unrelated objects.
