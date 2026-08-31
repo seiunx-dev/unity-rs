@@ -17,10 +17,11 @@ must be exact by default. Mesh OBJ rows are compared at their represented
 ``f32`` values. Shader output is checked against UnityPy's independently parsed
 name, property order, and per-SubShader Pass/UsePass/GrabPass counts instead of
 UnityPy's less complete text writer. Tight Sprite pixels are exact by default;
-known edge-only rasterizer differences require an explicit reporting flag. An
-independent vgmstream gate establishes the one-unit PCM16 rounding boundary for
-Vorbis, so that boundary can likewise be reported only with an explicit flag.
-Neither flag hides dimensions, counts, or difference metrics.
+known rasterizer differences on tight Sprites require an explicit reporting
+flag after their source textures have been checked. Alpha8 unstored-channel and
+RGB565 one-level conversion differences, plus the independently established
+one-unit PCM16 vgmstream rounding boundary, likewise require explicit flags.
+No flag hides dimensions, counts, or difference metrics.
 
 Both packages and Pillow must be installed in the running interpreter::
 
@@ -58,6 +59,7 @@ class ImageDifference:
     height: int
     differing_pixels: int
     alpha_differences: int
+    worst_channel: int
     worst_alpha: int
     worst_composited: float
 
@@ -77,12 +79,19 @@ class ShaderManifest:
     subshader_pass_counts: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class SpriteSourceComparison:
+    exact: bool
+    known_texture_differences: tuple[str, ...]
+
+
 @dataclass
 class ComparisonStats:
     bundles: int = 0
     container_entries: int = 0
     skipped: int = 0
     exact: int = 0
+    known_texture_differences: int = 0
     known_sprite_differences: int = 0
     known_audio_differences: int = 0
     oracle_failures: int = 0
@@ -339,6 +348,7 @@ def image_difference(left: Any, right: Any) -> ImageDifference:
 
     differing_pixels = 0
     alpha_differences = 0
+    worst_channel = 0
     worst_alpha = 0
     worst_composited = 0.0
     for offset in range(0, expected, 4):
@@ -349,6 +359,10 @@ def image_difference(left: Any, right: Any) -> ImageDifference:
         differing_pixels += 1
         left_alpha = left_pixel[3]
         right_alpha = right_pixel[3]
+        worst_channel = max(
+            worst_channel,
+            *(abs(left_pixel[channel] - right_pixel[channel]) for channel in range(4)),
+        )
         alpha_delta = abs(left_alpha - right_alpha)
         if alpha_delta:
             alpha_differences += 1
@@ -364,9 +378,129 @@ def image_difference(left: Any, right: Any) -> ImageDifference:
         height=height,
         differing_pixels=differing_pixels,
         alpha_differences=alpha_differences,
+        worst_channel=worst_channel,
         worst_alpha=worst_alpha,
         worst_composited=worst_composited,
     )
+
+
+def known_texture_difference_kind(
+    format_code: int, difference: ImageDifference
+) -> Optional[str]:
+    if format_code == 1 and difference.alpha_differences == 0:
+        return "Alpha8 unstored RGB fill"
+    if (
+        format_code == 7
+        and difference.alpha_differences == 0
+        and difference.worst_channel <= 1
+    ):
+        return "RGB565 one-level conversion rounding"
+    return None
+
+
+def effective_sprite_render_data(sprite: Any) -> Any:
+    atlas_reader = None
+    atlas_pointer = getattr(sprite, "m_SpriteAtlas", None)
+    if atlas_pointer is not None and int(atlas_pointer.path_id) != 0:
+        atlas_reader = atlas_pointer.deref()
+    elif getattr(sprite, "m_AtlasTags", None):
+        atlas_name = sprite.m_AtlasTags[0]
+        for reader in sprite.assets_file.objects.values():
+            if reader.type.name == "SpriteAtlas" and reader.peek_name() == atlas_name:
+                atlas_reader = reader
+                break
+    if atlas_reader is None:
+        return sprite.m_RD
+
+    atlas = atlas_reader.read()
+    render_data_key = sprite.m_RenderDataKey
+    for key, render_data in atlas.m_RenderDataMap:
+        if key == render_data_key:
+            return render_data
+    raise ValueError("SpriteAtlas does not contain the Sprite render-data key")
+
+
+def compare_sprite_sources(
+    left_sprite: Any, right_pointer: Any
+) -> SpriteSourceComparison:
+    render_data = effective_sprite_render_data(left_sprite)
+    source_pointers = [render_data.texture]
+    alpha_texture = getattr(render_data, "alphaTexture", None)
+    if alpha_texture is not None and int(alpha_texture.path_id) != 0:
+        source_pointers.append(alpha_texture)
+
+    right_sprite_reader = right_pointer.deref()
+    if right_sprite_reader is None:
+        raise ValueError("unity-rs Sprite pointer did not resolve")
+    right_sprite_file = right_sprite_reader.assets_file
+    right_environment = right_sprite_file.environment
+    known_differences: list[str] = []
+    compared = 0
+    for source_pointer in source_pointers:
+        if int(source_pointer.path_id) == 0:
+            continue
+        left_reader = source_pointer.deref()
+        if left_reader is None:
+            continue
+        source_name = getattr(left_reader.assets_file, "name", None)
+        if source_name is None:
+            source_name = left_reader.assets_file.path
+        if (
+            int(source_pointer.file_id) == 0
+            and left_reader.assets_file is left_sprite.assets_file
+        ):
+            right_file = right_sprite_file
+        else:
+            try:
+                right_file = right_environment.find_file(str(source_name))
+            except FileNotFoundError as error:
+                raise ValueError(
+                    "unity-rs could not find Sprite source file {!r}".format(
+                        source_name
+                    )
+                ) from error
+            if right_file is None:
+                raise ValueError(
+                    "unity-rs could not find Sprite source file {!r}".format(
+                        source_name
+                    )
+                )
+        right_reader = right_file.objects.get(int(left_reader.path_id))
+        if right_reader is None or right_reader.type.name != "Texture2D":
+            raise ValueError(
+                "unity-rs could not resolve Sprite Texture2D {}:{}".format(
+                    source_name, left_reader.path_id
+                )
+            )
+        left_texture = left_reader.read()
+        right_texture = right_reader.read()
+        difference = image_difference(left_texture.image, right_texture.image)
+        compared += 1
+        if difference.differing_pixels == 0:
+            continue
+        try:
+            format_code = int(left_texture.m_TextureFormat)
+        except (AttributeError, TypeError, ValueError):
+            format_code = -1
+        kind = known_texture_difference_kind(format_code, difference)
+        if kind is None:
+            raise ValueError(
+                "Sprite source Texture2D {}:{} has an unexplained pixel difference".format(
+                    source_name, left_reader.path_id
+                )
+            )
+        known_differences.append(kind)
+    if compared == 0:
+        raise ValueError("Sprite has no resolvable source Texture2D")
+    return SpriteSourceComparison(
+        exact=not known_differences,
+        known_texture_differences=tuple(known_differences),
+    )
+
+
+def sprite_uses_tight_mask(value: Any) -> bool:
+    settings = int(effective_sprite_render_data(value).settingsRaw)
+    return ((settings >> 1) & 1) == 0
 
 
 def container_rows(environment: Any) -> list[tuple[str, int, int, str]]:
@@ -416,6 +550,7 @@ def compare_pointer(
     args: argparse.Namespace,
     stats: ComparisonStats,
     problems: list[str],
+    texture_notes: list[str],
     sprite_notes: list[str],
     audio_notes: list[str],
     oracle_notes: list[str],
@@ -441,27 +576,86 @@ def compare_pointer(
 
     if kind in ("Texture2D", "Sprite"):
         try:
-            difference = image_difference(left_value.image, right_value.image)
+            left_image = left_value.image
         except (AttributeError, ImportError, OSError, ValueError) as error:
-            problems.append("{} image comparison failed: {}".format(label, error))
+            stats.oracle_failures += 1
+            oracle_notes.append(
+                "{} UnityPy image conversion failed: {}".format(label, error)
+            )
             return
+        try:
+            right_image = right_value.image
+        except (AttributeError, ImportError, OSError, ValueError) as error:
+            problems.append(
+                "{} unity-rs image conversion failed: {}".format(label, error)
+            )
+            return
+        difference = image_difference(left_image, right_image)
         if difference.differing_pixels == 0:
             stats.exact += 1
             return
         message = (
             "{} differs in {}/{} pixels; alpha differs in {}, worst alpha {}, "
-            "worst composited contribution {:.6g}".format(
+            "worst channel {}, worst composited contribution {:.6g}".format(
                 label,
                 difference.differing_pixels,
                 difference.width * difference.height,
                 difference.alpha_differences,
                 difference.worst_alpha,
+                difference.worst_channel,
                 difference.worst_composited,
             )
         )
-        if kind == "Sprite" and args.allow_known_sprite_mask_differences:
-            stats.known_sprite_differences += 1
-            sprite_notes.append(message)
+        texture_difference_kind: Optional[str] = None
+        if kind == "Texture2D":
+            try:
+                format_code = int(left_value.m_TextureFormat)
+            except (AttributeError, TypeError, ValueError):
+                format_code = -1
+            texture_difference_kind = known_texture_difference_kind(
+                format_code, difference
+            )
+        if (
+            texture_difference_kind is not None
+            and args.allow_known_texture_conversion_differences
+        ):
+            stats.known_texture_differences += 1
+            texture_notes.append("{}: {}".format(texture_difference_kind, message))
+        elif kind == "Sprite":
+            try:
+                source_comparison = compare_sprite_sources(left_value, right_pointer)
+            except (AttributeError, ImportError, OSError, TypeError, ValueError) as error:
+                problems.append(
+                    "{} could not classify its Sprite source: {}".format(label, error)
+                )
+                return
+            tight_mask = sprite_uses_tight_mask(left_value)
+            if (
+                source_comparison.exact
+                and tight_mask
+                and args.allow_known_sprite_mask_differences
+            ):
+                stats.known_sprite_differences += 1
+                sprite_notes.append(message)
+            elif (
+                source_comparison.known_texture_differences
+                and args.allow_known_texture_conversion_differences
+                and (not tight_mask or args.allow_known_sprite_mask_differences)
+            ):
+                stats.known_texture_differences += 1
+                texture_notes.append(
+                    "Sprite source {}: {}".format(
+                        ", ".join(source_comparison.known_texture_differences),
+                        message,
+                    )
+                )
+            elif not tight_mask:
+                problems.append(
+                    "{} differs although its source texture is exact and it does "
+                    "not use a tight mask".format(label)
+                )
+            else:
+                problems.append(message)
         else:
             problems.append(message)
         return
@@ -584,6 +778,7 @@ def compare_pointer_safely(
     args: argparse.Namespace,
     stats: ComparisonStats,
     problems: list[str],
+    texture_notes: list[str],
     sprite_notes: list[str],
     audio_notes: list[str],
     oracle_notes: list[str],
@@ -597,6 +792,7 @@ def compare_pointer_safely(
             args,
             stats,
             problems,
+            texture_notes,
             sprite_notes,
             audio_notes,
             oracle_notes,
@@ -619,6 +815,7 @@ def compare_bundle(
     args: argparse.Namespace,
     stats: ComparisonStats,
     problems: list[str],
+    texture_notes: list[str],
     sprite_notes: list[str],
     audio_notes: list[str],
     oracle_notes: list[str],
@@ -654,6 +851,7 @@ def compare_bundle(
             args,
             stats,
             problems,
+            texture_notes,
             sprite_notes,
             audio_notes,
             oracle_notes,
@@ -666,6 +864,7 @@ def compare_bundle(
             args,
             stats,
             problems,
+            texture_notes,
             sprite_notes,
             audio_notes,
             oracle_notes,
@@ -679,6 +878,7 @@ def compare_uncontained(
     args: argparse.Namespace,
     stats: ComparisonStats,
     problems: list[str],
+    texture_notes: list[str],
     sprite_notes: list[str],
     audio_notes: list[str],
     oracle_notes: list[str],
@@ -728,6 +928,7 @@ def compare_uncontained(
             args,
             stats,
             problems,
+            texture_notes,
             sprite_notes,
             audio_notes,
             oracle_notes,
@@ -752,6 +953,14 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--maximum-tree-values", type=int, default=1_000_000)
     parser.add_argument("--maximum-tree-depth", type=int, default=256)
+    parser.add_argument(
+        "--allow-known-texture-conversion-differences",
+        action="store_true",
+        help=(
+            "report Alpha8 unstored-RGB and one-level RGB565 conversion "
+            "differences without failing"
+        ),
+    )
     parser.add_argument(
         "--allow-known-sprite-mask-differences",
         action="store_true",
@@ -787,23 +996,29 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def report(
     stats: ComparisonStats,
     problems: list[str],
+    texture_notes: list[str],
     sprite_notes: list[str],
     audio_notes: list[str],
     oracle_notes: list[str],
 ) -> int:
     print(
-        "checked {} input(s), {} container entries: {} exact, {} known Sprite "
-        "difference(s), {} known audio difference(s), {} oracle failure(s), "
-        "{} skipped".format(
+        "checked {} input(s), {} container entries: {} exact, {} known Texture "
+        "difference(s), {} known Sprite difference(s), {} known audio "
+        "difference(s), {} oracle failure(s), {} skipped".format(
             stats.bundles,
             stats.container_entries,
             stats.exact,
+            stats.known_texture_differences,
             stats.known_sprite_differences,
             stats.known_audio_differences,
             stats.oracle_failures,
             stats.skipped,
         )
     )
+    if texture_notes:
+        print("\nknown Texture conversion differences:")
+        for note in texture_notes:
+            print("  " + note)
     if sprite_notes:
         print("\nknown Sprite rasterizer differences:")
         for note in sprite_notes:
@@ -821,7 +1036,13 @@ def report(
         for problem in problems:
             print("  " + problem, file=sys.stderr)
         return 1
-    if stats.exact + stats.known_sprite_differences + stats.known_audio_differences == 0:
+    if (
+        stats.exact
+        + stats.known_texture_differences
+        + stats.known_sprite_differences
+        + stats.known_audio_differences
+        == 0
+    ):
         print("no supported exports were compared", file=sys.stderr)
         return 1
     return 0
@@ -844,6 +1065,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     stats = ComparisonStats()
     problems: list[str] = []
+    texture_notes: list[str] = []
     sprite_notes: list[str] = []
     audio_notes: list[str] = []
     oracle_notes: list[str] = []
@@ -855,11 +1077,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args,
             stats,
             problems,
+            texture_notes,
             sprite_notes,
             audio_notes,
             oracle_notes,
         )
-    return report(stats, problems, sprite_notes, audio_notes, oracle_notes)
+    return report(
+        stats,
+        problems,
+        texture_notes,
+        sprite_notes,
+        audio_notes,
+        oracle_notes,
+    )
 
 
 if __name__ == "__main__":

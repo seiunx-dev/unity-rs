@@ -8,6 +8,7 @@ import struct
 import unittest
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import unpack_asset_compat_diff as diff
 
@@ -144,8 +145,62 @@ SubShader {
         changed = diff.image_difference(left, right)
         self.assertEqual(changed.differing_pixels, 1)
         self.assertEqual(changed.alpha_differences, 1)
+        self.assertEqual(changed.worst_channel, 10)
         self.assertEqual(changed.worst_alpha, 5)
         self.assertGreater(changed.worst_composited, 0)
+
+    def test_classifies_only_bounded_texture_conversion_differences(self) -> None:
+        alpha8 = diff.image_difference(
+            FakeImage((1, 1), bytes((0, 0, 0, 127))),
+            FakeImage((1, 1), bytes((255, 255, 255, 127))),
+        )
+        self.assertEqual(
+            diff.known_texture_difference_kind(1, alpha8),
+            "Alpha8 unstored RGB fill",
+        )
+
+        rgb565 = diff.image_difference(
+            FakeImage((1, 1), bytes((100, 100, 100, 255))),
+            FakeImage((1, 1), bytes((101, 99, 100, 255))),
+        )
+        self.assertEqual(
+            diff.known_texture_difference_kind(7, rgb565),
+            "RGB565 one-level conversion rounding",
+        )
+        larger = diff.image_difference(
+            FakeImage((1, 1), bytes((100, 100, 100, 255))),
+            FakeImage((1, 1), bytes((102, 100, 100, 255))),
+        )
+        self.assertIsNone(diff.known_texture_difference_kind(7, larger))
+
+    def test_tight_sprite_classification_uses_the_packing_mode_bit(self) -> None:
+        self.assertTrue(
+            diff.sprite_uses_tight_mask(
+                SimpleNamespace(m_RD=SimpleNamespace(settingsRaw=64))
+            )
+        )
+        self.assertFalse(
+            diff.sprite_uses_tight_mask(
+                SimpleNamespace(m_RD=SimpleNamespace(settingsRaw=66))
+            )
+        )
+
+    def test_sprite_classification_uses_atlas_render_data(self) -> None:
+        render_data = SimpleNamespace(settingsRaw=66)
+        key = object()
+        atlas = SimpleNamespace(m_RenderDataMap=[(key, render_data)])
+        atlas_reader = SimpleNamespace(read=lambda: atlas)
+        sprite = SimpleNamespace(
+            m_RD=SimpleNamespace(settingsRaw=64),
+            m_SpriteAtlas=SimpleNamespace(
+                path_id=7, deref=lambda: atlas_reader
+            ),
+            m_AtlasTags=[],
+            m_RenderDataKey=key,
+        )
+
+        self.assertIs(diff.effective_sprite_render_data(sprite), render_data)
+        self.assertFalse(diff.sprite_uses_tight_mask(sprite))
 
     def test_rejects_different_image_dimensions(self) -> None:
         with self.assertRaisesRegex(ValueError, "dimensions differ"):

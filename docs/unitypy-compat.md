@@ -129,6 +129,7 @@ Pillow installed:
 ```shell
 python3 tools/unpack_asset_compat_diff.py \
   --unity-version 2022.3.21f1 \
+  --allow-known-texture-conversion-differences \
   --allow-known-sprite-mask-differences \
   --include-uncontained \
   /private/corpus/bundle-a /private/corpus/bundle-b
@@ -141,10 +142,19 @@ newline and float spelling are not mistaken for geometry differences. Shader
 exports are compared to UnityPy's parsed name, property sequence and each
 SubShader's Pass/UsePass/GrabPass count; its text writer is not used as a
 full-text oracle because it omits render-state content emitted by the managed
-writer. Tight Sprite differences are failures unless the explicit flag is
-supplied; with the flag they remain fully counted and reported because UnityPy
-rasterizes the mask with Pillow while unity-rs follows the managed exporter's
-pixel-center rule.
+writer. Texture pixels are exact by default. The explicit
+`--allow-known-texture-conversion-differences` flag recognizes only Alpha8
+images whose stored alpha is exact and RGB565 images whose alpha is exact and
+decoded channels differ by at most one level. The former is UnityPy's black
+versus the managed exporter's white fill for unstored RGB channels; the latter
+is Pillow's `BGR;16` quantization versus the managed-compatible bit-replication
+conversion used by unity-rs. Tight Sprite differences are also failures unless
+their explicit flag is supplied. Before classifying one, the runner resolves
+direct and SpriteAtlas render data and proves that its source color/alpha
+textures are exact or one of the separately enabled texture conversions. The
+remaining rasterizer differences stay fully counted and reported because
+UnityPy rasterizes the mask with Pillow while unity-rs follows the managed
+exporter's pixel-center rule.
 
 Audio files are byte-exact by default. The separate vgmstream gate proves that
 Vorbis decoder rounding can differ by one PCM16 unit, so

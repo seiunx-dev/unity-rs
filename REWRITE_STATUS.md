@@ -44,8 +44,17 @@ Mesh 的 OBJ 几何值、9 个 Font 载荷，以及 379 个 Shader 的名称、�
 SubShader 的 Pass/UsePass/GrabPass 数全部一致；2 个 Vorbis AudioClip 的 WAV
 参数与帧数一致，分别只有 442/168192 与 2517/46080 个 PCM16 样本相差，最大均为 1，
 落在既有固定 vgmstream oracle 证明的舍入边界内并由显式开关逐项报告。真实私有文件未
-进入仓库。`unity_rs.compat` 尚未包含在当前 PyPI `0.5.1` 产物中，本阶段继续只用本地
-源码构建 wheel 验证，不提前发布或复用 `0.5.1` 作为新产物版本。
+进入仓库。第三阶段全量检查同一播放器目录中的 810 个 Texture2D 与 14 个 TextAsset：
+737 个纹理和全部文本精确一致；60 个 Alpha8 只在未存储的 RGB 黑/白填充约定上不同，
+1 个 RGB565 只在 Pillow 与已由托管 oracle 固定的 bit-replication 换算间相差一个色阶；
+另有 12 个 0×0 动态字体纹理被 UnityPy 误作目录打开而无法形成 oracle，均逐项报告而未
+计作通过。2,602 个 Sprite 中 2,151 个逐像素一致，450 个在源纹理精确一致后归为 tight
+mask 光栅化差异，另 1 个完整追溯到上述 RGB565 源纹理，零未解释差异。播放器目录的
+172,470 个 MonoBehaviour 对应 2,704 条序列化类型记录，但没有一条内嵌 TypeTree；因此
+没有用同一原始切片的全量字节自比较虚增语义证据，MonoBehaviour 的有效语义证据仍来自
+第一阶段带内嵌树的 CN 音乐/视频 bundle。`unity_rs.compat` 尚未包含在当前 PyPI `0.5.1`
+产物中，本阶段继续只用本地源码构建 wheel 验证，不提前发布或复用 `0.5.1` 作为新产物
+版本。
 
 **UnityPy 调用方 TypeTree 已接入（2026-08-29）**：兼容层的
 `read_typetree(nodes=...)` / `parse_as_dict(nodes=...)` 现在接受 UnityPy
