@@ -62,6 +62,7 @@ def main() -> None:
     assert isinstance(unitypy_compat.Texture2D.image, property)
     assert isinstance(unitypy_compat.Sprite.image, property)
     assert isinstance(unitypy_compat.AudioClip.samples, property)
+    assert isinstance(unitypy_compat.PPtr.type, property)
     assert hasattr(unitypy_compat.Font, "__init__")
     repository = Path(__file__).resolve().parents[3]
     for legal_file in ("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.txt"):

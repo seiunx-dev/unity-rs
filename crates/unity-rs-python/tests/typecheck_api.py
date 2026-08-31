@@ -173,6 +173,7 @@ def consume_public_api(
         compat_ptr = UnityPyCompat.PPtr(
             compat_reader.assets_file, 0, compat_reader.path_id
         )
+        compat_ptr_type: UnityPyCompat.ClassIDType = compat_ptr.type
         compat_resolved: Optional[UnityPyCompat.ObjectReader] = compat_ptr.deref()
 
     file_count: int = studio.file_count

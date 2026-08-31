@@ -437,15 +437,9 @@ class Environment:
     def _container_entries(self) -> List[Tuple[str, PPtr]]:
         entries: List[Tuple[str, PPtr]] = []
         for asset in self.assets:
-            for info in asset._iter_object_infos():
-                if info.container is not None:
-                    self._check_object_materialization(len(entries) + 1)
-                    entries.append(
-                        (
-                            info.container,
-                            PPtr(asset, 0, info.path_id),
-                        )
-                    )
+            for key, pointer in asset.container.items():
+                self._check_object_materialization(len(entries) + 1)
+                entries.append((key, pointer))
         return entries
 
     def save(self, pack: str = "none", out_path: str = "output") -> None:
@@ -550,12 +544,23 @@ class SerializedFile:
             offset += len(page)
 
     def _container_entries(self) -> List[Tuple[str, PPtr]]:
-        entries: List[Tuple[str, PPtr]] = []
         for info in self._iter_object_infos():
-            if info.container is not None:
+            if info.class_id != int(ClassIDType.AssetBundle):
+                continue
+            bundle = self.environment._native.read_asset_bundle(
+                info.file_index,
+                info.path_id,
+                maximum_entries=self.environment.maximum_compat_objects,
+                maximum_string_bytes=self.environment.maximum_type_tree_materialized_bytes,
+                maximum_total_string_bytes=self.environment.maximum_type_tree_materialized_bytes,
+            )
+            entries: List[Tuple[str, PPtr]] = []
+            for key, _preload_index, _preload_size, asset in bundle.container:
                 self.environment._check_object_materialization(len(entries) + 1)
-                entries.append((info.container, PPtr(self, 0, info.path_id)))
-        return entries
+                file_id, path_id = asset
+                entries.append((key, PPtr(self, file_id, path_id)))
+            return entries
+        return []
 
     def save(self, packer: str = "none") -> bytes:
         del packer
@@ -1111,6 +1116,13 @@ class PPtr:
     @property
     def path_id(self) -> int:
         return self.m_PathID
+
+    @property
+    def type(self) -> ClassIDType:
+        reader = self.deref()
+        if reader is None:
+            raise ValueError("PPtr can't resolve a null object reference")
+        return reader.type
 
     def deref(self) -> Optional[ObjectReader]:
         resolved = self.assets_file.environment._native.resolve_pptr(

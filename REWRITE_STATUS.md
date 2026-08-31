@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-08-29（Asia/Shanghai）
+最后更新：2026-09-01（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -32,6 +32,16 @@
 
 无头 Rust/Python 运行时重写已经完成；项目仍处于 **Rust/Python Beta** 阶段，因为还不能
 宣称覆盖全部 Unity/Tuanjie 版本长尾，也尚未达到可以删除托管 oracle 的证据强度。
+
+**旧 `unpack_asset` 导出契约已开始真实语料验收（2026-09-01）**：UnityPy 兼容层补齐
+`PPtr.type`，并改为从 `AssetBundle.container` 的直接 PPtr 构造
+`Environment.container`，不再把 Core 为预加载关系保留的 `ObjectInfo.container`
+注解误当成 UnityPy 容器成员。以 19 个 CN UnityFS bundle（角色、音乐、视频）对
+UnityPy 1.25.3 差分，113 个容器项中 99 个 Texture2D、TextAsset 与
+MonoBehaviour 导出完全一致，14 个 Sprite 差异均完整报告为两种已知 mask
+光栅化规则的边缘像素差；另以独立合成 Mesh 验证 OBJ 几何值一致。真实私有文件未进入
+仓库。`unity_rs.compat` 尚未包含在当前 PyPI `0.5.1` 产物中，本阶段继续只用本地源码
+构建 wheel 验证，不提前发布或复用 `0.5.1` 作为新产物版本。
 
 **UnityPy 调用方 TypeTree 已接入（2026-08-29）**：兼容层的
 `read_typetree(nodes=...)` / `parse_as_dict(nodes=...)` 现在接受 UnityPy

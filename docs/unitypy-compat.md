@@ -5,6 +5,11 @@ public behavior of UnityPy 1.25.3. It intentionally does not install a top-level
 `UnityPy` package: a real UnityPy installation remains importable for
 differential testing and applications can opt in explicitly:
 
+This facade is newer than the `unity-rs 0.5.1` artifacts currently published on
+PyPI. Until a later release is intentionally published, build and install the
+wheel from this checkout; the wheel and sdist content tests require the entire
+`unity_rs.compat` package to be present.
+
 ```python
 from unity_rs.compat import unitypy as UnityPy
 
@@ -113,3 +118,30 @@ installed UnityPy across the repository's synthetic serialized-file corpus:
 ```shell
 python3 tools/local_ci.py --fail-on-skip unitypy
 ```
+
+The former `unpack_asset` Lambda used container-driven Texture2D, Sprite,
+TextAsset and MonoBehaviour extraction. Its current UnityPy 1.25.x call shapes
+use `PPtr.type`, `PPtr.read()`, `m_Script` (not the older `script` alias), and
+`PPtr.deref().get_raw_data()` when no embedded TypeTree exists. Run the opt-in
+real-bundle differential against a locally built wheel with both UnityPy and
+Pillow installed:
+
+```shell
+python3 tools/unpack_asset_compat_diff.py \
+  --unity-version 2022.3.21f1 \
+  --allow-known-sprite-mask-differences \
+  --include-uncontained \
+  /private/corpus/bundle-a /private/corpus/bundle-b
+```
+
+The runner requires exact container identities, Texture2D pixels, TextAsset
+bytes, MonoBehaviour values, normalized Shader text, fonts and audio samples;
+Mesh OBJ rows are compared after narrowing numeric tokens to the `f32` values
+both exporters represent, so newline and float spelling are not mistaken for
+geometry differences. Tight Sprite differences are failures unless the
+explicit flag is supplied; with the flag they remain fully counted and reported
+because UnityPy rasterizes the mask
+with Pillow while unity-rs follows the managed exporter's pixel-center rule.
+`--include-uncontained` extends the old container-driven Lambda contract to
+supported objects that are present in a serialized file but absent from its
+AssetBundle container, which is useful for Mesh and other direct fixtures.

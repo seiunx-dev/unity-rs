@@ -2428,7 +2428,15 @@ def main() -> None:
         else:
             raise AssertionError("compatibility parsing must not weaken layout validation")
         assert not UnityPyCompat.PPtr(compat.file, 0, 0)
-        assert UnityPyCompat.PPtr(compat.file, 0, 7).deref() is compat_reader
+        compat_text_pointer = UnityPyCompat.PPtr(compat.file, 0, 7)
+        assert compat_text_pointer.deref() is compat_reader
+        assert compat_text_pointer.type is UnityPyCompat.ClassIDType.TextAsset
+        try:
+            UnityPyCompat.PPtr(compat.file, 0, 0).type
+        except ValueError as error:
+            assert "null object reference" in str(error)
+        else:
+            raise AssertionError("null PPtr types must fail explicitly")
         try:
             UnityPyCompat.PPtr(compat.file, 1, 7).deref()
         except FileNotFoundError:
@@ -4364,6 +4372,22 @@ def main() -> None:
         assert preload.path_id == 9
         assert preload.name == "python-preload"
         assert preload.assets == [(0, 31), (0, 32)]
+
+        compat_container = UnityPyCompat.load(container_path)
+        assert [
+            (key, pointer.file_id, pointer.path_id)
+            for key, pointer in compat_container.container.items()
+        ] == [
+            ("bundle/first", 0, 11),
+            ("bundle/second", 0, 12),
+        ]
+        assert [
+            (key, pointer.file_id, pointer.path_id)
+            for key, pointer in compat_container.file.container.items()
+        ] == [
+            ("bundle/first", 0, 11),
+            ("bundle/second", 0, 12),
+        ]
 
         for method, path_id, kwargs in (
             (container_studio.read_asset_bundle, 7, {"maximum_entries": 1}),
