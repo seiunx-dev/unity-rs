@@ -584,36 +584,40 @@ mod tests {
     }
 
     #[test]
-    fn reads_2024_skinned_renderer_tail_after_mask_interaction() {
-        let mut object = renderer_prefix("2024.0.0f1");
-        object.extend_from_slice(&5_i32.to_le_bytes());
-        object.push(1);
-        object.push(0);
-        align(&mut object, 4);
-        push_pptr(&mut object, 0, 50);
-        object.extend_from_slice(&2_i32.to_le_bytes());
-        push_pptr(&mut object, 0, 61);
-        push_pptr(&mut object, 1, 62);
-        object.extend_from_slice(&2_i32.to_le_bytes());
-        object.extend_from_slice(&0.25_f32.to_le_bytes());
-        object.extend_from_slice(&0.75_f32.to_le_bytes());
-        let file = parse_asset(SKINNED_MESH_RENDERER_CLASS_ID, "2024.0.0f1", &object);
+    fn reads_new_skinned_renderer_tails_after_mask_interaction() {
+        for version in ["2024.0.0f1", "6000.3.0f1"] {
+            let mut object = renderer_prefix(version);
+            object.extend_from_slice(&5_i32.to_le_bytes());
+            object.push(1);
+            object.push(0);
+            align(&mut object, 4);
+            push_pptr(&mut object, 0, 50);
+            object.extend_from_slice(&2_i32.to_le_bytes());
+            push_pptr(&mut object, 0, 61);
+            push_pptr(&mut object, 1, 62);
+            object.extend_from_slice(&2_i32.to_le_bytes());
+            object.extend_from_slice(&0.25_f32.to_le_bytes());
+            object.extend_from_slice(&0.75_f32.to_le_bytes());
+            let file = parse_asset(SKINNED_MESH_RENDERER_CLASS_ID, version, &object);
 
-        let renderer = read_skinned_mesh_renderer(&file, 0, RendererReadLimits::default()).unwrap();
+            let renderer =
+                read_skinned_mesh_renderer(&file, 0, RendererReadLimits::default()).unwrap();
 
-        assert_eq!(renderer.renderer.mask_interaction, 2);
-        assert_eq!(renderer.mesh.path_id, 50);
-        assert_eq!(renderer.bones[0].path_id, 61);
-        assert_eq!(renderer.bones[1].file_id, 1);
-        assert_eq!(
-            renderer
-                .blend_shape_weights
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            [0.25_f32.to_bits(), 0.75_f32.to_bits()]
-        );
-        assert_eq!(renderer.trailing_bytes, 0);
+            assert_eq!(renderer.renderer.mask_interaction, 2, "{version}");
+            assert_eq!(renderer.mesh.path_id, 50, "{version}");
+            assert_eq!(renderer.bones[0].path_id, 61, "{version}");
+            assert_eq!(renderer.bones[1].file_id, 1, "{version}");
+            assert_eq!(
+                renderer
+                    .blend_shape_weights
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                [0.25_f32.to_bits(), 0.75_f32.to_bits()],
+                "{version}",
+            );
+            assert_eq!(renderer.trailing_bytes, 0, "{version}");
+        }
     }
 
     #[test]
