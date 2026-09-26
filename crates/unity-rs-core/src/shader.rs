@@ -3185,6 +3185,84 @@ mod tests {
     }
 
     #[test]
+    fn studio_shader_text_honors_caller_selected_total_array_budget() {
+        use crate::studio::Studio;
+
+        // Five overlapping entries share one record whose program code has
+        // 900,000 bytes, so the parse counts 4,500,005 array elements: above
+        // the 4,000,000 default total while each array stays below the
+        // 1,000,000 per-array default.
+        const PROGRAMS: usize = 5;
+        const CODE_BYTES: usize = 900_000;
+        let record = shader_sub_program_record(201_510_240, 0, &[], &[], &vec![0x5a; CODE_BYTES]);
+        let header_length = 4 + 8 * PROGRAMS;
+        let entries = vec![(header_length, record.len(), 0); PROGRAMS];
+        let segment = shader_program_segment(&entries, &[&record], false);
+        let mut script = b"Shader \"Wide\" {".to_vec();
+        for index in 0..PROGRAMS {
+            script.extend_from_slice(format!("\nGpuProgramIndex {index}").as_bytes());
+        }
+        script.extend_from_slice(b"\n}");
+        let object = subprogram_shader_object("Wide", &script, "Wide.shader", &segment);
+        let studio = Studio::open_region(
+            "wide.assets",
+            Region::from_bytes(synthetic_v22_asset("5.4.6f3", 13, &object, Endian::Little)),
+        )
+        .unwrap();
+        let shader = studio.object(0, 7).unwrap();
+        let maximum_output_bytes = 1024 * 1024;
+
+        let default_error = shader.read_shader_text(maximum_output_bytes).unwrap_err();
+        assert!(
+            matches!(&default_error, Error::InvalidData(message)
+                if message == "Shader arrays total 4500005 elements, exceeding limit 4000000"),
+            "{default_error}"
+        );
+        let explicit_default = shader
+            .read_shader_text_with_limits(ShaderReadLimits {
+                maximum_output_bytes,
+                ..ShaderReadLimits::default()
+            })
+            .unwrap_err();
+        assert_eq!(explicit_default.to_string(), default_error.to_string());
+
+        let raised = ShaderReadLimits {
+            maximum_total_array_elements: 8_000_000,
+            maximum_output_bytes,
+            ..ShaderReadLimits::default()
+        };
+        let text = shader.read_shader_text_with_limits(raised).unwrap();
+        let diagnostic = "\"//shader disassembly not supported on Unknown\"";
+        let mut expected_script = "Shader \"Wide\" {".to_owned();
+        for _ in 0..PROGRAMS {
+            expected_script.push('\n');
+            expected_script.push_str(diagnostic);
+        }
+        expected_script.push_str("\n}");
+        let mut expected = SHADER_TEXT_HEADER.as_bytes().to_vec();
+        expected.extend_from_slice(expected_script.as_bytes());
+        assert_eq!(text, expected);
+
+        let lowered = ShaderReadLimits {
+            maximum_total_array_elements: 1_000_000,
+            ..raised
+        };
+        let lowered_error = shader.read_shader_text_with_limits(lowered).unwrap_err();
+        assert!(
+            matches!(&lowered_error, Error::InvalidData(message)
+                if message.starts_with("Shader arrays total ")
+                    && message.ends_with("exceeding limit 1000000")),
+            "{lowered_error}"
+        );
+
+        let short_output = ShaderReadLimits {
+            maximum_output_bytes: u64::try_from(expected.len()).unwrap() - 1,
+            ..raised
+        };
+        assert!(shader.read_shader_text_with_limits(short_output).is_err());
+    }
+
+    #[test]
     fn rejects_unknown_unity_and_gpu_record_versions() {
         // Above the verified majors the default is lenient: the newest known
         // layout is attempted, and this empty payload cannot satisfy it, so
