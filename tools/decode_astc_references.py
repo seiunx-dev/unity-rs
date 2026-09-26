@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Decodes the LDR ASTC fixtures with Khronos `astcenc` into reference blobs.
+"""Decodes the ASTC fixtures with Khronos `astcenc` into reference blobs.
 
 The `astc-<variant>-<N>x<N>-astcenc.rgba` blobs are the normative reference
-for this crate's LDR ASTC decoding: they are what the ASTC specification says
+for this crate's ASTC decoding: they are what the ASTC specification says
 the payloads decode to, produced by the specification's own reference codec
 rather than by another port of the AssetStudio decoder lineage.
-`ldr_astc_decodes_exactly_like_the_khronos_reference` in `texture.rs` pins the
+`ldr_astc_decodes_exactly_like_the_khronos_reference` and
+`hdr_astc_decodes_exactly_like_the_khronos_reference` in `texture.rs` pin the
 crate's output against them byte for byte, and the managed differential
-re-earns them against the crate's live output on every run.
+re-earns the LDR ones against the crate's live output on every run.
 
 This script regenerates the blobs from the committed `.bin` payloads. It wraps
-each payload in the `.astc` container `astcenc` reads, has `astcenc -dl`
-decompress it to a TGA, and normalizes that TGA (BGRA to RGBA, origin to
-top-down) into the raw pixel order `decode_mip_rgba8` returns. It needs the
-official `astcenc` command-line codec, 4.x or newer; the committed blobs came
-from astcenc 5.7.0.
+each payload in the `.astc` container `astcenc` reads. LDR payloads go through
+`astcenc -dl` to a TGA, which is normalized (BGRA to RGBA, origin to top-down)
+into the raw pixel order `decode_mip_rgba8` returns. HDR payloads go through
+`astcenc -dH` to a half-float DDS, whose top-down rows are already in that
+order; each channel is clamped to [0, 1] and rounded to eight bits, the
+conversion this crate applies to decoded HDR values. It needs the official
+`astcenc` command-line codec, 4.x or newer; the committed blobs came from
+astcenc 5.7.0.
 
 Usage, from the repository root:
 
@@ -23,6 +27,7 @@ Usage, from the repository root:
 
 from __future__ import annotations
 
+import math
 import os
 import struct
 import subprocess
@@ -58,6 +63,23 @@ def trusted_astcenc(argument: str) -> Path:
 BLOCK_SIZES = (4, 5, 6, 8, 10, 12)
 
 ASTC_MAGIC = b"\x13\xab\xa1\x5c"
+
+# (variant, astcenc decode mode, output suffix). The suffix selects the
+# reader: TGA for the eight-bit LDR decode, DDS for the half-float HDR one.
+VARIANTS = (
+    ("rgb", "-dl", ".tga"),
+    ("rgba", "-dl", ".tga"),
+    ("hdr", "-dH", ".dds"),
+    ("hdr-glow", "-dH", ".dds"),
+)
+
+DDS_MAGIC = b"DDS "
+DDS_HEADER_SIZE = 124
+DDS_DX10_HEADER_SIZE = 20
+DDS_FOURCC_DX10 = b"DX10"
+# D3DFMT_A16B16G16R16F, the legacy four-character code for RGBA half floats.
+DDS_FOURCC_RGBA16F = struct.pack("<I", 113)
+DXGI_FORMAT_R16G16B16A16_FLOAT = 10
 
 
 def wrap_astc(payload: bytes, block: int, width: int, height: int) -> bytes:
@@ -125,6 +147,59 @@ def read_tga(data: bytes, width: int, height: int) -> bytes:
     return bgra_rows_to_rgba(rows, width)
 
 
+def half_to_unorm8(value: float) -> int:
+    """Clamp a decoded HDR channel to [0, 1] and round it to eight bits."""
+    if math.isnan(value):
+        raise ValueError("astcenc produced a NaN channel: the payload holds an error block")
+    return math.floor(min(max(value, 0.0), 1.0) * 255.0 + 0.5)
+
+
+def read_dds(data: bytes, width: int, height: int) -> bytes:
+    """Convert a top-down RGBA half-float DDS to eight-bit RGBA."""
+    if len(data) < 4 + DDS_HEADER_SIZE or data[:4] != DDS_MAGIC:
+        raise ValueError("not a DDS file")
+    if struct.unpack_from("<I", data, 4)[0] != DDS_HEADER_SIZE:
+        raise ValueError("unexpected DDS header size")
+    dds_height, dds_width = struct.unpack_from("<II", data, 12)
+    if (dds_width, dds_height) != (width, height):
+        raise ValueError("DDS dimensions do not match the fixture")
+    fourcc = data[84:88]
+    offset = 4 + DDS_HEADER_SIZE
+    if fourcc == DDS_FOURCC_DX10:
+        if len(data) < offset + DDS_DX10_HEADER_SIZE:
+            raise ValueError("DDS DX10 header is truncated")
+        if struct.unpack_from("<I", data, offset)[0] != DXGI_FORMAT_R16G16B16A16_FLOAT:
+            raise ValueError("expected an RGBA half-float DDS")
+        offset += DDS_DX10_HEADER_SIZE
+    elif fourcc != DDS_FOURCC_RGBA16F:
+        raise ValueError(f"expected an RGBA half-float DDS, got four-character code {fourcc!r}")
+    count = width * height * 4
+    if len(data) - offset < count * 2:
+        raise ValueError("DDS pixel data is truncated")
+    values = struct.unpack_from(f"<{count}e", data, offset)
+    return bytes(half_to_unorm8(value) for value in values)
+
+
+def decode_fixture(
+    astcenc: Path, scratch: Path, name: str, block: int, mode: str, suffix: str
+) -> bytes:
+    """Decode one committed payload with astcenc into raw RGBA8 pixels."""
+    payload = (FIXTURES / f"{name}.bin").read_bytes()
+    size = block * 2
+    wrapped = scratch / f"{name}.astc"
+    wrapped.write_bytes(wrap_astc(payload, block, size, size))
+    decoded = scratch / f"{name}{suffix}"
+    subprocess.run(
+        [str(astcenc), mode, str(wrapped), str(decoded)],
+        check=True,
+        capture_output=True,
+        shell=False,
+    )
+    if suffix == ".tga":
+        return read_tga(decoded.read_bytes(), size, size)
+    return read_dds(decoded.read_bytes(), size, size)
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         sys.exit(__doc__.strip())
@@ -136,20 +211,12 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as scratch_name:
         scratch = Path(scratch_name)
         for block in BLOCK_SIZES:
-            for variant in ("rgb", "rgba"):
+            for variant, mode, suffix in VARIANTS:
                 name = f"astc-{variant}-{block}x{block}"
-                payload = (FIXTURES / f"{name}.bin").read_bytes()
-                size = block * 2
-                wrapped = scratch / f"{name}.astc"
-                wrapped.write_bytes(wrap_astc(payload, block, size, size))
-                decoded = scratch / f"{name}.tga"
-                subprocess.run(
-                    [str(astcenc), "-dl", str(wrapped), str(decoded)],
-                    check=True,
-                    capture_output=True,
-                    shell=False,
-                )
-                pixels = read_tga(decoded.read_bytes(), size, size)
+                try:
+                    pixels = decode_fixture(astcenc, scratch, name, block, mode, suffix)
+                except ValueError as error:
+                    sys.exit(f"{name}: {error}")
                 out = FIXTURES / f"{name}-astcenc.rgba"
                 out.write_bytes(pixels)
                 print(f"{out.name}: {len(pixels)} bytes")
