@@ -24,6 +24,7 @@ Usage, from the repository root, with `astc-encoder-py` installed:
 
 from __future__ import annotations
 
+import math
 import struct
 import sys
 from pathlib import Path
@@ -76,6 +77,32 @@ def gradient_hdr(width: int, height: int) -> bytes:
     return bytes(pixels)
 
 
+def glow_hdr(width: int, height: int) -> bytes:
+    """A bright core fading to a saturated rim, with one flat block.
+
+    The fade changes hue as well as level, so the encoder stores negative
+    endpoint deltas in its HDR RGB endpoint modes. The top-left block is one
+    flat colour, which the encoder stores as an HDR void-extent block; its
+    half floats scale to 255ths with a fraction above one half, so truncating
+    instead of rounding them shows in every channel.
+    """
+    pixels = bytearray()
+    for y in range(height):
+        for x in range(width):
+            if x < width // 2 and y < height // 2:
+                red, green, blue, alpha = 0.30098, 0.70098, 0.10098, 0.50098
+            else:
+                u = x / max(width - 1, 1)
+                v = y / max(height - 1, 1)
+                t = min(math.hypot(u - 0.75, v - 0.75) / 0.75, 1.0)
+                red = 8.0 * (1 - t) ** 3 + 0.02
+                green = 6.0 * (1 - t) ** 2 + 0.05 * t
+                blue = 1.0 + 3.0 * (1 - t)
+                alpha = 1.0 - 0.75 * t
+            pixels += struct.pack("<4e", red, green, blue, alpha)
+    return bytes(pixels)
+
+
 def encode(profile: int, block: int, image_type: int, width: int,
            height: int, pixels: bytes) -> bytes:
     config = astc.ASTCConfig(profile, block, block, 1,
@@ -99,6 +126,8 @@ def main() -> None:
              gradient(width, height, opaque=False)),
             ("hdr", astc.ASTCProfile.HDR, astc.ASTCType.F16,
              gradient_hdr(width, height)),
+            ("hdr-glow", astc.ASTCProfile.HDR, astc.ASTCType.F16,
+             glow_hdr(width, height)),
         )
         for name, profile, image_type, pixels in variants:
             payload = encode(profile, block, image_type, width, height, pixels)

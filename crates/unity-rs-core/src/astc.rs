@@ -20,9 +20,12 @@
 //! `* 255 / 65535` rescale instead. The two differ by at most one per byte;
 //! `astcenc` reference blobs pin the LDR output exactly and the managed
 //! differential carries the divergence as a declared bound (see
-//! `tests/fixtures/astc/README.md`). HDR keeps the vendored arithmetic,
-//! including its `VENDOR FIX` rounding restoration in `select_color_hdr`,
-//! and still matches the managed decoder byte for byte.
+//! `tests/fixtures/astc/README.md`). HDR keeps the vendored arithmetic with
+//! the corrections that restore the C++ original: the rounding in
+//! `select_color_hdr` (`VENDOR FIX`) and in the void-extent `f32_to_u8`, and
+//! the sign extension of the HDR RGB endpoint deltas (`sign_extend`). It is
+//! pinned byte for byte against `astcenc` reference blobs, and the original
+//! HDR fixtures still match the managed decoder exactly.
 //! `texture2ddecoder` is MIT OR Apache-2.0; the upstream notice sits beside
 //! the remaining vendored copy in `vendor/texture2ddecoder`.
 //!
@@ -416,9 +419,14 @@ fn select_color_hdr(v0: i32, v1: i32, weight: i32) -> u8 {
     }
 }
 
+// The HDR void-extent conversion. The C++ original rounds here too, with the
+// same `f32_to_u8` it uses for interpolated HDR texels; the port truncated
+// with `floor`, which put every void-extent channel whose scaled value has a
+// fraction of one half or more one step low. Adding a half before flooring
+// matches `select_color_hdr` above.
 #[inline]
 fn f32_to_u8(f: f32) -> u8 {
-    floor(f * 255.0).clamp(0.0, 255.0) as u8
+    floor(f * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }
 
 #[inline]
@@ -1319,6 +1327,12 @@ fn decode_endpoints_hdr11(endpoints: &mut [i32], v: &[i32], alpha1: i32, alpha2:
     }
 }
 
+/// Sign-extends the low `bits` bits of `value`.
+///
+/// The C++ original keeps the HDR RGB endpoint deltas in an `int16_t` and
+/// sign-extends them with `|= 0xff80`; in the `i32` of the port that mask
+/// turned every negative delta into a large positive one. The
+/// `astc-hdr-glow-*` fixtures pin the corrected result against `astcenc`.
 fn sign_extend(value: i32, bits: u32) -> i32 {
     let shift = i32::BITS - bits;
     (value << shift) >> shift
