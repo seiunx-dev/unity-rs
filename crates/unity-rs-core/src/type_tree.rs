@@ -501,7 +501,10 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 TypeValue::Unsigned(u64::from(self.reader.read_u8()?)),
                 index + 1,
             ),
-            ValueKind::Character => (TypeValue::Character(self.reader.read_u16()?), index + 1),
+            ValueKind::Character => (
+                TypeValue::Character(self.read_character(node.byte_size)?),
+                index + 1,
+            ),
             ValueKind::Unsigned16 => (
                 TypeValue::Unsigned(u64::from(self.reader.read_u16()?)),
                 index + 1,
@@ -656,7 +659,11 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 self.reader.read_u8()?;
                 index + 1
             }
-            ValueKind::Character | ValueKind::Unsigned16 => {
+            ValueKind::Character => {
+                self.read_character(node.byte_size)?;
+                index + 1
+            }
+            ValueKind::Unsigned16 => {
                 self.reader.read_u16()?;
                 index + 1
             }
@@ -1174,6 +1181,24 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         Ok(value)
     }
 
+    /// Reads one `char` at the width its node declares.
+    ///
+    /// Unity's own trees give `char` a byte size of 1: it is the element of
+    /// `string` and of byte vectors such as `Font.m_FontData`, and reading it
+    /// as two bytes runs such a vector past the end of its object. A two-byte
+    /// `char` is one UTF-16 unit. A node that states no size (-1, the default
+    /// for caller-supplied schemas) keeps the two-byte read the managed reader
+    /// applies to every `char`.
+    fn read_character(&mut self, byte_size: i32) -> Result<u16> {
+        match byte_size {
+            1 => Ok(u16::from(self.reader.read_u8()?)),
+            2 | -1 => self.reader.read_u16(),
+            other => Err(Error::invalid_data(format!(
+                "type tree char node declares {other} bytes, expected 1 or 2"
+            ))),
+        }
+    }
+
     fn clone_field_name(&mut self, value: &str) -> Result<String> {
         self.charge_materialized(value.len(), "type tree field-name bytes")?;
         let mut output = String::new();
@@ -1481,6 +1506,7 @@ pub fn validate_tree_shape(nodes: &[TypeTreeNode]) -> Result<()> {
 mod tests {
     use std::io::Cursor;
 
+    use crate::Error;
     use crate::endian::{Endian, EndianReader};
     use crate::serialized::{SerializedType, TypeTree, TypeTreeNode};
 
@@ -1739,6 +1765,157 @@ mod tests {
         assert_eq!(entries[0].value, TypeValue::Unsigned(2));
         assert_eq!(entries[1].key, TypeValue::Signed(3));
         assert_eq!(entries[1].value, TypeValue::Unsigned(4));
+    }
+
+    /// `Font.m_FontData` is a `vector<char>` whose element node has a byte size
+    /// of 1, like every `char` node in the engine class trees. Reading each
+    /// element as two bytes consumed twice the payload and ran off the end of
+    /// the object, on both the full read and the skip path a root-field
+    /// projection takes.
+    #[test]
+    fn reads_a_char_vector_at_the_element_byte_size() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0, false),
+                node("vector", "m_FontData", 1, true),
+                node("Array", "Array", 2, false),
+                node("SInt32", "size", 3, false),
+                TypeTreeNode {
+                    byte_size: 1,
+                    ..node("char", "data", 3, false)
+                },
+                node("int", "m_Trailing", 1, false),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5_i32.to_le_bytes());
+        bytes.extend_from_slice(&[0x00, 0x41, 0x7f, 0x80, 0xff]);
+        bytes.extend_from_slice(&[0; 3]);
+        bytes.extend_from_slice(&9_i32.to_le_bytes());
+
+        let value = read_type_tree_from_reader(
+            &tree,
+            EndianReader::new(Cursor::new(bytes.clone()), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            TypeValue::Object(vec![
+                TypeField {
+                    name: "m_FontData".to_owned(),
+                    value: TypeValue::Array(
+                        [0x00, 0x41, 0x7f, 0x80, 0xff]
+                            .into_iter()
+                            .map(TypeValue::Character)
+                            .collect()
+                    ),
+                },
+                TypeField {
+                    name: "m_Trailing".to_owned(),
+                    value: TypeValue::Signed(9),
+                },
+            ])
+        );
+
+        let projected = read_type_tree_root_field_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            &[],
+            "m_Trailing",
+        )
+        .unwrap();
+        assert_eq!(projected, Some(TypeValue::Signed(9)));
+    }
+
+    #[test]
+    fn reads_a_two_byte_or_unsized_char_as_one_utf16_unit() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0, false),
+                TypeTreeNode {
+                    byte_size: 2,
+                    ..node("char", "m_Wide", 1, false)
+                },
+                node("char", "m_Unsized", 1, false),
+                node("int", "m_Trailing", 1, false),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4e2d_u16.to_le_bytes());
+        bytes.extend_from_slice(&0x00e9_u16.to_le_bytes());
+        bytes.extend_from_slice(&7_i32.to_le_bytes());
+
+        let value = read_type_tree_from_reader(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            TypeValue::Object(vec![
+                TypeField {
+                    name: "m_Wide".to_owned(),
+                    value: TypeValue::Character(0x4e2d),
+                },
+                TypeField {
+                    name: "m_Unsized".to_owned(),
+                    value: TypeValue::Character(0x00e9),
+                },
+                TypeField {
+                    name: "m_Trailing".to_owned(),
+                    value: TypeValue::Signed(7),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_a_char_node_with_an_unexpected_byte_size() {
+        let tree = TypeTree {
+            nodes: vec![
+                node("Root", "Base", 0, false),
+                TypeTreeNode {
+                    byte_size: 4,
+                    ..node("char", "m_Value", 1, false)
+                },
+            ],
+            string_buffer: Vec::new(),
+        };
+        let bytes = 0x41_u32.to_le_bytes().to_vec();
+
+        let error = read_type_tree_from_reader(
+            &tree,
+            EndianReader::new(Cursor::new(bytes.clone()), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidData(message) if message.contains("declares 4 bytes")),
+            "{error:?}"
+        );
+
+        let error = read_type_tree_root_field_from_reader_with_reference_types(
+            &tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            &[],
+            "m_Other",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidData(message) if message.contains("declares 4 bytes")),
+            "{error:?}"
+        );
     }
 
     #[test]
