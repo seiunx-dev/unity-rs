@@ -935,13 +935,26 @@ impl StudioObject<'_> {
 
     /// Converts one Unity `Shader` to the bounded textual payload produced by
     /// `AssetStudio`'s managed shader converter.
+    ///
+    /// Every parse budget other than the output cap uses
+    /// [`ShaderReadLimits::default`]; use
+    /// [`read_shader_text_with_limits`](Self::read_shader_text_with_limits)
+    /// to select them explicitly.
     pub fn read_shader_text(&self, maximum_output_bytes: u64) -> Result<Vec<u8>> {
-        let limits = ShaderReadLimits {
+        self.read_shader_text_with_limits(ShaderReadLimits {
             maximum_output_bytes,
             ..ShaderReadLimits::default()
-        };
+        })
+    }
+
+    /// Converts one Unity `Shader` like
+    /// [`read_shader_text`](Self::read_shader_text), with every string, array,
+    /// blob, decompression, program-code and output budget chosen by the
+    /// caller. Exceeding any budget returns the same limit error as the
+    /// default path; the limits are never raised implicitly.
+    pub fn read_shader_text_with_limits(&self, limits: ShaderReadLimits) -> Result<Vec<u8>> {
         read_shader(&self.loaded().file, self.object_index, limits)?
-            .read_to_vec(maximum_output_bytes)
+            .read_to_vec(limits.maximum_output_bytes)
     }
 
     /// Streams one resident or collection-backed Unity `Mesh` using the managed-compatible OBJ

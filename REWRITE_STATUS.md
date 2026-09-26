@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-08-28（Asia/Shanghai）
+最后更新：2026-09-26（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -916,6 +916,16 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   连续色调 23.2→21.9 ms、精灵抠图 9.3→8.3 ms（滤波增量分别 -18%/-24%），五种
   压缩×滤波配置输出字节逐一比对不变（FNV 哈希回归锚）。default/best 档无感知——
   耗时由 flate2 主导。纯性能变更，API 面与输出字节均无变化；
+- **Shader 解析预算改由 Rust 调用方显式选择（2026-09-26，0.5.2）**：下游导出一个真实
+  Unity 6000.3 URP shader 时，`StudioObject::read_shader_text` 命中默认的数组元素总量预算
+  （`Shader arrays total 4010378 elements, exceeding limit 4000000`），而该入口只允许调整
+  输出上限。默认预算**不放宽**；Core 新增 `StudioObject::read_shader_text_with_limits`，
+  由调用方传入完整的 `ShaderReadLimits`（与 Mesh/Avatar 等 `*ReadLimits` 一样不另设取值
+  校验，过小的预算自然以同一限制错误拒绝），超限仍返回同一错误族与原文消息；
+  `read_shader_text` 改为委托该入口，行为逐字节不变。合成 5.4 fixture（五个程序共
+  4,500,005 个数组元素，单个数组均低于 1,000,000）覆盖三个方向：默认路径以原消息拒绝、
+  调高总量预算后完整转换、更低预算更早拒绝。Python `read_shader` 与 Node `readShader`
+  保持只接受输出上限的契约，新方法在两份 API 面审计中登记为 Rust-only；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

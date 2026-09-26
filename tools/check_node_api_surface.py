@@ -166,6 +166,11 @@ INTENTIONAL_RUST_ONLY = {
         "returns a borrowed Rust StudioObject; Node reads use the stable "
         "file/path key and expose objectIndex as metadata"
     ),
+    "StudioObject.read_shader_text_with_limits": (
+        "tunes every ShaderReadLimits parse budget for Rust callers; "
+        "Node keeps the output-capped readShader(maximumBytes) contract, "
+        "which maps to read_shader_text with the default parse budgets"
+    ),
 }
 
 MAPPED_OBJECTS = ("FileInfo", "ObjectInfo", "ResourceInfo")
