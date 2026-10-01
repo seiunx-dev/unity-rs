@@ -119,6 +119,7 @@ sure no build artifacts or unrelated user changes are included.
 - Never add a free-form `Agent:` line.
 - Never rewrite history, amend others' commits, force-push, publish, release,
   tag, or merge without explicit authorization.
-- Follow the standardized `CI`, `Release`, and `Docker` workflow rules in
-  `AGENTS.md`, including action versions, permissions, triggers, concurrency,
-  and canonical filenames. Preserve intentionally package-specific workflows.
+- Follow the workflow rules in `AGENTS.md`: `ci.yml` and `release.yml` are thin
+  callers of the shared `seiunx-dev/ci-templates` (`@v1`); reuse the templates
+  first and customize in the caller only when they cannot meet a need, with a
+  comment saying why. Keep `tools/check_ci_matrix.py` in step with the workflows.
