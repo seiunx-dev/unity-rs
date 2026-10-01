@@ -292,8 +292,8 @@ written in the caller with a comment saying why.
     (local-CI policy, Python/Node API surface, `check_ci_matrix.py`), warning-free
     rustdoc, `cargo package -p unity-rs-core` + `check_core_package.py`, the
     third-party license bundle and the delivery-scope audit.
-  - `Rust (Windows)` / `Rust (macOS)` (`rust-ci`): clippy and the workspace tests on
-    the other two desktop OSes.
+  - `Rust (Windows)` / `Rust (macOS)` (`rust-ci`, `lint: false`): the workspace tests
+    on the other two desktop OSes.
   - `cargo audit` (RustSec, `--deny unsound --deny yanked`), `Node-API` (debug addon,
     API/type tests and package checks on three OSes).
   - `Python wheels` (`maturin-wheels`): the abi3 wheel built in the manylinux_2_28
