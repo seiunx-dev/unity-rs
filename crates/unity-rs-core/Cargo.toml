@@ -17,7 +17,7 @@ image-webp = { version = "0.2.4", default-features = false }
 jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }
 lewton = { version = "0.10.2", default-features = false }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
-lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std"] }
+lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std"] }
 qoi = { version = "0.4.1", default-features = false, features = ["std"] }
 ruopus = { version = "0.1.2", default-features = false, features = ["std"] }
 serde = "1.0.229"
@@ -31,7 +31,7 @@ zstd = { version = "0.13.3", default-features = false }
 # The shipped library only decodes LZMA, so the encoder feature is off above.
 # Building the differential's LZMA block fixtures needs it; it adds no
 # dependency of its own and never reaches a consumer of the published crate.
-lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "encoder"] }
+lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "encoder"] }
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 
 [lints]
