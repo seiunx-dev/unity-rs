@@ -279,40 +279,71 @@ Examples from this repository's history:
 
 ## GitHub Actions workflows
 
-Use the standardized workflow layout in `.github/workflows`:
+CI reuses the shared templates in
+[`seiunx-dev/ci-templates`](https://github.com/seiunx-dev/ci-templates) at `@v1`.
+The files in `.github/workflows` are thin callers; jobs that no template covers are
+written in the caller with a comment saying why.
 
-- `ci.yml` runs on `main` pushes, pull requests targeting `main`, and manual
-  dispatch.
-- Rust CI order: `cargo fmt --all -- --check`,
-  `cargo check --locked --all-targets`,
-  `cargo clippy --locked --all-targets -- -D warnings`, then
-  `cargo test --locked`.
-- `release.yml` is the standard release build entrypoint. It runs on `v*` tags
-  and manual dispatch, builds release artifacts, uploads them with
-  `actions/upload-artifact`, and publishes GitHub Release assets on tag pushes.
-- `docker.yml` is the standard Docker entrypoint. It runs on `main` pushes,
-  `v*` tags, pull requests that touch Docker/build inputs, and manual dispatch.
-  Pull requests build only; non-pull-request runs push GHCR images with
-  lowercase image names and Docker metadata tags.
+- `ci.yml` (`CI`) runs on `main` pushes, pull requests targeting `main`, and manual
+  dispatch:
+  - `Rust` (`rust-ci`, toolchain from `rust-toolchain.toml` = MSRV 1.88): fmt, clippy
+    `--workspace --all-targets -D warnings`, the workspace tests once under
+    `cargo llvm-cov`, and, in the lint job, the structural audits and their self-tests
+    (local-CI policy, Python/Node API surface, `check_ci_matrix.py`), warning-free
+    rustdoc, `cargo package -p unity-rs-core` + `check_core_package.py`, the
+    third-party license bundle and the delivery-scope audit.
+  - `Rust (Windows)` / `Rust (macOS)` (`rust-ci`): clippy and the workspace tests on
+    the other two desktop OSes.
+  - `cargo audit` (RustSec, `--deny unsound --deny yanked`), `Node-API` (debug addon,
+    API/type tests and package checks on three OSes).
+  - `Python wheels` (`maturin-wheels`): the abi3 wheel built in the manylinux_2_28
+    container on Linux, installed into Python 3.14 and run through
+    `tests/installed_wheel.py` and `tests/python_api.py`. Pull requests build
+    linux-x64 and macos-arm64; `main` and dispatch runs build all six platforms.
+  - `Python 3.9 floor and sdist`: the floor wheel with both suites, the strict mypy
+    consumer, and the source distribution (contents check, a wheel rebuilt from it
+    and both suites against that wheel).
+  - `Differential oracles` (`scripts/ci/run-oracles.sh`: AssetStudio/.NET, vgmstream,
+    UnityPy on one build), `Python tool coverage`, `Sonar` (skipped green on
+    Dependabot/fork PRs), `Workflow lint` (actionlint).
+- The aggregate job **`CI OK`** is the only required status check.
+- `release.yml` (`Release`) replaces the tag-triggered half of the old `ci.yml` and
+  the manual `release-crates.yml`. Bump the shared version (workspace
+  `Cargo.toml`, `crates/unity-rs-node/package.json`, generated bindings) in a PR →
+  merge and wait for `CI OK` on `main` → push the tag `v<version>`. `release-gate`
+  refuses a tag that differs from `Cargo.toml` or `package.json` and waits for
+  `CI OK` on the tagged commit; then, in one run:
+  - `CLI binaries` (`rust-release`): `unity-rs-cli-<version>-<label>.tar.gz` / `.zip`
+    for the six platforms, each staged by `tools/stage_cli_artifact.py` (binary,
+    license, notices, third-party licenses at the archive root) and smoke-tested with
+    `--help` before packaging;
+  - `Python wheels` (`maturin-wheels`): six abi3 wheels with the same tests as CI,
+    plus the sdist; `Python distribution set` checks there are six wheels and one
+    sdist carrying the version;
+  - `Node package`: release addon, tests, package checks and `npm pack`, published as
+    `unity-rs-node-<version>-<label>.tgz`;
+  - PyPI (trusted publishing, workflow `release.yml`, environment `pypi`), crates.io
+    (`unity-rs-core` then `unity-rs-cli`, environment `crates-io`,
+    `CARGO_REGISTRY_TOKEN`), and the GitHub Release with the CLI archives, the Node
+    packages and `SHA256SUMS-<tag>.txt`.
+  Manual dispatch is a dry run: it builds and checks every artifact and publishes
+  nothing. See `docs/releasing.md`.
 
 Workflow maintenance rules:
 
-- Keep workflow filenames and top-level names aligned: `CI`, `Release`,
-  `Docker`, and optional package-specific names.
-- Use `actions/checkout@v6`, `actions/setup-go@v6`,
-  `actions/upload-artifact@v7`, `actions/download-artifact@v8`,
-  `softprops/action-gh-release@v3`, and current Docker actions
-  (`setup-buildx@v4`, `login@v4`, `metadata@v6`, `build-push@v7`).
-- Keep `permissions` minimal: `contents: read` for CI/Docker build-only work,
-  `contents: write` for release publishing, and `packages: write` only when
-  pushing container images.
-- Use workflow `concurrency` keyed by workflow name and ref, with release jobs
-  using `release-${{ github.ref_name }}` and `cancel-in-progress: false`.
-- Do not reintroduce legacy workflow names such as `rust-ci.yml`, `build.yml`,
-  `release-build.yml`, `docker-build.yml`, or `docker-release.yml` unless a
-  package-specific workflow already exists and is intentionally preserved.
-- Workflow moves must be atomic with their structural audits. In particular,
-  update `tools/check_ci_matrix.py`, `tools/test_ci_matrix.py`, local-CI
-  orchestration, artifact paths, and documentation whenever release jobs move
-  between workflow files. Do not add a placeholder `docker.yml` when the
-  repository has no Docker build input.
+- Use the shared templates first. Add custom jobs or steps only when a template
+  genuinely cannot meet the project's needs, keep them in the thin caller files, and
+  add a comment explaining why.
+- Template bugs and missing features are fixed upstream in `seiunx-dev/ci-templates`
+  (new `v1.x.y` tag), not worked around here.
+- Workflow moves must be atomic with their structural audits: update
+  `tools/check_ci_matrix.py`, `tools/test_ci_matrix.py`, local-CI orchestration,
+  artifact paths, and documentation whenever a job, target or artifact changes.
+- Keep top-level `permissions: contents: read`; grant `contents: write` /
+  `id-token: write` only on the job that needs it.
+- Do not set `*.reportPaths` in `sonar-project.properties` and do not suppress
+  `githubactions:S7637` there: the template's `sonar.yml` passes the report paths and
+  ignores S7637 for the `@v1` references.
+- Third-party actions in caller-side custom steps are pinned to a full commit SHA with a
+  `# vX.Y.Z` comment; Dependabot (`github-actions`) updates them and the template refs.
+- Do not add a placeholder `docker.yml`: the repository has no Docker build input.

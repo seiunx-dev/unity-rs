@@ -2,708 +2,243 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# PRs: one group per PR, newer pushes cancel older runs. Everything else: one group per
+# event and commit, so a queued main run is never replaced by a newer one (every commit keeps
+# its "CI OK" for the release gate).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_LLVM_COV_VERSION: "0.9.0"
-  COVERAGE_VERSION: "7.15.4"
-  MATURIN_VERSION: "1.13.3"
-  MYPY_VERSION: "1.18.2"
-  UNITYPY_VERSION: "1.25.0"
-  VGMSTREAM_VERSION: "r2117"
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  sonarqube:
-    name: SonarQube
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+  rust:
+    name: Rust
+    uses: seiunx-dev/ci-templates/.github/workflows/rust-ci.yml@v1
+    with:
+      coverage: true # toolchain 1.88.0 from rust-toolchain.toml (= MSRV)
+      env: RUSTDOCFLAGS=-D warnings
+      # The repository's structural audits and their self-tests run with the lint job.
+      extra-lint-command: |
+        python3 tools/test_local_ci.py
+        python3 tools/check_python_api_surface.py
+        python3 tools/test_python_api_surface.py
+        python3 tools/check_node_api_surface.py
+        python3 tools/test_node_api_surface.py
+        python3 tools/check_ci_matrix.py
+        python3 tools/test_ci_matrix.py
+        cargo doc --workspace --no-deps --locked
+        rm -rf target/package
+        cargo package --locked -p unity-rs-core
+        python3 tools/generate_dependency_licenses.py --check
+        python3 tools/check_delivery_scope.py
+        python3 tools/test_delivery_scope.py
+        python3 tools/check_core_package.py
+
+  rust-windows:
+    name: Rust (Windows)
+    uses: seiunx-dev/ci-templates/.github/workflows/rust-ci.yml@v1
+    with:
+      runs-on: windows-latest
+      cache-key-prefix: rust-windows
+      fmt: false
+
+  rust-macos:
+    name: Rust (macOS)
+    uses: seiunx-dev/ci-templates/.github/workflows/rust-ci.yml@v1
+    with:
+      runs-on: macos-latest
+      cache-key-prefix: rust-macos
+      fmt: false
+
+  # Not in rust-ci: RustSec audit of the lock file, with a prebuilt cargo-audit.
+  audit:
+    name: cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Check out repository with full history
-        uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
-      - name: Install Rust 1.88 with coverage tools
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal --component llvm-tools-preview
-          rustup override set 1.88.0
-      - name: Cache the Rust coverage driver
-        uses: actions/cache@v5
+          persist-credentials: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          path: ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-llvm-cov-${{ env.CARGO_LLVM_COV_VERSION }}-${{ runner.os }}
-      - name: Install pinned coverage tools
-        run: |
-          if [ ! -x "$HOME/.cargo/bin/cargo-llvm-cov" ]; then
-            cargo install cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}" --locked
-          fi
-          python3 -m pip install "coverage==${COVERAGE_VERSION}"
-      - name: Generate Rust coverage
-        run: cargo llvm-cov --workspace --locked --lcov --output-path target/sonar-rust.lcov
-      - name: Generate Python tool coverage
-        run: |
-          python3 -m coverage erase
-          python3 -m coverage run tools/test_ci_matrix.py
-          for test in \
-            tools/test_delivery_scope.py \
-            tools/test_decode_astc_references.py \
-            tools/test_extracted_corpus_diff.py \
-            tools/test_local_ci.py \
-            tools/test_node_api_surface.py \
-            tools/test_python_api_surface.py \
-            tools/test_validate_fbx_ascii.py \
-            tools/test_validate_fbx_binary.py \
-            tools/test_validate_png_output.py
-          do
-            python3 -m coverage run --append "$test"
-          done
-          python3 -m coverage xml -o target/sonar-python-coverage.xml
-      - name: Run SonarQube Cloud analysis
-        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          tool: cargo-audit@0.22.2
+      - run: cargo audit --file Cargo.lock --deny unsound --deny yanked
 
-  quality:
-    name: Format and lint (Rust 1.88)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      # Lint, doc and package builds on the fixed Ubuntu runner.
-      - name: Cache build artifacts
-        uses: actions/cache@v5
-        with:
-          path: target/
-          key: cargo-target-quality-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-target-quality-
-      - name: Install minimum Rust toolchain
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-          rustup override set 1.88.0
-      - name: Cache the locked RustSec auditor
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/bin/cargo-audit
-          key: cargo-audit-0.22.2-${{ runner.os }}
-      - name: Install locked RustSec auditor
-        # The cache key pins the version, so a restored binary is already the
-        # right one; cargo install refuses to overwrite it rather than
-        # no-op, hence the existence guard.
-        run: |
-          if [ ! -x "$HOME/.cargo/bin/cargo-audit" ]; then
-            cargo install cargo-audit --version 0.22.2 --locked --no-default-features
-          fi
-      - name: Audit locked Rust dependencies
-        run: cargo audit --file Cargo.lock --deny unsound --deny yanked
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Test the local CI completion policy
-        run: python3 tools/test_local_ci.py
-      - name: Verify Python API surface coverage
-        run: python3 tools/check_python_api_surface.py
-      - name: Test the Python API surface audit
-        run: python3 tools/test_python_api_surface.py
-      - name: Verify Node API surface coverage
-        run: python3 tools/check_node_api_surface.py
-      - name: Test the Node API surface audit
-        run: python3 tools/test_node_api_surface.py
-      - name: Verify six-platform release matrices
-        run: python3 tools/check_ci_matrix.py
-      - name: Test the release-matrix audit
-        run: python3 tools/test_ci_matrix.py
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Build warning-free Rust API documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --locked
-      - name: Verify publishable Rust core crate
-        # The restored target/ cache can carry the previous version's
-        # .crate archive; the legal-files audit and the tag-run upload must
-        # only ever see the archive this run produced.
-        run: |
-          rm -rf target/package
-          cargo package --locked -p unity-rs-core
-      - name: Verify locked third-party license bundle
-        run: python3 tools/generate_dependency_licenses.py --check
-      - name: Verify headless delivery scope
-        run: python3 tools/check_delivery_scope.py
-      - name: Test the headless delivery-scope audit
-        run: python3 tools/test_delivery_scope.py
-      - name: Verify Core crate legal files
-        run: python3 tools/check_core_package.py
-      - name: Upload Rust core crate
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7
-        with:
-          name: unity-rs-core-crate
-          path: target/package/unity-rs-core-*.crate
-          if-no-files-found: error
-
-  test:
-    name: Test on ${{ matrix.os }} (Rust 1.88)
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      # Workspace debug test builds per OS.
-      - name: Cache build artifacts
-        uses: actions/cache@v5
-        with:
-          path: target/
-          key: cargo-target-test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-target-test-${{ runner.os }}-
-      - name: Install minimum Rust toolchain
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-          rustup override set 1.88.0
-      - name: Build Rust workspace
-        run: cargo build --workspace --locked
-      - name: Run workspace tests
-        # The PyO3 cdylib is exercised by the installed-wheel job below. On
-        # macOS, forcing a cdylib test harness with --all-targets bypasses the
-        # extension module loader and cannot resolve Python's framework rpath.
-        run: cargo test --workspace --locked
-
+  # No template builds a napi-rs addon: debug addon, API/type tests and the package checks
+  # on the three desktop OSes.
   node:
-    name: Node-API binding (${{ matrix.os }})
+    name: Node-API (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+        os: [ubuntu-latest, windows-latest, macos-latest]
     defaults:
       run:
         working-directory: crates/unity-rs-node
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      # Node-API debug builds per OS.
-      - name: Cache build artifacts
-        uses: actions/cache@v5
+          persist-credentials: false
+      - uses: seiunx-dev/ci-templates/actions/setup-rust@v1
         with:
-          path: target/
-          key: cargo-target-node-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-target-node-${{ runner.os }}-
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-      - name: Install Node.js 24
-        uses: actions/setup-node@v6
+          cache-key: node
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: crates/unity-rs-node/package-lock.json
-      - name: Install locked Node build tooling
-        run: npm ci --ignore-scripts
-      - name: Build the native Node-API addon and TypeScript declarations
-        run: npm run build:debug
-      - name: Run installed-addon API tests
-        run: npm test
-      - name: Verify package contents
-        run: npm run test:package
+      - run: npm ci --ignore-scripts
+      - run: npm run build:debug
+      - run: npm test
+      - run: npm run test:package
 
-  python:
-    name: Python abi3 wheel (${{ matrix.artifact }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The Linux wheels cross-link against the manylinux_2_28 glibc floor
-          # through zig; building directly on the runner would tag them with
-          # its own much newer glibc (observed manylinux_2_35), locking out
-          # RHEL 8/9-era and Ubuntu 20.04-era consumers.
-          - os: ubuntu-latest
-            artifact: linux-x64
-            build_python: "3.9"
-            wheel_compatibility: manylinux_2_28
-            wheel_flags: --zig
-          - os: ubuntu-24.04-arm
-            artifact: linux-arm64
-            build_python: "3.9"
-            wheel_compatibility: manylinux_2_28
-            wheel_flags: --zig
-          - os: windows-latest
-            artifact: windows-x64
-            build_python: "3.9"
-            wheel_compatibility: pypi
-            wheel_flags: ""
-          - os: windows-11-arm
-            artifact: windows-arm64
-            build_python: "3.14"
-            wheel_compatibility: pypi
-            wheel_flags: ""
-          - os: macos-15-intel
-            artifact: macos-x64
-            build_python: "3.9"
-            wheel_compatibility: pypi
-            wheel_flags: ""
-          - os: macos-latest
-            artifact: macos-arm64
-            build_python: "3.9"
-            wheel_compatibility: pypi
-            wheel_flags: ""
+  # The abi3 wheel on every release platform (PRs: two of them), installed into Python 3.14
+  # (abi3 forward compatibility) and run through the installed-wheel and public API suites.
+  wheels:
+    name: Python wheels
+    uses: seiunx-dev/ci-templates/.github/workflows/maturin-wheels.yml@v1
+    with:
+      working-directory: crates/unity-rs-python
+      targets: >-
+        ${{ github.event_name == 'pull_request' && '[{"label":"linux-x64","os":"ubuntu-latest","target":"x86_64","manylinux":"2_28"},{"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]' || '[{"label":"linux-x64","os":"ubuntu-latest","target":"x86_64","manylinux":"2_28"},{"label":"linux-arm64","os":"ubuntu-24.04-arm","target":"aarch64","manylinux":"2_28"},{"label":"windows-x64","os":"windows-latest","target":"x64"},{"label":"windows-arm64","os":"windows-11-arm","target":"aarch64-pc-windows-msvc"},{"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},{"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]' }}
+      python-version: "3.14"
+      sdist: false
+      smoke-import: unity_rs
+      test-command: |
+        python -I tests/installed_wheel.py
+        python -I tests/python_api.py
+
+  # Not in maturin-wheels: the Python 3.9 floor, the source distribution (contents check, a
+  # wheel rebuilt from it and both suites against that wheel) and the strict mypy consumer.
+  python-floor:
+    name: Python 3.9 floor and sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: crates/unity-rs-python
+    env:
+      MATURIN_VERSION: 1.13.3
+      MYPY_VERSION: 1.18.2
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-      - name: Install wheel-build Python
-        id: build-python
-        uses: actions/setup-python@v6
+          persist-credentials: false
+      - uses: seiunx-dev/ci-templates/actions/setup-rust@v1
         with:
-          python-version: ${{ matrix.build_python }}
-      - name: Install wheel builder
-        run: python -m pip install "maturin==${{ env.MATURIN_VERSION }}"
-      - name: Install zig for manylinux cross-linking
-        if: matrix.wheel_flags == '--zig'
-        run: python -m pip install "ziglang==0.15.2"
-      - name: Build release wheel from the locked workspace
-        run: maturin build --release --locked --compatibility ${{ matrix.wheel_compatibility }} ${{ matrix.wheel_flags }} --interpreter "${{ steps.build-python.outputs.python-path }}" --out dist
-      - name: Build and compile-check the Python source distribution
-        if: matrix.artifact == 'linux-x64'
-        # Maturin prunes the workspace inside an sdist to Core + Python. Cargo
-        # must therefore remove the CLI/Node-only entries copied from the root
-        # lock file before it can compile that pruned workspace. The release
-        # wheel above remains the dependency-locked artifact we publish.
-        run: maturin build --release --sdist --compatibility pypi --interpreter "${{ steps.build-python.outputs.python-path }}" --out sdist-dist
-      - name: Verify Python source distribution contents
-        if: matrix.artifact == 'linux-x64'
-        run: python tests/sdist_contents.py sdist-dist
-      - name: Install the wheel rebuilt from the source distribution
-        if: matrix.artifact == 'linux-x64'
-        run: python -c "import glob, subprocess, sys; wheels = glob.glob('sdist-dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
-      - name: Test the wheel rebuilt from the source distribution
-        if: matrix.artifact == 'linux-x64'
+          cache-key: python-floor
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: py
+        with:
+          python-version: "3.9"
+      - run: python -m pip install "maturin==${MATURIN_VERSION}" "mypy==${MYPY_VERSION}"
+      - name: Wheel for the 3.9 floor
         run: |
+          maturin build --release --locked --interpreter "${{ steps.py.outputs.python-path }}" --out dist
+          python -c "import glob, subprocess, sys; w = glob.glob('dist/*.whl'); assert len(w) == 1, w; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', w[0]])"
           python -I tests/installed_wheel.py
           python -I tests/python_api.py
-      - name: Install wheel into the build interpreter
-        run: python -c "import glob, subprocess, sys; wheels = glob.glob('dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
-      - name: Test installed wheel on the build interpreter
-        run: |
-          python -I tests/installed_wheel.py
-          python -I tests/python_api.py
-      - name: Install the Python 3.9-compatible type checker
-        if: matrix.artifact == 'linux-x64'
-        run: python -m pip install "mypy==${{ env.MYPY_VERSION }}"
-      - name: Type-check a strict public API consumer
-        if: matrix.artifact == 'linux-x64'
+      - name: Strict public API consumer
         run: python -m mypy tests/typecheck_api.py
-      - name: Install Python 3.14 for abi3 forward-compatibility
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-      - name: Install the same abi3 wheel into Python 3.14
-        run: python -c "import glob, subprocess, sys; wheels = glob.glob('dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
-      - name: Test installed wheel on Python 3.14
+      # Maturin prunes the workspace inside an sdist to Core + Python; the wheel rebuilt from it
+      # proves that pruned workspace still compiles and passes both suites.
+      - name: Source distribution
         run: |
+          maturin build --release --sdist --compatibility pypi --interpreter "${{ steps.py.outputs.python-path }}" --out sdist-dist
+          python tests/sdist_contents.py sdist-dist
+          python -c "import glob, subprocess, sys; w = glob.glob('sdist-dist/*.whl'); assert len(w) == 1, w; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', w[0]])"
           python -I tests/installed_wheel.py
           python -I tests/python_api.py
-      - name: Upload Python wheel
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7
-        with:
-          name: unity-rs-python-${{ matrix.artifact }}
-          path: crates/unity-rs-python/dist/*.whl
-          if-no-files-found: error
-      - name: Upload Python source distribution
-        if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && matrix.artifact == 'linux-x64'
-        uses: actions/upload-artifact@v7
-        with:
-          name: unity-rs-python-sdist
-          path: crates/unity-rs-python/sdist-dist/*.tar.gz
-          if-no-files-found: error
 
-  managed-oracle:
-    name: Managed-to-Rust differential oracle
+  # The three differential oracles (AssetStudio/.NET, vgmstream, UnityPy) on one shared build.
+  oracles:
+    name: Differential oracles
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       UNITY_RS_ORACLE_REPO: ${{ github.workspace }}/managed-oracle-source
+      VGMSTREAM_VERSION: r2117
+      UNITYPY_VERSION: 1.25.0
+      MATURIN_VERSION: 1.13.3
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      # Shared with the other oracle jobs; see above.
-      - name: Cache build artifacts
-        uses: actions/cache@v5
-        with:
-          path: target/
-          key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-target-oracle-${{ runner.os }}-
-      # The managed reader is the compatibility oracle only; nothing shipped
-      # from this repository depends on it. It is pinned to the revision the
-      # differential was last validated against, so a change over there shows
-      # up as a deliberate bump here rather than as a surprise failure.
-      - name: Check out the managed AssetStudio oracle
-        uses: actions/checkout@v6
+          persist-credentials: false
+      # Pinned to the revision the differential was last validated against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Team-Haruki/AssetStudio
           ref: 5829998bc4c3bdcddc66dd7e77fb4ec557d4321b
           path: managed-oracle-source
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-      - name: Install .NET 10 oracle SDK
-        uses: actions/setup-dotnet@v5
+          persist-credentials: false
+      - uses: seiunx-dev/ci-templates/actions/setup-rust@v1
+        with:
+          cache-key: oracle
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: "10.0.x"
-      - name: Restore managed oracle offline-ready graph
-        run: dotnet restore oracle/AssetStudioOracle.csproj --ignore-failed-sources -p:NuGetAudit=false -p:AssetStudioRepo="$UNITY_RS_ORACLE_REPO"
-      - name: Compare managed and Rust manifests
-        run: cargo +1.88.0 test -p unity-rs-core --test dotnet_oracle --locked -- --ignored --nocapture
-      - name: Verify version-scoped MonoBehaviour schema generation
-        run: python3 tools/test_monoschema.py
-
-  audio-oracle:
-    name: vgmstream audio differential
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      # Shared with the other oracle jobs; see above.
-      - name: Cache build artifacts
-        uses: actions/cache@v5
-        with:
-          path: target/
-          key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-target-oracle-${{ runner.os }}-
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-      # vgmstream is the decoder oracle for the FSB codecs this crate decodes
-      # itself. Pinned to a release rather than tracking latest, so a change in
-      # its output shows up as a deliberate bump here.
-      - name: Install the vgmstream decoder oracle
-        run: |
-          curl --proto '=https' --proto-redir '=https' -fsSL -o vgmstream.zip \
-            https://github.com/vgmstream/vgmstream/releases/download/${{ env.VGMSTREAM_VERSION }}/vgmstream-linux.zip
-          mkdir -p "$HOME/.local/bin"
-          unzip -j vgmstream.zip vgmstream-cli -d "$HOME/.local/bin"
-          chmod +x "$HOME/.local/bin/vgmstream-cli"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Verify the oracle runs
-        # vgmstream uses exit 1 for both of its successful information modes.
-        # Parse the pinned version output instead of treating that documented
-        # status as an execution failure or hiding arbitrary errors with `|| true`.
-        run: python3 -c "import json, os, subprocess; result = subprocess.run(['vgmstream-cli', '-V'], check=False, capture_output=True, text=True); assert result.returncode == 1, result; assert json.loads(result.stdout)['version'] == os.environ['VGMSTREAM_VERSION']"
-      - name: Compare decoded PCM against vgmstream
-        run: cargo +1.88.0 test -p unity-rs-core --lib --locked -- --ignored
-
-  unitypy-oracle:
-    name: UnityPy differential oracle
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/unity-rs-python
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      # The three oracle jobs share one artifact cache: they compile near-identical core test builds, and only the first finisher saves.
-      - name: Cache build artifacts
-        uses: actions/cache@v5
-        with:
-          path: target/
-          key: cargo-target-oracle-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-target-oracle-${{ runner.os }}-
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-      - name: Install Python
-        id: build-python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install the wheel builder and the reference implementation
-        run: python -m pip install "maturin==${{ env.MATURIN_VERSION }}" "UnityPy==${{ env.UNITYPY_VERSION }}"
-      - name: Build and install this package
-        run: |
-          maturin build --release --locked --interpreter "${{ steps.build-python.outputs.python-path }}" --out dist
-          python -c "import glob, subprocess, sys; wheels = glob.glob('dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', wheels[0]])"
-      - name: Compare against UnityPy
-        run: python -I tests/unitypy_oracle.py
+      - run: ./scripts/ci/run-oracles.sh
 
-  package-cli:
-    name: Native CLI artifact (${{ matrix.artifact }})
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs:
-      - quality
-      - test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact: linux-x64
-            binary: target/release/unity-rs
-            smoke: ./target/release/artifact/unity-rs --help
-          - os: ubuntu-24.04-arm
-            artifact: linux-arm64
-            binary: target/release/unity-rs
-            smoke: ./target/release/artifact/unity-rs --help
-          - os: windows-latest
-            artifact: windows-x64
-            binary: target/release/unity-rs.exe
-            smoke: .\target\release\artifact\unity-rs.exe --help
-          - os: windows-11-arm
-            artifact: windows-arm64
-            binary: target/release/unity-rs.exe
-            smoke: .\target\release\artifact\unity-rs.exe --help
-          - os: macos-15-intel
-            artifact: macos-x64
-            binary: target/release/unity-rs
-            smoke: ./target/release/artifact/unity-rs --help
-          - os: macos-latest
-            artifact: macos-arm64
-            binary: target/release/unity-rs
-            smoke: ./target/release/artifact/unity-rs --help
+  # Coverage of the Python tooling under tools/ for Sonar (rust-ci only measures Rust).
+  tools:
+    name: Python tool coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-      - name: Install artifact staging Python
-        uses: actions/setup-python@v6
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Build release CLI
-        run: cargo +1.88.0 build --release --locked -p unity-rs-cli
-      - name: Stage binary with license and notices
-        run: python tools/stage_cli_artifact.py "${{ matrix.binary }}" target/release/artifact
-      - name: Smoke-test the staged CLI artifact
-        run: ${{ matrix.smoke }}
-      - name: Upload native CLI
-        uses: actions/upload-artifact@v7
+      - run: |
+          python -m pip install coverage==7.15.4
+          python -m coverage erase
+          for test in tools/test_ci_matrix.py tools/test_delivery_scope.py \
+                      tools/test_decode_astc_references.py tools/test_extracted_corpus_diff.py \
+                      tools/test_local_ci.py tools/test_node_api_surface.py \
+                      tools/test_python_api_surface.py tools/test_validate_fbx_ascii.py \
+                      tools/test_validate_fbx_binary.py tools/test_validate_png_output.py; do
+            python -m coverage run --append "$test"
+          done
+          python -m coverage xml -o coverage/python.xml
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: unity-rs-cli-${{ matrix.artifact }}
-          path: target/release/artifact
-          if-no-files-found: error
+          name: coverage-python
+          path: coverage/
+          retention-days: 3
 
-  package-node:
-    name: Node package artifact (${{ matrix.artifact }})
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs:
-      - quality
-      - test
-      - node
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact: linux-x64
-          - os: ubuntu-24.04-arm
-            artifact: linux-arm64
-          - os: windows-latest
-            artifact: windows-x64
-          - os: windows-11-arm
-            artifact: windows-arm64
-          - os: macos-15-intel
-            artifact: macos-x64
-          - os: macos-latest
-            artifact: macos-arm64
-    defaults:
-      run:
-        working-directory: crates/unity-rs-node
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Cache the cargo registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
-      - name: Install minimum Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
-      - name: Install Node.js 24
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: crates/unity-rs-node/package-lock.json
-      - name: Install locked Node build tooling
-        run: npm ci --ignore-scripts
-      - name: Build release Node-API addon
-        run: npm run build
-      - name: Test the exact release addon
-        run: npm test
-      - name: Verify package contents
-        run: npm run test:package
-      - name: Build platform package
-        run: npm pack
-      - name: Upload Node package
-        uses: actions/upload-artifact@v7
-        with:
-          name: unity-rs-node-${{ matrix.artifact }}
-          path: crates/unity-rs-node/*.tgz
-          if-no-files-found: error
+  sonar:
+    name: Sonar
+    needs: [rust, tools]
+    uses: seiunx-dev/ci-templates/.github/workflows/sonar.yml@v1
+    with:
+      project-version: auto
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-  publish-python:
-    name: Publish Python package to PyPI
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - quality
-      - test
-      - node
-      - python
-      - managed-oracle
-      - audio-oracle
-      - unitypy-oracle
-      - package-cli
-      - package-node
+  workflows:
+    name: Workflow lint
+    uses: seiunx-dev/ci-templates/.github/workflows/actionlint.yml@v1
+
+  ci-ok:
+    name: CI OK # the only required status check
+    if: always()
+    needs: [rust, rust-windows, rust-macos, audit, node, wheels, python-floor, oracles, tools, sonar, workflows]
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/unity-rs
-    permissions:
-      contents: read
-      id-token: write
+    timeout-minutes: 5
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Download tested Python distributions
-        uses: actions/download-artifact@v8
-        with:
-          pattern: unity-rs-python-*
-          path: dist
-          merge-multiple: true
-
-      - name: Validate release version and artifact set
-        shell: bash
-        run: |
-          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
-          import pathlib
-          import sys
-          import tomllib
-
-          expected = sys.argv[1]
-          workspace = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-          actual = workspace["workspace"]["package"]["version"]
-          if actual != expected:
-              raise SystemExit(
-                  f"release tag version {expected!r} does not match workspace version {actual!r}"
-              )
-
-          distributions = pathlib.Path("dist")
-          wheels = sorted(distributions.glob("*.whl"))
-          sdists = sorted(distributions.glob("*.tar.gz"))
-          if len(wheels) != 6 or len(sdists) != 1:
-              raise SystemExit(
-                  f"expected six wheels and one sdist, found {wheels!r} and {sdists!r}"
-              )
-          normalized = expected.replace("-", "_")
-          unexpected = [
-              path.name
-              for path in [*wheels, *sdists]
-              if normalized not in path.name
-          ]
-          if unexpected:
-              raise SystemExit(
-                  f"release artifacts do not match version {expected!r}: {unexpected!r}"
-              )
-          PY
-
-      - name: Publish distributions with Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-        with:
-          packages-dir: dist/
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
