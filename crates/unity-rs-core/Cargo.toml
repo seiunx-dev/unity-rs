@@ -25,7 +25,7 @@ serde_json = "1.0.151"
 symphonia = { version = "0.6.1", default-features = false, features = ["mpa"] }
 texture2ddecoder = { version = "0.1.2", default-features = false, features = ["alloc"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
-zstd = { version = "0.13.3", default-features = false }
+zstd = { version = "0.14.0", default-features = false }
 
 [dev-dependencies]
 # The shipped library only decodes LZMA, so the encoder feature is off above.
