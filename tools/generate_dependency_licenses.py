@@ -46,16 +46,16 @@ FALLBACKS = {
     ("alloc-stdlib", "0.2.4"): (
         ROOT / "tools" / "legal-fallbacks" / "alloc-stdlib-0.2.4-LICENSE",
     ),
-    ("napi", "3.12.1"): (
+    ("napi", "3.12.2"): (
         ROOT / "tools" / "legal-fallbacks" / "napi-rs-LICENSE",
     ),
-    ("napi-build", "2.4.1"): (
+    ("napi-build", "2.5.0"): (
         ROOT / "tools" / "legal-fallbacks" / "napi-rs-LICENSE",
     ),
-    ("napi-derive", "3.6.3"): (
+    ("napi-derive", "3.6.9"): (
         ROOT / "tools" / "legal-fallbacks" / "napi-rs-LICENSE",
     ),
-    ("napi-derive-backend", "6.1.2"): (
+    ("napi-derive-backend", "6.1.4"): (
         ROOT / "tools" / "legal-fallbacks" / "napi-rs-LICENSE",
     ),
     ("napi-sys", "3.3.0"): (

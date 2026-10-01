@@ -1513,7 +1513,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: convert_case 0.11.0
+Package: convert_case 0.12.0
 License expression: MIT
 Repository: https://github.com/rutrum/convert-case
 
@@ -1541,7 +1541,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-Package: crc32fast 1.5.0
+Package: crc32fast 1.5.2
 License expression: MIT OR Apache-2.0
 Repository: https://github.com/srijs/rust-crc32fast
 
@@ -2669,7 +2669,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: flate2 1.1.9
+Package: flate2 1.1.10
 License expression: MIT OR Apache-2.0
 Repository: https://github.com/rust-lang/flate2-rs
 
@@ -8152,7 +8152,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 
 ==============================================================================
-Package: miniz_oxide 0.8.9
+Package: miniz_oxide 0.9.1
 License expression: MIT OR Zlib OR Apache-2.0
 Repository: https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 
@@ -8405,7 +8405,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 
 ==============================================================================
-Package: napi 3.12.1
+Package: napi 3.12.2
 License expression: MIT
 Repository: https://github.com/napi-rs/napi-rs
 
@@ -8433,7 +8433,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-Package: napi-build 2.4.1
+Package: napi-build 2.5.0
 License expression: MIT
 Repository: https://github.com/napi-rs/napi-rs
 
@@ -8461,7 +8461,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-Package: napi-derive 3.6.3
+Package: napi-derive 3.6.9
 License expression: MIT
 Repository: https://github.com/napi-rs/napi-rs
 
@@ -8489,7 +8489,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-Package: napi-derive-backend 6.1.2
+Package: napi-derive-backend 6.1.4
 License expression: MIT
 Repository: https://github.com/napi-rs/napi-rs
 
@@ -10546,7 +10546,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: pyo3 0.29.0
+Package: pyo3 0.29.2
 License expression: MIT OR Apache-2.0
 Repository: https://github.com/pyo3/pyo3
 
@@ -10758,7 +10758,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: pyo3-build-config 0.29.0
+Package: pyo3-build-config 0.29.2
 License expression: MIT OR Apache-2.0
 Repository: https://github.com/pyo3/pyo3
 
@@ -10970,7 +10970,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: pyo3-ffi 0.29.0
+Package: pyo3-ffi 0.29.2
 License expression: MIT OR Apache-2.0
 Repository: https://github.com/pyo3/pyo3
 
@@ -11182,7 +11182,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: pyo3-macros 0.29.0
+Package: pyo3-macros 0.29.2
 License expression: MIT OR Apache-2.0
 Repository: https://github.com/pyo3/pyo3
 
@@ -11394,7 +11394,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: pyo3-macros-backend 0.29.0
+Package: pyo3-macros-backend 0.29.2
 License expression: MIT OR Apache-2.0
 Repository: https://github.com/pyo3/pyo3
 
