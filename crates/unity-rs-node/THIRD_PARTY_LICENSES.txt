@@ -8405,7 +8405,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 
 ==============================================================================
-Package: napi 3.12.2
+Package: napi 3.13.0
 License expression: MIT
 Repository: https://github.com/napi-rs/napi-rs
 
@@ -8517,7 +8517,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-Package: napi-sys 3.3.0
+Package: napi-sys 3.4.0
 License expression: MIT
 Repository: https://github.com/napi-rs/napi-rs
 
