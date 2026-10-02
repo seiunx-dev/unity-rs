@@ -33,7 +33,7 @@ static inline uint8_t f32_to_u8(const float f) {
 }
 ```
 
-Two ports of that function both lost the rounding, in different ways.
+Three ports of that function lost the rounding, in different ways.
 
 `src/astc.rs`, in `select_color_hdr`:
 
@@ -45,6 +45,13 @@ Two ports of that function both lost the rounding, in different ways.
 
 ```rust
 (f * 255.0).clamp(0.0, 255.0) as u8
+```
+
+`src/astc.rs`, in its own `f32_to_u8`, which converts the half floats of an
+HDR void-extent block:
+
+```rust
+floor(f * 255.0).clamp(0.0, 255.0) as u8
 ```
 
 `as u8` truncates, so the second is `floor` written another way. The LDR ASTC
@@ -81,7 +88,14 @@ LDR formats match the reference exactly while all six HDR ones do not.
 
 Adding a half before flooring is `roundf` for the non-negative values that
 survive the clamp, and avoids `f32::round`, which the crate cannot use in
-`no_std`.
+`no_std`. The void-extent `f32_to_u8` in `src/astc.rs` takes the same half:
+
+```diff
+ fn f32_to_u8(f: f32) -> u8 {
+-    floor(f * 255.0).clamp(0.0, 255.0) as u8
++    floor(f * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+ }
+```
 
 ### Reproduction
 
@@ -110,7 +124,10 @@ decoder with `f32_to_u8` corrected and nothing else changed, so the copy
 diffs cleanly against the published source. The ASTC decoder began the same
 way and has since moved to the maintained first-party fork in
 `crates/unity-rs-core/src/astc.rs`, which keeps the corrected
-`select_color_hdr` rounding. Every other format still comes from the crate.
+`select_color_hdr` rounding and, since 2026-09-26, the same rounding in its
+void-extent `f32_to_u8`, which the first vendoring missed because the
+fixtures then held no void-extent block. Every other format still comes from
+the crate.
 The six HDR ASTC formats and BC6H compare exactly against the managed
 decoder, so the copies are held to the same standard as the rest of the
 texture path rather than trusted because they were copied; the twelve LDR
@@ -364,6 +381,51 @@ Consequently it is not a safe replacement either. The only known replacement
 that passes the existing oracle remains a libopus binding, which would add a
 second native dependency to a crate whose audio decoding is otherwise pure
 Rust.
+
+---
+
+## 5. `texture2ddecoder` 0.1.2 — HDR RGB endpoint deltas lose their sign
+
+**Affects** the six ASTC HDR formats, in blocks that use the HDR RGB endpoint
+modes (11, 14 and 15) with a negative delta.
+
+**Severity** in those blocks the channels the deltas feed decode to the wrong
+value, up to 255 levels off. Alpha is unaffected.
+
+### What is wrong
+
+The C++ original holds the two deltas of `decode_endpoints_hdr11` in an
+`int16_t` and sign-extends them by setting the high bits:
+
+```c
+int16_t vd0, vd1;
+...
+vd0 = v[4] & 0x7f;
+if (vd0 & 0x40)
+    vd0 |= 0xff80;
+```
+
+The port declares them `i32` and keeps the masks (`0xff80`, `0xffc0`,
+`0xffe0`), which in 32 bits set bits 7 to 15 and leave the value positive. A
+delta of -1 becomes 65535, the endpoint that subtracts it clamps to zero, and
+the texels interpolated from it come out dark or with the wrong hue.
+
+### Measurement
+
+Five `ASTC_HDR_6x6` textures from an Android build made with Unity
+6000.3.12f1, decoded by this crate's 0.5.1 release and by `astcenc` 5.7.0
+(`-dH`), differed by more than one level on 3.9% to 9.2% of RGB values, by up
+to 255; alpha was within one. Every such block used endpoint mode 11 or 15.
+The `hdr-glow` fixtures reproduce it: 14% to 16% of RGB values, up to 255.
+
+### Status
+
+Present on `master` as of 2026-09-26; 0.1.2 is the latest release. Not filed.
+
+The first-party fork in `crates/unity-rs-core/src/astc.rs` sign-extends at the
+encoded width (`sign_extend`) since 2026-08-28, after the 0.5.1 release;
+`hdr_astc_decodes_exactly_like_the_khronos_reference` pins it against the
+`hdr-glow` references.
 
 ---
 
