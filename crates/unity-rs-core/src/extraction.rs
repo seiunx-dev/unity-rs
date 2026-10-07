@@ -611,7 +611,7 @@ impl Extractor {
                 bundle.copy_entry_with_cache(index, output, block_cache)
             });
         }
-        let region = Region::from_bytes(bundle.read_entry_with_cache(index, block_cache)?);
+        let region = Region::from_vec(bundle.read_entry_with_cache(index, block_cache)?);
         self.process_detected_region(label, region, desired_path, depth, detection)
     }
 
