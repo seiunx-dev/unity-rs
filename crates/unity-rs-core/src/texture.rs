@@ -2402,6 +2402,17 @@ fn decode_external_compressed_pixels(
         .map_err(|_| Error::invalid_data("Texture2D width is too large for this platform"))?;
     let height = usize::try_from(height)
         .map_err(|_| Error::invalid_data("Texture2D height is too large for this platform"))?;
+    if let Some(block) = format.astc_block_width() {
+        // ASTC writes RGBA8 straight into `output`: no intermediate word
+        // image, and no swizzle pass over it afterwards.
+        let block = usize::try_from(block).expect("ASTC block widths are at most 12");
+        return finish_external_decode(
+            format,
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::astc::decode_astc(input, width, height, block, block, output)
+            })),
+        );
+    }
     let pixel_count = width
         .checked_mul(height)
         .ok_or_else(|| Error::invalid_data("Texture2D decoder pixel count overflowed"))?;
@@ -2450,56 +2461,36 @@ fn decode_external_compressed_pixels(
         TextureFormat::ETC2_RGBA8 | TextureFormat::ETC_RGBA8_3DS => {
             texture2ddecoder::decode_etc2_rgba8(input, width, height, &mut decoded)
         }
-        TextureFormat::ASTC_RGB_4X4
-        | TextureFormat::ASTC_RGBA_4X4
-        | TextureFormat::ASTC_HDR_4X4 => {
-            crate::astc::decode_astc(input, width, height, 4, 4, &mut decoded)
-        }
-        TextureFormat::ASTC_RGB_5X5
-        | TextureFormat::ASTC_RGBA_5X5
-        | TextureFormat::ASTC_HDR_5X5 => {
-            crate::astc::decode_astc(input, width, height, 5, 5, &mut decoded)
-        }
-        TextureFormat::ASTC_RGB_6X6
-        | TextureFormat::ASTC_RGBA_6X6
-        | TextureFormat::ASTC_HDR_6X6 => {
-            crate::astc::decode_astc(input, width, height, 6, 6, &mut decoded)
-        }
-        TextureFormat::ASTC_RGB_8X8
-        | TextureFormat::ASTC_RGBA_8X8
-        | TextureFormat::ASTC_HDR_8X8 => {
-            crate::astc::decode_astc(input, width, height, 8, 8, &mut decoded)
-        }
-        TextureFormat::ASTC_RGB_10X10
-        | TextureFormat::ASTC_RGBA_10X10
-        | TextureFormat::ASTC_HDR_10X10 => {
-            crate::astc::decode_astc(input, width, height, 10, 10, &mut decoded)
-        }
-        TextureFormat::ASTC_RGB_12X12
-        | TextureFormat::ASTC_RGBA_12X12
-        | TextureFormat::ASTC_HDR_12X12 => {
-            crate::astc::decode_astc(input, width, height, 12, 12, &mut decoded)
-        }
         _ => Err("unsupported external texture decoder format"),
-    }))
-    .map_err(|_| {
-        Error::invalid_data(format!(
-            "Texture2D {} decoder rejected a malformed compressed block",
-            format.name().unwrap_or("compressed format")
-        ))
-    })?;
-    decode_result.map_err(|message| {
-        Error::invalid_data(format!(
-            "Texture2D {} decode failed: {message}",
-            format.name().unwrap_or("compressed format")
-        ))
-    })?;
+    }));
+    finish_external_decode(format, decode_result)?;
 
     for (source, destination) in decoded.iter().zip(output.chunks_exact_mut(4)) {
         let [blue, green, red, alpha] = source.to_le_bytes();
         destination.copy_from_slice(&[red, green, blue, alpha]);
     }
     Ok(())
+}
+
+/// Maps a contained decoder panic or a decoder's own rejection to the
+/// `InvalidData` errors every external block decoder reports.
+fn finish_external_decode(
+    format: TextureFormat,
+    result: std::thread::Result<std::result::Result<(), &'static str>>,
+) -> Result<()> {
+    result
+        .map_err(|_| {
+            Error::invalid_data(format!(
+                "Texture2D {} decoder rejected a malformed compressed block",
+                format.name().unwrap_or("compressed format")
+            ))
+        })?
+        .map_err(|message| {
+            Error::invalid_data(format!(
+                "Texture2D {} decode failed: {message}",
+                format.name().unwrap_or("compressed format")
+            ))
+        })
 }
 
 fn decode_crunched_pixels(
@@ -4098,6 +4089,54 @@ mod tests {
                 actual, expected,
                 "{name} no longer matches the astcenc reference decode"
             );
+        }
+    }
+
+    /// ASTC writes RGBA8 straight into the image, clipping edge blocks. A
+    /// surface narrower or shorter than its blocks reuses the same four-block
+    /// payload, so its decode must be exactly the top-left crop of the full
+    /// two-by-two-block decode -- for every footprint and both clip axes.
+    #[test]
+    fn ldr_astc_clips_partial_edge_blocks_to_the_full_decode() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
+        for (block, variant, format) in LDR_ASTC_CASES {
+            let name = format!("astc-{variant}-{block}x{block}");
+            let payload = std::fs::read(directory.join(format!("{name}.bin"))).unwrap();
+            let full_size = block * 2;
+            let full = decode_ldr_astc_fixture(&directory, &name, *block, *format);
+            for (width, height) in [
+                (full_size - 1, full_size),
+                (full_size, block + 1),
+                (block + 1, full_size - 1),
+            ] {
+                let object = texture_object(
+                    i32::try_from(width).unwrap(),
+                    i32::try_from(height).unwrap(),
+                    *format,
+                    1,
+                    &payload,
+                    None,
+                );
+                let file = parse_asset(&object);
+                let collection = collection_with(file.clone(), "unused", b"");
+                let texture =
+                    read_texture2d(&collection, &file, 0, TextureReadLimits::default()).unwrap();
+                let actual = texture
+                    .decode_mip_rgba8(0, TextureReadLimits::default())
+                    .unwrap()
+                    .pixels;
+                let expected: Vec<u8> = full
+                    .chunks_exact(full_size * 4)
+                    .take(height)
+                    .flat_map(|row| &row[..width * 4])
+                    .copied()
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "{name} at {width}x{height} is not the crop of the full decode"
+                );
+            }
         }
     }
 

@@ -56,13 +56,19 @@ use crate::vendor::texture2ddecoder::f16::fp16_ieee_to_fp32_value;
 struct Block {
     bytes: [u8; 16],
     bits: u128,
+    /// `bits` with its bit order reversed. The weight sequence is stored
+    /// from bit 127 downwards; reading it forwards from this word replaces a
+    /// per-chunk byte-table bit reversal.
+    reversed: u128,
 }
 
 impl Block {
     fn new(bytes: [u8; 16]) -> Self {
+        let bits = u128::from_le_bytes(bytes);
         Self {
             bytes,
-            bits: u128::from_le_bytes(bytes),
+            bits,
+            reversed: bits.reverse_bits(),
         }
     }
 }
@@ -100,12 +106,20 @@ fn getbits64(bits: u128, bit: isize, len: usize) -> u64 {
     window & mask
 }
 
+/// Packs one texel so that its little-endian bytes are the RGBA8 the caller
+/// receives. The decoder writes `to_le_bytes()` of these words straight into
+/// the output image, so no whole-image word buffer or swizzle pass exists.
 #[inline]
 const fn color(r: u8, g: u8, b: u8, a: u8) -> u32 {
-    u32::from_le_bytes([b, g, r, a])
+    u32::from_le_bytes([r, g, b, a])
 }
 
-fn copy_block_buffer(
+/// Writes the visible part of one decoded block into the RGBA8 image.
+///
+/// Edge blocks are clipped to the image; `image` holds exactly
+/// `w * h * 4` bytes, checked once by `decode_astc`.
+#[allow(clippy::too_many_arguments)]
+fn copy_block_rgba8(
     bx: usize,
     by: usize,
     w: usize,
@@ -113,18 +127,43 @@ fn copy_block_buffer(
     bw: usize,
     bh: usize,
     buffer: &[u32],
-    image: &mut [u32],
+    image: &mut [u8],
 ) {
     let x = bw * bx;
     let copy_width = if bw * (bx + 1) > w { w - bw * bx } else { bw };
     let y_0 = by * bh;
     let copy_height = if bh * (by + 1) > h { h - y_0 } else { bh };
-    let mut buffer_offset = 0;
-    for y in y_0..y_0 + copy_height {
-        let image_offset = y * w + x;
-        image[image_offset..image_offset + copy_width]
-            .copy_from_slice(&buffer[buffer_offset..buffer_offset + copy_width]);
-        buffer_offset += bw;
+    for (row, y) in (y_0..y_0 + copy_height).enumerate() {
+        let image_offset = (y * w + x) * 4;
+        let destination = &mut image[image_offset..image_offset + copy_width * 4];
+        let source = &buffer[row * bw..row * bw + copy_width];
+        // Dispatching on the footprint widths gives each row copy a constant
+        // length, so it compiles to a few wide moves instead of a `memcpy`
+        // call per 16-48 byte row.
+        match copy_width {
+            4 => copy_row_rgba8::<4>(destination, source),
+            5 => copy_row_rgba8::<5>(destination, source),
+            6 => copy_row_rgba8::<6>(destination, source),
+            8 => copy_row_rgba8::<8>(destination, source),
+            10 => copy_row_rgba8::<10>(destination, source),
+            12 => copy_row_rgba8::<12>(destination, source),
+            _ => copy_row_rgba8_dynamic(destination, source),
+        }
+    }
+}
+
+#[inline(always)]
+fn copy_row_rgba8<const N: usize>(destination: &mut [u8], source: &[u32]) {
+    let destination = &mut destination[..N * 4];
+    let source = &source[..N];
+    for (texel, word) in destination.chunks_exact_mut(4).zip(source) {
+        texel.copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+fn copy_row_rgba8_dynamic(destination: &mut [u8], source: &[u32]) {
+    for (texel, word) in destination.chunks_exact_mut(4).zip(source) {
+        texel.copy_from_slice(&word.to_le_bytes());
     }
 }
 
@@ -171,7 +210,9 @@ fn bit_reverse_u8(c: u8, bits: u8) -> u8 {
     }
 }
 
-#[inline]
+/// The byte-table reversal reversed weight reads used before `Block::reversed`;
+/// kept as the reference the equivalence test checks against.
+#[cfg(test)]
 fn bit_reverse_u64(d: u64, bits: usize) -> u64 {
     let ret = (BIT_REVERSE_TABLE[(d & 0xff) as usize] as u64) << 56
         | (BIT_REVERSE_TABLE[(d >> 8 & 0xff) as usize] as u64) << 48
@@ -450,6 +491,11 @@ struct InfillTexel {
 
 struct InfillTable {
     texels: [InfillTexel; 144],
+    /// Every texel samples exactly one grid point at full weight, in order.
+    /// That happens when the weight grid matches the block footprint (the
+    /// common 4x4-in-4x4 case); `(p * 16 + 8) >> 4 == p` for every `p`, so
+    /// the bilinear sum is then a plain copy.
+    identity: bool,
 }
 
 /// Lazily built infill tables for every weight-grid geometry of one image.
@@ -486,6 +532,7 @@ fn build_infill_table(bw: usize, bh: usize, width: usize, height: usize) -> Box<
     let dt = (1024 + bh / 2) / (bh - 1);
     let mut table = Box::new(InfillTable {
         texels: [InfillTexel::default(); 144],
+        identity: false,
     });
     let mut i = 0;
     for t in 0..bh {
@@ -506,6 +553,13 @@ fn build_infill_table(bw: usize, bh: usize, width: usize, height: usize) -> Box<
             i += 1;
         }
     }
+    table.identity = table.texels[..bw * bh]
+        .iter()
+        .enumerate()
+        .all(|(index, texel)| {
+            usize::from(texel.v) == index
+                && (texel.w00, texel.w01, texel.w10, texel.w11) == (16, 0, 0, 0)
+        });
     table
 }
 
@@ -524,6 +578,79 @@ struct AstcState {
     data: BlockData,
     scratch: WeightScratch,
     cache: InfillCache,
+    quant: QuantTables,
+}
+
+/// Unquantization results for every encodable value of one quantization
+/// range, built on first use from the per-value functions below.
+///
+/// A decoded integer-sequence element is fully identified by its trit/quint
+/// digit and its low bits, so `nonbits << bits_count | bits` indexes every
+/// value a range can produce: at most 32 for weights and 256 for colour
+/// endpoints. Building a table calls exactly the function the per-element
+/// loop used to call, so lookups return the same values, and a range whose
+/// function rejects its input still panics -- into the caller's
+/// `catch_unwind` -- on the first block that uses it.
+struct QuantTables {
+    weights: [Option<Box<[i32; 32]>>; 16],
+    endpoints: [Option<Box<[i32; 256]>>; 19],
+}
+
+impl QuantTables {
+    fn new() -> Self {
+        Self {
+            weights: Default::default(),
+            endpoints: Default::default(),
+        }
+    }
+
+    fn weights(&mut self, range: usize) -> &[i32; 32] {
+        self.weights[range].get_or_insert_with(|| {
+            let a = WEIGHT_PREC_TABLE_A[range] as usize;
+            let b = WEIGHT_PREC_TABLE_B[range] as usize;
+            let mut table = Box::new([0_i32; 32]);
+            for (index, value) in table.iter_mut().enumerate() {
+                if let Some(element) = quant_element(index, a, b) {
+                    *value = unquantize_weight(element, a, b);
+                }
+            }
+            table
+        })
+    }
+
+    fn endpoints(&mut self, range: usize) -> &[i32; 256] {
+        self.endpoints[range].get_or_insert_with(|| {
+            let a = CEM_TABLE_A[range];
+            let b = CEM_TABLE_B[range];
+            let mut table = Box::new([0_i32; 256]);
+            for (index, value) in table.iter_mut().enumerate() {
+                if let Some(element) = quant_element(index, a, b) {
+                    *value = expand_endpoint(element, a, b);
+                }
+            }
+            table
+        })
+    }
+}
+
+/// The sequence element a table slot stands for, or `None` for slots no
+/// sequence of this range can produce.
+fn quant_element(index: usize, a: usize, b: usize) -> Option<IntSeqData> {
+    let digits = match a {
+        3 => 3,
+        5 => 5,
+        _ => 1,
+    };
+    let nonbits = index >> b;
+    (nonbits < digits).then(|| IntSeqData {
+        bits: (index & ((1 << b) - 1)) as u64,
+        nonbits: nonbits as u64,
+    })
+}
+
+#[inline]
+fn quant_index(value: IntSeqData, b: usize) -> usize {
+    (value.nonbits << b | value.bits) as usize
 }
 
 impl AstcState {
@@ -535,6 +662,7 @@ impl AstcState {
                 wv: [0; 128],
             },
             cache: InfillCache::new(bw, bh),
+            quant: QuantTables::new(),
         }
     }
 }
@@ -728,7 +856,10 @@ fn read_sequence_block(
     reverse: bool,
 ) -> u64 {
     if reverse {
-        let bits = bit_reverse_u64(getbits64(block.bits, *position - size as isize, size), size);
+        // Bit `i` of a reversed read is block bit `position - 1 - i`, which
+        // is bit `128 - position + i` of the reversed word; both read as zero
+        // outside the block, exactly as `getbits64` treats the forward word.
+        let bits = getbits64(block.reversed, 128 - *position, size);
         *position -= stride as isize;
         bits
     } else {
@@ -1193,7 +1324,7 @@ fn sign_extend(value: i32, bits: u32) -> i32 {
     (value << shift) >> shift
 }
 
-fn decode_endpoints(block: &Block, data: &mut BlockData) {
+fn decode_endpoints(block: &Block, data: &mut BlockData, quant: &mut QuantTables) {
     let mut seq: [IntSeqData; 32] = [IntSeqData::default(); 32];
     let mut ev: [i32; 32] = [0; 32];
     decode_intseq(
@@ -1206,13 +1337,11 @@ fn decode_endpoints(block: &Block, data: &mut BlockData) {
         &mut seq,
     );
 
-    decode_endpoint_values(
-        &seq,
-        &mut ev,
-        CEM_TABLE_A[data.cem_range],
-        CEM_TABLE_B[data.cem_range],
-        data.endpoint_value_num,
-    );
+    let precision = CEM_TABLE_B[data.cem_range];
+    let table = quant.endpoints(data.cem_range);
+    for (value, element) in ev.iter_mut().zip(&seq).take(data.endpoint_value_num) {
+        *value = table[quant_index(*element, precision)];
+    }
 
     let mut v: &mut [i32] = &mut ev;
     for cem in 0..data.part_num {
@@ -1221,19 +1350,12 @@ fn decode_endpoints(block: &Block, data: &mut BlockData) {
     }
 }
 
-fn decode_endpoint_values(
-    sequence: &[IntSeqData],
-    values: &mut [i32],
-    encoding: usize,
-    precision: usize,
-    count: usize,
-) {
-    for index in 0..count {
-        values[index] = match encoding {
-            3 => expand_trit_endpoint(sequence[index], precision),
-            5 => expand_quint_endpoint(sequence[index], precision),
-            _ => expand_binary_endpoint(sequence[index].bits, precision),
-        };
+/// Unquantizes one colour endpoint value.
+fn expand_endpoint(value: IntSeqData, encoding: usize, precision: usize) -> i32 {
+    match encoding {
+        3 => expand_trit_endpoint(value, precision),
+        5 => expand_quint_endpoint(value, precision),
+        _ => expand_binary_endpoint(value.bits, precision),
     }
 }
 
@@ -1488,40 +1610,37 @@ fn decode_weights(
     data: &mut BlockData,
     scratch: &mut WeightScratch,
     cache: &mut InfillCache,
+    quant: &mut QuantTables,
 ) {
     let a = WEIGHT_PREC_TABLE_A[data.weight_range] as usize;
     let b = WEIGHT_PREC_TABLE_B[data.weight_range] as usize;
     decode_intseq(block, 128, a, b, data.weight_num, true, &mut scratch.seq);
-    unquantize_weights(
-        &scratch.seq[..data.weight_num],
-        &mut scratch.wv[..data.weight_num],
-        a,
-        b,
-    );
+    let table = quant.weights(data.weight_range);
+    for (output, value) in scratch.wv[..data.weight_num]
+        .iter_mut()
+        .zip(&scratch.seq[..data.weight_num])
+    {
+        *output = table[quant_index(*value, b)];
+    }
     interpolate_weights(data, &scratch.wv, cache);
 }
 
-fn unquantize_weights(sequence: &[IntSeqData], values: &mut [i32], a: usize, b: usize) {
+/// Unquantizes one weight to the 0..=64 interpolation range.
+fn unquantize_weight(value: IntSeqData, a: usize, b: usize) -> i32 {
     if a == 0 {
-        for (output, value) in values.iter_mut().zip(sequence) {
-            *output = unquantize_binary_weight(value.bits, b);
-            adjust_weight(output);
-        }
-        return;
+        let mut output = unquantize_binary_weight(value.bits, b);
+        adjust_weight(&mut output);
+        return output;
     }
     if b == 0 {
         let scale = if a == 3 { 32 } else { 16 };
-        for (output, value) in values.iter_mut().zip(sequence) {
-            *output = (value.nonbits * scale) as i32;
-        }
-        return;
+        return (value.nonbits * scale) as i32;
     }
-    for (output, value) in values.iter_mut().zip(sequence) {
-        *output = unquantize_mixed_weight(*value, a, b);
-        let sign = (value.bits & 1) * 0x7f;
-        *output = ((sign & 0x20) | ((*output as u64 ^ sign) >> 2)) as i32;
-        adjust_weight(output);
-    }
+    let mut output = unquantize_mixed_weight(value, a, b);
+    let sign = (value.bits & 1) * 0x7f;
+    output = ((sign & 0x20) | ((output as u64 ^ sign) >> 2)) as i32;
+    adjust_weight(&mut output);
+    output
 }
 
 fn unquantize_binary_weight(bits: u64, precision: usize) -> i32 {
@@ -1563,7 +1682,17 @@ fn interpolate_weights(data: &mut BlockData, values: &[i32], cache: &mut InfillC
     let table = cache.table(data.width, data.height);
     let weights = &mut data.weights[..texel_count];
     let texels = &table.texels[..texel_count];
-    if data.dual_plane {
+    if table.identity {
+        if data.dual_plane {
+            for (weight, pair) in weights.iter_mut().zip(values.chunks_exact(2)) {
+                *weight = [pair[0], pair[1]];
+            }
+        } else {
+            for (weight, value) in weights.iter_mut().zip(values) {
+                weight[0] = *value;
+            }
+        }
+    } else if data.dual_plane {
         interpolate_dual_plane_weights(weights, texels, values, data.width);
     } else {
         interpolate_single_plane_weights(weights, texels, values, data.width);
@@ -1764,6 +1893,17 @@ impl LdrPartition {
         }
         color(channels[0], channels[1], channels[2], channels[3])
     }
+
+    /// `pixel` with a weight per channel, for dual-plane blocks.
+    #[inline]
+    fn pixel_per_channel(&self, weights: [i32; 4]) -> u32 {
+        let mut channels = [0_u8; 4];
+        for index in 0..4 {
+            channels[index] =
+                (((self.base[index] + self.delta[index] * weights[index]) >> 6) >> 8) as u8;
+        }
+        color(channels[0], channels[1], channels[2], channels[3])
+    }
 }
 
 fn applicate_color(data: &BlockData, outbuf: &mut [u32]) {
@@ -1773,6 +1913,8 @@ fn applicate_color(data: &BlockData, outbuf: &mut [u32]) {
     let ldr = (0..data.part_num).all(|p| !CEM_HDR_C[data.cem[p]] && !CEM_HDR_A[data.cem[p]]);
     if ldr && !data.dual_plane {
         applicate_ldr_color(data, out, weights);
+    } else if ldr {
+        applicate_ldr_dual_plane_color(data, out, weights);
     } else if data.dual_plane {
         applicate_dual_plane_color(data, out, weights);
     } else if data.part_num > 1 {
@@ -1800,6 +1942,36 @@ fn applicate_ldr_color(data: &BlockData, out: &mut [u32], weights: &[[i32; 2]]) 
     }
     for ((pixel, weight), &partition) in out.iter_mut().zip(weights).zip(&data.partition) {
         *pixel = partitions[partition].pixel(weight[0]);
+    }
+}
+
+/// LDR dual-plane blocks: `LdrPartition` arithmetic is `select_color`'s
+/// rearranged (`low * (64 - w) + high * w + 32`), so this matches
+/// `interpolate_astc_color` for every LDR endpoint mode.
+fn applicate_ldr_dual_plane_color(data: &BlockData, out: &mut [u32], weights: &[[i32; 2]]) {
+    let mut partitions = [LdrPartition::default(); 4];
+    for (partition, endpoints) in partitions
+        .iter_mut()
+        .zip(&data.endpoints)
+        .take(data.part_num)
+    {
+        *partition = LdrPartition::new(endpoints);
+    }
+    let selector = data.plane_selector;
+    let channel_weights = |weight: &[i32; 2]| {
+        let mut channels = [weight[0]; 4];
+        channels[selector] = weight[1];
+        channels
+    };
+    if data.part_num == 1 {
+        let partition = partitions[0];
+        for (pixel, weight) in out.iter_mut().zip(weights) {
+            *pixel = partition.pixel_per_channel(channel_weights(weight));
+        }
+        return;
+    }
+    for ((pixel, weight), &partition) in out.iter_mut().zip(weights).zip(&data.partition) {
+        *pixel = partitions[partition].pixel_per_channel(channel_weights(weight));
     }
 }
 
@@ -1925,6 +2097,7 @@ fn decode_regular_astc_block(
         data: block_data,
         scratch,
         cache,
+        quant,
     } = state;
     block_data.bw = block_width;
     block_data.bh = block_height;
@@ -1934,8 +2107,8 @@ fn decode_regular_astc_block(
     if (grid + block_data.width) * planes + planes > 128 {
         return Err(());
     }
-    decode_endpoints(block, block_data);
-    decode_weights(block, block_data, scratch, cache);
+    decode_endpoints(block, block_data, quant);
+    decode_weights(block, block_data, scratch, cache, quant);
     if block_data.part_num > 1 {
         select_partition(block, block_data);
     }
@@ -1943,13 +2116,17 @@ fn decode_regular_astc_block(
     Ok(())
 }
 
+/// Decodes a whole ASTC surface into tightly packed RGBA8 rows.
+///
+/// `image` must hold at least `width * height * 4` bytes. Every texel is
+/// written, so the caller need not clear it first.
 pub fn decode_astc(
     data: &[u8],
     width: usize,
     height: usize,
     block_width: usize,
     block_height: usize,
-    image: &mut [u32],
+    image: &mut [u8],
 ) -> Result<(), &'static str> {
     let num_blocks_x = width.div_ceil(block_width);
     let num_blocks_y = height.div_ceil(block_height);
@@ -1960,7 +2137,11 @@ pub fn decode_astc(
     if data.len() < num_blocks_x * num_blocks_y * 16 {
         return Err("Not enough data to decode image!");
     }
-    if image.len() < width * height {
+    if width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .is_none_or(|length| image.len() < length)
+    {
         return Err("Image buffer is too small!");
     }
     if block_width * block_height > 144 {
@@ -1978,7 +2159,7 @@ pub fn decode_astc(
             {
                 return Err("ASTC block weight count exceeds the format limit");
             }
-            copy_block_buffer(
+            copy_block_rgba8(
                 bx,
                 by,
                 width,
@@ -1993,4 +2174,155 @@ pub fn decode_astc(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic xorshift so the differential inputs are reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn block(&mut self) -> Block {
+            let low = u128::from(self.next());
+            let high = u128::from(self.next());
+            Block::new((high << 64 | low).to_le_bytes())
+        }
+    }
+
+    #[test]
+    fn reversed_reads_match_the_byte_table_reversal() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..200 {
+            let block = rng.block();
+            for position in -70_isize..=200 {
+                for size in 1..=64 {
+                    let table = bit_reverse_u64(
+                        getbits64(block.bits, position - size as isize, size),
+                        size,
+                    );
+                    let reversed = getbits64(block.reversed, 128 - position, size);
+                    assert_eq!(table, reversed, "position {position}, size {size}");
+                }
+            }
+        }
+    }
+
+    /// Every element an integer sequence can decode to has its own table
+    /// slot, and that slot holds what the per-element function returns, so a
+    /// lookup is the function call it replaced.
+    #[test]
+    fn quantization_tables_equal_the_per_element_functions() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut tables = QuantTables::new();
+        let mut sequence = [IntSeqData::default(); 128];
+        for _ in 0..2_000 {
+            let block = rng.block();
+            for range in (2..8).chain(10..16) {
+                let a = WEIGHT_PREC_TABLE_A[range] as usize;
+                let b = WEIGHT_PREC_TABLE_B[range] as usize;
+                decode_intseq(&block, 128, a, b, 24, true, &mut sequence);
+                for element in &sequence[..24] {
+                    let index = quant_index(*element, b);
+                    let slot = quant_element(index, a, b).expect("element has a slot");
+                    assert_eq!((slot.bits, slot.nonbits), (element.bits, element.nonbits));
+                    assert_eq!(
+                        tables.weights(range)[index],
+                        unquantize_weight(*element, a, b)
+                    );
+                }
+            }
+            for range in 0..CEM_TABLE_A.len() {
+                let a = CEM_TABLE_A[range];
+                let b = CEM_TABLE_B[range];
+                decode_intseq(&block, 17, a, b, 8, false, &mut sequence);
+                for element in &sequence[..8] {
+                    let index = quant_index(*element, b);
+                    let slot = quant_element(index, a, b).expect("element has a slot");
+                    assert_eq!((slot.bits, slot.nonbits), (element.bits, element.nonbits));
+                    assert_eq!(
+                        tables.endpoints(range)[index],
+                        expand_endpoint(*element, a, b)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_resolution_weight_grids_infill_as_a_copy() {
+        let mut rng = Rng(0xdead_beef_cafe_f00d);
+        for footprint in [4, 5, 6, 8, 10, 12] {
+            let table = build_infill_table(footprint, footprint, footprint, footprint);
+            assert!(
+                table.identity,
+                "{footprint}x{footprint} grid in its own footprint"
+            );
+            assert!(!build_infill_table(footprint, footprint, footprint - 1, footprint).identity);
+
+            let texels = footprint * footprint;
+            // The bilinear path still reads the zero-weighted neighbours one
+            // row and one column past the grid, so pad past both planes.
+            let values: Vec<i32> = (0..400).map(|_| (rng.next() % 65) as i32).collect();
+            let mut bilinear = [[0_i32; 2]; 144];
+            interpolate_single_plane_weights(
+                &mut bilinear[..texels],
+                &table.texels[..texels],
+                &values,
+                footprint,
+            );
+            for (index, weight) in bilinear[..texels].iter().enumerate() {
+                assert_eq!(weight[0], values[index]);
+            }
+            interpolate_dual_plane_weights(
+                &mut bilinear[..texels],
+                &table.texels[..texels],
+                &values,
+                footprint,
+            );
+            for (index, weight) in bilinear[..texels].iter().enumerate() {
+                assert_eq!(*weight, [values[index * 2], values[index * 2 + 1]]);
+            }
+        }
+    }
+
+    #[test]
+    fn ldr_dual_plane_fast_path_matches_the_general_path() {
+        let ldr_modes: Vec<usize> = (0..16)
+            .filter(|&cem| !CEM_HDR_C[cem] && !CEM_HDR_A[cem])
+            .collect();
+        let mut rng = Rng(0x0123_4567_89ab_cdef);
+        for _ in 0..5_000 {
+            let mut data = BlockData::default();
+            data.bw = 6;
+            data.bh = 6;
+            data.dual_plane = true;
+            data.part_num = (rng.next() % 4) as usize + 1;
+            data.plane_selector = (rng.next() % 4) as usize;
+            for partition in 0..data.part_num {
+                data.cem[partition] = ldr_modes[(rng.next() as usize) % ldr_modes.len()];
+                for endpoint in &mut data.endpoints[partition] {
+                    *endpoint = (rng.next() % 256) as i32;
+                }
+            }
+            for texel in 0..36 {
+                data.weights[texel] = [(rng.next() % 65) as i32, (rng.next() % 65) as i32];
+                data.partition[texel] = (rng.next() as usize) % data.part_num;
+            }
+            let weights = &data.weights[..36];
+            let mut fast = [0_u32; 36];
+            let mut general = [0_u32; 36];
+            applicate_ldr_dual_plane_color(&data, &mut fast, weights);
+            applicate_dual_plane_color(&data, &mut general, weights);
+            assert_eq!(fast, general);
+        }
+    }
 }
