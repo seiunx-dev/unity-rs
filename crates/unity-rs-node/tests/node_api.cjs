@@ -2117,8 +2117,8 @@ testAsyncWorkers().catch((error) => {
   assert.strictEqual(document.FadeInTime, 0.5)
   assert.strictEqual(document.FadeOutTime, 1.25)
   assert.deepStrictEqual(document.Parameters, [
-    { Id: 'ParamAngleX', Value: 0.8, Blend: 0 },
-    { Id: 'ParamAngleY', Value: -0.25, Blend: 1 },
+    { Id: 'ParamAngleX', Value: 0.8, Blend: 'Overwrite' },
+    { Id: 'ParamAngleY', Value: -0.25, Blend: 'Add' },
   ])
   // A behaviour that is not an expression must fail rather than return an
   // empty document.

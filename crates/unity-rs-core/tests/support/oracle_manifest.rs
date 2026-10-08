@@ -1081,6 +1081,38 @@ fn mono_behaviour_manifest(
 /// reports the same absence by leaving the field null.
 type CubismDocument = Option<(Value, String)>;
 
+/// Rewrites exp3.json's `Blend` strings as the ordinals the managed extractor
+/// writes, the one declared divergence in this document.
+///
+/// unity-rs spells each mode as the Cubism format does (`"Add"`, `"Multiply"`,
+/// `"Overwrite"`); the managed extractor echoes the serialized
+/// `CubismParameterBlendMode` ordinal (`Override` 0, `Additive` 1,
+/// `Multiply` 2). Mapping the strings back keeps every other byte under the
+/// byte-level comparison, and the comparison then proves each string names the
+/// ordinal the managed side read. Every parameter must carry a string: one
+/// written as a number would mean the divergence no longer exists, and the
+/// mapping is refused rather than passed through.
+fn managed_blend_spelling(
+    document: &str,
+    parameters: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut output = document.to_owned();
+    let mut rewritten = 0;
+    for (name, ordinal) in [("Overwrite", 0), ("Add", 1), ("Multiply", 2)] {
+        let spelled = format!("\n      \"Blend\": \"{name}\"\n");
+        rewritten += output.matches(&spelled).count();
+        output = output.replace(&spelled, &format!("\n      \"Blend\": {ordinal}\n"));
+    }
+    if rewritten != parameters {
+        return Err(format!(
+            "exp3.json spells {rewritten} of {parameters} Blend values as Cubism strings; \
+             the declared divergence from the managed ordinals no longer holds"
+        )
+        .into());
+    }
+    Ok(output)
+}
+
 fn cubism_documents(
     value: &TypeValue,
 ) -> Result<(CubismDocument, CubismDocument, CubismDocument), Box<dyn std::error::Error>> {
@@ -1089,10 +1121,11 @@ fn cubism_documents(
             Ok(expression) => {
                 let mut document = Vec::new();
                 expression.write_exp3_json(&mut document, 1024 * 1024)?;
-                Some((
-                    serde_json::from_slice::<Value>(&document)?,
-                    String::from_utf8(document)?,
-                ))
+                let document = managed_blend_spelling(
+                    &String::from_utf8(document)?,
+                    expression.parameters.len(),
+                )?;
+                Some((serde_json::from_str::<Value>(&document)?, document))
             }
             Err(_) => None,
         };

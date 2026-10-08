@@ -4766,7 +4766,7 @@ mod tests {
         assert_eq!(expression.file_name, "expressions/smile.exp3.json");
         let json: serde_json::Value = serde_json::from_slice(&expression.json).unwrap();
         assert_eq!(json["Parameters"][0]["Id"], "ParamAngleX");
-        assert_eq!(json["Parameters"][0]["Blend"], 1);
+        assert_eq!(json["Parameters"][0]["Blend"], "Add");
         let pose = materialized.packages[0].pose.as_ref().unwrap();
         let pose_json: serde_json::Value = serde_json::from_slice(&pose.bytes).unwrap();
         assert_eq!(pose_json["Groups"][0][0]["Id"], "PartBody");
