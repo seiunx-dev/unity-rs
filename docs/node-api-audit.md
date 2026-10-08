@@ -1,6 +1,6 @@
 # Node API audit
 
-Last verified: 2026-08-25.
+Last verified: 2026-10-08.
 
 `unity-rs-node` is an optional direct napi-rs binding over
 `unity-rs-core`. It does not load the removed custom C ABI or a .NET
@@ -97,7 +97,7 @@ methods:
 - `tests/installed_package.cjs` loads the packed tarball from a temporary
   consumer, parses the installed `index.d.ts`, and compares its static methods,
   instance methods, and getters bidirectionally with the installed native
-  `UnityRs` class. The installed surface is therefore also locked at 85
+  `UnityRs` class. The installed surface is therefore also locked at 90
   methods and 4 properties; a reverse check renames one declaration method and
   proves that an otherwise count-preserving drift is rejected. A source-tree
   addon cannot hide a missing platform binary, declaration, or runtime member

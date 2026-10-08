@@ -1,6 +1,6 @@
 # Python API audit
 
-Last verified: 2026-08-25.
+Last verified: 2026-10-08.
 
 `unity-rs` is a direct PyO3 binding over `unity-rs-core`.  It does not
 load the removed custom C ABI or a .NET assembly.  This document records how

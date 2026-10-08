@@ -261,7 +261,7 @@ Rules:
   co-author avatar on the commit page. The trailer must be on its own line,
   separated from the subject by a blank line, in the form
   `Co-authored-by: <Display Name> <email>`. Suggested values per agent:
-  - Claude (any 4.x):
+  - Claude:
     `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>` (substitute the
     actual model, for example `Claude Sonnet 4.6` or `Claude Haiku 4.5`).
   - Codex: `Co-authored-by: Codex <noreply@openai.com>`
@@ -271,10 +271,10 @@ Rules:
 Examples from this repository's history:
 
 ```text
-[Feat] Add configurable asset export types
-[Fix] Nuverse parse issue
-[Chore] Update dependencies
-[Feat] Replace git2 with git CLI and add commit signing (#16)
+[Feat] Read one-byte type tree arrays as byte arrays (#37)
+[Fix] Read typetree char at its declared byte size (#28)
+[Chore] Prepare 0.6.0 release (#38)
+[Docs] Codify the default-lenient version ceiling policy
 ```
 
 ## GitHub Actions workflows

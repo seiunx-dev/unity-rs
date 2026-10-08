@@ -2,7 +2,7 @@
 
 最后更新：2026-10-08（Asia/Shanghai）
 
-本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
+本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。逐格式兼容矩阵与证据维护在本文，[`README.md`](README.md) 只保留简要能力概览；私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
 ## 目标范围
 
@@ -975,7 +975,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   比所需少一的单数组/总量预算以原消息拒绝，恰好等于所需时输出与默认路径一致；1,000,001
   个 keyword 名在默认预算下被拒、调高单数组预算后完整读取。类型树字节数组的计费与 3,200 万
   元素上限属于 #5 的 0.6 部分，设计见 `docs/design/0.6-byte-array-values.md`；
-- **类型树字节数组已于 2026-10-08 改为按字节计费（#5 的 0.6 部分，破坏性变更，待 0.6.0 发布）**：
+- **类型树字节数组已于 2026-10-08 改为按字节计费（#5 的 0.6 部分，破坏性变更，已随 0.6.0 发布）**：
   `TypeValue` 新增 `ByteArray { element: ByteElement, bytes: Vec<u8> }` 并改为
   `#[non_exhaustive]`；数据节点为无对齐标志的叶子 `UInt8`/`SInt8`/声明 1 字节的 `char` 时，
   数组以一次有界读取保留原始字节，不再为每个字节物化一个 32 字节的 `TypeValue`；`bool`、
