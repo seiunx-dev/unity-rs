@@ -4156,7 +4156,7 @@ mod tests {
             let name = format!("astc-{variant}-{block}x{block}");
             let payload = std::fs::read(directory.join(format!("{name}.bin"))).unwrap();
             let full_size = block * 2;
-            let full = decode_ldr_astc_fixture(&directory, &name, *block, *format);
+            let full = decode_astc_fixture(&directory, &name, *block, *format);
             for (width, height) in [
                 (full_size - 1, full_size),
                 (full_size, block + 1),
