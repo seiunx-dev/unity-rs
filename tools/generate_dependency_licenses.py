@@ -43,8 +43,8 @@ LEGAL_PREFIXES = (
     "AUTHORS",
 )
 FALLBACKS = {
-    ("alloc-stdlib", "0.2.4"): (
-        ROOT / "tools" / "legal-fallbacks" / "alloc-stdlib-0.2.4-LICENSE",
+    ("alloc-stdlib", "0.3.0"): (
+        ROOT / "tools" / "legal-fallbacks" / "alloc-stdlib-LICENSE",
     ),
     ("napi", "3.13.0"): (
         ROOT / "tools" / "legal-fallbacks" / "napi-rs-LICENSE",

@@ -250,7 +250,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: alloc-no-stdlib 2.0.4
+Package: alloc-no-stdlib 3.0.0
 License expression: BSD-3-Clause
 Repository: https://github.com/dropbox/rust-alloc-no-stdlib
 
@@ -269,11 +269,11 @@ Redistribution and use in source and binary forms, with or without modification,
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-Package: alloc-stdlib 0.2.4
+Package: alloc-stdlib 0.3.0
 License expression: BSD-3-Clause
 Repository: https://github.com/dropbox/rust-alloc-no-stdlib
 
---- alloc-stdlib-0.2.4-LICENSE ---
+--- alloc-stdlib-LICENSE ---
 MIT License
 
 Copyright (c) 2018 GitHub
@@ -779,7 +779,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-Package: brotli 8.0.4
+Package: brotli 9.0.0
 License expression: BSD-3-Clause AND MIT
 Repository: https://github.com/dropbox/rust-brotli
 
@@ -819,7 +819,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ==============================================================================
-Package: brotli-decompressor 5.0.3
+Package: brotli-decompressor 6.0.1
 License expression: BSD-3-Clause/MIT
 Repository: https://github.com/dropbox/rust-brotli-decompressor
 
