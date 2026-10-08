@@ -202,6 +202,10 @@ material = studio.read_material(0, 21)
 print(material.shader, material.texture_environments, material.colors)
 
 shader = studio.read_shader(0, 48, maximum_bytes=256 * 1024 * 1024)
+# A shader with very large sub-programs can raise the array budgets. The
+# defaults are 1,000,000 elements per array and 4,000,000 in total, the
+# decompressed sub-programs and their code bytes included.
+shader = studio.read_shader(0, 48, maximum_total_array_elements=16_000_000)
 Path("shader.shader").write_bytes(shader)
 
 mesh_obj = studio.read_mesh_obj(0, 43, maximum_bytes=256 * 1024 * 1024)

@@ -996,6 +996,10 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          --audio-format <auto|raw|wav>\n  \
          --maximum-metadata-bytes <N>  Cumulative report and output-name index bytes;\n  \
          the default is 268435456\n  \
+         --maximum-shader-array-elements <N>  Elements in any one Shader array;\n  \
+         the default is 1000000\n  \
+         --maximum-shader-total-array-elements <N>  Elements across all arrays of one\n  \
+         Shader, sub-programs included; the default is 4000000\n  \
          --class <ID>                  Export only this class, repeatable. IDs are the\n  \
          numbers list and export print, for example 114 for MonoBehaviour.\n  \
          --compact-json\n\n\
@@ -1480,6 +1484,12 @@ fn parse_export_arguments(arguments: &[OsString]) -> Result<ExportCommand> {
                     "--maximum-metadata-bytes",
                 )?)?;
             }
+            Some(flag @ (SHADER_ARRAY_ELEMENTS_FLAG | SHADER_TOTAL_ARRAY_ELEMENTS_FLAG)) => {
+                index += 1;
+                let value =
+                    parse_element_limit(required_flag_value(arguments, index, flag)?, flag)?;
+                *shader_array_limit(&mut options, flag) = value;
+            }
             Some("--class") => {
                 index += 1;
                 push_class_filter(
@@ -1518,6 +1528,26 @@ fn parse_metadata_limit(value: &OsString) -> Result<u64> {
         .ok_or_else(|| Error::invalid_data("metadata limit must be valid UTF-8 digits"))?
         .parse::<u64>()
         .map_err(|_| Error::invalid_data("metadata limit must be a non-negative integer"))
+}
+
+const SHADER_ARRAY_ELEMENTS_FLAG: &str = "--maximum-shader-array-elements";
+const SHADER_TOTAL_ARRAY_ELEMENTS_FLAG: &str = "--maximum-shader-total-array-elements";
+
+/// The `ExportOptions` Shader array budget a command-line flag sets.
+fn shader_array_limit<'a>(options: &'a mut ExportOptions, flag: &str) -> &'a mut usize {
+    if flag == SHADER_ARRAY_ELEMENTS_FLAG {
+        &mut options.maximum_shader_array_elements
+    } else {
+        &mut options.maximum_shader_total_array_elements
+    }
+}
+
+fn parse_element_limit(value: &OsString, flag: &str) -> Result<usize> {
+    value
+        .to_str()
+        .ok_or_else(|| Error::invalid_data(format!("{flag} must be valid UTF-8 digits")))?
+        .parse::<usize>()
+        .map_err(|_| Error::invalid_data(format!("{flag} must be a non-negative integer")))
 }
 
 /// Reads a class ID as the `list` and `export` output prints it.
@@ -4553,16 +4583,16 @@ mod tests {
         Live2dOutputNames, Live2dPublicationLock, LoadOptions, LossyOsStr,
         MAX_LIVE2D_OUTPUT_MODELS, MAX_LIVE2D_TOTAL_OUTPUT_BYTES, MAX_MONO_SCHEMA_DOCUMENTS,
         ModelExportCandidate, MonoSchemaDocumentBudget, NestedInspectLabel, PngCompression,
-        PngFilter, SceneObjectKey, allocate_fbx_batch_name, allocate_fbx_batch_name_with_probe,
-        allocate_live2d_output_path, charge_live2d_model, collect_cli_arguments_with_limits,
-        copy_inspect_path, copy_path_argument, escape_text, fallible_lowercase,
-        increment_class_count, increment_string_count, join_inspect_path,
-        obj_material_library_name, parse_cli_arguments, parse_export_arguments,
-        parse_extract_arguments, parse_live2d_arguments, parse_live2d_package_arguments,
-        persist_temporary_hard_link, positional_path_table, publish_fbx_with_textures,
-        push_class_filter, push_positional_path, read_bounded_schema_document,
-        sanitize_live2d_base_name, sorted_map_entries, split_load_options, write_object_reference,
-        write_scene_key,
+        PngFilter, SHADER_ARRAY_ELEMENTS_FLAG, SHADER_TOTAL_ARRAY_ELEMENTS_FLAG, SceneObjectKey,
+        allocate_fbx_batch_name, allocate_fbx_batch_name_with_probe, allocate_live2d_output_path,
+        charge_live2d_model, collect_cli_arguments_with_limits, copy_inspect_path,
+        copy_path_argument, escape_text, fallible_lowercase, increment_class_count,
+        increment_string_count, join_inspect_path, obj_material_library_name, parse_cli_arguments,
+        parse_export_arguments, parse_extract_arguments, parse_live2d_arguments,
+        parse_live2d_package_arguments, persist_temporary_hard_link, positional_path_table,
+        publish_fbx_with_textures, push_class_filter, push_positional_path,
+        read_bounded_schema_document, sanitize_live2d_base_name, sorted_map_entries,
+        split_load_options, write_object_reference, write_scene_key,
     };
     use std::collections::HashMap;
     use std::ffi::{OsStr, OsString};
@@ -5190,6 +5220,11 @@ mod tests {
         assert_eq!(command.options.jpeg_quality, 75);
         assert_eq!(command.options.audio_format, AudioExportFormat::Auto);
         assert_eq!(command.options.maximum_metadata_bytes, 256 * 1024 * 1024);
+        assert_eq!(command.options.maximum_shader_array_elements, 1_000_000);
+        assert_eq!(
+            command.options.maximum_shader_total_array_elements,
+            4_000_000
+        );
         assert!(!command.options.overwrite_existing);
         assert!(command.options.restore_text_asset_extension);
         assert!(command.options.pretty_json);
@@ -5215,6 +5250,10 @@ mod tests {
             "wav",
             "--maximum-metadata-bytes",
             "123",
+            "--maximum-shader-array-elements",
+            "8148110",
+            "--maximum-shader-total-array-elements",
+            "16000000",
             "--overwrite",
             "--no-restore-text-extension",
             "--compact-json",
@@ -5230,6 +5269,11 @@ mod tests {
         assert_eq!(command.options.png_filter, PngFilter::Adaptive);
         assert_eq!(command.options.audio_format, AudioExportFormat::Wav);
         assert_eq!(command.options.maximum_metadata_bytes, 123);
+        assert_eq!(command.options.maximum_shader_array_elements, 8_148_110);
+        assert_eq!(
+            command.options.maximum_shader_total_array_elements,
+            16_000_000
+        );
         assert!(command.options.overwrite_existing);
         assert!(!command.options.restore_text_asset_extension);
         assert!(!command.options.pretty_json);
@@ -5349,6 +5393,37 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn export_arguments_validate_the_shader_array_budgets() {
+        for (flag, other_default) in [
+            (SHADER_ARRAY_ELEMENTS_FLAG, 4_000_000),
+            (SHADER_TOTAL_ARRAY_ELEMENTS_FLAG, 1_000_000),
+        ] {
+            let command =
+                parse_export_arguments(&arguments(&[flag, "0", "input", "output"])).unwrap();
+            let configured = (
+                command.options.maximum_shader_array_elements,
+                command.options.maximum_shader_total_array_elements,
+            );
+            if flag == SHADER_ARRAY_ELEMENTS_FLAG {
+                assert_eq!(configured, (0, other_default));
+            } else {
+                assert_eq!(configured, (other_default, 0));
+            }
+            for bad in ["-1", "1.5", "not-a-number", ""] {
+                let error = parse_export_arguments(&arguments(&[flag, bad, "input", "output"]))
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{flag} must be a non-negative integer")),
+                    "{error}"
+                );
+            }
+            assert!(parse_export_arguments(&arguments(&["input", "output", flag])).is_err());
+        }
     }
 
     #[test]

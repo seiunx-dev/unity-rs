@@ -205,7 +205,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `darwin-{x64,arm64}`、`linux-{x64,arm64}-gnu` 或 `win32-{x64,arm64}-msvc` 文件名，随后
   真正 `npm pack`、在临时消费者中离线安装该 `.tgz`，再从安装目录 `require()` 并断言运行时
   顶层导出恰为 `UnityRs`。安装后的 `index.d.ts` 还会被重新解析，并与安装后的 native
-  class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 85 个方法与 4 个
+  class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 88 个方法与 4 个
   属性，另以保持数量不变的重命名反向测试证明不是只数成员。源码树能加载但发布包漏文件、
   声明/运行时漂移或带错架构时都会直接失败。macOS
   arm64 debug/release 与 Linux amd64/arm64 release 容器已实际通过；2026-08-24 的正式
@@ -939,6 +939,22 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   4,500,005 个数组元素，单个数组均低于 1,000,000）覆盖三个方向：默认路径以原消息拒绝、
   调高总量预算后完整转换、更低预算更早拒绝。Python `read_shader` 与 Node `readShader`
   保持只接受输出上限的契约，新方法在两份 API 面审计中登记为 Rust-only；
+- **Shader 数组预算已于 2026-10-08 开放给 Python、Node 与 CLI（#5 近期部分）**：Python
+  `read_shader` 新增仅关键字参数 `maximum_array_elements`/`maximum_total_array_elements`，
+  Node `readShader`/`readShaderAsync` 在 `maximumBytes` 之后新增可选位置参数
+  `maximumArrayElements`/`maximumTotalArrayElements`，默认值与 `ShaderReadLimits::default`
+  相同（1,000,000/4,000,000），均改为委托 `read_shader_text_with_limits`；其余解析预算仍取
+  Core 默认。批量导出的 Core `ExportOptions` 新增 `maximum_shader_array_elements`/
+  `maximum_shader_total_array_elements`，CLI `export` 对应
+  `--maximum-shader-array-elements`/`--maximum-shader-total-array-elements`，Node
+  `exportWithOptions` 对应 `maximumShaderArrayElements`/`maximumShaderTotalArrayElements`
+  （负数以 `must be non-negative` 拒绝）；Python `export` 仍只暴露对象数、总输出与元数据三项
+  预算，未加入。默认预算**不放宽**，输出逐字节不变。`read_shader_text_with_limits` 在两份 API
+  面审计中由 Rust-only 改为映射到 `read_shader`/`readShader`。合成 Unity 6 fixture（3 个
+  keyword 名与 3 个 flag，共 6 个元素）在 Python、Node 同步/异步与 CLI 进程级测试中验证：
+  比所需少一的单数组/总量预算以原消息拒绝，恰好等于所需时输出与默认路径一致；1,000,001
+  个 keyword 名在默认预算下被拒、调高单数组预算后完整读取。类型树字节数组的计费与 3,200 万
+  元素上限属于 #5 的 0.6 部分，设计见 `docs/design/0.6-byte-array-values.md`；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

@@ -39,7 +39,7 @@ class PythonApiSurfaceAuditTests(unittest.TestCase):
             check_python_api_surface.CORE_STUDIO.read_text(encoding="utf-8"),
             check_python_api_surface.STUB.read_text(encoding="utf-8"),
         )
-        self.assertEqual((core_methods, rust_only), (109, 5))
+        self.assertEqual((core_methods, rust_only), (109, 4))
         check_python_api_surface.validate_texture_gil_boundary(
             check_python_api_surface.PYTHON_BINDING.read_text(encoding="utf-8")
         )

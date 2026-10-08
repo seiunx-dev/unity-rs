@@ -118,6 +118,7 @@ CORE_TO_NODE = {
     "StudioObject.read_raw": NODE_READ_RAW,
     "StudioObject.read_text_bytes": "UnityRs.readText",
     "StudioObject.read_shader_text": "UnityRs.readShader",
+    "StudioObject.read_shader_text_with_limits": "UnityRs.readShader",
     "StudioObject.write_mesh_obj": "UnityRs.readMeshObj",
     "StudioObject.read_mesh_obj": "UnityRs.readMeshObj",
     "StudioObject.read_animation_clip": "UnityRs.readAnimationClipInfo",
@@ -165,11 +166,6 @@ INTENTIONAL_RUST_ONLY = {
     "Studio.object_by_index": (
         "returns a borrowed Rust StudioObject; Node reads use the stable "
         "file/path key and expose objectIndex as metadata"
-    ),
-    "StudioObject.read_shader_text_with_limits": (
-        "tunes every ShaderReadLimits parse budget for Rust callers; "
-        "Node keeps the output-capped readShader(maximumBytes) contract, "
-        "which maps to read_shader_text with the default parse budgets"
     ),
 }
 

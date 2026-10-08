@@ -105,6 +105,7 @@ CORE_TO_PYTHON = {
     "StudioObject.read_raw": PY_READ_RAW,
     "StudioObject.read_text_bytes": "UnityRs.read_text",
     "StudioObject.read_shader_text": "UnityRs.read_shader",
+    "StudioObject.read_shader_text_with_limits": "UnityRs.read_shader",
     "StudioObject.write_mesh_obj": "UnityRs.read_mesh_obj",
     "StudioObject.read_mesh_obj": "UnityRs.read_mesh_obj",
     "StudioObject.read_animation_clip": "UnityRs.read_animation_clip",
@@ -152,11 +153,6 @@ INTENTIONAL_RUST_ONLY = {
     "Studio.object_by_index": (
         "returns a borrowed Rust StudioObject; Python exposes object_index as "
         "metadata but reads use the managed-compatible file/path key"
-    ),
-    "StudioObject.read_shader_text_with_limits": (
-        "tunes every ShaderReadLimits parse budget for Rust callers; "
-        "Python keeps the output-capped read_shader(maximum_bytes) contract, "
-        "which maps to read_shader_text with the default parse budgets"
     ),
 }
 

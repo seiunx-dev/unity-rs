@@ -179,6 +179,8 @@ const exportOptions: ExportConfiguration = {
   maximumTextureArrayBundleBytes: 1024,
   maximumSpriteOutputBytes: 1024,
   maximumShaderOutputBytes: 1024,
+  maximumShaderArrayElements: 8_148_110,
+  maximumShaderTotalArrayElements: 16_000_000,
   maximumMonobehaviourJsonBytes: 1024,
   maximumMeshObjectBytes: 1024,
   maximumMeshOutputBytes: 1024,
@@ -319,6 +321,8 @@ function consumeEveryUnityRsMember(studio: UnityRs): void {
   void studio.readTypeTreeDumpAsync(0, 1n, 1024);
   void studio.readShader(0, 1n, 1024);
   void studio.readShaderAsync(0, 1n, 1024);
+  void studio.readShader(0, 1n, 1024, 8_148_110, 16_000_000);
+  void studio.readShaderAsync(0, 1n, null, null, 16_000_000);
   void studio.readMeshObj(0, 1n, 1024);
   void studio.readMeshObjAsync(0, 1n, 1024);
   void studio.readTexture(0, 1n, 0, 1024);

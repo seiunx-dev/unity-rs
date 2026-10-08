@@ -35,10 +35,6 @@ methods:
   while object reads use the managed-compatible `(file_index, path_id)` key;
   duplicate path IDs therefore keep first-match collection semantics instead
   of pretending Python can preserve a Rust borrow;
-- `read_shader_text_with_limits` lets Rust callers choose every
-  `ShaderReadLimits` parse budget. Python keeps the output-capped
-  `read_shader(maximum_bytes)` contract, which maps to `read_shader_text` with
-  the default parse budgets;
 - low-level provider traits remain explicit Python callables or schema registry
   objects rather than exposing Rust trait objects.
 
@@ -47,12 +43,12 @@ methods:
 - `tools/check_python_api_surface.py` parses both the Rust high-level source and
   the Python 3.9-compatible stub. All 109 public methods across `Studio`,
   `StudioFile`, `StudioResource` and `StudioObject` must map to a real Python
-  symbol or one of the five Rust-only entries above. It also
+  symbol or one of the four Rust-only entries above. It also
   requires every public `UnityRs` method and property to be used by the
   strict mypy consumer. A newly published but unclassified Core method, a
   missing Python target, or a published but unconsumed Python method fails
   `quality`. `tools/test_python_api_surface.py` runs the current
-  109-Core/5-Rust-only and 66-method/4-property pairs and proves all those
+  109-Core/4-Rust-only and 67-method/4-property pairs and proves all those
   failure directions instead of silently checking an empty surface.
 - `tests/installed_wheel.py` compares the installed runtime and shipped `.pyi`
   in both directions and compares every literal default parameter.

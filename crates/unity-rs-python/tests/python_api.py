@@ -113,13 +113,16 @@ def synthetic_text_asset() -> bytes:
     return finish_v22_asset(49, payload)
 
 
-def synthetic_unity6_shader(unity_version: str = "6000.2.0f1") -> bytes:
+def synthetic_unity6_shader(unity_version: str = "6000.2.0f1", keywords: int = 0) -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "Unity6Object")
     push_i32(payload, 0)  # properties
     push_i32(payload, 0)  # subshaders
-    push_i32(payload, 0)  # keyword names
-    push_i32(payload, 0)  # keyword flags
+    push_i32(payload, keywords)  # keyword names, each an empty aligned string
+    payload.extend(b"\x00" * (4 * keywords))
+    push_i32(payload, keywords)  # keyword flags, one byte each
+    payload.extend(b"\x00" * keywords)
+    align(payload, 4)
     push_aligned_string(payload, "Parsed/Unity6")
     push_aligned_string(payload, "")
     push_aligned_string(payload, "")
@@ -2529,6 +2532,48 @@ def main() -> None:
             pass
         else:
             raise AssertionError("Shader output limit should be enforced")
+
+        # The array budgets reach the reader. Three keyword names and three
+        # flags are six elements, three in the largest array: one below either
+        # figure is refused, and the figure itself reads the same text.
+        keyword_studio = UnityRs.from_bytes(synthetic_unity6_shader(keywords=3))
+        assert keyword_studio.read_shader(0, 7) == shader
+        assert keyword_studio.read_shader(0, 7, maximum_array_elements=3) == shader
+        assert keyword_studio.read_shader(0, 7, maximum_total_array_elements=6) == shader
+        for options, message in (
+            (
+                {"maximum_array_elements": 2},
+                "Shader keyword name has 3 elements, exceeding limit 2",
+            ),
+            (
+                {"maximum_total_array_elements": 5},
+                "Shader arrays total 6 elements, exceeding limit 5",
+            ),
+        ):
+            try:
+                keyword_studio.read_shader(0, 7, **options)
+            except ValueError as error:
+                assert message in str(error), error
+            else:
+                raise AssertionError(f"Shader array budget {options} should be enforced")
+        for name in ("maximum_array_elements", "maximum_total_array_elements"):
+            try:
+                keyword_studio.read_shader(0, 7, **{name: -1})
+            except (OverflowError, TypeError, ValueError):
+                pass
+            else:
+                raise AssertionError(f"negative {name} should be rejected")
+
+        # Raising a budget admits what the default refuses: 1,000,001 keyword
+        # names exceed the 1,000,000 per-array default.
+        wide_studio = UnityRs.from_bytes(synthetic_unity6_shader(keywords=1_000_001))
+        try:
+            wide_studio.read_shader(0, 7)
+        except ValueError as error:
+            assert "has 1000001 elements, exceeding limit 1000000" in str(error), error
+        else:
+            raise AssertionError("the default per-array Shader budget should refuse 1,000,001")
+        assert wide_studio.read_shader(0, 7, maximum_array_elements=1_000_001) == shader
 
         # Above the verified Unity majors the default is lenient: the newest
         # known layout is attempted. This 6000.2-layout shader relabeled 7000

@@ -1131,6 +1131,8 @@ class UnityRs:
         path_id: int,
         *,
         maximum_bytes: int = 536_870_912,
+        maximum_array_elements: int = 1_000_000,
+        maximum_total_array_elements: int = 4_000_000,
     ) -> bytes: ...
     def read_model_obj(
         self,

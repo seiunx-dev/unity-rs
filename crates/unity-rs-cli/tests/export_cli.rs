@@ -152,7 +152,7 @@ fn exports_a_unity6_shader_from_the_native_cli() {
     let input = root.join("unity6-shader.assets");
     let output = root.join("output");
     fs::create_dir_all(&root).unwrap();
-    fs::write(&input, synthetic_v22_unity6_shader()).unwrap();
+    fs::write(&input, synthetic_v22_unity6_shader(0)).unwrap();
 
     let result = Command::new(env!("CARGO_BIN_EXE_unity-rs"))
         .arg("export")
@@ -182,6 +182,79 @@ fn exports_a_unity6_shader_from_the_native_cli() {
         stdout.contains("1 succeeded, 0 unsupported, 0 failed"),
         "summary should report a plain success: {stdout}"
     );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn export_applies_the_shader_array_budgets_from_the_command_line() {
+    // Three keyword names and three keyword flags: six array elements, three
+    // in the largest array. Each budget refuses the shader one below what it
+    // needs and admits it at exactly that, so the flags reach the reader.
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("unity-rs-cli-shader-limits-{unique}"));
+    let input = root.join("keywords.assets");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&input, synthetic_v22_unity6_shader(3)).unwrap();
+
+    for (case, flags, refused) in [
+        ("defaults", &[][..], None),
+        (
+            "per-array",
+            &["--maximum-shader-array-elements", "2"][..],
+            Some("Shader keyword name has 3 elements, exceeding limit 2"),
+        ),
+        (
+            "per-array-exact",
+            &["--maximum-shader-array-elements", "3"][..],
+            None,
+        ),
+        (
+            "total",
+            &["--maximum-shader-total-array-elements", "5"][..],
+            Some("Shader arrays total 6 elements, exceeding limit 5"),
+        ),
+        (
+            "total-exact",
+            &["--maximum-shader-total-array-elements", "6"][..],
+            None,
+        ),
+    ] {
+        let output = root.join(case);
+        let result = Command::new(env!("CARGO_BIN_EXE_unity-rs"))
+            .arg("export")
+            .args(flags)
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let exported = output
+            .join("0000_keywords.assets")
+            .join("Unity6Object.shader");
+        if let Some(message) = refused {
+            assert_eq!(result.status.code(), Some(3), "{case}: {stdout}{stderr}");
+            assert!(
+                stdout.contains("0 succeeded, 0 unsupported, 1 failed"),
+                "{case}: {stdout}"
+            );
+            assert!(
+                stdout.contains(message) || stderr.contains(message),
+                "{case}: {stdout}{stderr}"
+            );
+            assert!(!exported.exists(), "{case}");
+        } else {
+            assert!(result.status.success(), "{case}: {stdout}{stderr}");
+            assert!(
+                stdout.contains("1 succeeded, 0 unsupported, 0 failed"),
+                "{case}: {stdout}"
+            );
+            assert!(exported.is_file(), "{case}");
+        }
+    }
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -802,12 +875,18 @@ fn synthetic_v22_switch_mip_chain() -> Vec<u8> {
     finish_v22(&metadata, &object)
 }
 
-fn synthetic_v22_unity6_shader() -> Vec<u8> {
+fn synthetic_v22_unity6_shader(keywords: usize) -> Vec<u8> {
     let mut object = Vec::new();
     push_aligned_string(&mut object, "Unity6Object");
-    for _ in 0..4 {
-        push_i32_le(&mut object, 0); // properties, subshaders, keywords, keyword flags
+    push_i32_le(&mut object, 0); // properties
+    push_i32_le(&mut object, 0); // subshaders
+    push_i32_le(&mut object, i32::try_from(keywords).unwrap()); // keyword names
+    for _ in 0..keywords {
+        push_aligned_string(&mut object, "");
     }
+    push_i32_le(&mut object, i32::try_from(keywords).unwrap()); // keyword flags
+    object.resize(object.len() + keywords, 0);
+    align_vec(&mut object, 4);
     push_aligned_string(&mut object, "Parsed/Unity6");
     push_aligned_string(&mut object, "");
     push_aligned_string(&mut object, "");

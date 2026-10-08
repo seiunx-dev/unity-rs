@@ -58,6 +58,7 @@ use unity_rs_core::serialized::{
     AssetBundleMetadata, ContainerMetadataReadLimits, PreloadDataMetadata, ResourceManagerMetadata,
     TypeTree, TypeTreeNode,
 };
+use unity_rs_core::shader::ShaderReadLimits;
 use unity_rs_core::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
     write_direct_wav,
@@ -2994,17 +2995,37 @@ impl PyUnityRs {
     }
 
     /// Converts one Unity `Shader` to UnityRs's bounded text payload.
-    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
+    ///
+    /// `maximum_array_elements` bounds any one array the reader walks and
+    /// `maximum_total_array_elements` all of them together, decompressed
+    /// sub-programs and their code bytes included. Every other parse budget
+    /// keeps its `ShaderReadLimits` default.
+    #[pyo3(signature = (
+        file_index,
+        path_id,
+        *,
+        maximum_bytes=536_870_912,
+        maximum_array_elements=1_000_000,
+        maximum_total_array_elements=4_000_000
+    ))]
     fn read_shader<'py>(
         &self,
         py: Python<'py>,
         file_index: usize,
         path_id: i64,
         maximum_bytes: u64,
+        maximum_array_elements: usize,
+        maximum_total_array_elements: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let limits = ShaderReadLimits {
+            maximum_array_elements,
+            maximum_total_array_elements,
+            maximum_output_bytes: maximum_bytes,
+            ..ShaderReadLimits::default()
+        };
         let bytes = py.detach(|| {
             self.object(file_index, path_id)?
-                .read_shader_text(maximum_bytes)
+                .read_shader_text_with_limits(limits)
                 .map_err(core_error)
         })?;
         python_bytes(py, &bytes)
