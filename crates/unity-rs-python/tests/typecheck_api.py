@@ -160,6 +160,13 @@ def consume_public_api(
     raw: bytes = studio.read_raw(0, 1)
     text: bytes = studio.read_text(0, 1)
     shader: bytes = studio.read_shader(0, 1)
+    shader = studio.read_shader(
+        0,
+        1,
+        maximum_bytes=1024,
+        maximum_array_elements=8_148_110,
+        maximum_total_array_elements=16_000_000,
+    )
     mesh: bytes = studio.read_mesh_obj(0, 1)
     static_fbx: bytes = studio.read_static_fbx()
     static_binary_fbx: bytes = studio.read_static_fbx_binary()

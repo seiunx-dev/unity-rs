@@ -49,6 +49,7 @@ use unity_rs_core::scene_hierarchy::SceneHierarchyLimits;
 use unity_rs_core::scene_hierarchy::SceneObjectKey;
 use unity_rs_core::scene_textures::SceneTextureLimits;
 use unity_rs_core::serialized::{ContainerMetadataReadLimits, TypeTree, TypeTreeNode};
+use unity_rs_core::shader::ShaderReadLimits;
 use unity_rs_core::simple_assets::{
     AudioClipAsset, SimpleAssetReadLimits, SimpleBinaryAsset, direct_wav_output_size,
     write_direct_wav,
@@ -930,6 +931,11 @@ pub struct ExportConfiguration {
     pub maximum_texture_array_bundle_bytes: Option<i64>,
     pub maximum_sprite_output_bytes: Option<i64>,
     pub maximum_shader_output_bytes: Option<i64>,
+    /// Elements in any one array of an exported `Shader`; default 1,000,000.
+    pub maximum_shader_array_elements: Option<i64>,
+    /// Elements across all arrays of one exported `Shader`, decompressed
+    /// sub-programs included; default 4,000,000.
+    pub maximum_shader_total_array_elements: Option<i64>,
     pub maximum_monobehaviour_json_bytes: Option<i64>,
     pub maximum_mesh_object_bytes: Option<i64>,
     pub maximum_mesh_output_bytes: Option<i64>,
@@ -1141,6 +1147,16 @@ fn apply_export_limits(
         options.maximum_shader_output_bytes,
         configured.maximum_shader_output_bytes,
         "maximumShaderOutputBytes",
+    )?;
+    configured.maximum_shader_array_elements = usize_non_negative_limit(
+        options.maximum_shader_array_elements,
+        configured.maximum_shader_array_elements,
+        "maximumShaderArrayElements",
+    )?;
+    configured.maximum_shader_total_array_elements = usize_non_negative_limit(
+        options.maximum_shader_total_array_elements,
+        configured.maximum_shader_total_array_elements,
+        "maximumShaderTotalArrayElements",
     )?;
     configured.maximum_monobehaviour_json_bytes = usize_non_negative_limit(
         options.maximum_monobehaviour_json_bytes,
@@ -1701,27 +1717,57 @@ impl UnityRs {
         )
     }
 
+    /// Converts one Unity `Shader` to the bounded text payload.
+    ///
+    /// `maximumArrayElements` bounds any one array the reader walks and
+    /// `maximumTotalArrayElements` all of them together, decompressed
+    /// sub-programs and their code bytes included; the defaults are 1,000,000
+    /// and 4,000,000. Every other parse budget keeps its Core default.
     #[napi]
     pub fn read_shader(
         &self,
         file_index: u32,
         path_id: BigInt,
         maximum_bytes: Option<i64>,
+        maximum_array_elements: Option<i64>,
+        maximum_total_array_elements: Option<i64>,
     ) -> Result<Buffer> {
+        let (maximum_array_elements, maximum_total_array_elements) =
+            shader_array_limits(maximum_array_elements, maximum_total_array_elements)?;
+        let limits = ShaderReadLimits {
+            maximum_array_elements,
+            maximum_total_array_elements,
+            maximum_output_bytes: byte_limit(maximum_bytes)?,
+            ..ShaderReadLimits::default()
+        };
         self.object(file_index, bigint_i64(path_id, "pathId")?)?
-            .read_shader_text(byte_limit(maximum_bytes)?)
+            .read_shader_text_with_limits(limits)
             .map(Buffer::from)
             .map_err(core_error)
     }
 
+    /// Converts one Unity `Shader` on a worker thread, with the same budgets
+    /// as `readShader`.
     #[napi(ts_return_type = "Promise<Buffer>")]
     pub fn read_shader_async(
         &self,
         file_index: u32,
         path_id: BigInt,
         maximum_bytes: Option<i64>,
+        maximum_array_elements: Option<i64>,
+        maximum_total_array_elements: Option<i64>,
     ) -> Result<AsyncTask<ReadBytesTask>> {
-        self.read_bytes_task(file_index, path_id, maximum_bytes, ByteReadKind::Shader)
+        let (maximum_array_elements, maximum_total_array_elements) =
+            shader_array_limits(maximum_array_elements, maximum_total_array_elements)?;
+        self.read_bytes_task(
+            file_index,
+            path_id,
+            maximum_bytes,
+            ByteReadKind::Shader {
+                maximum_array_elements,
+                maximum_total_array_elements,
+            },
+        )
     }
 
     #[napi]
@@ -3697,9 +3743,14 @@ impl Task for OpenBufferTask {
 enum ByteReadKind {
     Raw,
     Text,
-    TypeTreeJson { pretty: bool },
+    TypeTreeJson {
+        pretty: bool,
+    },
     TypeTreeDump,
-    Shader,
+    Shader {
+        maximum_array_elements: usize,
+        maximum_total_array_elements: usize,
+    },
     MeshObj,
 }
 
@@ -3729,7 +3780,15 @@ impl Task for ReadBytesTask {
                     .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?,
             ),
             ByteReadKind::TypeTreeDump => object.read_type_tree_dump(self.maximum),
-            ByteReadKind::Shader => object.read_shader_text(self.maximum),
+            ByteReadKind::Shader {
+                maximum_array_elements,
+                maximum_total_array_elements,
+            } => object.read_shader_text_with_limits(ShaderReadLimits {
+                maximum_array_elements,
+                maximum_total_array_elements,
+                maximum_output_bytes: self.maximum,
+                ..ShaderReadLimits::default()
+            }),
             ByteReadKind::MeshObj => object.read_mesh_obj(MeshReadLimits {
                 maximum_object_bytes: self.maximum,
                 maximum_output_bytes: self.maximum,
@@ -4505,6 +4564,26 @@ fn sprite_limits(maximum: u64) -> SpriteReadLimits {
         maximum_raster_operations: maximum,
         ..SpriteReadLimits::default()
     }
+}
+
+/// Validates the caller's Shader array budgets, defaulting each to Core's.
+fn shader_array_limits(
+    maximum_array_elements: Option<i64>,
+    maximum_total_array_elements: Option<i64>,
+) -> Result<(usize, usize)> {
+    let defaults = ShaderReadLimits::default();
+    Ok((
+        usize_non_negative_limit(
+            maximum_array_elements,
+            defaults.maximum_array_elements,
+            "maximumArrayElements",
+        )?,
+        usize_non_negative_limit(
+            maximum_total_array_elements,
+            defaults.maximum_total_array_elements,
+            "maximumTotalArrayElements",
+        )?,
+    ))
 }
 
 fn sprite_atlas_limits(

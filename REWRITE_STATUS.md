@@ -939,6 +939,22 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   4,500,005 个数组元素，单个数组均低于 1,000,000）覆盖三个方向：默认路径以原消息拒绝、
   调高总量预算后完整转换、更低预算更早拒绝。Python `read_shader` 与 Node `readShader`
   保持只接受输出上限的契约，新方法在两份 API 面审计中登记为 Rust-only；
+- **Shader 数组预算已于 2026-10-08 开放给 Python、Node 与 CLI（#5 近期部分）**：Python
+  `read_shader` 新增仅关键字参数 `maximum_array_elements`/`maximum_total_array_elements`，
+  Node `readShader`/`readShaderAsync` 在 `maximumBytes` 之后新增可选位置参数
+  `maximumArrayElements`/`maximumTotalArrayElements`，默认值与 `ShaderReadLimits::default`
+  相同（1,000,000/4,000,000），均改为委托 `read_shader_text_with_limits`；其余解析预算仍取
+  Core 默认。批量导出的 Core `ExportOptions` 新增 `maximum_shader_array_elements`/
+  `maximum_shader_total_array_elements`，CLI `export` 对应
+  `--maximum-shader-array-elements`/`--maximum-shader-total-array-elements`，Node
+  `exportWithOptions` 对应 `maximumShaderArrayElements`/`maximumShaderTotalArrayElements`
+  （负数以 `must be non-negative` 拒绝）；Python `export` 仍只暴露对象数、总输出与元数据三项
+  预算，未加入。默认预算**不放宽**，输出逐字节不变。`read_shader_text_with_limits` 在两份 API
+  面审计中由 Rust-only 改为映射到 `read_shader`/`readShader`。合成 Unity 6 fixture（3 个
+  keyword 名与 3 个 flag，共 6 个元素）在 Python、Node 同步/异步与 CLI 进程级测试中验证：
+  比所需少一的单数组/总量预算以原消息拒绝，恰好等于所需时输出与默认路径一致；1,000,001
+  个 keyword 名在默认预算下被拒、调高单数组预算后完整读取。类型树字节数组的计费与 3,200 万
+  元素上限属于 #5 的 0.6 部分，设计见 `docs/design/0.6-byte-array-values.md`；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

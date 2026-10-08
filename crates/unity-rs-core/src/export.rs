@@ -105,6 +105,13 @@ pub struct ExportOptions {
     pub maximum_texture_array_bundle_bytes: u64,
     pub maximum_sprite_output_bytes: u64,
     pub maximum_shader_output_bytes: u64,
+    /// Per-array element budget of each exported `Shader`, as
+    /// [`ShaderReadLimits::maximum_array_elements`].
+    pub maximum_shader_array_elements: usize,
+    /// Cumulative array element budget of each exported `Shader`, including
+    /// its decompressed sub-programs, as
+    /// [`ShaderReadLimits::maximum_total_array_elements`].
+    pub maximum_shader_total_array_elements: usize,
     pub maximum_monobehaviour_json_bytes: usize,
     pub maximum_mesh_object_bytes: u64,
     pub maximum_mesh_output_bytes: u64,
@@ -112,6 +119,7 @@ pub struct ExportOptions {
 
 impl Default for ExportOptions {
     fn default() -> Self {
+        let shader_defaults = ShaderReadLimits::default();
         Self {
             mode: ExportMode::Auto,
             filename_format: FilenameFormat::AssetName,
@@ -137,6 +145,8 @@ impl Default for ExportOptions {
             maximum_texture_array_bundle_bytes: 1024 * 1024 * 1024,
             maximum_sprite_output_bytes: 512 * 1024 * 1024,
             maximum_shader_output_bytes: 512 * 1024 * 1024,
+            maximum_shader_array_elements: shader_defaults.maximum_array_elements,
+            maximum_shader_total_array_elements: shader_defaults.maximum_total_array_elements,
             maximum_monobehaviour_json_bytes: 256 * 1024 * 1024,
             maximum_mesh_object_bytes: 512 * 1024 * 1024,
             maximum_mesh_output_bytes: 512 * 1024 * 1024,
@@ -770,6 +780,8 @@ fn select_auto_export_payload(
             let limits = ShaderReadLimits {
                 maximum_script_bytes: options.maximum_simple_asset_bytes,
                 maximum_output_bytes: options.maximum_shader_output_bytes,
+                maximum_array_elements: options.maximum_shader_array_elements,
+                maximum_total_array_elements: options.maximum_shader_total_array_elements,
                 ..ShaderReadLimits::default()
             };
             let shader = read_shader(file, object_index, limits)?;

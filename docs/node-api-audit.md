@@ -41,10 +41,6 @@ methods:
 - `object_by_index` returns a borrowed Rust `StudioObject`. Node exposes
   `objectIndex` for diagnostics and paging, while reads use the stable
   `(fileIndex, pathId)` key and retain collection first-match semantics;
-- `read_shader_text_with_limits` lets Rust callers choose every
-  `ShaderReadLimits` parse budget. Node keeps the output-capped
-  `readShader(maximumBytes)` contract, which maps to `read_shader_text` with
-  the default parse budgets;
 - low-level provider traits become explicit JavaScript callbacks or inert
   schema descriptions. Work that needs a callback runs on a libuv worker so
   the event loop can execute the callback without deadlocking.
@@ -54,7 +50,7 @@ methods:
 - `tools/check_node_api_surface.py` parses the four high-level Core impl blocks,
   the `#[napi] impl UnityRs` block, mapped napi object fields, generated
   `index.d.ts`, and the strict TypeScript consumer. All 109 public Core methods
-  must map to a real symbol in both Rust and TypeScript or one of the five
+  must map to a real symbol in both Rust and TypeScript or one of the four
   Rust-only entries above.
 - The Rust class and generated declaration must expose exactly the same current
   85 methods and 4 properties. A stale checked-in declaration, an addon method

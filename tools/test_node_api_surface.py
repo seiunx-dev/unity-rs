@@ -32,7 +32,7 @@ class NodeApiSurfaceAuditTests(unittest.TestCase):
                 self.rust,
                 self.declarations,
             ),
-            (109, 5),
+            (109, 4),
         )
         self.assertEqual(
             check_node_api_surface.validate_surface(

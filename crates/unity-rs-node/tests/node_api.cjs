@@ -94,6 +94,32 @@ function syntheticTextAsset() {
   return finishV22Asset(49, payload)
 }
 
+// A Unity 6 Shader in its parsed form whose keyword names (empty strings) and
+// keyword flags (one byte each) both hold `keywords` entries.
+function syntheticUnity6Shader(keywords = 0) {
+  const payload = Buffer.concat([
+    alignedString('Unity6Object'),
+    i32(0), // properties
+    i32(0), // subshaders
+    i32(keywords),
+    Buffer.alloc(4 * keywords), // keyword names
+    align(Buffer.concat([i32(keywords), Buffer.alloc(keywords)]), 4), // keyword flags
+    alignedString('Parsed/Unity6'),
+    alignedString(''),
+    alignedString(''),
+    i32(0), // dependencies
+    i32(0), // render-pipeline custom editors
+    Buffer.alloc(4), // disable no-subshaders message, aligned
+    Buffer.alloc(4 * 5), // platforms, offsets, compressed and decompressed lengths, blob
+    i32(0), // stage counts
+    i32(0), // object dependencies
+    i32(0), // non-modifiable textures
+    Buffer.alloc(4), // baked, aligned
+    Buffer.alloc(16), // asset GUID
+  ])
+  return finishV22Asset(48, payload, '6000.2.0f1')
+}
+
 function syntheticLegacyAnimation() {
   let payload = Buffer.concat([pptr(31), Buffer.from([1])])
   payload = align(payload, 4)
@@ -1935,6 +1961,40 @@ async function testAsyncWorkers() {
   )
   await assert.rejects(asyncStudio.readTextAsync(0, 7n, 9), /limit|exceed/i)
   await assert.rejects(asyncStudio.readShaderAsync(0, 7n), /Shader|class ID/i)
+
+  // The Shader array budgets reach the reader on both paths. Three keyword
+  // names and three flags are six elements, three in the largest array: one
+  // below either figure is refused, and the figure itself reads the same text.
+  const shaderText = Buffer.concat([
+    Buffer.from(
+      '//////////////////////////////////////////\n//\n' +
+        '// NOTE: This is *not* a valid shader file\n//\n' +
+        '///////////////////////////////////////////\n',
+    ),
+    Buffer.from('Shader "Parsed/Unity6" {\nProperties {\n}\n}'),
+  ])
+  const keywordShader = addon.UnityRs.fromBuffer(syntheticUnity6Shader(3), 'keywords.assets')
+  assert.deepEqual(keywordShader.readShader(0, 7n), shaderText)
+  assert.deepEqual(await keywordShader.readShaderAsync(0, 7n), shaderText)
+  assert.deepEqual(keywordShader.readShader(0, 7n, null, 3), shaderText)
+  assert.deepEqual(await keywordShader.readShaderAsync(0, 7n, null, null, 6), shaderText)
+  const perArray = /Shader keyword name has 3 elements, exceeding limit 2/
+  const total = /Shader arrays total 6 elements, exceeding limit 5/
+  assert.throws(() => keywordShader.readShader(0, 7n, null, 2), perArray)
+  await assert.rejects(keywordShader.readShaderAsync(0, 7n, null, 2), perArray)
+  assert.throws(() => keywordShader.readShader(0, 7n, null, null, 5), total)
+  await assert.rejects(keywordShader.readShaderAsync(0, 7n, null, null, 5), total)
+  assert.throws(() => keywordShader.readShader(0, 7n, null, -1), /maximumArrayElements must be non-negative/)
+  assert.throws(
+    () => keywordShader.readShaderAsync(0, 7n, null, null, -1),
+    /maximumTotalArrayElements must be non-negative/,
+  )
+  // Raising a budget admits what the default refuses: 1,000,001 keyword names
+  // exceed the 1,000,000 per-array default.
+  const wideShader = addon.UnityRs.fromBuffer(syntheticUnity6Shader(1_000_001), 'wide.assets')
+  assert.throws(() => wideShader.readShader(0, 7n), /has 1000001 elements, exceeding limit 1000000/)
+  assert.deepEqual(wideShader.readShader(0, 7n, null, 1_000_001), shaderText)
+  assert.deepEqual(await wideShader.readShaderAsync(0, 7n, null, 1_000_001), shaderText)
   await assert.rejects(asyncStudio.readMeshObjAsync(0, 7n), /Mesh|class ID/i)
   await assert.rejects(asyncStudio.readTextureAsync(0, 7n), /Texture2D|class ID/i)
   await assert.rejects(asyncStudio.readTypeTreeJsonAsync(0, 7n), /TypeTree|type tree/i)
@@ -2386,6 +2446,8 @@ console.log('node api: multi-buffer, resource range and scene ok')
       maximumTextureArrayBundleBytes: 1024,
       maximumSpriteOutputBytes: 1024,
       maximumShaderOutputBytes: 1024,
+      maximumShaderArrayElements: 1024,
+      maximumShaderTotalArrayElements: 1024,
       maximumMonobehaviourJsonBytes: 1024,
       maximumMeshObjectBytes: 1024,
       maximumMeshOutputBytes: 1024,
@@ -2420,6 +2482,8 @@ console.log('node api: multi-buffer, resource range and scene ok')
       'maximumTextureArrayBundleBytes',
       'maximumSpriteOutputBytes',
       'maximumShaderOutputBytes',
+      'maximumShaderArrayElements',
+      'maximumShaderTotalArrayElements',
       'maximumMonobehaviourJsonBytes',
       'maximumMeshObjectBytes',
       'maximumMeshOutputBytes',

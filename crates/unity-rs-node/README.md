@@ -10,7 +10,12 @@ The first binding slice supports:
   keep their old positional arguments and accept options last;
 - bounded file, object, and resource metadata pages;
 - bounded resource, raw-object, `TextAsset`, TypeTree JSON/dump, `Shader`, and
-  `Mesh` reads;
+  `Mesh` reads; `readShader(fileIndex, pathId, maximumBytes?,
+  maximumArrayElements?, maximumTotalArrayElements?)` and its worker form take
+  Core's Shader array budgets (1,000,000 per array and 4,000,000 in total,
+  decompressed sub-programs included, by default), and `exportWithOptions`
+  takes the same pair as `maximumShaderArrayElements` and
+  `maximumShaderTotalArrayElements`;
 - bounded legacy `Animation`, `AnimatorOverrideController`, `AssetBundle`,
   `ResourceManager`, `PreloadData`, and complete `Sprite`/`SpriteAtlas`
   reference/metadata reads;

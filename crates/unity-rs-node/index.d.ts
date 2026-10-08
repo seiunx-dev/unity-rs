@@ -101,8 +101,20 @@ export declare class UnityRs {
   readTypeTreeJsonAsync(fileIndex: number, pathId: bigint, pretty?: boolean | undefined | null, maximumBytes?: number | undefined | null): Promise<Buffer>
   readTypeTreeDump(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Buffer
   readTypeTreeDumpAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<Buffer>
-  readShader(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Buffer
-  readShaderAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<Buffer>
+  /**
+   * Converts one Unity `Shader` to the bounded text payload.
+   *
+   * `maximumArrayElements` bounds any one array the reader walks and
+   * `maximumTotalArrayElements` all of them together, decompressed
+   * sub-programs and their code bytes included; the defaults are 1,000,000
+   * and 4,000,000. Every other parse budget keeps its Core default.
+   */
+  readShader(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null, maximumArrayElements?: number | undefined | null, maximumTotalArrayElements?: number | undefined | null): Buffer
+  /**
+   * Converts one Unity `Shader` on a worker thread, with the same budgets
+   * as `readShader`.
+   */
+  readShaderAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null, maximumArrayElements?: number | undefined | null, maximumTotalArrayElements?: number | undefined | null): Promise<Buffer>
   readMeshObj(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Buffer
   readMeshObjAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<Buffer>
   readTexture(fileIndex: number, pathId: bigint, mipLevel?: number | undefined | null, maximumBytes?: number | undefined | null): RgbaImage
@@ -750,6 +762,13 @@ export interface ExportConfiguration {
   maximumTextureArrayBundleBytes?: number
   maximumSpriteOutputBytes?: number
   maximumShaderOutputBytes?: number
+  /** Elements in any one array of an exported `Shader`; default 1,000,000. */
+  maximumShaderArrayElements?: number
+  /**
+   * Elements across all arrays of one exported `Shader`, decompressed
+   * sub-programs included; default 4,000,000.
+   */
+  maximumShaderTotalArrayElements?: number
   maximumMonobehaviourJsonBytes?: number
   maximumMeshObjectBytes?: number
   maximumMeshOutputBytes?: number
