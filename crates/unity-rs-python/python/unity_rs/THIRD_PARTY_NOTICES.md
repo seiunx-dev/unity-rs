@@ -120,7 +120,7 @@ are consulted for format knowledge and executed as compatibility oracles.
 
 ## Maintenance notes
 
-The published `alloc-stdlib 0.2.4` crate and the split napi-rs crates used by
+The published `alloc-stdlib 0.3.0` crate and the split napi-rs crates used by
 the Node binding do not carry a top-level license file in their Cargo source
 archives. Reviewed copies from their official upstream repositories are pinned
 under `tools/legal-fallbacks/`; the generator maps them only to the exact
