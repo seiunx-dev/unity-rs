@@ -42,7 +42,10 @@ use crate::loader::{
     AssetCollection, AssetLoadOptions, LoadDiagnostic, LoadedResource, LoadedSerializedFile,
 };
 use crate::material::{Material, MaterialReadLimits, read_material};
-use crate::mesh::{MeshReadLimits, write_mesh_object_obj_with_collection};
+use crate::mesh::{
+    MeshGeometry, MeshReadLimits, read_mesh_geometry_with_collection,
+    write_mesh_object_obj_with_collection,
+};
 use crate::model_animation::{ModelAnimationLimits, build_model_animations_with_acl_decoder};
 use crate::model_export::{
     ModelExportCandidate, ModelExportPlanLimits, plan_animator_exports, plan_split_object_exports,
@@ -977,6 +980,23 @@ impl StudioObject<'_> {
         let write_result = self.write_mesh_obj(&mut output, limits);
         output.finish(write_result)?;
         Ok(output.bytes)
+    }
+
+    /// Reads one resident or collection-backed Unity `Mesh` as typed arrays:
+    /// positions, normals, tangents, colours, all eight texture-coordinate
+    /// channels, per-sub-mesh indices, bind poses, bone hashes, skin weights
+    /// and blend shapes.
+    ///
+    /// Every parse budget in `limits` applies, and `maximum_output_bytes`
+    /// caps the little-endian size of all numeric arrays in the result. See
+    /// [`read_mesh_geometry`](crate::mesh::read_mesh_geometry).
+    pub fn read_mesh(&self, limits: MeshReadLimits) -> Result<MeshGeometry> {
+        read_mesh_geometry_with_collection(
+            &self.studio.collection,
+            &self.loaded().file,
+            self.object_index,
+            limits,
+        )
     }
 
     /// Reads one bounded Unity or Tuanjie `AnimationClip` object.

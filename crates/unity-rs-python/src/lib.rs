@@ -44,7 +44,9 @@ use unity_rs_core::live2d_schema::{
 };
 use unity_rs_core::loader::{AssetLoadLimits, AssetLoadOptions, LoadDiagnostic, LoadFailurePolicy};
 use unity_rs_core::material::{Material, MaterialReadLimits, NamedMaterialProperty};
-use unity_rs_core::mesh::MeshReadLimits;
+use unity_rs_core::mesh::{
+    MeshBlendShapeVertex, MeshBlendShapes, MeshGeometry, MeshReadLimits, MeshVertexAttribute,
+};
 use unity_rs_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
 use unity_rs_core::mono_schema::{
     MonoBehaviourSchemaEntry, MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry,
@@ -827,6 +829,219 @@ struct PyAnimatorController {
     entity_id_count: Option<usize>,
     tos: Vec<(u32, String)>,
     animation_clips: Vec<(i32, i64)>,
+}
+
+/// One floating-point vertex attribute of a `Mesh`.
+///
+/// `data` packs `dimension` little-endian `float32` values per vertex,
+/// vertex-major, for every vertex of the mesh.
+#[pyclass(name = "MeshAttribute", frozen)]
+#[derive(Debug)]
+struct PyMeshAttribute {
+    #[pyo3(get)]
+    dimension: usize,
+    data: Vec<u8>,
+}
+
+#[pymethods]
+impl PyMeshAttribute {
+    #[getter]
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.data)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MeshAttribute(dimension={}, bytes={})",
+            self.dimension,
+            self.data.len()
+        )
+    }
+}
+
+/// One sub-mesh: its serialized ranges and its triangle-list indices, packed
+/// as little-endian `uint32` values.
+#[pyclass(name = "MeshSubMesh", frozen)]
+#[derive(Debug)]
+struct PyMeshSubMesh {
+    #[pyo3(get)]
+    first_byte: u32,
+    #[pyo3(get)]
+    index_count: u32,
+    #[pyo3(get)]
+    first_vertex: u32,
+    #[pyo3(get)]
+    vertex_count: u32,
+    indices: Vec<u8>,
+}
+
+#[pymethods]
+impl PyMeshSubMesh {
+    #[getter]
+    fn indices<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.indices)
+    }
+}
+
+/// A mesh's blend shapes. `vertices`, `normals` and `tangents` pack three
+/// little-endian `float32` deltas per shape vertex, `indices` one `uint32`
+/// mesh-vertex index per shape vertex, and `full_weights` one `float32` per
+/// frame. `frames` holds `(first_vertex, vertex_count, has_normals,
+/// has_tangents)` and `channels` holds `(name, name_hash, frame_index,
+/// frame_count)`.
+#[pyclass(name = "MeshBlendShapes", frozen)]
+#[derive(Debug)]
+struct PyMeshBlendShapes {
+    vertices: Vec<u8>,
+    normals: Vec<u8>,
+    tangents: Vec<u8>,
+    indices: Vec<u8>,
+    #[pyo3(get)]
+    frames: Vec<(u32, u32, bool, bool)>,
+    #[pyo3(get)]
+    channels: Vec<(String, u32, usize, usize)>,
+    full_weights: Vec<u8>,
+}
+
+#[pymethods]
+impl PyMeshBlendShapes {
+    #[getter]
+    fn vertices<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.vertices)
+    }
+
+    #[getter]
+    fn normals<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.normals)
+    }
+
+    #[getter]
+    fn tangents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.tangents)
+    }
+
+    #[getter]
+    fn indices<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.indices)
+    }
+
+    #[getter]
+    fn full_weights<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.full_weights)
+    }
+}
+
+/// One `Mesh` as typed little-endian arrays.
+///
+/// Every array covers `vertex_count` vertices. `uvs` always has eight
+/// entries, `None` where the mesh has no such channel. `bind_poses` packs 16
+/// `float32` values per bone in Unity's serialized column-major order,
+/// `bone_name_hashes` one `uint32` per bone, `skin_weights` four `float32`
+/// and `skin_bone_indices` four `uint32` values per vertex.
+#[pyclass(name = "Mesh", frozen)]
+#[derive(Debug)]
+struct PyMesh {
+    #[pyo3(get)]
+    path_id: i64,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    vertex_count: usize,
+    positions: Py<PyMeshAttribute>,
+    normals: Option<Py<PyMeshAttribute>>,
+    tangents: Option<Py<PyMeshAttribute>>,
+    colors: Option<Py<PyMeshAttribute>>,
+    uvs: Vec<Option<Py<PyMeshAttribute>>>,
+    sub_meshes: Vec<Py<PyMeshSubMesh>>,
+    bind_poses: Vec<u8>,
+    bone_name_hashes: Vec<u8>,
+    #[pyo3(get)]
+    root_bone_name_hash: u32,
+    skin_weights: Option<Vec<u8>>,
+    skin_bone_indices: Option<Vec<u8>>,
+    blend_shapes: Option<Py<PyMeshBlendShapes>>,
+}
+
+fn clone_optional_reference<T>(py: Python<'_>, value: Option<&Py<T>>) -> Option<Py<T>> {
+    value.map(|value| value.clone_ref(py))
+}
+
+fn optional_python_bytes<'py>(
+    py: Python<'py>,
+    bytes: Option<&Vec<u8>>,
+) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    bytes.map(|bytes| python_bytes(py, bytes)).transpose()
+}
+
+#[pymethods]
+impl PyMesh {
+    #[getter]
+    fn positions(&self, py: Python<'_>) -> Py<PyMeshAttribute> {
+        self.positions.clone_ref(py)
+    }
+
+    #[getter]
+    fn normals(&self, py: Python<'_>) -> Option<Py<PyMeshAttribute>> {
+        clone_optional_reference(py, self.normals.as_ref())
+    }
+
+    #[getter]
+    fn tangents(&self, py: Python<'_>) -> Option<Py<PyMeshAttribute>> {
+        clone_optional_reference(py, self.tangents.as_ref())
+    }
+
+    #[getter]
+    fn colors(&self, py: Python<'_>) -> Option<Py<PyMeshAttribute>> {
+        clone_optional_reference(py, self.colors.as_ref())
+    }
+
+    #[getter]
+    fn uvs(&self, py: Python<'_>) -> Vec<Option<Py<PyMeshAttribute>>> {
+        self.uvs
+            .iter()
+            .map(|value| clone_optional_reference(py, value.as_ref()))
+            .collect()
+    }
+
+    #[getter]
+    fn sub_meshes(&self, py: Python<'_>) -> PyResult<Vec<Py<PyMeshSubMesh>>> {
+        clone_python_references(py, &self.sub_meshes, "Mesh sub-meshes")
+    }
+
+    #[getter]
+    fn bind_poses<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.bind_poses)
+    }
+
+    #[getter]
+    fn bone_name_hashes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        python_bytes(py, &self.bone_name_hashes)
+    }
+
+    #[getter]
+    fn skin_weights<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        optional_python_bytes(py, self.skin_weights.as_ref())
+    }
+
+    #[getter]
+    fn skin_bone_indices<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        optional_python_bytes(py, self.skin_bone_indices.as_ref())
+    }
+
+    #[getter]
+    fn blend_shapes(&self, py: Python<'_>) -> Option<Py<PyMeshBlendShapes>> {
+        clone_optional_reference(py, self.blend_shapes.as_ref())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Mesh(path_id={}, name={:?}, vertex_count={}, sub_meshes={})",
+            self.path_id,
+            self.name,
+            self.vertex_count,
+            self.sub_meshes.len()
+        )
+    }
 }
 
 /// Stable skeleton, TOS, and human-description metadata from one `Avatar`.
@@ -3138,23 +3353,37 @@ impl PyUnityRs {
         path_id: i64,
         maximum_bytes: u64,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let maximum_usize = usize::try_from(maximum_bytes)
-            .map_err(|_| PyValueError::new_err("maximum_bytes does not fit this platform"))?;
-        let limits = MeshReadLimits {
-            maximum_object_bytes: maximum_bytes,
-            maximum_vertex_data_bytes: maximum_usize,
-            maximum_compressed_data_bytes: maximum_bytes,
-            maximum_auxiliary_bytes: maximum_bytes,
-            maximum_decoded_bytes: maximum_bytes,
-            maximum_output_bytes: maximum_bytes,
-            ..MeshReadLimits::default()
-        };
+        let limits = python_mesh_limits(maximum_bytes)?;
         let bytes = py.detach(|| {
             self.object(file_index, path_id)?
                 .read_mesh_obj(limits)
                 .map_err(core_error)
         })?;
         python_bytes(py, &bytes)
+    }
+
+    /// Reads one supported resident or externally streamed Unity `Mesh` as
+    /// typed little-endian arrays: positions, normals, tangents, colours,
+    /// eight UV channels, per-sub-mesh indices, bind poses, bone hashes, skin
+    /// weights and blend shapes. `maximum_bytes` bounds every parse budget
+    /// and the total size of the returned arrays.
+    #[pyo3(signature = (file_index, path_id, *, maximum_bytes=536_870_912))]
+    fn read_mesh(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        path_id: i64,
+        maximum_bytes: u64,
+    ) -> PyResult<PyMesh> {
+        let limits = python_mesh_limits(maximum_bytes)?;
+        let mesh = py.detach(|| {
+            let geometry = self
+                .object(file_index, path_id)?
+                .read_mesh(limits)
+                .map_err(core_error)?;
+            prepare_mesh(geometry)
+        })?;
+        mesh.into_python(py)
     }
 
     /// Parses bounded curve, muscle, ACL, and streaming metadata from one
@@ -4601,6 +4830,248 @@ fn prepare_animator_controller(controller: AnimatorController) -> PyResult<PyAni
         tos,
         animation_clips,
     })
+}
+
+fn python_mesh_limits(maximum_bytes: u64) -> PyResult<MeshReadLimits> {
+    let maximum_usize = usize::try_from(maximum_bytes)
+        .map_err(|_| PyValueError::new_err("maximum_bytes does not fit this platform"))?;
+    Ok(MeshReadLimits {
+        maximum_object_bytes: maximum_bytes,
+        maximum_vertex_data_bytes: maximum_usize,
+        maximum_compressed_data_bytes: maximum_bytes,
+        maximum_auxiliary_bytes: maximum_bytes,
+        maximum_decoded_bytes: maximum_bytes,
+        maximum_output_bytes: maximum_bytes,
+        ..MeshReadLimits::default()
+    })
+}
+
+/// Packs the `M` values each record contributes as little-endian bytes, with
+/// a fallible allocation sized before any copy.
+fn pack_le<R, T, const M: usize, const N: usize>(
+    records: &[R],
+    select: impl Fn(&R) -> [T; M],
+    to_bytes: impl Fn(T) -> [u8; N],
+    field: &'static str,
+) -> PyResult<Vec<u8>> {
+    let length = records
+        .len()
+        .checked_mul(M * N)
+        .ok_or_else(|| PyMemoryError::new_err(format!("{field} byte size overflowed")))?;
+    let mut bytes = reserve_metadata(length, field)?;
+    for record in records {
+        for value in select(record) {
+            bytes.extend_from_slice(&to_bytes(value));
+        }
+    }
+    Ok(bytes)
+}
+
+fn pack_f32(values: &[f32], field: &'static str) -> PyResult<Vec<u8>> {
+    pack_le(values, |value| [*value], f32::to_le_bytes, field)
+}
+
+fn pack_u32(values: &[u32], field: &'static str) -> PyResult<Vec<u8>> {
+    pack_le(values, |value| [*value], u32::to_le_bytes, field)
+}
+
+struct PreparedMeshAttribute {
+    dimension: usize,
+    data: Vec<u8>,
+}
+
+impl PreparedMeshAttribute {
+    fn new(dimension: usize, values: &[f32], field: &'static str) -> PyResult<Self> {
+        Ok(Self {
+            dimension,
+            data: pack_f32(values, field)?,
+        })
+    }
+
+    fn from_core(
+        attribute: Option<&MeshVertexAttribute>,
+        field: &'static str,
+    ) -> PyResult<Option<Self>> {
+        attribute
+            .map(|attribute| Self::new(attribute.dimension, &attribute.values, field))
+            .transpose()
+    }
+
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyMeshAttribute>> {
+        Py::new(
+            py,
+            PyMeshAttribute {
+                dimension: self.dimension,
+                data: self.data,
+            },
+        )
+    }
+}
+
+/// A `Mesh` packed into little-endian arrays without the GIL; only the Python
+/// object wrapping happens attached.
+struct PreparedMesh {
+    path_id: i64,
+    name: String,
+    vertex_count: usize,
+    positions: PreparedMeshAttribute,
+    normals: Option<PreparedMeshAttribute>,
+    tangents: Option<PreparedMeshAttribute>,
+    colors: Option<PreparedMeshAttribute>,
+    uvs: Vec<Option<PreparedMeshAttribute>>,
+    sub_meshes: Vec<PyMeshSubMesh>,
+    bind_poses: Vec<u8>,
+    bone_name_hashes: Vec<u8>,
+    root_bone_name_hash: u32,
+    skin_weights: Option<Vec<u8>>,
+    skin_bone_indices: Option<Vec<u8>>,
+    blend_shapes: Option<PyMeshBlendShapes>,
+}
+
+fn prepare_mesh(geometry: MeshGeometry) -> PyResult<PreparedMesh> {
+    let MeshGeometry { mesh, channels, .. } = geometry;
+    let positions =
+        PreparedMeshAttribute::new(3, mesh.vertices.as_flattened(), "Python Mesh positions")?;
+    let normals = mesh
+        .normals
+        .as_deref()
+        .map(|normals| PreparedMeshAttribute::new(3, normals.as_flattened(), "Python Mesh normals"))
+        .transpose()?;
+    let mut uvs = reserve_metadata(channels.uvs.len(), "Python Mesh UV channels")?;
+    for uv in &channels.uvs {
+        uvs.push(PreparedMeshAttribute::from_core(
+            uv.as_ref(),
+            "Python Mesh UVs",
+        )?);
+    }
+    let mut sub_meshes = reserve_metadata(mesh.sub_meshes.len(), "Python Mesh sub-meshes")?;
+    for sub_mesh in &mesh.sub_meshes {
+        sub_meshes.push(PyMeshSubMesh {
+            first_byte: sub_mesh.first_byte,
+            index_count: sub_mesh.index_count,
+            first_vertex: sub_mesh.first_vertex,
+            vertex_count: sub_mesh.vertex_count,
+            indices: pack_u32(&sub_mesh.indices, "Python Mesh sub-mesh indices")?,
+        });
+    }
+    let (skin_weights, skin_bone_indices) = match &mesh.skin {
+        Some(skin) => (
+            Some(pack_le(
+                skin,
+                |influence| influence.weights,
+                f32::to_le_bytes,
+                "Python Mesh skin weights",
+            )?),
+            Some(pack_le(
+                skin,
+                |influence| influence.bone_indices,
+                u32::to_le_bytes,
+                "Python Mesh skin bone indices",
+            )?),
+        ),
+        None => (None, None),
+    };
+    let blend_shapes = mesh
+        .blend_shapes
+        .as_ref()
+        .map(prepare_blend_shapes)
+        .transpose()?;
+    Ok(PreparedMesh {
+        path_id: mesh.path_id,
+        vertex_count: mesh.vertices.len(),
+        positions,
+        normals,
+        tangents: PreparedMeshAttribute::from_core(
+            channels.tangents.as_ref(),
+            "Python Mesh tangents",
+        )?,
+        colors: PreparedMeshAttribute::from_core(channels.colors.as_ref(), "Python Mesh colours")?,
+        uvs,
+        sub_meshes,
+        bind_poses: pack_f32(mesh.bind_poses.as_flattened(), "Python Mesh bind poses")?,
+        bone_name_hashes: pack_u32(&mesh.bone_name_hashes, "Python Mesh bone hashes")?,
+        root_bone_name_hash: mesh.root_bone_name_hash,
+        skin_weights,
+        skin_bone_indices,
+        blend_shapes,
+        name: mesh.name,
+    })
+}
+
+fn prepare_blend_shapes(shapes: &MeshBlendShapes) -> PyResult<PyMeshBlendShapes> {
+    let vector = |select: fn(&MeshBlendShapeVertex) -> [f32; 3], field| {
+        pack_le(&shapes.vertices, select, f32::to_le_bytes, field)
+    };
+    let mut frames = reserve_metadata(shapes.frames.len(), "Python Mesh blend-shape frames")?;
+    frames.extend(shapes.frames.iter().map(|frame| {
+        (
+            frame.first_vertex,
+            frame.vertex_count,
+            frame.has_normals,
+            frame.has_tangents,
+        )
+    }));
+    let mut channels = reserve_metadata(shapes.channels.len(), "Python Mesh blend-shape channels")?;
+    channels.extend(shapes.channels.iter().map(|channel| {
+        (
+            channel.name.clone(),
+            channel.name_hash,
+            channel.frame_index,
+            channel.frame_count,
+        )
+    }));
+    Ok(PyMeshBlendShapes {
+        vertices: vector(|vertex| vertex.vertex, "Python Mesh blend-shape vertices")?,
+        normals: vector(|vertex| vertex.normal, "Python Mesh blend-shape normals")?,
+        tangents: vector(|vertex| vertex.tangent, "Python Mesh blend-shape tangents")?,
+        indices: pack_le(
+            &shapes.vertices,
+            |vertex| [vertex.index],
+            u32::to_le_bytes,
+            "Python Mesh blend-shape indices",
+        )?,
+        frames,
+        channels,
+        full_weights: pack_f32(&shapes.full_weights, "Python Mesh blend-shape weights")?,
+    })
+}
+
+impl PreparedMesh {
+    fn into_python(self, py: Python<'_>) -> PyResult<PyMesh> {
+        let optional = |attribute: Option<PreparedMeshAttribute>| {
+            attribute
+                .map(|attribute| attribute.into_python(py))
+                .transpose()
+        };
+        let mut uvs = reserve_metadata(self.uvs.len(), "Python Mesh UV channels")?;
+        for uv in self.uvs {
+            uvs.push(optional(uv)?);
+        }
+        let mut sub_meshes = reserve_metadata(self.sub_meshes.len(), "Python Mesh sub-meshes")?;
+        for sub_mesh in self.sub_meshes {
+            sub_meshes.push(Py::new(py, sub_mesh)?);
+        }
+        Ok(PyMesh {
+            path_id: self.path_id,
+            name: self.name,
+            vertex_count: self.vertex_count,
+            positions: self.positions.into_python(py)?,
+            normals: optional(self.normals)?,
+            tangents: optional(self.tangents)?,
+            colors: optional(self.colors)?,
+            uvs,
+            sub_meshes,
+            bind_poses: self.bind_poses,
+            bone_name_hashes: self.bone_name_hashes,
+            root_bone_name_hash: self.root_bone_name_hash,
+            skin_weights: self.skin_weights,
+            skin_bone_indices: self.skin_bone_indices,
+            blend_shapes: self
+                .blend_shapes
+                .map(|shapes| Py::new(py, shapes))
+                .transpose()?,
+        })
+    }
 }
 
 fn prepare_avatar(avatar: Avatar) -> PyResult<PyAvatar> {
@@ -6522,6 +6993,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAclDecodedClip>()?;
     module.add_class::<PyAnimatorController>()?;
     module.add_class::<PyAvatar>()?;
+    module.add_class::<PyMesh>()?;
+    module.add_class::<PyMeshAttribute>()?;
+    module.add_class::<PyMeshSubMesh>()?;
+    module.add_class::<PyMeshBlendShapes>()?;
     module.add_class::<PyMonoBehaviourSchema>()?;
     module.add_class::<PyMonoBehaviourSchemas>()?;
     module.add_class::<PyBuildSettings>()?;

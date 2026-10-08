@@ -734,6 +734,187 @@ function modelMesh() {
   return Buffer.concat([payload, i64(0), u32(0), alignedString('')])
 }
 
+// (stream, offset, format, dimension) for Unity 2019+ shader channels 0-13:
+// position, normal, tangent, UNorm8 colour, UV0, a Float16 UV3, and four skin
+// weights with UInt8 bone indices.
+const RICH_MESH_CHANNELS = [
+  [0, 0, 0, 3], [1, 0, 0, 3], [2, 0, 0, 4], [3, 0, 2, 4], [4, 0, 0, 2],
+  [0, 0, 0, 0], [0, 0, 0, 0], [5, 0, 1, 2], [0, 0, 0, 0], [0, 0, 0, 0],
+  [0, 0, 0, 0], [0, 0, 0, 0], [6, 0, 0, 4], [7, 0, 6, 4],
+]
+const RICH_MESH_POSITIONS = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+const RICH_MESH_NORMALS = [[0, 0, 1], [0, 1, 0], [1, 0, 0]]
+const RICH_MESH_TANGENTS = [[1, 0, 0, 1], [0, 0, 1, -1], [0, 1, 0, 1]]
+const RICH_MESH_COLORS = [255, 0, 0, 255, 0, 255, 0, 51, 0, 0, 255, 0]
+const RICH_MESH_UV0 = [[0, 0], [1, 0], [0, 1]]
+// Float16 bits of (0.5, 0.25), (1.5, 2), (-1, 0.125).
+const RICH_MESH_UV3_HALVES = [0x3800, 0x3400, 0x3e00, 0x4000, 0xbc00, 0x3000]
+const RICH_MESH_WEIGHTS = [[1, 0, 0, 0], [0.5, 0.5, 0, 0], [0.25, 0.25, 0.5, 0]]
+const RICH_MESH_BONES = [0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 2, 0]
+const IDENTITY = Array.from({ length: 16 }, (_, index) => (index % 5 === 0 ? 1 : 0))
+
+// One blend shape, one bind pose with its bone hash, and every vertex channel
+// above, each stream on the 16-byte boundary Unity uses.
+function richMesh() {
+  const streams = [
+    f32s(RICH_MESH_POSITIONS.flat()),
+    f32s(RICH_MESH_NORMALS.flat()),
+    f32s(RICH_MESH_TANGENTS.flat()),
+    Buffer.from(RICH_MESH_COLORS),
+    f32s(RICH_MESH_UV0.flat()),
+    Buffer.concat(RICH_MESH_UV3_HALVES.map((bits) => {
+      const output = Buffer.alloc(2)
+      output.writeUInt16LE(bits)
+      return output
+    })),
+    f32s(RICH_MESH_WEIGHTS.flat()),
+    Buffer.from(RICH_MESH_BONES),
+  ]
+  let vertexData = Buffer.alloc(0)
+  for (const stream of streams) {
+    vertexData = Buffer.concat([align(vertexData, 16), stream])
+  }
+  let payload = Buffer.concat([
+    alignedString('node rich'),
+    i32(1),
+    ...[0, 3, 0, 0, 0, 3].map(u32),
+    Buffer.alloc(24),
+    i32(1),
+    f32s([0.5, 0, 0, 0, 0.25, 0, 0, 0, 0.125]),
+    u32(2),
+    i32(1),
+    u32(0),
+    u32(1),
+    Buffer.from([1, 1, 0, 0]),
+    i32(1),
+    alignedString('blendShape.smile'),
+    u32(0xc0ffee),
+    i32(0),
+    i32(1),
+    i32(1),
+    f32(100),
+    i32(1),
+    f32s(IDENTITY),
+    i32(1),
+    u32(0xb0e),
+    u32(0xb0e),
+    i32(0),
+    i32(0),
+    Buffer.from([0, 1, 0, 0]),
+    i32(0),
+    i32(6),
+    Buffer.from([0, 0, 1, 0, 2, 0]),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    u32(3),
+    i32(RICH_MESH_CHANNELS.length),
+    Buffer.from(RICH_MESH_CHANNELS.flat()),
+    i32(vertexData.length),
+    vertexData,
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([
+    payload,
+    ...Array.from({ length: 4 }, emptyPackedFloat),
+    ...Array.from({ length: 3 }, emptyPackedInt),
+    emptyPackedFloat(),
+    ...Array.from({ length: 2 }, emptyPackedInt),
+    u32(0),
+    Buffer.alloc(24),
+    i32(0),
+    i32(0),
+    i32(0),
+  ])
+  payload = align(payload, 4)
+  payload = Buffer.concat([payload, i32(0)])
+  payload = align(payload, 4)
+  payload = Buffer.concat([payload, Buffer.alloc(8)])
+  payload = align(payload, 4)
+  return Buffer.concat([payload, i64(0), u32(0), alignedString('')])
+}
+
+function floatRows(buffer, width) {
+  const values = Array.from({ length: buffer.length / 4 }, (_, index) => buffer.readFloatLE(index * 4))
+  return Array.from({ length: values.length / width }, (_, row) => values.slice(row * width, row * width + width))
+}
+
+function uint32s(buffer) {
+  return Array.from({ length: buffer.length / 4 }, (_, index) => buffer.readUInt32LE(index * 4))
+}
+
+async function testTypedMesh() {
+  const modelInput = syntheticTexturedModel()
+  const model = addon.UnityRs.fromBuffer(modelInput, 'mesh-model.assets', modelInput.length)
+  const plain = model.readMesh(0, 51n)
+  assert.equal(plain.pathId, 51n)
+  assert.equal(plain.name, 'node triangle')
+  assert.equal(plain.vertexCount, 3)
+  assert.equal(plain.positions.dimension, 3)
+  assert.deepEqual(floatRows(plain.positions.data, 3), [[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+  assert.equal(plain.normals, undefined)
+  assert.equal(plain.tangents, undefined)
+  assert.equal(plain.colors, undefined)
+  assert.deepEqual(plain.uvs, Array(8).fill(null))
+  assert.equal(plain.subMeshes.length, 1)
+  const [subMesh] = plain.subMeshes
+  assert.deepEqual(
+    [subMesh.firstByte, subMesh.indexCount, subMesh.firstVertex, subMesh.vertexCount],
+    [0, 3, 0, 3],
+  )
+  assert.deepEqual(uint32s(subMesh.indices), [0, 1, 2])
+  assert.equal(plain.bindPoses.length, 0)
+  assert.equal(plain.boneNameHashes.length, 0)
+  assert.equal(plain.skinWeights, undefined)
+  assert.equal(plain.blendShapes, undefined)
+  assert.deepEqual(await model.readMeshAsync(0, 51n), plain)
+  assert.throws(() => model.readMesh(0, 51n, 8), /exceeding limit 8/)
+  await assert.rejects(model.readMeshAsync(0, 51n, 8), /exceeding limit 8/)
+  assert.throws(() => model.readMesh(0, 41n), /Mesh|class ID/i)
+  assert.throws(() => model.readMesh(0, 51n, -1), /maximumBytes/)
+
+  const richInput = finishV22Asset(43, richMesh())
+  const rich = addon.UnityRs.fromBuffer(richInput, 'rich-mesh.assets', richInput.length)
+  const mesh = rich.readMesh(0, 7n)
+  assert.deepEqual(floatRows(mesh.normals.data, 3), RICH_MESH_NORMALS)
+  assert.equal(mesh.tangents.dimension, 4)
+  assert.deepEqual(floatRows(mesh.tangents.data, 4), RICH_MESH_TANGENTS)
+  assert.equal(mesh.colors.dimension, 4)
+  floatRows(mesh.colors.data, 1).flat().forEach((value, index) => {
+    assert.ok(Math.abs(value - RICH_MESH_COLORS[index] / 255) < 1e-7)
+  })
+  assert.deepEqual(floatRows(mesh.uvs[0].data, 2), RICH_MESH_UV0)
+  assert.deepEqual(mesh.uvs.map((uv) => uv && uv.dimension), [2, null, null, 2, null, null, null, null])
+  assert.deepEqual(floatRows(mesh.uvs[3].data, 2), [[0.5, 0.25], [1.5, 2], [-1, 0.125]])
+  assert.deepEqual(floatRows(mesh.skinWeights, 4), RICH_MESH_WEIGHTS)
+  assert.deepEqual(uint32s(mesh.skinBoneIndices), RICH_MESH_BONES)
+  assert.deepEqual(floatRows(mesh.bindPoses, 16), [IDENTITY])
+  assert.deepEqual(uint32s(mesh.boneNameHashes), [0xb0e])
+  assert.equal(mesh.rootBoneNameHash, 0xb0e)
+  const shapes = mesh.blendShapes
+  assert.deepEqual(floatRows(shapes.vertices, 3), [[0.5, 0, 0]])
+  assert.deepEqual(floatRows(shapes.normals, 3), [[0, 0.25, 0]])
+  assert.deepEqual(floatRows(shapes.tangents, 3), [[0, 0, 0.125]])
+  assert.deepEqual(uint32s(shapes.indices), [2])
+  assert.deepEqual(shapes.frames, [{ firstVertex: 0, vertexCount: 1, hasNormals: true, hasTangents: true }])
+  assert.deepEqual(shapes.channels, [{ name: 'blendShape.smile', nameHash: 0xc0ffee, frameIndex: 0, frameCount: 1 }])
+  assert.deepEqual(floatRows(shapes.fullWeights, 1), [[100]])
+  assert.deepEqual(await rich.readMeshAsync(0, 7n), mesh)
+  // The OBJ carries positions, UV0 and normals only.
+  assert.equal(
+    rich.readMeshObj(0, 7n).toString('utf8'),
+    'g node rich\r\nv -0 0 0\r\nv -1 0 0\r\nv -0 1 0\r\nvt 0 0\r\nvt 1 0\r\nvt 0 1\r\n'
+      + 'vn -0 0 1\r\nvn -0 1 0\r\nvn -1 0 0\r\ng node rich_0\r\nf 3/3/3 2/2/2 1/1/1\r\n',
+  )
+  console.log('node api: typed mesh ok')
+}
+
+testTypedMesh().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
+
 function finishV22Objects(objects, version = '2022.3.62f1') {
   const classes = [...new Set(objects.map(({ classId }) => classId))]
     .sort((left, right) => left - right)

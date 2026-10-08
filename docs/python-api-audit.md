@@ -41,14 +41,14 @@ methods:
 ## Enforced evidence
 
 - `tools/check_python_api_surface.py` parses both the Rust high-level source and
-  the Python 3.9-compatible stub. All 109 public methods across `Studio`,
+  the Python 3.9-compatible stub. All 110 public methods across `Studio`,
   `StudioFile`, `StudioResource` and `StudioObject` must map to a real Python
   symbol or one of the four Rust-only entries above. It also
   requires every public `UnityRs` method and property to be used by the
   strict mypy consumer. A newly published but unclassified Core method, a
   missing Python target, or a published but unconsumed Python method fails
   `quality`. `tools/test_python_api_surface.py` runs the current
-  109-Core/4-Rust-only and 67-method/4-property pairs and proves all those
+  110-Core/4-Rust-only and 68-method/4-property pairs and proves all those
   failure directions instead of silently checking an empty surface.
 - `tests/installed_wheel.py` compares the installed runtime and shipped `.pyi`
   in both directions and compares every literal default parameter.

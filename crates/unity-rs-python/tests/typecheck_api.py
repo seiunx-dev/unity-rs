@@ -38,6 +38,10 @@ from unity_rs import (
     Live2dPackageSet,
     LoadDiagnostic,
     Material,
+    Mesh,
+    MeshAttribute,
+    MeshBlendShapes,
+    MeshSubMesh,
     ModelObj,
     ModelTextureLimits,
     MonoBehaviourJson,
@@ -168,6 +172,50 @@ def consume_public_api(
         maximum_total_array_elements=16_000_000,
     )
     mesh: bytes = studio.read_mesh_obj(0, 1)
+    typed_mesh: Mesh = studio.read_mesh(0, 1, maximum_bytes=1_048_576)
+    mesh_header: tuple[int, str, int, int] = (
+        typed_mesh.path_id,
+        typed_mesh.name,
+        typed_mesh.vertex_count,
+        typed_mesh.root_bone_name_hash,
+    )
+    mesh_positions: MeshAttribute = typed_mesh.positions
+    mesh_position_bytes: tuple[int, bytes] = (
+        mesh_positions.dimension,
+        mesh_positions.data,
+    )
+    mesh_channels: list[Optional[MeshAttribute]] = [
+        typed_mesh.normals,
+        typed_mesh.tangents,
+        typed_mesh.colors,
+        *typed_mesh.uvs,
+    ]
+    mesh_sub_mesh: MeshSubMesh = typed_mesh.sub_meshes[0]
+    mesh_sub_mesh_fields: tuple[int, int, int, int, bytes] = (
+        mesh_sub_mesh.first_byte,
+        mesh_sub_mesh.index_count,
+        mesh_sub_mesh.first_vertex,
+        mesh_sub_mesh.vertex_count,
+        mesh_sub_mesh.indices,
+    )
+    mesh_bones: tuple[bytes, bytes, Optional[bytes], Optional[bytes]] = (
+        typed_mesh.bind_poses,
+        typed_mesh.bone_name_hashes,
+        typed_mesh.skin_weights,
+        typed_mesh.skin_bone_indices,
+    )
+    mesh_shapes: Optional[MeshBlendShapes] = typed_mesh.blend_shapes
+    if mesh_shapes is not None:
+        shape_arrays: tuple[bytes, bytes, bytes, bytes, bytes] = (
+            mesh_shapes.vertices,
+            mesh_shapes.normals,
+            mesh_shapes.tangents,
+            mesh_shapes.indices,
+            mesh_shapes.full_weights,
+        )
+        shape_frames: list[tuple[int, int, bool, bool]] = mesh_shapes.frames
+        shape_channels: list[tuple[str, int, int, int]] = mesh_shapes.channels
+        del shape_arrays, shape_frames, shape_channels
     static_fbx: bytes = studio.read_static_fbx()
     static_binary_fbx: bytes = studio.read_static_fbx_binary()
     animated_fbx: bytes = studio.read_fbx(acl_decoder=acl_decoder)
@@ -306,6 +354,12 @@ def consume_public_api(
         text,
         shader,
         mesh,
+        typed_mesh,
+        mesh_header,
+        mesh_position_bytes,
+        mesh_channels,
+        mesh_sub_mesh_fields,
+        mesh_bones,
         static_fbx,
         static_binary_fbx,
         animated_fbx,

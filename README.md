@@ -202,6 +202,10 @@ Node-facing handoff.
   Switch mip-zero texture paths;
 - Mesh and scene graph parsing, OBJ/MTL, ASCII/binary FBX 7.4, materials,
   textures, skin clusters, static blend shapes, and supported animation tracks;
+- typed `Mesh` reads (`StudioObject::read_mesh`, Python `read_mesh`, Node
+  `readMesh`): positions, normals, tangents, colours, UV0-UV7, per-sub-mesh
+  indices, bind poses, bone hashes, skin weights and blend shapes as packed
+  little-endian arrays, from resident and `CompressedMesh` data alike;
 - AnimationClip, Animation, AnimatorController, AnimatorOverrideController,
   Avatar, Animator/SplitObjects planning, and caller-injected ACL decoding;
 - MonoScript/MonoBehaviour metadata and JSON via embedded TypeTrees or trusted,

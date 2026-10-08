@@ -117,6 +117,16 @@ export declare class UnityRs {
   readShaderAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null, maximumArrayElements?: number | undefined | null, maximumTotalArrayElements?: number | undefined | null): Promise<Buffer>
   readMeshObj(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Buffer
   readMeshObjAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<Buffer>
+  /**
+   * Reads one supported resident or externally streamed Unity `Mesh` as
+   * typed little-endian arrays: positions, normals, tangents, colours,
+   * eight UV channels, per-sub-mesh indices, bind poses, bone hashes, skin
+   * weights and blend shapes. `maximumBytes` bounds every parse budget
+   * and the total size of the returned arrays.
+   */
+  readMesh(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Mesh
+  /** Reads one `Mesh` like `readMesh` on a worker thread. */
+  readMeshAsync(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Promise<Mesh>
   readTexture(fileIndex: number, pathId: bigint, mipLevel?: number | undefined | null, maximumBytes?: number | undefined | null): RgbaImage
   readTextureAsync(fileIndex: number, pathId: bigint, mipLevel?: number | undefined | null, maximumBytes?: number | undefined | null): Promise<RgbaImage>
   readTextureArray(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): Array<RgbaImage>
@@ -920,6 +930,86 @@ export interface Material {
 export interface MemoryInput {
   name: string
   data: Buffer
+}
+
+/**
+ * One `Mesh` as typed little-endian arrays, each covering `vertexCount`
+ * vertices.
+ */
+export interface Mesh {
+  pathId: bigint
+  name: string
+  vertexCount: number
+  positions: MeshAttribute
+  normals?: MeshAttribute
+  tangents?: MeshAttribute
+  colors?: MeshAttribute
+  /** UV0 through UV7; `null` where the mesh has no such channel. */
+  uvs: Array<MeshAttribute | null>
+  subMeshes: Array<MeshSubMesh>
+  /** 16 float32 values per bone in Unity's serialized column-major order. */
+  bindPoses: Buffer
+  /** One uint32 per bone. */
+  boneNameHashes: Buffer
+  rootBoneNameHash: number
+  /** Four float32 weights per vertex. */
+  skinWeights?: Buffer
+  /** Four uint32 bone indices per vertex. */
+  skinBoneIndices?: Buffer
+  blendShapes?: MeshBlendShapes
+}
+
+/** One floating-point vertex attribute of a `Mesh`. */
+export interface MeshAttribute {
+  /** Components per vertex, 1 through 4. */
+  dimension: number
+  /**
+   * `dimension` little-endian float32 values per vertex, vertex-major, for
+   * every vertex of the mesh.
+   */
+  data: Buffer
+}
+
+/** One named blend-shape channel and its range of frames. */
+export interface MeshBlendShapeChannel {
+  name: string
+  nameHash: number
+  frameIndex: number
+  frameCount: number
+}
+
+/** One blend-shape frame's range of shape vertices. */
+export interface MeshBlendShapeFrame {
+  firstVertex: number
+  vertexCount: number
+  hasNormals: boolean
+  hasTangents: boolean
+}
+
+/** A mesh's blend shapes as little-endian arrays. */
+export interface MeshBlendShapes {
+  /** Three float32 position deltas per shape vertex. */
+  vertices: Buffer
+  /** Three float32 normal deltas per shape vertex. */
+  normals: Buffer
+  /** Three float32 tangent deltas per shape vertex. */
+  tangents: Buffer
+  /** One uint32 mesh-vertex index per shape vertex. */
+  indices: Buffer
+  frames: Array<MeshBlendShapeFrame>
+  channels: Array<MeshBlendShapeChannel>
+  /** One float32 full weight per frame. */
+  fullWeights: Buffer
+}
+
+/** One sub-mesh: its serialized ranges and its triangle-list indices. */
+export interface MeshSubMesh {
+  firstByte: number
+  indexCount: number
+  firstVertex: number
+  vertexCount: number
+  /** Little-endian uint32 triangle-list indices. */
+  indices: Buffer
 }
 
 /**

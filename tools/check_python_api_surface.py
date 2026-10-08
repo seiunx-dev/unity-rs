@@ -108,6 +108,7 @@ CORE_TO_PYTHON = {
     "StudioObject.read_shader_text_with_limits": "UnityRs.read_shader",
     "StudioObject.write_mesh_obj": "UnityRs.read_mesh_obj",
     "StudioObject.read_mesh_obj": "UnityRs.read_mesh_obj",
+    "StudioObject.read_mesh": "UnityRs.read_mesh",
     "StudioObject.read_animation_clip": "UnityRs.read_animation_clip",
     "StudioObject.read_legacy_animation": "UnityRs.read_legacy_animation",
     "StudioObject.read_animator_override_controller": (
@@ -340,6 +341,7 @@ METADATA_PROJECTION_GIL_EXPECTATIONS = (
     ("fn read_preload_data(", "prepare_preload_data("),
     ("fn read_animator_controller(", "prepare_animator_controller("),
     ("fn read_avatar(", "prepare_avatar("),
+    ("fn read_mesh(", "prepare_mesh("),
 )
 
 

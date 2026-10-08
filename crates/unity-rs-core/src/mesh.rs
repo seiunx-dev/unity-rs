@@ -138,6 +138,44 @@ pub struct Mesh {
     pub sub_meshes: Vec<MeshSubMesh>,
 }
 
+/// One floating-point vertex attribute, stored vertex-major: the components of
+/// vertex 0, then those of vertex 1, and so on.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MeshVertexAttribute {
+    /// Components per vertex, 1 through 4.
+    pub dimension: usize,
+    /// `dimension` values per vertex, for every vertex of the mesh.
+    pub values: Vec<f32>,
+}
+
+/// The vertex channels [`Mesh`] does not carry, decoded by
+/// [`read_mesh_geometry`] and [`read_mesh_geometry_with_collection`].
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
+pub struct MeshVertexChannels {
+    /// Tangents, normally four components with the handedness in `w`.
+    pub tangents: Option<MeshVertexAttribute>,
+    /// Vertex colours as floats, normally four (RGBA) components. Normalized
+    /// integer formats are scaled to `0..=1` (or `-1..=1`) as Unity does.
+    pub colors: Option<MeshVertexAttribute>,
+    /// Texture coordinates 0 through 7 at their stored dimension. `uvs[0]` is
+    /// the channel behind [`Mesh::uv0`], without its truncation to two
+    /// components.
+    pub uvs: [Option<MeshVertexAttribute>; 8],
+}
+
+/// One mesh with every vertex channel this reader decodes.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MeshGeometry {
+    /// Positions, normals, UV0, sub-meshes, skinning and blend shapes, exactly
+    /// as [`read_mesh_with_collection`] returns them.
+    pub mesh: Mesh,
+    /// Tangents, colours and every texture-coordinate channel.
+    pub channels: MeshVertexChannels,
+}
+
 /// Parses the common resident `Mesh` representation used by standard Unity
 /// 2017.3-2023 and 6000.0-6000.3, and by non-virtual Tuanjie 2022.3.x meshes.
 /// Unity 6000.2's serialized mesh-LOD tail is walked from its sample-verified
@@ -165,6 +203,38 @@ pub fn read_mesh_with_collection(
     limits: MeshReadLimits,
 ) -> Result<Mesh> {
     read_mesh_inner(Some(collection), file, object_index, limits)
+}
+
+/// Parses a resident mesh like [`read_mesh`] and also decodes its tangents,
+/// colours and all eight texture-coordinate channels, from the vertex data and
+/// from packed `CompressedMesh` vectors alike.
+///
+/// The extra channels are charged against `maximum_decoded_bytes` together
+/// with the base ones, and `maximum_output_bytes` caps the little-endian size
+/// of every numeric array in the result: positions, normals, the channels
+/// above, sub-mesh indices, bind poses, bone hashes, skin weights and indices,
+/// and blend-shape vertices and weights. A channel stored in an integer vertex
+/// format, or one whose length does not match the vertex count, is refused
+/// rather than reinterpreted. [`read_mesh`] and the OBJ and FBX writers do not
+/// decode these channels and are unaffected by them.
+pub fn read_mesh_geometry(
+    file: &SerializedFile,
+    object_index: usize,
+    limits: MeshReadLimits,
+) -> Result<MeshGeometry> {
+    read_mesh_geometry_inner(None, file, object_index, limits)
+}
+
+/// Parses a mesh like [`read_mesh_geometry`], resolving external
+/// `StreamingInfo` vertex bytes through the collection's bounded resource
+/// table.
+pub fn read_mesh_geometry_with_collection(
+    collection: &AssetCollection,
+    file: &SerializedFile,
+    object_index: usize,
+    limits: MeshReadLimits,
+) -> Result<MeshGeometry> {
+    read_mesh_geometry_inner(Some(collection), file, object_index, limits)
 }
 
 /// The packed geometry Unity writes when a mesh is compressed.
@@ -203,9 +273,8 @@ impl CompressedMesh {
 
     /// Reconstructs the attributes the `Mesh` type carries.
     ///
-    /// Tangents and colours are decoded by the managed reader too, but this
-    /// type has nowhere to put them, so their vectors are left packed rather
-    /// than decoded and dropped.
+    /// Tangents, colours and the texture coordinates past UV0 are left packed
+    /// here; [`Self::overlay_channels`] decodes them for a geometry read.
     /// Writes whatever the packed vectors carry over `decoded`, field by field.
     ///
     /// An empty vector leaves the vertex-data value in place, which is what the
@@ -238,6 +307,162 @@ impl CompressedMesh {
         }
         if let Some(skin) = self.decode_skin(vertex_count)? {
             decoded.skin = Some(skin);
+        }
+        Ok(())
+    }
+
+    /// Decodes the packed tangents, float colours and texture coordinates over
+    /// the vertex-data channels, as the managed reader does: each vector that
+    /// carries items replaces the channel it describes.
+    fn overlay_channels(
+        &self,
+        decoded: &mut DecodedVertexData,
+        limits: MeshReadLimits,
+    ) -> Result<()> {
+        let vertex_count = decoded.vertices.len();
+        let mut budget = DecodedBudget {
+            used: decoded.decoded_bytes,
+            limit: limits.maximum_decoded_bytes,
+        };
+        let channels = decoded
+            .channels
+            .get_or_insert_with(MeshVertexChannels::default);
+        if let Some(tangents) = self.decode_tangents(limits, &mut budget)? {
+            channels.tangents = Some(tangents);
+        }
+        if let Some(colors) = self.decode_float_colors(limits, &mut budget)? {
+            channels.colors = Some(colors);
+        }
+        self.decode_uvs(vertex_count, channels, &mut budget)?;
+        decoded.decoded_bytes = budget.used;
+        Ok(())
+    }
+
+    /// Rebuilds four-component tangents from an octahedral pair and two sign
+    /// bits per tangent: one for the third component, one for the handedness.
+    fn decode_tangents(
+        &self,
+        limits: MeshReadLimits,
+        budget: &mut DecodedBudget,
+    ) -> Result<Option<MeshVertexAttribute>> {
+        if self.tangents.is_empty() {
+            return Ok(None);
+        }
+        let count = packed_items(self.tangents.item_count)? / 2;
+        if count > limits.maximum_vertices {
+            return Err(Error::invalid_data(format!(
+                "compressed Mesh has {count} tangents, exceeding limit {}",
+                limits.maximum_vertices
+            )));
+        }
+        let sign_count = packed_items(self.tangent_signs.item_count)?;
+        let overflow = || Error::invalid_data("compressed Mesh tangent size overflowed");
+        let required_signs = count.checked_mul(2).ok_or_else(overflow)?;
+        if sign_count < required_signs {
+            return Err(Error::invalid_data(
+                "compressed Mesh has fewer tangent signs than tangents need",
+            ));
+        }
+        if sign_count > limits.maximum_vertices.saturating_mul(2) {
+            return Err(Error::invalid_data(format!(
+                "compressed Mesh has {sign_count} tangent signs, exceeding limit {}",
+                limits.maximum_vertices.saturating_mul(2)
+            )));
+        }
+        let value_count = count.checked_mul(4).ok_or_else(overflow)?;
+        budget.charge(value_count)?;
+        let pairs = self.tangents.unpack(2, 0, None)?;
+        let signs = self.tangent_signs.unpack()?;
+        let mut values = reserve_vec(value_count, "compressed Mesh tangents")?;
+        for (index, pair) in pairs.chunks_exact(2).enumerate() {
+            let [x, y, z] = restore_octahedral(pair[0], pair[1]);
+            let z = if signs[index * 2] == 0 { -z } else { z };
+            let w = if signs[index * 2 + 1] > 0 { 1.0 } else { -1.0 };
+            values.extend_from_slice(&[x, y, z, w]);
+        }
+        Ok(Some(MeshVertexAttribute {
+            dimension: 4,
+            values,
+        }))
+    }
+
+    /// Unpacks the RGBA float colours, four values per vertex.
+    fn decode_float_colors(
+        &self,
+        limits: MeshReadLimits,
+        budget: &mut DecodedBudget,
+    ) -> Result<Option<MeshVertexAttribute>> {
+        if self.float_colors.is_empty() {
+            return Ok(None);
+        }
+        let item_count = packed_items(self.float_colors.item_count)?;
+        if !item_count.is_multiple_of(4) {
+            return Err(Error::invalid_data(format!(
+                "compressed Mesh float colours hold {item_count} values, not whole RGBA colours"
+            )));
+        }
+        if item_count / 4 > limits.maximum_vertices {
+            return Err(Error::invalid_data(format!(
+                "compressed Mesh has {} colours, exceeding limit {}",
+                item_count / 4,
+                limits.maximum_vertices
+            )));
+        }
+        budget.charge(item_count)?;
+        Ok(Some(MeshVertexAttribute {
+            dimension: 4,
+            values: self.float_colors.unpack(1, 0, None)?,
+        }))
+    }
+
+    /// Unpacks every texture-coordinate channel the packed UV vector holds.
+    ///
+    /// With a channel descriptor, each present channel follows the previous
+    /// one at its own dimension. Without one the vector holds two-component
+    /// UV0, then UV1 when there is room for it -- the legacy rule the managed
+    /// reader and `UnityPy` both apply.
+    fn decode_uvs(
+        &self,
+        vertex_count: usize,
+        channels: &mut MeshVertexChannels,
+        budget: &mut DecodedBudget,
+    ) -> Result<()> {
+        const BITS_PER_CHANNEL: u32 = 4;
+        const DIMENSION_MASK: u32 = 3;
+        const CHANNEL_EXISTS: u32 = 4;
+
+        if self.uv.is_empty() {
+            return Ok(());
+        }
+        let mut unpack = |dimension: usize, first_item: usize| -> Result<MeshVertexAttribute> {
+            budget.charge(vertex_count.saturating_mul(dimension))?;
+            Ok(MeshVertexAttribute {
+                dimension,
+                values: self.uv.unpack(dimension, first_item, Some(vertex_count))?,
+            })
+        };
+        if self.uv_info == 0 {
+            channels.uvs[0] = Some(unpack(2, 0)?);
+            let item_count = packed_items(self.uv.item_count)?;
+            if item_count >= vertex_count.saturating_mul(4) {
+                channels.uvs[1] = Some(unpack(2, vertex_count.saturating_mul(2))?);
+            }
+            return Ok(());
+        }
+        let mut first_item = 0_usize;
+        for (index, slot) in channels.uvs.iter_mut().enumerate() {
+            let shift = u32::try_from(index).expect("eight channels fit u32") * BITS_PER_CHANNEL;
+            let descriptor = (self.uv_info >> shift) & ((1 << BITS_PER_CHANNEL) - 1);
+            if descriptor & CHANNEL_EXISTS == 0 {
+                continue;
+            }
+            let dimension = usize::try_from(1 + (descriptor & DIMENSION_MASK))
+                .expect("a dimension of at most four fits usize");
+            *slot = Some(unpack(dimension, first_item)?);
+            first_item = vertex_count
+                .checked_mul(dimension)
+                .and_then(|length| first_item.checked_add(length))
+                .ok_or_else(|| Error::invalid_data("compressed Mesh UV offset overflowed"))?;
         }
         Ok(())
     }
@@ -352,6 +577,32 @@ impl CompressedMesh {
     }
 }
 
+/// Running total of decoded attribute bytes for a geometry read.
+struct DecodedBudget {
+    used: u64,
+    limit: u64,
+}
+
+impl DecodedBudget {
+    fn charge(&mut self, values: usize) -> Result<()> {
+        self.used = decoded_bytes(values, 1)?
+            .checked_add(self.used)
+            .ok_or_else(|| Error::invalid_data("Mesh decoded byte count overflowed"))?;
+        if self.used > self.limit {
+            return Err(Error::invalid_data(format!(
+                "Mesh decoded attributes require {} bytes, exceeding limit {}",
+                self.used, self.limit
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn packed_items(item_count: u32) -> Result<usize> {
+    usize::try_from(item_count)
+        .map_err(|_| Error::invalid_data("compressed Mesh item count does not fit usize"))
+}
+
 /// Restores the third component of an octahedrally packed unit vector.
 fn restore_octahedral(x: f32, y: f32) -> [f32; 3] {
     let squared = 1.0 - x * x - y * y;
@@ -446,6 +697,34 @@ fn read_mesh_inner(
     object_index: usize,
     limits: MeshReadLimits,
 ) -> Result<Mesh> {
+    read_mesh_checked(collection, file, object_index, limits, false).map(|(mesh, _)| mesh)
+}
+
+fn read_mesh_geometry_inner(
+    collection: Option<&AssetCollection>,
+    file: &SerializedFile,
+    object_index: usize,
+    limits: MeshReadLimits,
+) -> Result<MeshGeometry> {
+    let (mesh, channels) = read_mesh_checked(collection, file, object_index, limits, true)?;
+    Ok(MeshGeometry {
+        mesh,
+        channels: channels.unwrap_or_default(),
+    })
+}
+
+/// Runs the version gate and object checks around [`read_mesh_body`].
+///
+/// `with_channels` selects the extra-channel decode. Without it the work and
+/// every error are exactly those of the base reader, which the OBJ and FBX
+/// writers depend on.
+fn read_mesh_checked(
+    collection: Option<&AssetCollection>,
+    file: &SerializedFile,
+    object_index: usize,
+    limits: MeshReadLimits,
+    with_channels: bool,
+) -> Result<(Mesh, Option<MeshVertexChannels>)> {
     let outcome = validate_mesh_version(file)?;
     // The object lookup and the declared-byte-size budget depend only on
     // metadata, so they run before the lenient wrapper and keep their error
@@ -461,7 +740,7 @@ fn read_mesh_inner(
         outcome,
         "Mesh",
         &file.unity_version,
-        read_mesh_body(collection, file, object_index, limits),
+        read_mesh_body(collection, file, object_index, limits, with_channels),
     )
 }
 
@@ -503,7 +782,8 @@ fn read_mesh_body(
     file: &SerializedFile,
     object_index: usize,
     limits: MeshReadLimits,
-) -> Result<Mesh> {
+    with_channels: bool,
+) -> Result<(Mesh, Option<MeshVertexChannels>)> {
     let version = file.unity_version.components();
     let is_tuanjie = file.unity_version.build_type.as_deref() == Some("t");
     let object = require_mesh(file, object_index)?;
@@ -556,6 +836,7 @@ fn read_mesh_body(
         reader.reader.endian(),
         limits,
         version,
+        with_channels,
     )?;
     if decoded.vertices.is_empty() {
         // Unity writes empty meshes -- a placeholder renderer, a mesh whose
@@ -586,7 +867,7 @@ fn read_mesh_body(
         limits,
     )?;
 
-    Ok(Mesh {
+    let mesh = Mesh {
         path_id: object.path_id,
         name,
         vertices: decoded.vertices,
@@ -598,7 +879,110 @@ fn read_mesh_body(
         skin,
         blend_shapes,
         sub_meshes,
-    })
+    };
+    if !with_channels {
+        return Ok((mesh, None));
+    }
+    let channels = decoded.channels.unwrap_or_default();
+    validate_mesh_geometry(&mesh, &channels, limits)?;
+    Ok((mesh, Some(channels)))
+}
+
+/// Checks that every per-vertex array of a geometry read covers the vertex
+/// count exactly and that the arrays fit the output budget.
+///
+/// The base reader leaves a short normal or UV0 array for the OBJ writer to
+/// refuse; a typed result hands the arrays to the caller directly, so the same
+/// mismatch is refused here instead.
+fn validate_mesh_geometry(
+    mesh: &Mesh,
+    channels: &MeshVertexChannels,
+    limits: MeshReadLimits,
+) -> Result<()> {
+    let vertex_count = mesh.vertices.len();
+    let require = |label: &str, length: usize| -> Result<()> {
+        if length == vertex_count {
+            Ok(())
+        } else {
+            Err(Error::invalid_data(format!(
+                "Mesh {label} covers {length} vertices but the mesh has {vertex_count}"
+            )))
+        }
+    };
+    if let Some(normals) = &mesh.normals {
+        require("normal", normals.len())?;
+    }
+    if let Some(uv0) = &mesh.uv0 {
+        require("UV0", uv0.len())?;
+    }
+    for (label, attribute) in channels.labelled() {
+        let dimension = attribute.dimension.max(1);
+        if !attribute.values.len().is_multiple_of(dimension) {
+            return Err(Error::invalid_data(format!(
+                "Mesh {label} holds {} values, not a multiple of its dimension {dimension}",
+                attribute.values.len()
+            )));
+        }
+        require(&label, attribute.values.len() / dimension)?;
+    }
+    let total = mesh_geometry_bytes(mesh, channels)
+        .ok_or_else(|| Error::invalid_data("Mesh geometry byte count overflowed"))?;
+    if total > limits.maximum_output_bytes {
+        return Err(Error::invalid_data(format!(
+            "Mesh geometry arrays require {total} bytes, exceeding limit {}",
+            limits.maximum_output_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// The little-endian size of every numeric array a geometry read returns.
+fn mesh_geometry_bytes(mesh: &Mesh, channels: &MeshVertexChannels) -> Option<u64> {
+    let bytes = |count: usize, size: u64| u64::try_from(count).ok()?.checked_mul(size);
+    let mut total = bytes(mesh.vertices.len(), 12)?;
+    let mut add = |value: Option<u64>| -> Option<()> {
+        total = total.checked_add(value?)?;
+        Some(())
+    };
+    add(bytes(mesh.normals.as_ref().map_or(0, Vec::len), 12))?;
+    for (_, attribute) in channels.labelled() {
+        add(bytes(attribute.values.len(), 4))?;
+    }
+    for sub_mesh in &mesh.sub_meshes {
+        add(bytes(sub_mesh.indices.len(), 4))?;
+    }
+    add(bytes(mesh.bind_poses.len(), 64))?;
+    add(bytes(mesh.bone_name_hashes.len(), 4))?;
+    add(bytes(mesh.skin.as_ref().map_or(0, Vec::len), 32))?;
+    if let Some(shapes) = &mesh.blend_shapes {
+        add(bytes(shapes.vertices.len(), 40))?;
+        add(bytes(shapes.full_weights.len(), 4))?;
+    }
+    Some(total)
+}
+
+impl MeshVertexChannels {
+    /// Every present channel with the name errors use for it.
+    fn labelled(&self) -> impl Iterator<Item = (String, &MeshVertexAttribute)> {
+        let tangents = self
+            .tangents
+            .as_ref()
+            .map(|attribute| ("tangent".to_owned(), attribute));
+        let colors = self
+            .colors
+            .as_ref()
+            .map(|attribute| ("colour".to_owned(), attribute));
+        let uvs = self
+            .uvs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, attribute)| {
+                attribute
+                    .as_ref()
+                    .map(|attribute| (format!("UV{index}"), attribute))
+            });
+        tangents.into_iter().chain(colors).chain(uvs)
+    }
 }
 
 fn read_raw_sub_meshes(
@@ -845,6 +1229,7 @@ fn read_virtual_geometry_flag(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_mesh_sources(
     vertex_data: VertexData,
     compressed: &CompressedMesh,
@@ -853,6 +1238,7 @@ fn decode_mesh_sources(
     endian: Endian,
     limits: MeshReadLimits,
     version: (u32, u32, u32),
+    with_channels: bool,
 ) -> Result<DecodedVertexData> {
     if mesh_compression != 0 && !compressed.has_items() {
         return Err(Error::invalid_data(format!(
@@ -860,12 +1246,15 @@ fn decode_mesh_sources(
         )));
     }
     let mut decoded = if vertex_data.has_vertices() {
-        vertex_data.decode(endian, limits, version)?
+        vertex_data.decode(endian, limits, version, with_channels)?
     } else {
         DecodedVertexData::default()
     };
     if compressed.has_items() {
         overlay_compressed_mesh(compressed, index_buffer, &mut decoded, limits)?;
+        if with_channels {
+            compressed.overlay_channels(&mut decoded, limits)?;
+        }
     }
     Ok(decoded)
 }
@@ -1216,6 +1605,72 @@ struct DecodedVertexData {
     normals: Option<Vec<[f32; 3]>>,
     uv0: Option<Vec<[f32; 2]>>,
     skin: Option<Vec<MeshBoneWeight>>,
+    /// Present only when a geometry read asked for the extra channels.
+    channels: Option<MeshVertexChannels>,
+    /// Decoded attribute bytes charged so far against `maximum_decoded_bytes`
+    /// by a geometry read; the packed overlay adds its channels to it.
+    decoded_bytes: u64,
+}
+
+/// Where one extra channel lands in [`MeshVertexChannels`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtraChannel {
+    Tangent,
+    Color,
+    Uv(usize),
+}
+
+impl ExtraChannel {
+    fn label(self) -> String {
+        match self {
+            Self::Tangent => "tangent".to_owned(),
+            Self::Color => "colour".to_owned(),
+            Self::Uv(index) => format!("UV{index}"),
+        }
+    }
+
+    fn slot(self, channels: &mut MeshVertexChannels) -> &mut Option<MeshVertexAttribute> {
+        match self {
+            Self::Tangent => &mut channels.tangents,
+            Self::Color => &mut channels.colors,
+            Self::Uv(index) => &mut channels.uvs[index],
+        }
+    }
+}
+
+/// Unity's shader-channel numbering for the channels beyond position, normal
+/// and the skin pair. 2018 inserted the tangent at 2 and widened texture
+/// coordinates to eight; 5.x through 2017 keep colour at 2, four texture
+/// coordinates from 3, and the tangent last. Both orders are what the managed
+/// reader and `UnityPy` assign.
+const EXTRA_CHANNELS_2018: [(usize, ExtraChannel); 10] = [
+    (2, ExtraChannel::Tangent),
+    (3, ExtraChannel::Color),
+    (4, ExtraChannel::Uv(0)),
+    (5, ExtraChannel::Uv(1)),
+    (6, ExtraChannel::Uv(2)),
+    (7, ExtraChannel::Uv(3)),
+    (8, ExtraChannel::Uv(4)),
+    (9, ExtraChannel::Uv(5)),
+    (10, ExtraChannel::Uv(6)),
+    (11, ExtraChannel::Uv(7)),
+];
+const EXTRA_CHANNELS_2017: [(usize, ExtraChannel); 6] = [
+    (2, ExtraChannel::Color),
+    (3, ExtraChannel::Uv(0)),
+    (4, ExtraChannel::Uv(1)),
+    (5, ExtraChannel::Uv(2)),
+    (6, ExtraChannel::Uv(3)),
+    (7, ExtraChannel::Tangent),
+];
+
+/// One extra channel selected for decoding, with the component count it is
+/// read at.
+#[derive(Debug, Clone, Copy)]
+struct PlannedChannel {
+    target: ExtraChannel,
+    channel: Channel,
+    dimension: u8,
 }
 
 impl VertexData {
@@ -1229,6 +1684,7 @@ impl VertexData {
         endian: Endian,
         limits: MeshReadLimits,
         version: (u32, u32, u32),
+        with_channels: bool,
     ) -> Result<DecodedVertexData> {
         if self.vertex_count == 0 {
             return Err(Error::unsupported("Mesh has no vertices"));
@@ -1262,10 +1718,20 @@ impl VertexData {
                 .channels
                 .get(12..=13)
                 .is_some_and(|channels| channels.iter().any(|channel| channel.dimension != 0));
+        let extra_channels = if with_channels {
+            self.plan_extra_channels(version)?
+        } else {
+            Vec::new()
+        };
+        let extra_components = extra_channels
+            .iter()
+            .map(|planned| usize::from(planned.dimension))
+            .sum::<usize>();
         let decoded_components = 3_usize
             .checked_add(if normal_channel.is_some() { 3 } else { 0 })
             .and_then(|value| value.checked_add(if uv0_channel.is_some() { 2 } else { 0 }))
             .and_then(|value| value.checked_add(if has_skin_channels { 8 } else { 0 }))
+            .and_then(|value| value.checked_add(extra_components))
             .ok_or_else(|| Error::invalid_data("Mesh decoded component count overflowed"))?;
         let total_decoded = decoded_bytes(self.vertex_count, decoded_components)?;
         if total_decoded > limits.maximum_decoded_bytes {
@@ -1283,12 +1749,95 @@ impl VertexData {
             .map(|channel| self.decode_vec2(channel, endian, version))
             .transpose()?;
         let skin = self.decode_skin(version, endian)?;
+        let channels = if with_channels {
+            let mut channels = MeshVertexChannels::default();
+            for planned in extra_channels {
+                *planned.target.slot(&mut channels) =
+                    Some(self.decode_attribute(planned, endian, version)?);
+            }
+            Some(channels)
+        } else {
+            None
+        };
         Ok(DecodedVertexData {
             vertices,
             normals,
             uv0,
             skin,
+            channels,
+            decoded_bytes: if with_channels { total_decoded } else { 0 },
         })
+    }
+
+    /// Selects the present tangent, colour and texture-coordinate channels and
+    /// refuses any stored in an integer format: the managed reader leaves such
+    /// a channel out and `UnityPy` returns its raw integers, so there is no
+    /// floating-point value to agree on.
+    fn plan_extra_channels(&self, version: (u32, u32, u32)) -> Result<Vec<PlannedChannel>> {
+        let layout: &[(usize, ExtraChannel)] = if version.0 >= 2018 {
+            &EXTRA_CHANNELS_2018
+        } else {
+            &EXTRA_CHANNELS_2017
+        };
+        let mut planned = Vec::new();
+        for &(index, target) in layout {
+            let Some(channel) = self
+                .channels
+                .get(index)
+                .copied()
+                .filter(|channel| channel.dimension != 0)
+            else {
+                continue;
+            };
+            if vertex_format_kind(channel.format, version)?.is_integer() {
+                return Err(Error::unsupported(format!(
+                    "Mesh {} channel {index} uses integer format {}; only floating-point and normalized formats are decoded",
+                    target.label(),
+                    channel.format
+                )));
+            }
+            require_component_dimension(channel, index, &target.label())?;
+            // Before 2018 a colour in the packed `Color` format declares one
+            // component for its four bytes; both managed readers widen it.
+            let dimension =
+                if version.0 < 2018 && target == ExtraChannel::Color && channel.format == 2 {
+                    4
+                } else {
+                    channel.dimension
+                };
+            planned.push(PlannedChannel {
+                target,
+                channel,
+                dimension,
+            });
+        }
+        Ok(planned)
+    }
+
+    fn decode_attribute(
+        &self,
+        planned: PlannedChannel,
+        endian: Endian,
+        version: (u32, u32, u32),
+    ) -> Result<MeshVertexAttribute> {
+        let dimension = usize::from(planned.dimension);
+        let count = self
+            .vertex_count
+            .checked_mul(dimension)
+            .ok_or_else(|| Error::invalid_data("Mesh attribute value count overflowed"))?;
+        let mut values = reserve_vec(count, "Mesh vertex attribute values")?;
+        for vertex in 0..self.vertex_count {
+            for component in 0..planned.dimension {
+                values.push(self.read_float_component(
+                    planned.channel,
+                    vertex,
+                    component,
+                    endian,
+                    version,
+                )?);
+            }
+        }
+        Ok(MeshVertexAttribute { dimension, values })
     }
 
     fn validate_channel_ranges(&self, version: (u32, u32, u32)) -> Result<()> {
@@ -2445,9 +2994,11 @@ mod tests {
     use crate::studio::Studio;
 
     use super::{
-        MESH_CLASS_ID, Mesh, MeshReadLimits, MeshSubMesh, STREAM_ALIGNMENT, read_mesh,
+        MESH_CLASS_ID, Mesh, MeshReadLimits, MeshSubMesh, MeshVertexAttribute, STREAM_ALIGNMENT,
+        read_mesh, read_mesh_geometry, read_mesh_geometry_with_collection,
         read_mesh_with_collection, triangulate, write_mesh_obj, write_mesh_object_obj,
     };
+    use crate::Error;
 
     #[test]
     fn obj_floats_render_the_way_the_managed_exporter_renders_them() {
@@ -2949,6 +3500,327 @@ mod tests {
         assert_eq!(mesh.sub_meshes[0].indices, [0, 1, 2]);
     }
 
+    fn attribute(attribute: Option<&MeshVertexAttribute>) -> (usize, Vec<f32>) {
+        let attribute = attribute.expect("channel is present");
+        (attribute.dimension, attribute.values.clone())
+    }
+
+    fn obj_text(mesh: &Mesh) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_mesh_obj(mesh, &mut output, u64::MAX).unwrap();
+        output
+    }
+
+    #[test]
+    fn geometry_read_decodes_every_vertex_channel_without_changing_the_mesh() {
+        for skinning in [false, true] {
+            let object = resident_mesh_fixture(MeshFixtureOptions {
+                extra_channels: true,
+                skinning,
+                ..MeshFixtureOptions::default()
+            });
+            let file = parse_v22_mesh(&object);
+            let geometry = read_mesh_geometry(&file, 0, MeshReadLimits::default()).unwrap();
+            let base = read_mesh(&file, 0, MeshReadLimits::default()).unwrap();
+
+            // The base fields are exactly what the base reader returns, NaN
+            // position included, so compare them through the OBJ text.
+            assert_eq!(obj_text(&geometry.mesh), obj_text(&base));
+            assert_eq!(geometry.mesh.skin, base.skin);
+            assert_eq!(geometry.mesh.skin.is_some(), skinning);
+            let plain = read_mesh(
+                &parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+                    skinning,
+                    ..MeshFixtureOptions::default()
+                })),
+                0,
+                MeshReadLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(obj_text(&base), obj_text(&plain));
+
+            let channels = &geometry.channels;
+            assert_eq!(
+                attribute(channels.tangents.as_ref()),
+                (4, FIXTURE_TANGENTS.as_flattened().to_vec())
+            );
+            let colors: Vec<f32> = FIXTURE_COLORS
+                .as_flattened()
+                .iter()
+                .map(|value| f32::from(*value) / 255.0)
+                .collect();
+            assert_eq!(attribute(channels.colors.as_ref()), (4, colors));
+            let uv0: Vec<f32> = FIXTURE_VERTICES.iter().flat_map(|(_, uv, _)| *uv).collect();
+            assert_eq!(attribute(channels.uvs[0].as_ref()), (2, uv0));
+            assert_eq!(
+                attribute(channels.uvs[1].as_ref()),
+                (2, FIXTURE_UV1.as_flattened().to_vec())
+            );
+            assert!(channels.uvs[2..7].iter().all(Option::is_none));
+            assert_eq!(
+                attribute(channels.uvs[7].as_ref()),
+                (3, FIXTURE_UV7.as_flattened().to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_read_follows_the_2017_channel_numbering() {
+        let object = resident_mesh_fixture(MeshFixtureOptions {
+            extra_channels: true,
+            layout_version: (2017, 4, 40),
+            ..MeshFixtureOptions::default()
+        });
+        let file = parse_v22_mesh_version(&object, "2017.4.40f1");
+        let geometry = read_mesh_geometry(&file, 0, MeshReadLimits::default()).unwrap();
+
+        let channels = &geometry.channels;
+        assert_eq!(
+            attribute(channels.tangents.as_ref()),
+            (4, FIXTURE_TANGENTS.as_flattened().to_vec())
+        );
+        assert_eq!(attribute(channels.colors.as_ref()).0, 4);
+        assert!((channels.colors.as_ref().unwrap().values[7] - 128.0 / 255.0).abs() < 1e-7);
+        assert_eq!(
+            attribute(channels.uvs[1].as_ref()),
+            (2, FIXTURE_UV1.as_flattened().to_vec())
+        );
+        assert!(channels.uvs[2..].iter().all(Option::is_none));
+        assert_eq!(
+            obj_text(&geometry.mesh),
+            obj_text(&read_mesh(&file, 0, MeshReadLimits::default()).unwrap())
+        );
+    }
+
+    #[test]
+    fn geometry_read_decodes_packed_tangents_colours_and_uvs() {
+        let object = resident_mesh_fixture(MeshFixtureOptions {
+            compressed: true,
+            compressed_uv_info: Some(0x65),
+            ..MeshFixtureOptions::default()
+        });
+        let file = parse_v22_mesh(&object);
+        let geometry = read_mesh_geometry(&file, 0, MeshReadLimits::default()).unwrap();
+        let channels = &geometry.channels;
+
+        // Pairs (0, 0), (1, 0) and (1, 1): the first restores z = 1, which
+        // its zero sign negates; the third is off the unit sphere and is
+        // normalized in the plane, as the managed reader does. The second
+        // sign of each pair picks the handedness.
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!(
+            attribute(channels.tangents.as_ref()),
+            (
+                4,
+                vec![
+                    0.0, 0.0, -1.0, 1.0, 1.0, 0.0, 0.0, -1.0, half, half, 0.0, 1.0
+                ]
+            )
+        );
+        let colors: Vec<f32> = [255_u8, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0]
+            .iter()
+            .map(|value| f32::from(*value) / 255.0)
+            .collect();
+        assert_eq!(attribute(channels.colors.as_ref()), (4, colors));
+        // Descriptor 0x65: UV0 has two components and UV1 three, packed back
+        // to back.
+        assert_eq!(
+            attribute(channels.uvs[0].as_ref()),
+            (2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        );
+        assert_eq!(
+            attribute(channels.uvs[1].as_ref()),
+            (3, (7_u8..=15).map(f32::from).collect())
+        );
+        assert!(channels.uvs[2..].iter().all(Option::is_none));
+        assert_eq!(
+            geometry.mesh.uv0.as_deref(),
+            Some(&[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]][..])
+        );
+
+        // Without a descriptor the vector holds two-component UV0 and, when
+        // there is room, UV1 after it.
+        let legacy = read_mesh_geometry(
+            &parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+                compressed: true,
+                compressed_uv_info: Some(0),
+                ..MeshFixtureOptions::default()
+            })),
+            0,
+            MeshReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            attribute(legacy.channels.uvs[1].as_ref()),
+            (2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+        );
+
+        // The OBJ and the base reader see none of it.
+        assert_eq!(
+            obj_text(&geometry.mesh),
+            obj_text(&read_mesh(&file, 0, MeshReadLimits::default()).unwrap())
+        );
+    }
+
+    #[test]
+    fn geometry_read_refuses_what_it_cannot_return_faithfully() {
+        // An integer texture coordinate has no agreed float value. The base
+        // reader never looks at the channel and still succeeds.
+        let integer = parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+            extra_channels: true,
+            extra_uv_format: 10,
+            ..MeshFixtureOptions::default()
+        }));
+        let error = read_mesh_geometry(&integer, 0, MeshReadLimits::default()).unwrap_err();
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message.contains("UV7 channel 11 uses integer format 10")),
+            "{error}"
+        );
+        read_mesh(&integer, 0, MeshReadLimits::default()).unwrap();
+
+        // Two packed tangents for three vertices.
+        let short = parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+            compressed: true,
+            compressed_uv_info: Some(0x65),
+            compressed_tangent_items: Some(4),
+            ..MeshFixtureOptions::default()
+        }));
+        let error = read_mesh_geometry(&short, 0, MeshReadLimits::default()).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidData(message) if message == "Mesh tangent covers 2 vertices but the mesh has 3"),
+            "{error}"
+        );
+        read_mesh(&short, 0, MeshReadLimits::default()).unwrap();
+
+        // Four tangents need eight signs; the fixture packs six.
+        let unsigned = parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+            compressed: true,
+            compressed_uv_info: Some(0x65),
+            compressed_tangent_items: Some(8),
+            ..MeshFixtureOptions::default()
+        }));
+        let error = read_mesh_geometry(&unsigned, 0, MeshReadLimits::default()).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidData(message) if message.contains("fewer tangent signs")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn geometry_read_charges_extra_channels_to_the_decoded_and_output_budgets() {
+        let file = parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+            extra_channels: true,
+            ..MeshFixtureOptions::default()
+        }));
+        // Positions, normals and UV0 take 96 bytes; the geometry read adds
+        // tangents, colours and UV0, UV1 and UV7 at full width: 180 more.
+        let decoded = MeshReadLimits {
+            maximum_decoded_bytes: 275,
+            ..MeshReadLimits::default()
+        };
+        read_mesh(&file, 0, decoded).unwrap();
+        let error = read_mesh_geometry(&file, 0, decoded).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidData(message) if message == "Mesh decoded attributes require 276 bytes, exceeding limit 275"),
+            "{error}"
+        );
+        read_mesh_geometry(
+            &file,
+            0,
+            MeshReadLimits {
+                maximum_decoded_bytes: 276,
+                ..MeshReadLimits::default()
+            },
+        )
+        .unwrap();
+
+        // 36 + 36 bytes of positions and normals, 48 + 48 of tangents and
+        // colours, 24 + 24 + 36 of UVs and 12 of indices.
+        let output = MeshReadLimits {
+            maximum_output_bytes: 263,
+            ..MeshReadLimits::default()
+        };
+        let error = read_mesh_geometry(&file, 0, output).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidData(message) if message == "Mesh geometry arrays require 264 bytes, exceeding limit 263"),
+            "{error}"
+        );
+
+        // Packed channels are charged as they are unpacked.
+        let packed = parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+            compressed: true,
+            compressed_uv_info: Some(0x65),
+            ..MeshFixtureOptions::default()
+        }));
+        let error = read_mesh_geometry(
+            &packed,
+            0,
+            MeshReadLimits {
+                maximum_decoded_bytes: 100,
+                ..MeshReadLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidData(message) if message.starts_with("Mesh decoded attributes require")),
+            "{error}"
+        );
+        let error = read_mesh_geometry(
+            &packed,
+            0,
+            MeshReadLimits {
+                maximum_vertices: 2,
+                ..MeshReadLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidData(_)), "{error}");
+    }
+
+    #[test]
+    fn studio_reads_typed_mesh_geometry_with_its_budgets() {
+        let file = parse_v22_mesh(&resident_mesh_fixture(MeshFixtureOptions {
+            extra_channels: true,
+            skinning: true,
+            blend_shapes: true,
+            ..MeshFixtureOptions::default()
+        }));
+        let collection = AssetCollection::from_loaded_parts(
+            vec![LoadedSerializedFile {
+                path: "mesh.assets".to_owned(),
+                file,
+            }],
+            Vec::new(),
+        );
+        let direct = read_mesh_geometry_with_collection(
+            &collection,
+            &collection.serialized_files()[0].file,
+            0,
+            MeshReadLimits::default(),
+        )
+        .unwrap();
+        let studio = Studio::from_collection(collection);
+        let object = studio.object(0, 7).unwrap();
+        let geometry = object.read_mesh(MeshReadLimits::default()).unwrap();
+
+        assert_eq!(obj_text(&geometry.mesh), obj_text(&direct.mesh));
+        assert_eq!(geometry.channels, direct.channels);
+        assert_eq!(geometry.mesh.bind_poses.len(), 2);
+        assert_eq!(geometry.mesh.bone_name_hashes, [111, 222]);
+        assert_eq!(
+            geometry.mesh.blend_shapes.as_ref().unwrap().channels.len(),
+            1
+        );
+        let error = object
+            .read_mesh(MeshReadLimits {
+                maximum_output_bytes: 64,
+                ..MeshReadLimits::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeding limit 64"), "{error}");
+        assert!(studio.object(0, 8).is_none());
+    }
+
     #[test]
     fn expands_strip_and_quad_topology_into_triangles() {
         // A three-index submesh as a strip is one triangle with the source
@@ -3222,6 +4094,14 @@ mod tests {
         truncate_vertex_data: bool,
         layout_version: (u32, u32, u32),
         tuanjie: Option<TuanjieMeshFixture>,
+        /// Adds tangent, colour and extra texture-coordinate streams.
+        extra_channels: bool,
+        /// Format of the highest extra texture-coordinate channel.
+        extra_uv_format: u8,
+        /// Packs tangents, colours and UVs too, with this UV descriptor.
+        compressed_uv_info: Option<u32>,
+        /// Overrides the packed tangent item count, two per tangent.
+        compressed_tangent_items: Option<u32>,
     }
 
     impl Default for MeshFixtureOptions {
@@ -3243,6 +4123,10 @@ mod tests {
                 truncate_vertex_data: false,
                 layout_version: (2022, 3, 62),
                 tuanjie: None,
+                extra_channels: false,
+                extra_uv_format: 0,
+                compressed_uv_info: None,
+                compressed_tangent_items: None,
             }
         }
     }
@@ -3386,6 +4270,12 @@ mod tests {
         push_u32(object, 3);
         let channel_count = if options.skinning && options.layout_version >= (2018, 2, 0) {
             14
+        } else if options.extra_channels {
+            if options.layout_version.0 < 2018 {
+                8
+            } else {
+                12
+            }
         } else if options.layout_version.0 < 2018 {
             4
         } else {
@@ -3394,14 +4284,36 @@ mod tests {
         push_i32(object, channel_count);
         object.extend_from_slice(&[0, 0, options.position_format, 3]);
         object.extend_from_slice(&[1, 0, 0, 3]);
-        object.extend_from_slice(&[0, 0, 0, 0]);
-        if options.layout_version.0 >= 2018 {
+        if options.extra_channels && options.layout_version.0 < 2018 {
+            // 2017 numbering: colour 2, UV0 3, UV1 4, UV2-3 absent, tangent 7.
+            object.extend_from_slice(&[3, 0, 2, 4]);
+            object.extend_from_slice(&[2, 0, 0, 2]);
+            object.extend_from_slice(&[4, 0, 0, 2]);
             object.extend_from_slice(&[0, 0, 0, 0]);
-        }
-        object.extend_from_slice(&[2, 0, 0, 2]);
-        if options.skinning && options.layout_version >= (2018, 2, 0) {
-            for _ in 5..12 {
+            object.extend_from_slice(&[0, 0, 0, 0]);
+            object.extend_from_slice(&[5, 0, 0, 4]);
+        } else if options.extra_channels {
+            // 2018+ numbering: tangent 2, colour 3, UV0 4, UV1 5, UV7 11.
+            object.extend_from_slice(&[5, 0, 0, 4]);
+            object.extend_from_slice(&[6, 0, 2, 4]);
+            object.extend_from_slice(&[2, 0, 0, 2]);
+            object.extend_from_slice(&[7, 0, 1, 2]);
+            for _ in 6..11 {
                 object.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            object.extend_from_slice(&[8, 0, options.extra_uv_format, 3]);
+        } else {
+            object.extend_from_slice(&[0, 0, 0, 0]);
+            if options.layout_version.0 >= 2018 {
+                object.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            object.extend_from_slice(&[2, 0, 0, 2]);
+        }
+        if options.skinning && options.layout_version >= (2018, 2, 0) {
+            if !options.extra_channels {
+                for _ in 5..12 {
+                    object.extend_from_slice(&[0, 0, 0, 0]);
+                }
             }
             object.extend_from_slice(&[3, 0, 0, 4]);
             let index_format = if options.layout_version.0 < 2019 {
@@ -3421,7 +4333,9 @@ mod tests {
     }
 
     fn push_compressed_mesh_fixture(object: &mut Vec<u8>, options: MeshFixtureOptions) {
-        if options.compressed {
+        if let Some(uv_info) = options.compressed_uv_info {
+            push_compressed_channel_fixture(object, uv_info, options);
+        } else if options.compressed {
             // A three-vertex triangle. Range 255 with an 8-bit width makes each
             // packed value decode to itself, so the expected geometry is plain.
             push_packed_float_data(object, 9, 255.0, 0.0, &[1, 0, 0, 0, 2, 0, 0, 0, 3], 8);
@@ -3450,6 +4364,55 @@ mod tests {
             }
             push_u32(object, 0);
         }
+    }
+
+    /// The packed triangle of [`push_compressed_mesh_fixture`] plus tangents,
+    /// float colours and texture coordinates.
+    ///
+    /// Tangent pairs and signs are one bit wide over a range of one, so they
+    /// are exactly 0 or 1. Colours are eight bits over a range of one, so each
+    /// is its byte over 255. UVs are eight bits over a range of 255, so each
+    /// decodes to its own byte: UV0 holds 1..=6, and the next channel
+    /// continues from 7.
+    fn push_compressed_channel_fixture(
+        object: &mut Vec<u8>,
+        uv_info: u32,
+        options: MeshFixtureOptions,
+    ) {
+        push_packed_float_data(object, 9, 255.0, 0.0, &[1, 0, 0, 0, 2, 0, 0, 0, 3], 8);
+        let uv_values: Vec<u32> = (1..=if uv_info == 0 { 12 } else { 15 }).collect();
+        push_packed_float_data(
+            object,
+            u32::try_from(uv_values.len()).unwrap(),
+            255.0,
+            0.0,
+            &uv_values,
+            8,
+        );
+        push_packed_float_data(object, 6, 2.0, -1.0, &[255, 128, 255, 128, 255, 128], 8);
+        let tangent_pairs = [0, 0, 1, 0, 1, 1];
+        push_packed_float_data(
+            object,
+            options.compressed_tangent_items.unwrap_or(6),
+            1.0,
+            0.0,
+            &tangent_pairs,
+            1,
+        );
+        push_empty_packed_int(object); // weights
+        push_packed_int_data(object, &[1, 1, 1], 1); // normal signs
+        push_packed_int_data(object, &[0, 1, 1, 0, 1, 1], 1); // tangent signs
+        push_packed_float_data(
+            object,
+            12,
+            1.0,
+            0.0,
+            &[255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0],
+            8,
+        );
+        push_empty_packed_int(object); // bone indices
+        push_packed_int_data(object, &[0, 1, 2], 8); // triangles
+        push_u32(object, uv_info);
     }
 
     fn push_mesh_fixture_tail(object: &mut Vec<u8>, options: MeshFixtureOptions) {
@@ -3583,7 +4546,59 @@ mod tests {
         if options.skinning && options.layout_version >= (2018, 2, 0) {
             push_resident_skinning(&mut vertex_data);
         }
+        if options.extra_channels {
+            push_extra_vertex_streams(&mut vertex_data, options);
+        }
         vertex_data
+    }
+
+    const FIXTURE_TANGENTS: [[f32; 4]; 3] = [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, -1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ];
+    const FIXTURE_COLORS: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 255, 0, 128], [0, 0, 255, 0]];
+    const FIXTURE_UV1: [[f32; 2]; 3] = [[0.5, 0.25], [1.0, 0.75], [0.0, 2.0]];
+    const FIXTURE_UV7: [[f32; 3]; 3] = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
+
+    /// Appends one stream per extra channel, in stream-index order: tangent,
+    /// colour, UV1 (Float16) and UV7 from 2018, or colour, UV1 (Float32) and
+    /// tangent before it.
+    fn push_extra_vertex_streams(vertex_data: &mut Vec<u8>, options: MeshFixtureOptions) {
+        let tangents = |output: &mut Vec<u8>| {
+            pad_vertex_stream(output);
+            for value in FIXTURE_TANGENTS.as_flattened() {
+                output.extend_from_slice(&value.to_le_bytes());
+            }
+        };
+        let colors = |output: &mut Vec<u8>| {
+            pad_vertex_stream(output);
+            output.extend_from_slice(FIXTURE_COLORS.as_flattened());
+        };
+        if options.layout_version.0 < 2018 {
+            colors(vertex_data);
+            pad_vertex_stream(vertex_data);
+            for value in FIXTURE_UV1.as_flattened() {
+                vertex_data.extend_from_slice(&value.to_le_bytes());
+            }
+            tangents(vertex_data);
+            return;
+        }
+        tangents(vertex_data);
+        colors(vertex_data);
+        pad_vertex_stream(vertex_data);
+        for value in FIXTURE_UV1.as_flattened() {
+            vertex_data.extend_from_slice(&exact_half_bits(*value).to_le_bytes());
+        }
+        pad_vertex_stream(vertex_data);
+        for value in FIXTURE_UV7.as_flattened() {
+            if options.extra_uv_format == 0 {
+                vertex_data.extend_from_slice(&value.to_le_bytes());
+            } else {
+                // An integer format of the same four-byte width.
+                vertex_data.extend_from_slice(&[0; 4]);
+            }
+        }
     }
 
     fn push_resident_skinning(vertex_data: &mut Vec<u8>) {

@@ -205,7 +205,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `darwin-{x64,arm64}`、`linux-{x64,arm64}-gnu` 或 `win32-{x64,arm64}-msvc` 文件名，随后
   真正 `npm pack`、在临时消费者中离线安装该 `.tgz`，再从安装目录 `require()` 并断言运行时
   顶层导出恰为 `UnityRs`。安装后的 `index.d.ts` 还会被重新解析，并与安装后的 native
-  class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 88 个方法与 4 个
+  class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 90 个方法与 4 个
   属性，另以保持数量不变的重命名反向测试证明不是只数成员。源码树能加载但发布包漏文件、
   声明/运行时漂移或带错架构时都会直接失败。macOS
   arm64 debug/release 与 Linux amd64/arm64 release 容器已实际通过；2026-08-24 的正式
@@ -975,6 +975,28 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   比所需少一的单数组/总量预算以原消息拒绝，恰好等于所需时输出与默认路径一致；1,000,001
   个 keyword 名在默认预算下被拒、调高单数组预算后完整读取。类型树字节数组的计费与 3,200 万
   元素上限属于 #5 的 0.6 部分，设计见 `docs/design/0.6-byte-array-values.md`；
+- **类型化 Mesh 读取已于 2026-10-08 加入 Studio、Python 与 Node（#11）**：Core 新增
+  `mesh::read_mesh_geometry`/`read_mesh_geometry_with_collection` 与
+  `StudioObject::read_mesh`，返回 `MeshGeometry { mesh, channels }`：`mesh` 与
+  `read_mesh_with_collection` 完全相同，`channels` 为新增的 tangent、colour 与 UV0-UV7
+  （各自保留存储维度）。三个新结构均为 `#[non_exhaustive]`，`Mesh` 本身未改，属于向后兼容的
+  新增。顶点数据按 2018+（tangent 2、colour 3、UV 4-11）与 2017（colour 2、UV0-3 为 3-6、
+  tangent 7，打包 `Color` 格式按托管 reader 扩为 4 分量）两套通道编号解码；`CompressedMesh`
+  的打包 tangent（八面体对 + z 符号 + 手性符号）、float colour 与按 `m_UVInfo` 依次排布的
+  UV（无描述符时为 UV0 加可容纳的 UV1）此前留作未解码，现在解码。额外通道计入
+  `maximum_decoded_bytes`，`maximum_output_bytes` 限制结果中全部数值数组的小端字节总量；整数
+  格式的额外通道以 `Unsupported` 拒绝（托管 reader 丢弃、UnityPy 返回原始整数，没有可对照的
+  浮点值），长度与顶点数不符以 `InvalidData` 拒绝。`read_mesh` 与 OBJ/FBX 路径不解码这些通道，
+  工作量与错误不变。Python `read_mesh(file_index, path_id, *, maximum_bytes)` 返回 `Mesh`
+  （`MeshAttribute`/`MeshSubMesh`/`MeshBlendShapes`），Node `readMesh`/`readMeshAsync`
+  返回同形对象，各通道为 `{dimension, data}` 小端 float32 打包字节，子网格索引、骨骼哈希与
+  蒙皮索引为 uint32；打包在 `py.detach` 内或 worker `compute` 中完成。两份 API 面审计登记为
+  110 个 Core 方法、Python 68 个与 Node 90 个方法。验证：私有语料 10 个真实 Mesh（Unity
+  2022.3，含 tangent、colour、UV1）的 position/tangent/colour/UV0/UV1/索引与 UnityPy 1.25.0
+  按 f32 逐值一致；合成 `CompressedMesh`（三种 `m_UVInfo`）的通道映射、维度、符号与归一化回退
+  与 UnityPy 一致，余下末位差异来自 UnityPy 用双精度计算而本项目沿用托管 reader 的 f32 运算
+  顺序（基础 position 同样如此）。同一语料上 OBJ、ASCII/binary FBX、静态 FBX、模型 OBJ 与
+  GameObject FBX 的全部输出摘要在改动前后逐字节相同；
 - **legacy streamed AudioClip 的 `clips × serialized files` 放大已于 2026-08-24 收口**：旧版
   AudioClip 的外部资源只存 offset/size，reader 必须从拥有它的 `.assets` 路径派生 `.resS` 名称；
   旧入口为每个 clip 用指针相等线扫 `AssetCollection` 的完整 SerializedFile 表，目标在表尾时批量

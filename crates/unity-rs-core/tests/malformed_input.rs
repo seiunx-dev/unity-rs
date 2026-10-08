@@ -23,6 +23,7 @@ use unity_rs_core::live2d_package::{
     Live2dPackageLimits, Live2dPackageMaterializeLimits, build_live2d_packages,
     materialize_live2d_packages,
 };
+use unity_rs_core::mesh::MeshReadLimits;
 use unity_rs_core::scene_hierarchy::SceneHierarchyLimits;
 use unity_rs_core::source::Region;
 use unity_rs_core::studio::Studio;
@@ -68,6 +69,9 @@ fn exercise(bytes: &[u8]) -> bool {
     for object in studio.objects() {
         let _ = object.name();
         let _ = object.read_raw(1 << 20);
+        // The typed mesh read decodes every vertex channel, packed or not, so
+        // the damaged model mesh reaches the channel decoders too.
+        let _ = object.read_mesh(MeshReadLimits::default());
     }
     for file in studio.files() {
         let _ = file.unity_version();

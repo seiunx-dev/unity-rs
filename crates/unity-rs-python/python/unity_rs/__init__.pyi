@@ -464,6 +464,85 @@ class Avatar:
     @property
     def root_motion_bone_name(self) -> Optional[str]: ...
 
+class MeshAttribute:
+    """``dimension`` little-endian float32 values per vertex, vertex-major."""
+
+    @property
+    def dimension(self) -> int: ...
+    @property
+    def data(self) -> bytes: ...
+
+class MeshSubMesh:
+    @property
+    def first_byte(self) -> int: ...
+    @property
+    def index_count(self) -> int: ...
+    @property
+    def first_vertex(self) -> int: ...
+    @property
+    def vertex_count(self) -> int: ...
+    @property
+    def indices(self) -> bytes:
+        """Triangle-list indices as little-endian uint32 values."""
+
+class MeshBlendShapes:
+    @property
+    def vertices(self) -> bytes:
+        """Three little-endian float32 position deltas per shape vertex."""
+    @property
+    def normals(self) -> bytes: ...
+    @property
+    def tangents(self) -> bytes: ...
+    @property
+    def indices(self) -> bytes:
+        """One little-endian uint32 mesh-vertex index per shape vertex."""
+    @property
+    def frames(self) -> list[tuple[int, int, bool, bool]]:
+        """``(first_vertex, vertex_count, has_normals, has_tangents)``."""
+    @property
+    def channels(self) -> list[tuple[str, int, int, int]]:
+        """``(name, name_hash, frame_index, frame_count)``."""
+    @property
+    def full_weights(self) -> bytes:
+        """One little-endian float32 per frame."""
+
+class Mesh:
+    @property
+    def path_id(self) -> int: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def vertex_count(self) -> int: ...
+    @property
+    def positions(self) -> MeshAttribute: ...
+    @property
+    def normals(self) -> Optional[MeshAttribute]: ...
+    @property
+    def tangents(self) -> Optional[MeshAttribute]: ...
+    @property
+    def colors(self) -> Optional[MeshAttribute]: ...
+    @property
+    def uvs(self) -> list[Optional[MeshAttribute]]:
+        """UV0 through UV7; ``None`` where the mesh has no such channel."""
+    @property
+    def sub_meshes(self) -> list[MeshSubMesh]: ...
+    @property
+    def bind_poses(self) -> bytes:
+        """16 little-endian float32 values per bone, column-major."""
+    @property
+    def bone_name_hashes(self) -> bytes:
+        """One little-endian uint32 per bone."""
+    @property
+    def root_bone_name_hash(self) -> int: ...
+    @property
+    def skin_weights(self) -> Optional[bytes]:
+        """Four little-endian float32 weights per vertex."""
+    @property
+    def skin_bone_indices(self) -> Optional[bytes]:
+        """Four little-endian uint32 bone indices per vertex."""
+    @property
+    def blend_shapes(self) -> Optional[MeshBlendShapes]: ...
+
 class CubismExpressionParameter:
     @property
     def id(self) -> str: ...
@@ -1157,6 +1236,13 @@ class UnityRs:
         *,
         maximum_bytes: int = 536_870_912,
     ) -> bytes: ...
+    def read_mesh(
+        self,
+        file_index: int,
+        path_id: int,
+        *,
+        maximum_bytes: int = 536_870_912,
+    ) -> Mesh: ...
     def read_animation_clip(
         self,
         file_index: int,

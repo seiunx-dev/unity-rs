@@ -49,11 +49,11 @@ methods:
 
 - `tools/check_node_api_surface.py` parses the four high-level Core impl blocks,
   the `#[napi] impl UnityRs` block, mapped napi object fields, generated
-  `index.d.ts`, and the strict TypeScript consumer. All 109 public Core methods
+  `index.d.ts`, and the strict TypeScript consumer. All 110 public Core methods
   must map to a real symbol in both Rust and TypeScript or one of the four
   Rust-only entries above.
 - The Rust class and generated declaration must expose exactly the same current
-  88 methods and 4 properties. A stale checked-in declaration, an addon method
+  90 methods and 4 properties. A stale checked-in declaration, an addon method
   missing from the declaration, or a declaration with no Rust export fails
   `quality` before a platform-specific addon is loaded.
 - Every public `UnityRs` member is called by `tests/types.ts`; pinned `tsc`

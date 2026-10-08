@@ -13,6 +13,12 @@ import type {
   LegacyAnimationInfo,
   Live2DPackageSet,
   LoadDiagnosticInfo,
+  Mesh,
+  MeshAttribute,
+  MeshBlendShapeChannel,
+  MeshBlendShapeFrame,
+  MeshBlendShapes,
+  MeshSubMesh,
   ModelTextureLimits,
   MonoBehaviourJson,
   MonoBehaviourSchema,
@@ -272,6 +278,52 @@ void live2dWithAcl;
 // The source-level API audit reads this file and fails when a generated
 // declaration is not exercised here; tsc then verifies the actual arguments
 // and return types rather than merely checking that the name exists.
+function consumeMesh(mesh: Mesh): void {
+  const header: [bigint, string, number, number] = [
+    mesh.pathId,
+    mesh.name,
+    mesh.vertexCount,
+    mesh.rootBoneNameHash,
+  ];
+  const positions: MeshAttribute = mesh.positions;
+  const positionData: [number, Buffer] = [positions.dimension, positions.data];
+  const channels: Array<MeshAttribute | null | undefined> = [
+    mesh.normals,
+    mesh.tangents,
+    mesh.colors,
+    ...mesh.uvs,
+  ];
+  const subMesh: MeshSubMesh | undefined = mesh.subMeshes[0];
+  const subMeshFields: Array<number | Buffer> | undefined = subMesh && [
+    subMesh.firstByte,
+    subMesh.indexCount,
+    subMesh.firstVertex,
+    subMesh.vertexCount,
+    subMesh.indices,
+  ];
+  const bones: Array<Buffer | undefined> = [
+    mesh.bindPoses,
+    mesh.boneNameHashes,
+    mesh.skinWeights,
+    mesh.skinBoneIndices,
+  ];
+  const shapes: MeshBlendShapes | undefined = mesh.blendShapes;
+  if (shapes !== undefined) {
+    const arrays: Buffer[] = [
+      shapes.vertices,
+      shapes.normals,
+      shapes.tangents,
+      shapes.indices,
+      shapes.fullWeights,
+    ];
+    const frame: MeshBlendShapeFrame | undefined = shapes.frames[0];
+    const channel: MeshBlendShapeChannel | undefined = shapes.channels[0];
+    void [arrays, frame?.firstVertex, frame?.vertexCount, frame?.hasNormals, frame?.hasTangents];
+    void [channel?.name, channel?.nameHash, channel?.frameIndex, channel?.frameCount];
+  }
+  void [header, positionData, channels, subMeshFields, bones];
+}
+
 function consumeEveryUnityRsMember(studio: UnityRs): void {
   void new UnityRs("fixture.assets");
   void UnityRs.openWithVersion("fixture.assets", "2022.3.62f1");
@@ -325,6 +377,8 @@ function consumeEveryUnityRsMember(studio: UnityRs): void {
   void studio.readShaderAsync(0, 1n, null, null, 16_000_000);
   void studio.readMeshObj(0, 1n, 1024);
   void studio.readMeshObjAsync(0, 1n, 1024);
+  consumeMesh(studio.readMesh(0, 1n, 1024));
+  void studio.readMeshAsync(0, 1n).then(consumeMesh);
   void studio.readTexture(0, 1n, 0, 1024);
   void studio.readTextureAsync(0, 1n, 0, 1024);
   void studio.readTextureArray(0, 1n, 1024);
