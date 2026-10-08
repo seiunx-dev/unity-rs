@@ -3996,6 +3996,15 @@ mod tests {
         );
     }
 
+    const HDR_ASTC_CASES: &[(usize, TextureFormat)] = &[
+        (4, TextureFormat::ASTC_HDR_4X4),
+        (5, TextureFormat::ASTC_HDR_5X5),
+        (6, TextureFormat::ASTC_HDR_6X6),
+        (8, TextureFormat::ASTC_HDR_8X8),
+        (10, TextureFormat::ASTC_HDR_10X10),
+        (12, TextureFormat::ASTC_HDR_12X12),
+    ];
+
     /// Every HDR ASTC footprint decodes exactly as the managed decoder does.
     ///
     /// The two of these tests used to record a divergence rather than assert
@@ -4004,18 +4013,9 @@ mod tests {
     /// with that one expression restored made all seven formats exact.
     #[test]
     fn hdr_astc_decodes_exactly_like_the_managed_decoder() {
-        const CASES: &[(usize, TextureFormat)] = &[
-            (4, TextureFormat::ASTC_HDR_4X4),
-            (5, TextureFormat::ASTC_HDR_5X5),
-            (6, TextureFormat::ASTC_HDR_6X6),
-            (8, TextureFormat::ASTC_HDR_8X8),
-            (10, TextureFormat::ASTC_HDR_10X10),
-            (12, TextureFormat::ASTC_HDR_12X12),
-        ];
-
         let directory =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
-        for (block, format) in CASES {
+        for (block, format) in HDR_ASTC_CASES {
             let name = format!("astc-hdr-{block}x{block}");
             let payload = std::fs::read(directory.join(format!("{name}.bin"))).unwrap();
             let expected = std::fs::read(directory.join(format!("{name}-managed.rgba"))).unwrap();
@@ -4037,6 +4037,58 @@ mod tests {
         }
     }
 
+    /// Every HDR ASTC fixture decodes exactly as Khronos `astcenc` does.
+    ///
+    /// The committed `-astcenc.rgba` blobs are `astcenc` 5.7.0's `-dH`
+    /// decompression of the payloads, clamped to [0, 1] and rounded to eight
+    /// bits. The smooth `hdr` gradient exercises neither of the two HDR paths
+    /// the `hdr-glow` payloads were made for: HDR RGB endpoint modes with
+    /// negative deltas, which an earlier version of this decoder sign-extended
+    /// into large positive ones and decoded with channels up to 255 levels
+    /// off, and an HDR void-extent block whose half floats must be rounded
+    /// rather than truncated.
+    #[test]
+    fn hdr_astc_decodes_exactly_like_the_khronos_reference() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/astc");
+        for (block, format) in HDR_ASTC_CASES {
+            for variant in ["hdr", "hdr-glow"] {
+                let name = format!("astc-{variant}-{block}x{block}");
+                let expected =
+                    std::fs::read(directory.join(format!("{name}-astcenc.rgba"))).unwrap();
+                let actual = decode_astc_fixture(&directory, &name, *block, *format);
+                assert_eq!(
+                    actual, expected,
+                    "{name} no longer matches the astcenc reference decode"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounds_hdr_void_extent_half_floats_to_the_nearest_level() {
+        // An HDR void-extent block the way `astcenc` writes one: the marker,
+        // the HDR flag and all-ones extent coordinates, then four half floats
+        // whose 255ths have a fraction above one half. Truncating them gives
+        // 76, 178, 25 and 127.
+        let mut block = [0xff_u8; 16];
+        block[0] = 0xfc;
+        for (index, half) in [0x34d1_u16, 0x399c, 0x2e76, 0x3802].iter().enumerate() {
+            block[8 + index * 2..10 + index * 2].copy_from_slice(&half.to_le_bytes());
+        }
+        let object = texture_object(6, 6, TextureFormat::ASTC_HDR_6X6, 1, &block, None);
+        let file = parse_asset(&object);
+        let collection = collection_with(file.clone(), "unused", b"");
+        let texture = read_texture2d(&collection, &file, 0, TextureReadLimits::default()).unwrap();
+        assert_eq!(
+            texture
+                .decode_mip_rgba8(0, TextureReadLimits::default())
+                .unwrap()
+                .pixels,
+            [77, 179, 26, 128].repeat(36)
+        );
+    }
+
     const LDR_ASTC_CASES: &[(usize, &str, TextureFormat)] = &[
         (4, "rgb", TextureFormat::ASTC_RGB_4X4),
         (4, "rgba", TextureFormat::ASTC_RGBA_4X4),
@@ -4052,7 +4104,7 @@ mod tests {
         (12, "rgba", TextureFormat::ASTC_RGBA_12X12),
     ];
 
-    fn decode_ldr_astc_fixture(
+    fn decode_astc_fixture(
         directory: &std::path::Path,
         name: &str,
         block: usize,
@@ -4084,7 +4136,7 @@ mod tests {
         for (block, variant, format) in LDR_ASTC_CASES {
             let name = format!("astc-{variant}-{block}x{block}");
             let expected = std::fs::read(directory.join(format!("{name}-astcenc.rgba"))).unwrap();
-            let actual = decode_ldr_astc_fixture(&directory, &name, *block, *format);
+            let actual = decode_astc_fixture(&directory, &name, *block, *format);
             assert_eq!(
                 actual, expected,
                 "{name} no longer matches the astcenc reference decode"
@@ -4104,7 +4156,7 @@ mod tests {
             let name = format!("astc-{variant}-{block}x{block}");
             let payload = std::fs::read(directory.join(format!("{name}.bin"))).unwrap();
             let full_size = block * 2;
-            let full = decode_ldr_astc_fixture(&directory, &name, *block, *format);
+            let full = decode_astc_fixture(&directory, &name, *block, *format);
             for (width, height) in [
                 (full_size - 1, full_size),
                 (full_size, block + 1),
@@ -4158,7 +4210,7 @@ mod tests {
         for (block, variant, format) in LDR_ASTC_CASES {
             let name = format!("astc-{variant}-{block}x{block}");
             let managed = std::fs::read(directory.join(format!("{name}-managed.rgba"))).unwrap();
-            let actual = decode_ldr_astc_fixture(&directory, &name, *block, *format);
+            let actual = decode_astc_fixture(&directory, &name, *block, *format);
             assert_eq!(actual.len(), managed.len(), "{name} sizes differ");
             let mut differing = 0_usize;
             for (index, (ours, theirs)) in actual.iter().zip(&managed).enumerate() {
