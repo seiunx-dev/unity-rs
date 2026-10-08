@@ -252,10 +252,10 @@ live2d = studio.read_live2d_packages(
 for package in live2d.packages:
     print(package.directory_name, package.moc_file_name)
 
-# By default a motion segment whose tangents are both flat is written as a
-# line, as the managed extractor does; Unity plays it as an ease-in-out.
-# force_bezier_motions writes every segment as the Bezier that reproduces the
-# curve, like force_bezier on read_cubism_fade_motion and the managed CLI's
+# By default a source segment whose tangents are both flat is exported as a
+# line, as the managed extractor does, although Unity plays that source
+# segment as an ease-in-out. force_bezier_motions writes every segment as the
+# Bezier that reproduces the source curve, like force_bezier on read_cubism_fade_motion and the managed CLI's
 # --l2d-smooth-motions. Sampled AnimationClip motions (dense, constant or ACL
 # data) also carry flat tangents but are interpolated linearly by Unity, so
 # the default suits them better.

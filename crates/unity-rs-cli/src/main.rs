@@ -1025,9 +1025,11 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          live2d-package exports verified MOC, texture PNG, model3.json, expression, motion,\n  \
          physics, pose, and display-info files when embedded or supplied schemas are available.\n  \
          --l2d-smooth-motions          Write every motion segment between two keys as a\n  \
-         Bezier, as the managed CLI option of that name does. By default a segment\n  \
-         whose tangents are both flat is written as a line, which Unity plays as an\n  \
-         ease-in-out; sampled AnimationClip curves carry flat tangents and are linear.\n\n\
+         Bezier, as the managed CLI option of that name does. By default a source\n  \
+         segment whose tangents are both flat is exported as a line, which plays\n  \
+         linearly, although Unity plays that source segment as an ease-in-out.\n  \
+         Sampled AnimationClip data also has flat tangents but Unity plays it\n  \
+         linearly, so the default suits it.\n\n\
          Legacy compatibility:\n  unity-rs <input> -m info\n  \
          unity-rs <input> -m <export|exportRaw|dump|extract|l2d|live2d|animator|splitObjects> -o <output>\n  \
          The l2d and live2d modes also take --l2d-smooth-motions.\n  \
