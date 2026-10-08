@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-09-26（Asia/Shanghai）
+最后更新：2026-10-08（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。更细的逐格式兼容矩阵见 [`README.md`](README.md)，私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -538,6 +538,12 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `"Multiply"`、Multiply 报成 `"Overwrite"`、Override 报成 `"Add"`。现序数 0/1/2 分别对应
   `Overwrite`/`Add`/`Multiply`；exp3.json 仍写出序列化序数本身，与托管提取器逐字节一致，
   Node 与托管差分不受影响；
+- **exp3.json 的 `Blend` 已于 2026-10-08 改写为 Cubism 格式字符串**：exp3.json 规范把 `Blend`
+  定义为 `"Add"`、`"Multiply"`、`"Overwrite"` 三个字符串，Cubism SDK for Unity 与 Native
+  Framework 都按字符串选模式，其余一律当作 Add；此前照托管提取器写出的序列化序数因此会让
+  Multiply/Override 参数读回成加法。现按上一条的名称写出字符串。这是对托管提取器的声明式
+  差分：托管差分在 Rust 侧把三个字符串映射回序数 0/1/2 后仍逐字节比较整份文档，并要求每个
+  参数都写成字符串，差分一旦消失即失败；Python `.json` 与 Node `json` 随之变化；
 - **FBX 批量输出名称的错误上限与重复扫描已于 2026-08-25 收口**：SplitObjects/Animator
   规划允许最多 1,000,000 个候选，但 CLI 原先以 `HashSet<String>` 保存名称，并让每个同名
   候选从无后缀、`~1` 重新扫描；循环还误用“创建临时文件最多尝试 1,024 次”的常量，导致

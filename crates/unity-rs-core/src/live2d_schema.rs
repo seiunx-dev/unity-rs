@@ -42,7 +42,7 @@ impl Default for CubismExpressionReadLimits {
 /// and `Multiply` 2; its exp3.json importer maps `"Add"`, `"Multiply"` and
 /// `"Overwrite"` onto them. The managed extractor's `BlendType` lists the
 /// same names in another order, so its names do not describe the serialized
-/// value; only the ordinal it echoes into exp3.json is kept here.
+/// value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CubismExpressionBlend {
     Add,
@@ -60,12 +60,13 @@ impl CubismExpressionBlend {
         }
     }
 
-    /// The serialized `CubismParameterBlendMode` ordinal.
-    const fn ordinal(self) -> u8 {
+    /// The exp3.json `Blend` string, as the Cubism format specifies it and
+    /// the Cubism SDK for Unity and Native Framework read it back.
+    const fn exp3_name(self) -> &'static str {
         match self {
-            Self::Overwrite => 0,
-            Self::Add => 1,
-            Self::Multiply => 2,
+            Self::Add => "Add",
+            Self::Multiply => "Multiply",
+            Self::Overwrite => "Overwrite",
         }
     }
 }
@@ -91,8 +92,15 @@ pub struct CubismExpression {
 
 impl CubismExpression {
     /// Writes the same ordered fields used by `AssetStudio`'s `exp3.json`
-    /// projection. Blend modes remain the serialized numeric ordinals, as the
-    /// managed extractor writes them.
+    /// projection, with `Blend` spelled as the exp3.json format's
+    /// `"Add"`, `"Multiply"` or `"Overwrite"`.
+    ///
+    /// The managed extractor writes the serialized ordinal there instead. Cubism
+    /// readers select the mode by those strings and treat anything else as
+    /// `Add`, so a multiply or overwrite parameter written as a number would
+    /// read back as additive. This is a declared divergence from the managed
+    /// output; the managed differential maps the strings back to ordinals and
+    /// checks that they agree.
     pub fn write_exp3_json<W: Write>(&self, output: &mut W, maximum_bytes: u64) -> Result<u64> {
         let mut writer = BoundedWriter::new(output, maximum_bytes);
         writer.write_all(b"{\n  \"Type\": ")?;
@@ -113,7 +121,7 @@ impl CubismExpression {
             writer.write_all(b",\n      \"Value\": ")?;
             write_number(&mut writer, parameter.value)?;
             writer.write_all(b",\n      \"Blend\": ")?;
-            write!(writer, "{}", parameter.blend.ordinal())?;
+            write_json_string(&mut writer, parameter.blend.exp3_name())?;
             writer.write_all(b"\n    }")?;
         }
         if !self.parameters.is_empty() {
@@ -798,7 +806,7 @@ mod tests {
         assert_eq!(parsed["Type"], "Live2D Expression");
         assert_eq!(parsed["FadeInTime"], 0.5);
         assert_eq!(parsed["Parameters"][0]["Id"], "ParamAngleX");
-        assert_eq!(parsed["Parameters"][0]["Blend"], 0);
+        assert_eq!(parsed["Parameters"][0]["Blend"], "Overwrite");
         assert!(
             expression
                 .write_exp3_json(&mut Vec::new(), written - 1)
@@ -939,12 +947,13 @@ mod tests {
             ]
         );
 
-        // exp3.json keeps the serialized ordinals unchanged.
+        // exp3.json spells each mode as the Cubism format's string, which is
+        // what the SDK importer maps back onto the same ordinal.
         let mut json = Vec::new();
         expression.write_exp3_json(&mut json, 4096).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        for (index, ordinal) in [0, 1, 2].into_iter().enumerate() {
-            assert_eq!(parsed["Parameters"][index]["Blend"], ordinal);
+        for (index, name) in ["Overwrite", "Add", "Multiply"].into_iter().enumerate() {
+            assert_eq!(parsed["Parameters"][index]["Blend"], name);
         }
     }
 

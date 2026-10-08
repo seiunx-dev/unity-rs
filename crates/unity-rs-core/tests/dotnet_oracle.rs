@@ -850,6 +850,10 @@ fn assert_cubism_moc(executable: &Path) {
 /// the other two it uses Newtonsoft's default float format throughout. Having
 /// all three in the differential is what keeps that distinction honest: get it
 /// backwards on any one of them and that document fails while the others pass.
+///
+/// `Blend` is the one declared divergence: unity-rs writes the Cubism format's
+/// strings where the managed extractor writes ordinals, and the Rust manifest
+/// maps them back (`managed_blend_spelling`) before the byte comparison.
 fn assert_cubism_expression(executable: &Path) {
     const REVISION: &str = "2022.3.62f1";
 

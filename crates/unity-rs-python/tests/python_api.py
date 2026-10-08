@@ -4016,7 +4016,7 @@ def main() -> None:
         assert parameter.value == 0.25
         # Serialized ordinal 1 is the Unity SDK's Additive mode.
         assert parameter.blend == "Add"
-        assert b'"Blend": 1' in expression.json
+        assert b'"Blend": "Add"' in expression.json
         exact_expression = UnityRs(expression_path).read_cubism_expression(
             0, 7, maximum_output_bytes=len(expression.json)
         )
