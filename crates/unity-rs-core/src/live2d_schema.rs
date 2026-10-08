@@ -535,10 +535,9 @@ fn auxiliary_integer(value: &TypeValue, name: &str, owner: &str) -> Result<i64> 
 
 fn auxiliary_array<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a [TypeValue]> {
     match auxiliary_field(value, name, owner)? {
-        Some(TypeValue::Array(value)) => Ok(value),
-        Some(_) => Err(Error::invalid_data(format!(
-            "{owner} {name} is not an array"
-        ))),
+        Some(value) => value
+            .element_values()
+            .ok_or_else(|| Error::invalid_data(format!("{owner} {name} is not an array"))),
         None => Err(Error::invalid_data(format!("{owner} has no {name}"))),
     }
 }
@@ -668,12 +667,11 @@ fn required_array<'a>(
     names: &[&str],
     description: &str,
 ) -> Result<&'a [TypeValue]> {
-    match required_field(value, names, description)? {
-        TypeValue::Array(value) => Ok(value),
-        _ => Err(Error::invalid_data(format!(
-            "Cubism expression {description} is not an array"
-        ))),
-    }
+    required_field(value, names, description)?
+        .element_values()
+        .ok_or_else(|| {
+            Error::invalid_data(format!("Cubism expression {description} is not an array"))
+        })
 }
 
 struct StringBudget {
@@ -777,7 +775,7 @@ impl<W: Write> Write for BoundedWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
-    use crate::type_tree::{TypeField, TypeValue};
+    use crate::type_tree::{ByteElement, TypeField, TypeValue};
 
     use super::{
         CubismAuxiliaryReadLimits, CubismDisplayEntry, CubismExpressionBlend,
@@ -921,6 +919,74 @@ mod tests {
             ..CubismAuxiliaryReadLimits::default()
         };
         assert!(project_cubism_display_info(9, &display_value, limits).is_err());
+    }
+
+    /// A schema whose array field is a byte vector reads as a byte array from
+    /// 0.6. Empty, it is still an empty list, as the element-wise array was;
+    /// with bytes in it, it is refused as not an array of parameters or links.
+    #[test]
+    fn treats_byte_arrays_as_empty_lists_or_refuses_them() {
+        let bytes = |bytes: Vec<u8>| TypeValue::ByteArray {
+            element: ByteElement::Unsigned8,
+            bytes,
+        };
+        let with_parameters = |parameters| {
+            let mut value = expression_value(Vec::new());
+            let TypeValue::Object(fields) = &mut value else {
+                unreachable!()
+            };
+            fields[4].value = parameters;
+            value
+        };
+        let expression = project_cubism_expression(
+            1,
+            &with_parameters(bytes(Vec::new())),
+            CubismExpressionReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            expression,
+            project_cubism_expression(
+                1,
+                &expression_value(Vec::new()),
+                CubismExpressionReadLimits::default()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            project_cubism_expression(
+                1,
+                &with_parameters(bytes(vec![1])),
+                CubismExpressionReadLimits::default()
+            )
+            .unwrap_err()
+            .to_string(),
+            "Cubism expression Parameters is not an array"
+        );
+
+        let pose = |links| {
+            TypeValue::Object(vec![
+                field("GroupIndex", TypeValue::Signed(0)),
+                field("Link", links),
+            ])
+        };
+        let read = project_cubism_pose_part(
+            8,
+            &pose(bytes(Vec::new())),
+            CubismAuxiliaryReadLimits::default(),
+        )
+        .unwrap();
+        assert!(read.links.is_empty());
+        assert_eq!(
+            project_cubism_pose_part(
+                8,
+                &pose(bytes(vec![1])),
+                CubismAuxiliaryReadLimits::default()
+            )
+            .unwrap_err()
+            .to_string(),
+            "CubismPosePart Link is not an array"
+        );
     }
 
     #[test]

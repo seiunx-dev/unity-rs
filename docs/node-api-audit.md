@@ -43,7 +43,12 @@ methods:
   `(fileIndex, pathId)` key and retain collection first-match semantics;
 - low-level provider traits become explicit JavaScript callbacks or inert
   schema descriptions. Work that needs a callback runs on a libuv worker so
-  the event loop can execute the callback without deadlocking.
+  the event loop can execute the callback without deadlocking;
+- the dynamic `TypeValue` tree and `TypeTreeReadLimits` are not exposed: type
+  trees reach JavaScript only as bounded JSON or dump `Buffer`s read with
+  Core's default limits. If a structured reader is added,
+  `TypeValue::ByteArray` must become a `Buffer`, not an array of numbers (see
+  `docs/design/0.6-byte-array-values.md`).
 
 ## Enforced evidence
 

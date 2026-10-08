@@ -672,12 +672,9 @@ fn field<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a TypeVa
 }
 
 fn array_field<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a [TypeValue]> {
-    match field(value, name, owner)? {
-        TypeValue::Array(value) => Ok(value),
-        _ => Err(Error::invalid_data(format!(
-            "{owner} {name} is not an array"
-        ))),
-    }
+    field(value, name, owner)?
+        .element_values()
+        .ok_or_else(|| Error::invalid_data(format!("{owner} {name} is not an array")))
 }
 
 fn string_field<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a str> {
@@ -1144,6 +1141,39 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// From 0.6 a byte vector reads as a byte array. Empty, the parallel
+    /// arrays still read as empty lists, as the element-wise arrays did; with
+    /// bytes in them they are refused as not arrays of ids, curves or times.
+    #[test]
+    fn treats_byte_arrays_as_empty_lists_or_refuses_them() {
+        let bytes = |bytes: Vec<u8>| TypeValue::ByteArray {
+            element: crate::type_tree::ByteElement::Signed8,
+            bytes,
+        };
+        let mut empty = motion_value();
+        let TypeValue::Object(fields) = &mut empty else {
+            unreachable!()
+        };
+        for field in &mut fields[4..8] {
+            field.value = bytes(Vec::new());
+        }
+        let motion =
+            project_cubism_fade_motion(1, &empty, CubismFadeMotionReadLimits::default()).unwrap();
+        assert!(motion.curves.is_empty());
+
+        let mut value = motion_value();
+        let TypeValue::Object(fields) = &mut value else {
+            unreachable!()
+        };
+        fields[6].value = bytes(vec![4]);
+        assert_eq!(
+            project_cubism_fade_motion(1, &value, CubismFadeMotionReadLimits::default())
+                .unwrap_err()
+                .to_string(),
+            "fade motion ParameterFadeInTimes is not an array"
+        );
     }
 
     #[test]

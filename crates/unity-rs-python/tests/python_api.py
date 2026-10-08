@@ -2256,6 +2256,50 @@ def synthetic_type_tree_object() -> bytes:
     return finish_v22_tree_asset(114, type_tree_probe_tree(), payload)
 
 
+def synthetic_byte_array_object() -> bytes:
+    """A MonoBehaviour with `UInt8` and `SInt8` vectors, and a `bool` one.
+
+    The first two are read as byte arrays from 0.6; the `bool` vector stays
+    element-wise. Every byte value appears, so a sign slip shows as a wrong
+    document. One-byte `char` vectors are left to the Rust tests and the
+    managed oracle: UnityPy reads every `char` as one integer, where this
+    project and the managed reader write a one-character string.
+    """
+    tree = TreeBuilder()
+    tree.push("MonoBehaviour", "Base", -1, 0)
+    tree.push("PPtr<GameObject>", "m_GameObject", 12, 1)
+    tree.push("int", "m_FileID", 4, 2)
+    tree.push("SInt64", "m_PathID", 8, 2)
+    tree.push("UInt8", "m_Enabled", 1, 1, flags=ALIGN)
+    tree.push("PPtr<MonoScript>", "m_Script", 12, 1)
+    tree.push("int", "m_FileID", 4, 2)
+    tree.push("SInt64", "m_PathID", 8, 2)
+    tree.string("m_Name", 1)
+    for element, field in (("UInt8", "Unsigned"), ("SInt8", "Signed"), ("bool", "Flags")):
+        tree.push("vector", field, -1, 1, flags=ALIGN)
+        tree.push("Array", "Array", -1, 2, is_array=1)
+        tree.push("int", "size", 4, 3)
+        tree.push(element, "data", 1, 3)
+
+    payload = bytearray()
+    push_i32(payload, 0)
+    payload.extend(struct.pack("<q", 0))
+    payload.append(1)
+    align(payload, 4)
+    push_i32(payload, 0)
+    payload.extend(struct.pack("<q", 0))
+    push_aligned_string(payload, "byte-arrays")
+    every_byte = bytes(range(256))
+    for _ in range(2):
+        push_i32(payload, len(every_byte))
+        payload.extend(every_byte)
+        align(payload, 4)
+    push_i32(payload, 3)
+    payload.extend((1, 0, 1))
+    align(payload, 4)
+    return finish_v22_tree_asset(114, tree.nodes, payload)
+
+
 def push_blob_type_tree(metadata: bytearray, nodes: list[dict[str, int | str]]) -> None:
     """The format 19+ blob encoding: 32-byte nodes, then the string buffer."""
     buffer = bytearray()
@@ -2459,8 +2503,67 @@ def assert_schema_construction_releases_gil() -> None:
     assert schemas.schema_count == 100_000
 
 
+def check_byte_array_type_tree_json() -> None:
+    """One-byte vectors read as byte arrays from 0.6 (#5).
+
+    The JSON is the same document 0.5 wrote, and a ``CubismMoc``-sized
+    ``_bytes`` that 0.5 refused -- over 32,000,000 elements and 64 bytes of
+    budget each -- reads with the default limits.
+    """
+    nodes = mono_behaviour_nodes() + (
+        ("vector", "_bytes", 1, True),
+        ("Array", "Array", 2, False),
+        ("int", "size", 3, False),
+        ("UInt8", "data", 3, False),
+        ("vector", "signed", 1, True),
+        ("Array", "Array", 2, False),
+        ("int", "size", 3, False),
+        ("SInt8", "data", 3, False),
+    )
+
+    def asset(moc: bytes) -> bytes:
+        payload = bytearray()
+        push_pptr(payload, 0)
+        payload.append(1)
+        align(payload, 4)
+        push_pptr(payload, 0)
+        push_aligned_string(payload, "moc")
+        push_i32(payload, len(moc))
+        payload.extend(moc)
+        align(payload, 4)
+        push_i32(payload, 3)
+        payload.extend(struct.pack("<3b", -128, -1, 127))
+        align(payload, 4)
+        return finish_v22_type_tree_mono(nodes, payload)
+
+    def document(body: str) -> str:
+        return (
+            '{"m_GameObject":{"m_FileID":0,"m_PathID":0},"m_Enabled":1,'
+            '"m_Script":{"m_FileID":0,"m_PathID":0},"m_Name":"moc",'
+            f'"_bytes":[{body}],"signed":[-128,-1,127]}}'
+        )
+
+    small = UnityRs.from_bytes(asset(bytes((0, 1, 255))))
+    assert small.read_type_tree_json(0, 7) == document("0,1,255")
+    assert json.loads(small.read_type_tree_json(0, 7, pretty=True)) == json.loads(
+        document("0,1,255")
+    )
+    assert "\t\tint size = 3\r\n\t\t\t[0]\r\n\t\t\tUInt8 data = 0\r\n" in (
+        small.read_type_tree_dump(0, 7)
+    )
+
+    length = 44_999_616
+    whole, tail = divmod(length, 256)
+    large = UnityRs.from_bytes(asset(bytes(range(256)) * whole + bytes(range(tail))))
+    chunks = [",".join(map(str, range(256)))] * whole
+    if tail:
+        chunks.append(",".join(map(str, range(tail))))
+    assert large.read_type_tree_json(0, 7) == document(",".join(chunks))
+
+
 def main() -> None:
     assert_schema_construction_releases_gil()
+    check_byte_array_type_tree_json()
     assert AnimationClip.__name__ == "AnimationClip"
     assert LegacyAnimation.__name__ == "LegacyAnimation"
     assert AnimatorOverrideController.__name__ == "AnimatorOverrideController"

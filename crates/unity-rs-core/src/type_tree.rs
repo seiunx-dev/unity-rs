@@ -133,14 +133,25 @@ fn managed_type_identity(value: &TypeValue) -> Result<(&str, &str, &str)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeTreeReadLimits {
     pub maximum_depth: usize,
+    /// Values counted while walking the tree. A [`TypeValue::ByteArray`]
+    /// counts as one value, however many bytes it holds.
     pub maximum_values: usize,
+    /// Elements of one element-wise array or map. Byte arrays read as
+    /// [`TypeValue::ByteArray`] are bounded by `maximum_byte_array_bytes`
+    /// instead.
     pub maximum_array_elements: usize,
     pub maximum_string_bytes: usize,
     pub maximum_typeless_bytes: usize,
+    /// Bytes of one array read as [`TypeValue::ByteArray`]: a `UInt8`,
+    /// `SInt8` or one-byte `char` vector. The cumulative bound is still
+    /// `maximum_materialized_bytes`, which each byte array is charged by its
+    /// capacity.
+    pub maximum_byte_array_bytes: usize,
     /// Conservative upper bound for heap work retained by the materialized
     /// value tree and its parser indexes. This includes value/vector slots,
-    /// cloned field names, decoded strings, subtree boundaries, and their
-    /// fallible capacities.
+    /// cloned field names, decoded strings, byte-array bytes, subtree
+    /// boundaries, and their fallible capacities. Each slot is charged once,
+    /// by the container that allocates it.
     pub maximum_materialized_bytes: usize,
 }
 
@@ -159,15 +170,66 @@ impl Default for TypeTreeReadLimits {
             maximum_array_elements: 32_000_000,
             maximum_string_bytes: 16 * 1024 * 1024,
             maximum_typeless_bytes: 256 * 1024 * 1024,
-            // Set from a measurement, like the two above. A Live2D
-            // MonoBehaviour in a shipping Unity 6000.3 build materializes to
-            // between 384 and 512 MiB of value tree -- the same content whose
-            // package materialization was measured at 439 MB -- and at 256 MiB
-            // an otherwise clean 11,639-object export failed on two of them.
-            // This is the bound that actually decides peak heap for one
-            // object, so raising it raises that peak: 512 MiB covers what has
-            // been measured here, and is not a proof that nothing needs more.
+            // The largest byte array measured is a Live2D `CubismMoc._bytes`
+            // of 44,999,616 bytes in a shipping Unity 6000.3 build. This
+            // matches `maximum_typeless_bytes`, the bound on the other kind
+            // of raw byte run a type tree holds.
+            maximum_byte_array_bytes: 256 * 1024 * 1024,
+            // Set from a measurement, like the two above, and kept in 0.6.
+            // Before 0.6 every slot was charged twice and a one-byte element
+            // cost 64 bytes, so a Live2D MonoBehaviour in a shipping Unity
+            // 6000.3 build charged between 384 and 512 MiB -- the same content
+            // whose package materialization was measured at 439 MB -- and at
+            // 256 MiB an otherwise clean 11,639-object export failed on two of
+            // them. With one charge per slot and byte arrays charged by their
+            // length the same objects charge less, and this is now an honest
+            // bound on retained heap. That corpus has not been re-measured
+            // under the new accounting. On a 135-bundle Unity 2022.3 game
+            // corpus measured for 0.6, the largest object needs 2,647,023
+            // bytes (2,647,087 before) and a 44,999,616-byte `CubismMoc._bytes`
+            // needs its length plus under 1 KiB. It decides peak heap for one
+            // object, so it stays where real content was measured until a
+            // corpus run under the new accounting justifies another figure.
             maximum_materialized_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// How the elements of a [`TypeValue::ByteArray`] are typed in the tree.
+///
+/// Each variant maps a byte to exactly the value the element-wise reader would
+/// have produced for it; see [`ByteElement::value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ByteElement {
+    /// `UInt8`, read element-wise as [`TypeValue::Unsigned`] `0..=255`.
+    Unsigned8,
+    /// `SInt8`, read element-wise as [`TypeValue::Signed`] `-128..=127`.
+    Signed8,
+    /// A `char` whose node declares a byte size of 1, read element-wise as
+    /// [`TypeValue::Character`] `0..=255`.
+    Character8,
+}
+
+impl ByteElement {
+    /// The value the element-wise reader produces for one byte of this
+    /// element type.
+    #[must_use]
+    pub fn value(self, byte: u8) -> TypeValue {
+        match self {
+            Self::Unsigned8 => TypeValue::Unsigned(u64::from(byte)),
+            Self::Signed8 => TypeValue::Signed(i64::from(byte.cast_signed())),
+            Self::Character8 => TypeValue::Character(u16::from(byte)),
+        }
+    }
+
+    /// The Unity type name of the element node this variant reads.
+    #[must_use]
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::Unsigned8 => "UInt8",
+            Self::Signed8 => "SInt8",
+            Self::Character8 => "char",
         }
     }
 }
@@ -175,7 +237,11 @@ impl Default for TypeTreeReadLimits {
 /// Lossless-enough dynamic representation of a value read from a Unity type
 /// tree. Objects and maps use ordered vectors because Unity metadata order is
 /// significant and duplicate field names must not be silently overwritten.
+///
+/// New variants may be added in minor releases, so a `match` outside this crate
+/// needs a wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum TypeValue {
     Signed(i64),
     Unsigned(u64),
@@ -194,7 +260,20 @@ pub enum TypeValue {
         offset: u64,
         size: u64,
     },
+    /// An element-wise array: every element is its own value.
     Array(Vec<Self>),
+    /// An array of one-byte elements, kept as its bytes.
+    ///
+    /// The reader produces this for a `vector` or other array whose data node
+    /// is an unaligned leaf of type `UInt8`, `SInt8`, or `char` with a declared
+    /// byte size of 1. Any other array, including `bool` arrays, stays
+    /// [`TypeValue::Array`]. It stands for the same array the element-wise
+    /// path would read -- [`ByteElement::value`] gives each element -- and the
+    /// JSON and dump writers emit it identically.
+    ByteArray {
+        element: ByteElement,
+        bytes: Vec<u8>,
+    },
     Object(Vec<TypeField>),
     Map(Vec<TypeMapEntry>),
 }
@@ -210,6 +289,44 @@ impl TypeValue {
         match self {
             Self::Float32(value) => Some(f64::from(*value)),
             Self::Float(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Returns the bytes of a [`TypeValue::ByteArray`].
+    ///
+    /// Element-wise arrays return `None`, even when every element is a byte:
+    /// only arrays the reader typed as one-byte elements are byte arrays.
+    #[must_use]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::ByteArray { bytes, .. } => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// The values of an element-wise array, for readers that walk records,
+    /// strings or numbers.
+    ///
+    /// An empty byte array yields no values, as the empty element-wise array
+    /// 0.5 read for it did. A non-empty one holds bytes, which none of those
+    /// readers take, so it is `None` like any other non-array.
+    pub(crate) fn element_values(&self) -> Option<&[TypeValue]> {
+        match self {
+            Self::Array(values) => Some(values),
+            Self::ByteArray { bytes, .. } if bytes.is_empty() => Some(&[]),
+            _ => None,
+        }
+    }
+
+    /// Returns the element count of either array variant.
+    ///
+    /// Maps are not arrays here, although they serialize as one.
+    #[must_use]
+    pub fn array_len(&self) -> Option<usize> {
+        match self {
+            Self::Array(values) => Some(values.len()),
+            Self::ByteArray { bytes, .. } => Some(bytes.len()),
             _ => None,
         }
     }
@@ -351,6 +468,18 @@ pub fn read_type_tree_from_reader_with_reference_types<R: Read + Seek>(
     limits: TypeTreeReadLimits,
     reference_types: &[SerializedType],
 ) -> Result<TypeValue> {
+    read_type_tree_measured(tree, reader, absolute_start, limits, reference_types)
+        .map(|(value, _)| value)
+}
+
+/// The full read, also returning the materialized bytes it charged.
+fn read_type_tree_measured<R: Read + Seek>(
+    tree: &TypeTree,
+    reader: EndianReader<R>,
+    absolute_start: u64,
+    limits: TypeTreeReadLimits,
+    reference_types: &[SerializedType],
+) -> Result<(TypeValue, usize)> {
     let (layout, layout_bytes) = TypeTreeLayout::new_bounded(
         &tree.nodes,
         0,
@@ -393,7 +522,7 @@ pub fn read_type_tree_from_reader_with_reference_types<R: Read + Seek>(
              not match this object"
         )));
     }
-    Ok(value)
+    Ok((value, parser.materialized_bytes))
 }
 
 fn read_type_tree_root_field_from_reader_with_reference_types<R: Read + Seek>(
@@ -482,8 +611,26 @@ struct TypeTreeValueReader<'a, R> {
 }
 
 impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
+    /// Reads a value that no container holds -- the root, a projected field,
+    /// or a temporary -- and charges its own `TypeValue` slot.
     fn read_node(&mut self, index: usize, depth: usize) -> Result<(TypeValue, usize)> {
-        self.visit_node(depth, true)?;
+        self.read_value(index, depth, true)
+    }
+
+    /// Reads a value into a slot its container already charged for: an array
+    /// element, a record field, or a map key or value. Charging the slot again
+    /// here would count every contained value twice.
+    fn read_slot(&mut self, index: usize, depth: usize) -> Result<(TypeValue, usize)> {
+        self.read_value(index, depth, false)
+    }
+
+    fn read_value(
+        &mut self,
+        index: usize,
+        depth: usize,
+        charge_slot: bool,
+    ) -> Result<(TypeValue, usize)> {
+        self.visit_node(depth, charge_slot)?;
 
         let node = self.nodes.get(index).ok_or_else(|| {
             Error::invalid_data(format!("type tree node index {index} is out of range"))
@@ -820,6 +967,12 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
 
     fn skip_array(&mut self, index: usize, depth: usize) -> Result<bool> {
         let shape = validate_array_shape(self.nodes, &self.layout, index)?;
+        if self.byte_element(shape.data_index).is_some() {
+            let count = self.read_byte_array_length(depth)?;
+            self.require_remaining(count)?;
+            self.skip_bytes(count, "type tree byte array")?;
+            return Ok(shape.align);
+        }
         let count = self.read_length(self.limits.maximum_array_elements, "array element")?;
         for _ in 0..count {
             self.skip_node(shape.data_index, depth + 1)?;
@@ -861,7 +1014,9 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         self.reader.set_position(end)
     }
 
-    fn read_class(&mut self, index: usize, depth: usize) -> Result<TypeValue> {
+    /// Counts the direct children of `index`, checking that each sits one
+    /// level below it.
+    fn count_children(&self, index: usize, label: &str) -> Result<usize> {
         let parent_level = self.nodes[index].level;
         let end = self.layout.subtree_end(index);
         let mut child_count = 0_usize;
@@ -870,7 +1025,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
             let node = &self.nodes[child];
             if node.level != parent_level + 1 {
                 return Err(Error::invalid_data(format!(
-                    "type tree class child at index {child} has level {}, expected {}",
+                    "{label} child at index {child} has level {}, expected {}",
                     node.level,
                     parent_level + 1
                 )));
@@ -880,15 +1035,27 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 .ok_or_else(|| Error::invalid_data("type tree field count overflowed"))?;
             child = self.layout.subtree_end(child);
         }
-        self.charge_capacity::<TypeField>(child_count, "type tree field storage")?;
+        Ok(child_count)
+    }
+
+    /// Charges and reserves the field slots of one record up front.
+    fn reserve_fields(&mut self, child_count: usize, field: &str) -> Result<Vec<TypeField>> {
+        self.charge_capacity::<TypeField>(child_count, field)?;
         let mut fields = Vec::new();
         fields.try_reserve_exact(child_count).map_err(|error| {
             Error::invalid_data(format!(
                 "cannot allocate {child_count} type tree fields: {error}"
             ))
         })?;
+        Ok(fields)
+    }
 
-        child = index + 1;
+    fn read_class(&mut self, index: usize, depth: usize) -> Result<TypeValue> {
+        let end = self.layout.subtree_end(index);
+        let child_count = self.count_children(index, "type tree class")?;
+        let mut fields = self.reserve_fields(child_count, "type tree field storage")?;
+
+        let mut child = index + 1;
         while child < end {
             let node = &self.nodes[child];
             if node.type_name == MANAGED_REFERENCES_REGISTRY {
@@ -902,7 +1069,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 self.has_registry = true;
             }
             let name = self.clone_field_name(&node.field_name)?;
-            let (value, next) = self.read_node(child, depth + 1)?;
+            let (value, next) = self.read_slot(child, depth + 1)?;
             fields.push(TypeField { name, value });
             child = next;
         }
@@ -912,22 +1079,17 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
     /// Reads one registry entry: its `rid`, the managed type it names, and the
     /// stored value laid out by that type's own tree.
     fn read_referenced_object(&mut self, index: usize, depth: usize) -> Result<TypeValue> {
-        let parent_level = self.nodes[index].level;
         let end = self.layout.subtree_end(index);
-        let mut fields = Vec::new();
+        // A null entry leaves its data slot unused, but the slot is allocated
+        // either way, so the capacity is what is charged.
+        let child_count = self.count_children(index, "managed reference")?;
+        let mut fields = self.reserve_fields(child_count, "managed reference field storage")?;
         // `Some(None)` is a declared null reference; outer `None` means the
         // entry has not named its type yet.
         let mut reference_type_index = None;
         let mut child = index + 1;
         while child < end {
             let node = &self.nodes[child];
-            if node.level != parent_level + 1 {
-                return Err(Error::invalid_data(format!(
-                    "managed reference child at index {child} has level {}, expected {}",
-                    node.level,
-                    parent_level + 1
-                )));
-            }
             let name = self.clone_field_name(&node.field_name)?;
             if node.type_name == REFERENCED_OBJECT_DATA {
                 let reference_type_index = reference_type_index.ok_or_else(|| {
@@ -938,29 +1100,20 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
                 // invented.
                 if let Some(tree_index) = reference_type_index {
                     let value = self.read_reference_type(tree_index, depth + 1)?;
-                    self.push_field(&mut fields, TypeField { name, value })?;
+                    fields.push(TypeField { name, value });
                 }
                 child = self.layout.subtree_end(child);
                 continue;
             }
-            let (value, next) = self.read_node(child, depth + 1)?;
+            let (value, next) = self.read_slot(child, depth + 1)?;
             if node.type_name == REFERENCED_MANAGED_TYPE {
                 reference_type_index =
                     Some(self.reference_type_index(managed_type_identity(&value)?)?);
             }
-            self.push_field(&mut fields, TypeField { name, value })?;
+            fields.push(TypeField { name, value });
             child = next;
         }
         Ok(TypeValue::Object(fields))
-    }
-
-    fn push_field(&mut self, fields: &mut Vec<TypeField>, field: TypeField) -> Result<()> {
-        self.charge_materialized(std::mem::size_of::<TypeField>(), "managed reference field")?;
-        fields.try_reserve(1).map_err(|error| {
-            Error::invalid_data(format!("cannot grow managed reference fields: {error}"))
-        })?;
-        fields.push(field);
-        Ok(())
     }
 
     /// Finds the reference type an entry names, or `None` for a null entry.
@@ -1097,6 +1250,8 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         Ok(layout)
     }
 
+    /// Reads the value one registry entry stores, into the `data` field slot
+    /// the entry already charged for.
     fn read_reference_type(&mut self, tree_index: usize, depth: usize) -> Result<TypeValue> {
         let layout = self.reference_type_layout(tree_index)?;
         let tree = self
@@ -1118,7 +1273,7 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
         let outer = self.nodes;
         let outer_layout = std::mem::replace(&mut self.layout, layout);
         self.nodes = tree_nodes;
-        let result = self.read_node(0, depth);
+        let result = self.read_slot(0, depth);
         self.nodes = outer;
         self.layout = outer_layout;
         let (value, next) = result?;
@@ -1133,6 +1288,10 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
 
     fn read_array(&mut self, index: usize, depth: usize) -> Result<(TypeValue, bool)> {
         let shape = validate_array_shape(self.nodes, &self.layout, index)?;
+        if let Some(element) = self.byte_element(shape.data_index) {
+            let bytes = self.read_byte_array(depth)?;
+            return Ok((TypeValue::ByteArray { element, bytes }, shape.align));
+        }
         let count = self.read_length(self.limits.maximum_array_elements, "array element")?;
         self.charge_capacity::<TypeValue>(count, "type tree array storage")?;
         let mut values = Vec::new();
@@ -1140,9 +1299,80 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
             Error::invalid_data(format!("cannot allocate {count} array values: {error}"))
         })?;
         for _ in 0..count {
-            values.push(self.read_node(shape.data_index, depth + 1)?.0);
+            values.push(self.read_slot(shape.data_index, depth + 1)?.0);
         }
         Ok((TypeValue::Array(values), shape.align))
+    }
+
+    /// The element type of an array whose bytes can be kept as they are, or
+    /// `None` for an array that has to be read element by element.
+    ///
+    /// Only an unaligned leaf `UInt8`, `SInt8`, or one-byte `char` qualifies:
+    /// an aligned element would need padding after every byte, a `char` of
+    /// another or undeclared size is not one byte, and a `bool` has to be
+    /// checked one byte at a time.
+    fn byte_element(&self, data_index: usize) -> Option<ByteElement> {
+        let data = self.nodes.get(data_index)?;
+        if data.meta_flags & ALIGN_BYTES_FLAG != 0
+            || self.layout.subtree_end(data_index) != data_index.checked_add(1)?
+        {
+            return None;
+        }
+        match ValueKind::from_type_name(&data.type_name) {
+            ValueKind::Unsigned8 => Some(ByteElement::Unsigned8),
+            ValueKind::Signed8 => Some(ByteElement::Signed8),
+            ValueKind::Character if data.byte_size == 1 => Some(ByteElement::Character8),
+            _ => None,
+        }
+    }
+
+    /// Reads a byte array's length and applies the limits its elements would
+    /// have met element by element: one byte array counts as one value, its
+    /// length is bounded by `maximum_byte_array_bytes`, and a non-empty one
+    /// still has elements one level deeper.
+    fn read_byte_array_length(&mut self, depth: usize) -> Result<usize> {
+        let length = checked_length(self.reader.read_i32()?, "type tree byte array")?;
+        if length > self.limits.maximum_byte_array_bytes {
+            return Err(Error::invalid_data(format!(
+                "type tree byte array length {length} exceeds limit {} \
+                 (maximum_byte_array_bytes)",
+                self.limits.maximum_byte_array_bytes
+            )));
+        }
+        if length != 0 && depth.saturating_add(1) > self.limits.maximum_depth {
+            return Err(Error::invalid_data(format!(
+                "object type tree exceeds depth limit {}",
+                self.limits.maximum_depth
+            )));
+        }
+        Ok(length)
+    }
+
+    /// Fails with end of input, before anything is allocated, when fewer than
+    /// `length` bytes remain.
+    fn require_remaining(&mut self, length: usize) -> Result<()> {
+        let remaining = self.reader.remaining()?;
+        if u64::try_from(length).map_or(true, |length| length > remaining) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("type tree byte array needs {length} bytes but only {remaining} remain"),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Reads one byte array with a single bounded read, charging its capacity.
+    fn read_byte_array(&mut self, depth: usize) -> Result<Vec<u8>> {
+        let length = self.read_byte_array_length(depth)?;
+        self.require_remaining(length)?;
+        self.charge_materialized(length, "type tree byte array bytes")?;
+        let bytes = self.reader.read_bytes(length)?;
+        let slack = bytes.capacity().saturating_sub(length);
+        if slack != 0 {
+            self.charge_materialized(slack, "type tree byte array bytes")?;
+        }
+        Ok(bytes)
     }
 
     fn read_map(&mut self, index: usize, depth: usize) -> Result<(TypeValue, bool)> {
@@ -1154,8 +1384,8 @@ impl<'a, R: Read + Seek> TypeTreeValueReader<'a, R> {
             Error::invalid_data(format!("cannot allocate {count} map entries: {error}"))
         })?;
         for _ in 0..count {
-            let key = self.read_node(shape.first_index, depth + 1)?.0;
-            let value = self.read_node(shape.second_index, depth + 1)?.0;
+            let key = self.read_slot(shape.first_index, depth + 1)?.0;
+            let value = self.read_slot(shape.second_index, depth + 1)?.0;
             entries.push(TypeMapEntry { key, value });
         }
         Ok((TypeValue::Map(entries), shape.align))
@@ -1511,11 +1741,159 @@ mod tests {
     use crate::serialized::{SerializedType, TypeTree, TypeTreeNode};
 
     use super::{
-        ReferenceTypeLookupEntry, TypeField, TypeTreeLayout, TypeTreeReadLimits,
-        TypeTreeValueReader, TypeValue, read_type_tree_from_reader,
-        read_type_tree_from_reader_with_reference_types,
+        ByteElement, ReferenceTypeLookupEntry, TypeField, TypeMapEntry, TypeTreeLayout,
+        TypeTreeReadLimits, TypeTreeValueReader, TypeValue, read_type_tree_from_reader,
+        read_type_tree_from_reader_with_reference_types, read_type_tree_measured,
         read_type_tree_root_field_from_reader_with_reference_types,
     };
+
+    const VALUE: usize = std::mem::size_of::<TypeValue>();
+    const FIELD: usize = std::mem::size_of::<TypeField>();
+    const ENTRY: usize = std::mem::size_of::<TypeMapEntry>();
+    const INDEX: usize = std::mem::size_of::<usize>();
+
+    fn read(
+        tree: &TypeTree,
+        bytes: Vec<u8>,
+        limits: TypeTreeReadLimits,
+    ) -> crate::Result<TypeValue> {
+        read_type_tree_from_reader(
+            tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            limits,
+        )
+    }
+
+    /// The value and the exact materialized bytes the read charged.
+    fn measure(
+        tree: &TypeTree,
+        bytes: Vec<u8>,
+        references: &[SerializedType],
+    ) -> (TypeValue, usize) {
+        read_type_tree_measured(
+            tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            TypeTreeReadLimits::default(),
+            references,
+        )
+        .unwrap()
+    }
+
+    fn project(
+        tree: &TypeTree,
+        bytes: Vec<u8>,
+        limits: TypeTreeReadLimits,
+        field_name: &str,
+    ) -> crate::Result<Option<TypeValue>> {
+        read_type_tree_root_field_from_reader_with_reference_types(
+            tree,
+            EndianReader::new(Cursor::new(bytes), Endian::Little),
+            0,
+            limits,
+            &[],
+            field_name,
+        )
+    }
+
+    fn tree(nodes: Vec<TypeTreeNode>) -> TypeTree {
+        TypeTree {
+            nodes,
+            string_buffer: Vec::new(),
+        }
+    }
+
+    fn sized(byte_size: i32, node: TypeTreeNode) -> TypeTreeNode {
+        TypeTreeNode { byte_size, ..node }
+    }
+
+    /// A `vector` root whose data node is `data`.
+    fn vector_of(data: TypeTreeNode) -> TypeTree {
+        tree(vec![
+            node("vector", "_bytes", 0, false),
+            node("Array", "Array", 1, false),
+            node("int", "size", 2, false),
+            TypeTreeNode { level: 2, ..data },
+        ])
+    }
+
+    fn counted(count: i32, elements: &[u8]) -> Vec<u8> {
+        let mut bytes = count.to_le_bytes().to_vec();
+        bytes.extend_from_slice(elements);
+        bytes
+    }
+
+    /// The layout of a Cubism `CubismMoc` `MonoBehaviour`: the standard header,
+    /// then the raw moc in `_bytes`, as in the reproduction in #5.
+    fn moc_behaviour(length: usize) -> (TypeTree, Vec<u8>) {
+        let tree = tree(vec![
+            node("MonoBehaviour", "Base", 0, false),
+            node("PPtr<GameObject>", "m_GameObject", 1, false),
+            node("int", "m_FileID", 2, false),
+            node("SInt64", "m_PathID", 2, false),
+            node("UInt8", "m_Enabled", 1, true),
+            node("PPtr<MonoScript>", "m_Script", 1, false),
+            node("int", "m_FileID", 2, false),
+            node("SInt64", "m_PathID", 2, false),
+            node("string", "m_Name", 1, true),
+            node("Array", "Array", 2, true),
+            node("int", "size", 3, false),
+            sized(1, node("char", "data", 3, false)),
+            node("vector", "_bytes", 1, true),
+            node("Array", "Array", 2, false),
+            node("int", "size", 3, false),
+            sized(1, node("UInt8", "data", 3, false)),
+        ]);
+        let mut bytes = Vec::with_capacity(length + 64);
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.extend_from_slice(&0_i64.to_le_bytes());
+        bytes.extend_from_slice(&[1, 0, 0, 0]);
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.extend_from_slice(&9_i64.to_le_bytes());
+        bytes.extend_from_slice(&5_i32.to_le_bytes());
+        bytes.extend_from_slice(b"repro\0\0\0");
+        bytes.extend_from_slice(&i32::try_from(length).unwrap().to_le_bytes());
+        bytes.extend(
+            (0..length).map(|index| (index.wrapping_mul(2_654_435_761) >> 7).to_le_bytes()[0]),
+        );
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+        (tree, bytes)
+    }
+
+    /// Lengths from #5: 8,380,000 was the last that read on 0.5, 8,400,000 and
+    /// 16,800,000 passed the 512 MiB budget through value and array storage,
+    /// 32,000,001 passed the element-count limit, and 20,193,600, 27,990,336
+    /// and 44,999,616 are the three `CubismMoc._bytes` arrays examined there.
+    /// Every one now reads with the default limits and costs its length plus a
+    /// fixed few hundred bytes of the materialized budget.
+    #[test]
+    fn reads_moc_sized_byte_arrays_with_default_limits() {
+        let (_, empty) = moc_behaviour(0);
+        let (empty_tree, _) = moc_behaviour(0);
+        let (_, base) = measure(&empty_tree, empty, &[]);
+        for length in [
+            8_380_000, 8_400_000, 16_800_000, 20_193_600, 27_990_336, 32_000_001, 44_999_616,
+        ] {
+            let (tree, bytes) = moc_behaviour(length);
+            let expected = bytes[44..44 + length].to_vec();
+            let (value, charged) = measure(&tree, bytes, &[]);
+            assert_eq!(charged, base + length, "{length} bytes");
+            let TypeValue::Object(fields) = &value else {
+                panic!("root is not a record")
+            };
+            assert_eq!(fields[4].name, "_bytes");
+            assert_eq!(fields[4].value.array_len(), Some(length));
+            assert_eq!(fields[4].value.as_bytes(), Some(&expected[..]));
+            assert!(matches!(
+                fields[4].value,
+                TypeValue::ByteArray {
+                    element: ByteElement::Unsigned8,
+                    ..
+                }
+            ));
+        }
+    }
 
     #[test]
     fn builds_and_queries_large_subtree_boundaries_in_linear_work() {
@@ -1806,12 +2184,10 @@ mod tests {
             TypeValue::Object(vec![
                 TypeField {
                     name: "m_FontData".to_owned(),
-                    value: TypeValue::Array(
-                        [0x00, 0x41, 0x7f, 0x80, 0xff]
-                            .into_iter()
-                            .map(TypeValue::Character)
-                            .collect()
-                    ),
+                    value: TypeValue::ByteArray {
+                        element: ByteElement::Character8,
+                        bytes: vec![0x00, 0x41, 0x7f, 0x80, 0xff],
+                    },
                 },
                 TypeField {
                     name: "m_Trailing".to_owned(),
@@ -2489,6 +2865,343 @@ mod tests {
         };
         assert_eq!(stored.len(), 1, "the inner registry was read: {stored:?}");
         assert_eq!(stored[0].value, TypeValue::Signed(99));
+    }
+
+    /// The budget charges `size_of::<TypeValue>()` per slot, so a new variant
+    /// that widened the enum would silently raise the cost of every value.
+    /// `ByteArray` fits beside the existing 24-byte payloads.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_byte_array_does_not_widen_type_value() {
+        assert_eq!(VALUE, 32);
+    }
+
+    /// Every slot is charged once, by whoever allocates it: the root by the
+    /// reader, a field by its record, an element by its array, a pair by its
+    /// map. 0.5 charged each contained value a second time when it was read.
+    #[test]
+    fn charges_each_value_slot_exactly_once() {
+        let scalar = tree(vec![node("int", "value", 0, false)]);
+        let (_, charged) = measure(&scalar, 7_i32.to_le_bytes().to_vec(), &[]);
+        assert_eq!(charged, INDEX + VALUE);
+
+        let record = tree(vec![
+            node("Root", "Base", 0, false),
+            node("int", "a", 1, false),
+            node("int", "bb", 1, false),
+            node("int", "ccc", 1, false),
+        ]);
+        let (_, charged) = measure(&record, vec![0; 12], &[]);
+        assert_eq!(charged, 4 * INDEX + VALUE + 3 * FIELD + "abbccc".len());
+
+        let ints = vector_of(node("int", "data", 0, false));
+        let mut payload = 3_i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0; 12]);
+        let (value, charged) = measure(&ints, payload, &[]);
+        assert_eq!(value.array_len(), Some(3));
+        assert_eq!(charged, 4 * INDEX + VALUE + 3 * VALUE);
+
+        let bytes = vector_of(node("UInt8", "data", 0, false));
+        let (value, charged) = measure(&bytes, counted(5, &[1, 2, 3, 4, 5]), &[]);
+        assert_eq!(value.as_bytes(), Some(&[1, 2, 3, 4, 5][..]));
+        assert_eq!(charged, 4 * INDEX + VALUE + 5);
+
+        let map = tree(vec![
+            node("map", "m_Map", 0, false),
+            node("Array", "Array", 1, false),
+            node("int", "size", 2, false),
+            node("pair", "data", 2, false),
+            node("int", "first", 3, false),
+            node("int", "second", 3, false),
+        ]);
+        let mut payload = 2_i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0; 16]);
+        let (_, charged) = measure(&map, payload, &[]);
+        assert_eq!(charged, 6 * INDEX + VALUE + 2 * ENTRY);
+
+        let text = tree(vec![
+            node("Root", "Base", 0, false),
+            node("string", "m_Name", 1, false),
+            node("Array", "Array", 2, false),
+            node("int", "size", 3, false),
+            sized(1, node("char", "data", 3, false)),
+        ]);
+        let (_, charged) = measure(&text, counted(3, b"abc\0"), &[]);
+        assert_eq!(charged, 5 * INDEX + VALUE + FIELD + "m_Name".len() + 3);
+    }
+
+    /// The registry is the one container that grew field by field. It now
+    /// charges its slots up front like a record, and the value stored under
+    /// `data` lands in a slot the entry already paid for.
+    #[test]
+    fn charges_a_serialize_reference_registry_exactly_once() {
+        let mut nodes = vec![
+            node("Root", "Base", 0, false),
+            node("int", "m_Value", 1, false),
+        ];
+        nodes.extend(registry_nodes(1));
+        let registry = tree(nodes);
+        let references = [reference_type(
+            "Payload",
+            vec![
+                node("Payload", "Base", 0, true),
+                node("int", "m_Stored", 1, false),
+            ],
+        )];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7_i32.to_le_bytes());
+        bytes.extend_from_slice(&2_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_i32.to_le_bytes());
+        push_registry_entry(&mut bytes, 1000, "Payload");
+        bytes.extend_from_slice(&5_i32.to_le_bytes());
+
+        let (_, charged) = measure(&registry, bytes, &references);
+        let tree_index = registry.nodes.len() * INDEX;
+        let root = VALUE + 2 * FIELD + "m_Value".len() + "references".len();
+        let registry_record = 2 * FIELD + "version".len() + "RefIds".len();
+        let entries = VALUE;
+        let entry = 3 * FIELD + "rid".len() + "type".len() + "data".len();
+        let identity = 3 * FIELD + "classnsasm".len() + "PayloadGameGame.dll".len();
+        let lookup = std::mem::size_of::<ReferenceTypeLookupEntry<'_>>()
+            + std::mem::size_of::<Option<TypeTreeLayout>>()
+            + 2 * INDEX;
+        let stored = FIELD + "m_Stored".len();
+        assert_eq!(
+            charged,
+            tree_index + root + registry_record + entries + entry + identity + lookup + stored
+        );
+    }
+
+    #[test]
+    fn bounds_one_byte_array_by_maximum_byte_array_bytes() {
+        let tree = vector_of(node("UInt8", "data", 0, false));
+        let limits = TypeTreeReadLimits {
+            maximum_byte_array_bytes: 8,
+            maximum_array_elements: 2,
+            ..TypeTreeReadLimits::default()
+        };
+        let value = read(&tree, counted(8, &[7; 8]), limits).unwrap();
+        assert_eq!(value.as_bytes(), Some(&[7; 8][..]));
+        let record = record_with(&tree);
+        assert_eq!(
+            project(&record, counted(8, &[7; 8]), limits, "m_Other").unwrap(),
+            None
+        );
+
+        for error in [
+            read(&tree, counted(9, &[7; 9]), limits).unwrap_err(),
+            project(&record, counted(9, &[7; 9]), limits, "m_Other").unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::InvalidData(_)), "{error:?}");
+            assert_eq!(
+                error.to_string(),
+                "type tree byte array length 9 exceeds limit 8 (maximum_byte_array_bytes)"
+            );
+        }
+    }
+
+    #[test]
+    fn bounds_byte_arrays_by_the_remaining_materialized_budget() {
+        let tree = vector_of(node("SInt8", "data", 0, false));
+        let base = 4 * INDEX + VALUE;
+        let at = |maximum_materialized_bytes| TypeTreeReadLimits {
+            maximum_materialized_bytes,
+            ..TypeTreeReadLimits::default()
+        };
+        let value = read(&tree, counted(16, &[0xff; 16]), at(base + 16)).unwrap();
+        assert_eq!(
+            value,
+            TypeValue::ByteArray {
+                element: ByteElement::Signed8,
+                bytes: vec![0xff; 16]
+            }
+        );
+        let error = read(&tree, counted(16, &[0xff; 16]), at(base + 15)).unwrap_err();
+        assert!(matches!(error, Error::InvalidData(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "type tree byte array bytes raises materialized type tree bytes to {}, \
+                 exceeding limit {}",
+                base + 16,
+                base + 15
+            )
+        );
+    }
+
+    /// Only an unaligned leaf `UInt8`, `SInt8` or one-byte `char` is kept as
+    /// bytes. Everything else keeps the element-wise value 0.5 produced.
+    #[test]
+    fn keeps_other_one_byte_arrays_element_wise() {
+        let aligned = vector_of(node("UInt8", "data", 0, true));
+        let mut payload = 2_i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(
+            read(&aligned, payload, TypeTreeReadLimits::default()).unwrap(),
+            TypeValue::Array(vec![TypeValue::Unsigned(1), TypeValue::Unsigned(2)])
+        );
+
+        let wide = vector_of(sized(2, node("char", "data", 0, false)));
+        let mut payload = 2_i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0x41, 0, 0x2d, 0x4e]);
+        assert_eq!(
+            read(&wide, payload.clone(), TypeTreeReadLimits::default()).unwrap(),
+            TypeValue::Array(vec![
+                TypeValue::Character(0x41),
+                TypeValue::Character(0x4e2d)
+            ])
+        );
+        let undeclared = vector_of(node("char", "data", 0, false));
+        assert_eq!(
+            read(&undeclared, payload, TypeTreeReadLimits::default()).unwrap(),
+            TypeValue::Array(vec![
+                TypeValue::Character(0x41),
+                TypeValue::Character(0x4e2d)
+            ])
+        );
+
+        let booleans = vector_of(node("bool", "data", 0, false));
+        assert_eq!(
+            read(
+                &booleans,
+                counted(2, &[1, 0]),
+                TypeTreeReadLimits::default()
+            )
+            .unwrap(),
+            TypeValue::Array(vec![TypeValue::Boolean(true), TypeValue::Boolean(false)])
+        );
+
+        // A data node with children is not a leaf, whatever its name.
+        let mut branch = vector_of(node("UInt8", "data", 0, false)).nodes;
+        branch.push(node("int", "inner", 3, false));
+        let value = read(
+            &tree(branch),
+            counted(1, &[9]),
+            TypeTreeReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(value, TypeValue::Array(vec![TypeValue::Unsigned(9)]));
+        assert_eq!(value.as_bytes(), None);
+        assert_eq!(value.array_len(), Some(1));
+    }
+
+    #[test]
+    fn rejects_malformed_byte_array_counts_before_allocating() {
+        let tree = vector_of(node("UInt8", "data", 0, false));
+        let unbounded = TypeTreeReadLimits {
+            maximum_byte_array_bytes: usize::MAX,
+            maximum_materialized_bytes: usize::MAX,
+            ..TypeTreeReadLimits::default()
+        };
+        // A count far beyond the input must not reserve its length first.
+        for result in [
+            read(&tree, counted(i32::MAX, &[1, 2, 3]), unbounded).map(|_| ()),
+            project(
+                &record_with(&tree),
+                counted(i32::MAX, &[1, 2, 3]),
+                unbounded,
+                "x",
+            )
+            .map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(&error, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "type tree byte array needs 2147483647 bytes but only 3 remain"
+            );
+        }
+
+        let error = read(&tree, counted(4, &[1, 2, 3]), unbounded).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "type tree byte array needs 4 bytes but only 3 remain",
+            "a truncated run is end of input, not a partial array"
+        );
+
+        for result in [
+            read(&tree, counted(-1, &[]), unbounded).map(|_| ()),
+            project(&record_with(&tree), counted(-1, &[]), unbounded, "x").map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidData(_)), "{error:?}");
+            assert_eq!(
+                error.to_string(),
+                "type tree byte array length cannot be negative: -1"
+            );
+        }
+    }
+
+    /// The tree wrapped as the only field of a record root, for projection.
+    fn record_with(inner: &TypeTree) -> TypeTree {
+        let mut nodes = vec![node("Root", "Base", 0, false)];
+        nodes.extend(inner.nodes.iter().map(|node| TypeTreeNode {
+            level: node.level + 1,
+            ..node.clone()
+        }));
+        tree(nodes)
+    }
+
+    /// A byte array counts as one value and is not an element-count problem,
+    /// on both the read and the projection skip path. Its bytes still sit one
+    /// level deeper, so the depth limit applies to a non-empty one as it did.
+    #[test]
+    fn counts_a_byte_array_as_one_value_one_level_deep() {
+        let bytes = vector_of(node("UInt8", "data", 0, false));
+        let ints = vector_of(node("int", "data", 0, false));
+        let tight = TypeTreeReadLimits {
+            maximum_values: 1,
+            maximum_array_elements: 2,
+            ..TypeTreeReadLimits::default()
+        };
+        assert_eq!(
+            read(&bytes, counted(100, &[3; 100]), tight)
+                .unwrap()
+                .array_len(),
+            Some(100)
+        );
+        let mut payload = 2_i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0; 8]);
+        assert!(
+            read(&ints, payload, tight)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds value limit 1")
+        );
+
+        let record = record_with(&bytes);
+        let mut payload = counted(100, &[3; 100]);
+        payload.extend_from_slice(&7_i32.to_le_bytes());
+        let mut nodes = record.nodes.clone();
+        nodes.push(node("int", "m_Trailing", 1, false));
+        let projected = project(
+            &tree(nodes),
+            payload,
+            // The root, the byte array and the trailing field.
+            TypeTreeReadLimits {
+                maximum_values: 3,
+                ..tight
+            },
+            "m_Trailing",
+        )
+        .unwrap();
+        assert_eq!(projected, Some(TypeValue::Signed(7)));
+
+        let shallow = TypeTreeReadLimits {
+            maximum_depth: 0,
+            ..TypeTreeReadLimits::default()
+        };
+        assert_eq!(
+            read(&bytes, counted(0, &[]), shallow).unwrap().array_len(),
+            Some(0)
+        );
+        for tree in [&bytes, &ints] {
+            let error = read(tree, counted(1, &[0; 4]), shallow).unwrap_err();
+            assert_eq!(error.to_string(), "object type tree exceeds depth limit 0");
+        }
     }
 
     fn node(type_name: &str, field_name: &str, level: u32, align: bool) -> TypeTreeNode {
