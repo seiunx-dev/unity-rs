@@ -35,7 +35,14 @@ impl Default for CubismExpressionReadLimits {
     }
 }
 
-/// Cubism expression blend mode, matching the managed `BlendType` ordinal.
+/// Cubism expression blend mode, named after the exp3.json `Blend` values.
+///
+/// `CubismExpressionData` serializes the Cubism SDK for Unity's
+/// `CubismParameterBlendMode`, whose ordinals are `Override` 0, `Additive` 1
+/// and `Multiply` 2; its exp3.json importer maps `"Add"`, `"Multiply"` and
+/// `"Overwrite"` onto them. The managed extractor's `BlendType` lists the
+/// same names in another order, so its names do not describe the serialized
+/// value; only the ordinal it echoes into exp3.json is kept here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CubismExpressionBlend {
     Add,
@@ -44,11 +51,21 @@ pub enum CubismExpressionBlend {
 }
 
 impl CubismExpressionBlend {
+    const fn from_ordinal(ordinal: i64) -> Option<Self> {
+        match ordinal {
+            0 => Some(Self::Overwrite),
+            1 => Some(Self::Add),
+            2 => Some(Self::Multiply),
+            _ => None,
+        }
+    }
+
+    /// The serialized `CubismParameterBlendMode` ordinal.
     const fn ordinal(self) -> u8 {
         match self {
-            Self::Add => 0,
-            Self::Multiply => 1,
-            Self::Overwrite => 2,
+            Self::Overwrite => 0,
+            Self::Add => 1,
+            Self::Multiply => 2,
         }
     }
 }
@@ -74,7 +91,8 @@ pub struct CubismExpression {
 
 impl CubismExpression {
     /// Writes the same ordered fields used by `AssetStudio`'s `exp3.json`
-    /// projection. Blend modes remain their managed numeric enum ordinals.
+    /// projection. Blend modes remain the serialized numeric ordinals, as the
+    /// managed extractor writes them.
     pub fn write_exp3_json<W: Write>(&self, output: &mut W, maximum_bytes: u64) -> Result<u64> {
         let mut writer = BoundedWriter::new(output, maximum_bytes);
         writer.write_all(b"{\n  \"Type\": ")?;
@@ -163,15 +181,10 @@ pub fn project_cubism_expression(
         let id = strings.copy(required_string(parameter, &["Id"], "parameter Id")?)?;
         let value = required_number(parameter, &["Value"], "parameter Value")?;
         let blend = required_integer(parameter, &["Blend"], "parameter Blend")?;
-        let blend = match blend {
-            0 => CubismExpressionBlend::Add,
-            1 => CubismExpressionBlend::Multiply,
-            2 => CubismExpressionBlend::Overwrite,
-            _ => {
-                return Err(Error::invalid_data(format!(
-                    "Cubism expression parameter {index} has unknown blend ordinal {blend}"
-                )));
-            }
+        let Some(blend) = CubismExpressionBlend::from_ordinal(blend) else {
+            return Err(Error::invalid_data(format!(
+                "Cubism expression parameter {index} has unknown blend ordinal {blend}"
+            )));
         };
         projected.push(CubismExpressionParameter { id, value, blend });
     }
@@ -774,7 +787,10 @@ mod tests {
         assert_eq!(expression.path_id, 17);
         assert_eq!(expression.source_name, "smile.exp3");
         assert_eq!(expression.expression_type, "Live2D Expression");
-        assert_eq!(expression.parameters[0].blend, CubismExpressionBlend::Add);
+        assert_eq!(
+            expression.parameters[0].blend,
+            CubismExpressionBlend::Overwrite
+        );
         let mut json = Vec::new();
         let written = expression.write_exp3_json(&mut json, 1024).unwrap();
         assert_eq!(written, u64::try_from(json.len()).unwrap());
@@ -897,6 +913,39 @@ mod tests {
             ..CubismAuxiliaryReadLimits::default()
         };
         assert!(project_cubism_display_info(9, &display_value, limits).is_err());
+    }
+
+    #[test]
+    fn names_blend_ordinals_after_the_unity_sdk_enum() {
+        // `CubismParameterBlendMode`: Override 0, Additive 1, Multiply 2.
+        let value = expression_value(vec![
+            parameter("ParamA", 1.0, 0),
+            parameter("ParamB", 1.0, 1),
+            parameter("ParamC", 1.0, 2),
+        ]);
+        let expression =
+            project_cubism_expression(3, &value, CubismExpressionReadLimits::default()).unwrap();
+        let blends: Vec<_> = expression
+            .parameters
+            .iter()
+            .map(|parameter| parameter.blend)
+            .collect();
+        assert_eq!(
+            blends,
+            [
+                CubismExpressionBlend::Overwrite,
+                CubismExpressionBlend::Add,
+                CubismExpressionBlend::Multiply,
+            ]
+        );
+
+        // exp3.json keeps the serialized ordinals unchanged.
+        let mut json = Vec::new();
+        expression.write_exp3_json(&mut json, 4096).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        for (index, ordinal) in [0, 1, 2].into_iter().enumerate() {
+            assert_eq!(parsed["Parameters"][index]["Blend"], ordinal);
+        }
     }
 
     fn expression_value(parameters: Vec<TypeValue>) -> TypeValue {

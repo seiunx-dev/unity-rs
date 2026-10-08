@@ -531,6 +531,13 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   本地门禁通过；公开常规矩阵
   [32781978836](https://github.com/seiunx-dev/unity-rs/actions/runs/32781978836) 为 16 个实际 job
   全绿、2 个手工发布条件 job 正常跳过、0 失败；
+- **Cubism expression 的 blend 名称已于 2026-09-26 按 Unity SDK 枚举更正**：`CubismExpressionData`
+  序列化的是 Cubism SDK for Unity 的 `CubismParameterBlendMode`（`Override` 0、`Additive` 1、
+  `Multiply` 2），而 `CubismExpressionBlend` 原先照托管 `BlendType` 的顺序（Add、Multiply、
+  Overwrite）解释序数，Python 的 `CubismExpressionParameter.blend` 因此把 Additive 报成
+  `"Multiply"`、Multiply 报成 `"Overwrite"`、Override 报成 `"Add"`。现序数 0/1/2 分别对应
+  `Overwrite`/`Add`/`Multiply`；exp3.json 仍写出序列化序数本身，与托管提取器逐字节一致，
+  Node 与托管差分不受影响；
 - **FBX 批量输出名称的错误上限与重复扫描已于 2026-08-25 收口**：SplitObjects/Animator
   规划允许最多 1,000,000 个候选，但 CLI 原先以 `HashSet<String>` 保存名称，并让每个同名
   候选从无后缀、`~1` 重新扫描；循环还误用“创建临时文件最多尝试 1,024 次”的常量，导致
