@@ -5706,14 +5706,20 @@ fn core_error(error: unity_rs_core::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        DisplayRowImage, DisplayRowImages, ModelTextureLimits, OpenOptions, copy_path_string,
-        load_options, materialize_core_bytes, model_texture_limits, parse_audio_format,
-        parse_export_mode, parse_filename_format, parse_image_format,
+        ByteReadKind, DisplayRowImage, DisplayRowImages, ExportConfiguration, ModelTextureLimits,
+        OpenOptions, ReadBytesTask, UnityRs, copy_path_string, export_configuration, load_options,
+        materialize_core_bytes, model_texture_limits, parse_audio_format, parse_export_mode,
+        parse_filename_format, parse_image_format, shader_array_limits,
     };
+    use napi::Task;
+    use napi::bindgen_prelude::BigInt;
     use std::io::Write;
+    use std::sync::Arc;
     use unity_rs_core::export::{AudioExportFormat, ExportMode, FilenameFormat};
     use unity_rs_core::image_export::ImageFormat;
     use unity_rs_core::loader::LoadFailurePolicy;
+    use unity_rs_core::source::Region;
+    use unity_rs_core::studio::Studio;
 
     fn decoded_test_image(first: u8, second: u8) -> unity_rs_core::texture::RgbaImage {
         unity_rs_core::texture::RgbaImage {
@@ -5869,6 +5875,181 @@ mod tests {
                 .to_string()
                 .contains("writer reported 1 bytes but produced 2")
         );
+    }
+
+    fn aligned_string(output: &mut Vec<u8>, value: &str) {
+        output.extend_from_slice(&i32::try_from(value.len()).unwrap().to_le_bytes());
+        output.extend_from_slice(value.as_bytes());
+        output.resize(output.len().next_multiple_of(4), 0);
+    }
+
+    /// The Unity 6 parsed-form Shader of `tests/node_api.cjs`, with `keywords`
+    /// keyword names and flags, in a one-object v22 serialized file.
+    fn keyword_shader_asset(keywords: usize) -> Vec<u8> {
+        let count = i32::try_from(keywords).unwrap().to_le_bytes();
+        let mut payload = Vec::new();
+        aligned_string(&mut payload, "Unity6Object");
+        payload.extend_from_slice(&[0; 8]); // properties, subshaders
+        payload.extend_from_slice(&count);
+        payload.resize(payload.len() + 4 * keywords, 0); // empty keyword names
+        payload.extend_from_slice(&count);
+        payload.resize((payload.len() + keywords).next_multiple_of(4), 0); // flags
+        aligned_string(&mut payload, "Parsed/Unity6");
+        aligned_string(&mut payload, "");
+        aligned_string(&mut payload, "");
+        // Dependencies, custom editors, the aligned no-subshaders flag,
+        // platforms, offsets, both lengths, blob, stage counts, object
+        // dependencies, non-modifiable textures, aligned baked flag, GUID.
+        payload.resize(payload.len() + 4 * 12 + 16, 0);
+
+        let mut metadata = b"6000.2.0f1\0".to_vec();
+        metadata.extend_from_slice(&13_i32.to_le_bytes());
+        metadata.push(0);
+        metadata.extend_from_slice(&1_i32.to_le_bytes());
+        metadata.extend_from_slice(&48_i32.to_le_bytes());
+        metadata.extend_from_slice(&[0, 0xff, 0xff]);
+        metadata.extend_from_slice(&[0; 16]);
+        metadata.extend_from_slice(&1_i32.to_le_bytes());
+        metadata.resize((48 + metadata.len()).next_multiple_of(4) - 48, 0);
+        metadata.extend_from_slice(&7_i64.to_le_bytes());
+        metadata.extend_from_slice(&0_i64.to_le_bytes());
+        metadata.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        metadata.extend_from_slice(&[0; 17]);
+        let data_offset = (48 + metadata.len()).next_multiple_of(16);
+        let mut file = vec![0; 48];
+        file[8..12].copy_from_slice(&22_u32.to_be_bytes());
+        file[20..24].copy_from_slice(&u32::try_from(metadata.len()).unwrap().to_be_bytes());
+        let file_size = u64::try_from(data_offset + payload.len()).unwrap();
+        file[24..32].copy_from_slice(&file_size.to_be_bytes());
+        file[32..40].copy_from_slice(&u64::try_from(data_offset).unwrap().to_be_bytes());
+        file.extend_from_slice(&metadata);
+        file.resize(data_offset, 0);
+        file.extend_from_slice(&payload);
+        file
+    }
+
+    #[test]
+    fn shader_reads_apply_the_caller_array_budgets() {
+        let studio = Arc::new(
+            Studio::open_region(
+                "keywords.assets",
+                Region::from_bytes(keyword_shader_asset(3)),
+            )
+            .expect("synthetic shader asset"),
+        );
+        let addon = UnityRs {
+            studio: Arc::clone(&studio),
+        };
+        let text = addon
+            .read_shader(0, BigInt::from(7_i64), None, None, None)
+            .expect("default budgets");
+        assert!(text.ends_with(b"Shader \"Parsed/Unity6\" {\nProperties {\n}\n}"));
+        let exact = addon
+            .read_shader(0, BigInt::from(7_i64), None, Some(3), Some(6))
+            .expect("budgets equal to the shader's arrays");
+        assert_eq!(&exact[..], &text[..]);
+        let Err(error) = addon.read_shader(0, BigInt::from(7_i64), None, Some(2), None) else {
+            panic!("one below the largest array must be refused");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Shader keyword name has 3 elements, exceeding limit 2"),
+            "{error}"
+        );
+        assert!(
+            addon
+                .read_shader_async(0, BigInt::from(7_i64), None, Some(-1), None)
+                .is_err()
+        );
+        assert!(
+            addon
+                .read_shader_async(0, BigInt::from(7_i64), None, None, Some(5))
+                .is_ok()
+        );
+
+        // The worker computation carries the same budgets.
+        let mut task = ReadBytesTask {
+            studio,
+            file_index: 0,
+            path_id: 7,
+            maximum: 1024,
+            kind: ByteReadKind::Shader {
+                maximum_array_elements: 1_000_000,
+                maximum_total_array_elements: 5,
+            },
+        };
+        let error = task.compute().expect_err("one below the total");
+        assert!(
+            error
+                .to_string()
+                .contains("Shader arrays total 6 elements, exceeding limit 5"),
+            "{error}"
+        );
+        task.kind = ByteReadKind::Shader {
+            maximum_array_elements: 3,
+            maximum_total_array_elements: 6,
+        };
+        assert_eq!(task.compute().expect("exact budgets"), &text[..]);
+    }
+
+    #[test]
+    fn maps_the_shader_array_budgets() {
+        assert_eq!(
+            shader_array_limits(None, None).unwrap(),
+            (1_000_000, 4_000_000)
+        );
+        assert_eq!(shader_array_limits(Some(0), Some(7)).unwrap(), (0, 7));
+        for (array, total, field) in [
+            (Some(-1), None, "maximumArrayElements"),
+            (None, Some(-1), "maximumTotalArrayElements"),
+        ] {
+            let error = shader_array_limits(array, total).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{field} must be non-negative")),
+                "{error}"
+            );
+        }
+
+        let configured = export_configuration(Some(ExportConfiguration {
+            mode: None,
+            filename_format: None,
+            image_format: None,
+            jpeg_quality: None,
+            compression: None,
+            png_filter: None,
+            audio_format: None,
+            overwrite_existing: None,
+            restore_text_asset_extension: None,
+            pretty_json: None,
+            maximum_objects: None,
+            maximum_total_output_bytes: None,
+            maximum_metadata_bytes: None,
+            maximum_raw_object_bytes: None,
+            maximum_type_tree_json_bytes: None,
+            maximum_type_tree_dump_bytes: None,
+            maximum_text_asset_bytes: None,
+            maximum_simple_asset_bytes: None,
+            maximum_audio_output_bytes: None,
+            maximum_texture_output_bytes: None,
+            maximum_texture_array_output_bytes: None,
+            maximum_texture_array_bundle_bytes: None,
+            maximum_sprite_output_bytes: None,
+            maximum_shader_output_bytes: None,
+            maximum_shader_array_elements: Some(8_148_110),
+            maximum_shader_total_array_elements: Some(16_000_000),
+            maximum_monobehaviour_json_bytes: None,
+            maximum_mesh_object_bytes: None,
+            maximum_mesh_output_bytes: None,
+        }))
+        .expect("configured export options");
+        assert_eq!(configured.maximum_shader_array_elements, 8_148_110);
+        assert_eq!(configured.maximum_shader_total_array_elements, 16_000_000);
+        let defaults = export_configuration(None).expect("default export options");
+        assert_eq!(defaults.maximum_shader_array_elements, 1_000_000);
+        assert_eq!(defaults.maximum_shader_total_array_elements, 4_000_000);
     }
 
     #[cfg(unix)]
