@@ -48,7 +48,7 @@ methods:
   strict mypy consumer. A newly published but unclassified Core method, a
   missing Python target, or a published but unconsumed Python method fails
   `quality`. `tools/test_python_api_surface.py` runs the current
-  109-Core/4-Rust-only and 66-method/4-property pairs and proves all those
+  109-Core/4-Rust-only and 67-method/4-property pairs and proves all those
   failure directions instead of silently checking an empty surface.
 - `tests/installed_wheel.py` compares the installed runtime and shipped `.pyi`
   in both directions and compares every literal default parameter.

@@ -205,7 +205,7 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   `darwin-{x64,arm64}`、`linux-{x64,arm64}-gnu` 或 `win32-{x64,arm64}-msvc` 文件名，随后
   真正 `npm pack`、在临时消费者中离线安装该 `.tgz`，再从安装目录 `require()` 并断言运行时
   顶层导出恰为 `UnityRs`。安装后的 `index.d.ts` 还会被重新解析，并与安装后的 native
-  class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 85 个方法与 4 个
+  class 双向逐项核对 static method、instance method 和 getter；当前精确锁定 88 个方法与 4 个
   属性，另以保持数量不变的重命名反向测试证明不是只数成员。源码树能加载但发布包漏文件、
   声明/运行时漂移或带错架构时都会直接失败。macOS
   arm64 debug/release 与 Linux amd64/arm64 release 容器已实际通过；2026-08-24 的正式
