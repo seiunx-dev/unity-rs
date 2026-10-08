@@ -36,6 +36,7 @@ from unity_rs import (
     FbxCandidate,
     LegacyAnimation,
     Live2dPackage,
+    Live2dPackageSet,
     Material,
     ModelTextureLimits,
     MonoBehaviourSchema,
@@ -1474,7 +1475,16 @@ def synthetic_cubism_physics() -> bytes:
 
 
 def synthetic_cubism_fade_motion() -> bytes:
-    nodes = mono_behaviour_nodes() + (
+    return finish_v22_type_tree_mono(
+        cubism_fade_motion_nodes(), cubism_fade_motion_payload(script_path_id=0)
+    )
+
+
+TreeNodes = tuple[tuple[str, str, int, bool], ...]
+
+
+def cubism_fade_motion_nodes() -> TreeNodes:
+    return mono_behaviour_nodes() + (
         ("string", "MotionName", 1, False),
         ("Array", "Array", 2, True),
         ("int", "size", 3, False),
@@ -1516,11 +1526,19 @@ def synthetic_cubism_fade_motion() -> bytes:
         ("float", "data", 3, False),
         ("float", "MotionLength", 1, False),
     )
+
+
+def cubism_fade_motion_payload(*, script_path_id: int) -> bytearray:
+    """One `ParamAngleX` curve with keys (0, 0) and (1, 1), all tangents flat.
+
+    Unity plays that segment as 3t^2 - 2t^3; the managed default writes it as a
+    line and its forceBezier switch as the Bezier that reproduces the ease.
+    """
     payload = bytearray()
     push_pptr(payload, 0)
     payload.append(1)
     align(payload, 4)
-    push_pptr(payload, 0)
+    push_pptr(payload, script_path_id)
     push_aligned_string(payload, "idle.fade.asset")
     push_aligned_string(payload, "idle")
     push_f32s(payload, (0.2, 0.3))
@@ -1539,7 +1557,105 @@ def synthetic_cubism_fade_motion() -> bytes:
     push_f32s(payload, (0.4,))
     push_i32(payload, 1)
     push_f32s(payload, (0.5, 1.0))
-    return finish_v22_type_tree_mono(nodes, payload)
+    return payload
+
+
+def synthetic_live2d_package_with_motion() -> bytes:
+    """A `Hero` model, its MOC and one loose `CubismFadeMotionData`.
+
+    The CubismModel and fade-motion layouts come from their embedded trees and
+    the MOC from its native fields, as in the CLI and Core package fixtures.
+    """
+    model_nodes = mono_behaviour_nodes() + (
+        ("PPtr<CubismMoc>", "_moc", 1, False),
+        ("int", "m_FileID", 2, False),
+        ("SInt64", "m_PathID", 2, False),
+    )
+    types: tuple[tuple[int, Optional[int], Optional[TreeNodes]], ...] = (
+        (1, None, None),
+        (4, None, None),
+        (114, 0x20, model_nodes),
+        (114, 0x30, None),
+        (114, 0x2A, cubism_fade_motion_nodes()),
+        (115, None, None),
+    )
+
+    def behaviour_prefix(script_path_id: int, name: str) -> bytearray:
+        output = bytearray()
+        push_pptr(output, 1)
+        output.append(1)
+        align(output, 4)
+        push_pptr(output, script_path_id)
+        push_aligned_string(output, name)
+        return output
+
+    def mono_script(class_name: str) -> bytearray:
+        output = bytearray()
+        push_aligned_string(output, "Cubism script")
+        push_i32(output, 0)
+        output.extend(bytes((0x55,)) * 16)
+        for value in (class_name, "Live2D.Cubism.Core", "Live2D.Cubism.dll"):
+            push_aligned_string(output, value)
+        return output
+
+    game_object = bytearray()
+    push_i32(game_object, 2)
+    push_pptr(game_object, 10)
+    push_pptr(game_object, 20)
+    push_i32(game_object, 0)
+    push_aligned_string(game_object, "Hero")
+    transform = bytearray()
+    push_pptr(transform, 1)
+    push_f32s(transform, (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0))
+    push_i32(transform, 0)
+    push_pptr(transform, 0)
+    model = behaviour_prefix(100, "")
+    push_pptr(model, 30)
+    moc = behaviour_prefix(102, "moc")
+    push_i32(moc, 5)
+    moc.extend(b"MOC3\x09")
+    objects = (
+        (1, 0, game_object),
+        (10, 1, transform),
+        (20, 2, model),
+        (30, 3, moc),
+        (32, 4, cubism_fade_motion_payload(script_path_id=112)),
+        (100, 5, mono_script("CubismModel")),
+        (102, 5, mono_script("CubismMoc")),
+        (112, 5, mono_script("CubismFadeMotionData")),
+    )
+
+    metadata = bytearray(b"2022.3.62f1\0")
+    push_i32(metadata, 13)
+    metadata.append(1)
+    push_i32(metadata, len(types))
+    for class_id, script_hash, nodes in types:
+        push_i32(metadata, class_id)
+        metadata.append(0)
+        metadata.extend(struct.pack("<h", -1))
+        if script_hash is not None:
+            metadata.extend(bytes((script_hash,)) * 16)
+        metadata.extend(bytes((0x42,)) * 16)
+        if nodes is None:
+            push_i32(metadata, 0)
+            push_i32(metadata, 0)
+        else:
+            push_blob_tree(metadata, nodes)
+        push_i32(metadata, 0)
+    data = bytearray()
+    push_i32(metadata, len(objects))
+    for path_id, type_index, payload in objects:
+        align(data, 4)
+        align_with_base(metadata, 48, 4)
+        metadata.extend(struct.pack("<q", path_id))
+        metadata.extend(struct.pack("<q", len(data)))
+        push_u32(metadata, len(payload))
+        push_i32(metadata, type_index)
+        data.extend(payload)
+    for _ in range(3):
+        push_i32(metadata, 0)
+    metadata.append(0)
+    return finish_v22(metadata, data)
 
 
 def finish_v22_type_tree_mono(
@@ -4191,6 +4307,54 @@ def main() -> None:
             pass
         else:
             raise AssertionError("Cubism motion output limits must be enforced")
+        # The issue #10 curve: the default keeps the managed linear segment,
+        # force_bezier the Bezier that reproduces Unity's 3t^2 - 2t^3.
+        segments = json.loads(motion.json)["Curves"][0]["Segments"]
+        assert segments == [0, 0, 0, 1, 1]
+        bezier = UnityRs(motion_path).read_cubism_fade_motion(0, 7, force_bezier=True)
+        assert json.loads(bezier.json)["Curves"][0]["Segments"] == [
+            0, 0, 1, 0.333, 0, 0.667, 1, 1, 1
+        ]
+
+        package_path = Path(directory) / "live2d.assets"
+        package_path.write_bytes(synthetic_live2d_package_with_motion())
+        package_studio = UnityRs(package_path)
+
+        def package_files(packages: Live2dPackageSet) -> dict[str, bytes]:
+            assert packages.diagnostics == []
+            assert len(packages.packages) == 1
+            package = packages.packages[0]
+            files = {
+                package.moc_file_name: package.moc,
+                package.manifest_file_name: package.manifest,
+            }
+            for motion_file in package.motions:
+                files[motion_file.file_name] = motion_file.json
+            assert package.textures == [] and package.expressions == []
+            return files
+
+        motion_file = "motions/idle.fade.motion3.json"
+        default_files = package_files(package_studio.read_live2d_packages())
+        assert sorted(default_files) == [
+            "Hero.moc3",
+            "Hero.model3.json",
+            motion_file,
+        ]
+        assert default_files["Hero.moc3"] == b"MOC3\x09"
+        # The package motion is the per-motion reader's document, and the
+        # default stays linear.
+        assert default_files[motion_file] == motion.json
+        assert (
+            package_files(package_studio.read_live2d_packages(force_bezier_motions=False))
+            == default_files
+        )
+        smooth_files = package_files(
+            package_studio.read_live2d_packages(force_bezier_motions=True)
+        )
+        assert smooth_files[motion_file] == bezier.json
+        assert {name: data for name, data in smooth_files.items() if name != motion_file} == {
+            name: data for name, data in default_files.items() if name != motion_file
+        }
 
 
 if __name__ == "__main__":

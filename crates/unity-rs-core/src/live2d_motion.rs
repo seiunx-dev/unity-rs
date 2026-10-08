@@ -955,6 +955,67 @@ mod tests {
     }
 
     #[test]
+    fn force_bezier_writes_a_flat_tangent_segment_as_its_exact_bezier() {
+        // Keys (0, 0) and (1, 1) with every tangent flat: Unity evaluates the
+        // segment as 3t^2 - 2t^3, not as the line the managed default writes.
+        let flat = |time, value| CubismMotionKeyframe {
+            time,
+            value,
+            in_slope: 0.0,
+            out_slope: 0.0,
+        };
+        let motion = CubismFadeMotion {
+            path_id: 7,
+            source_name: "idle.fade.asset".to_owned(),
+            motion_name: "idle".to_owned(),
+            fade_in_time: 0.2,
+            fade_out_time: 0.3,
+            motion_length: 1.0,
+            curves: vec![CubismFadeMotionCurve {
+                parameter_id: "ParamAngleX".to_owned(),
+                fade_in_time: 0.4,
+                fade_out_time: 0.5,
+                keyframes: vec![flat(0.0, 0.0), flat(1.0, 1.0)],
+            }],
+        };
+        let segments = |force_bezier| {
+            let mut json = Vec::new();
+            motion
+                .write_motion3_json(
+                    &CubismMotionTargetNames::default(),
+                    force_bezier,
+                    &mut json,
+                    64 * 1024,
+                )
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            (
+                parsed["Curves"][0]["Segments"].clone(),
+                parsed["Meta"]["TotalPointCount"].clone(),
+            )
+        };
+        assert_eq!(
+            segments(false),
+            (serde_json::json!([0, 0, 0, 1, 1]), serde_json::json!(2))
+        );
+        let (bezier, points) = segments(true);
+        assert_eq!(
+            bezier,
+            serde_json::json!([0, 0, 1, 0.333, 0, 0.667, 1, 1, 1])
+        );
+        assert_eq!(points, 4);
+        // With control points at thirds of the interval the Bezier's x is
+        // linear in its parameter, so its y at time t is 3t^2 - 2t^3.
+        for step in 0..=20_u8 {
+            let t = f64::from(step) / 20.0;
+            let u = 1.0 - t;
+            let bezier_y = 3.0 * u * t * t + t * t * t;
+            let hermite_y = 3.0 * t * t - 2.0 * t * t * t;
+            assert!((bezier_y - hermite_y).abs() < 1e-12, "t = {t}");
+        }
+    }
+
+    #[test]
     fn classifies_part_targets_without_materializing_a_lowercase_identifier() {
         let targets = CubismMotionTargetNames {
             parameters: Vec::new(),

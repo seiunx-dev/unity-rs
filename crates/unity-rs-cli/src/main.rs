@@ -74,6 +74,8 @@ const MAX_FBX_BATCH_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_FBX_BATCH_NAME_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FBX_BATCH_NAME_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_LIVE2D_PACKAGE_OUTPUTS: usize = 100_000;
+/// The managed CLI's spelling of its `forceBezier` motion switch.
+const SMOOTH_MOTIONS_FLAG: &str = "--l2d-smooth-motions";
 const MAX_LIVE2D_PACKAGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_LIVE2D_PACKAGE_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_MONO_SCHEMA_DOCUMENTS: usize = 1_024;
@@ -245,9 +247,7 @@ fn run_with_arguments(arguments: &[OsString], output: &mut impl Write) -> CliRes
         CliCommand::Obj(command) => export_obj(&command, &load, output),
         CliCommand::FbxBatch(command) => export_fbx_batch(&command, &load, output),
         CliCommand::Live2d(command) => export_live2d(&command, &load, output),
-        CliCommand::Live2dPackage(command) => {
-            export_live2d_packages(&command.input, &command.output, &load, output)
-        }
+        CliCommand::Live2dPackage(command) => export_live2d_packages(&command, &load, output),
         CliCommand::Export(command) => export_path(
             &command.input,
             &command.output,
@@ -708,8 +708,11 @@ fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliComman
 
     let mut mode: Option<&str> = None;
     let mut output = None;
-    let mut overwrite_existing = false;
-    let mut restore_text_asset_extension = true;
+    let mut flags = LegacyFlags {
+        overwrite_existing: false,
+        restore_text_asset_extension: true,
+        smooth_live2d_motions: false,
+    };
     let mut index = 1;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -742,8 +745,9 @@ fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliComman
                     ));
                 }
             }
-            Some("-r" | "--overwrite-existing") => overwrite_existing = true,
-            Some("--not-restore-extension") => restore_text_asset_extension = false,
+            Some("-r" | "--overwrite-existing") => flags.overwrite_existing = true,
+            Some("--not-restore-extension") => flags.restore_text_asset_extension = false,
+            Some(SMOOTH_MOTIONS_FLAG) => flags.smooth_live2d_motions = true,
             _ => {
                 return Err(CliError::Usage(format!(
                     "unsupported legacy argument: {}",
@@ -759,23 +763,38 @@ fn parse_bare_or_legacy_arguments(arguments: &[OsString]) -> CliResult<CliComman
     } else {
         "inspect"
     });
-    dispatch_legacy_mode(
-        input,
-        mode,
-        output,
-        overwrite_existing,
-        restore_text_asset_extension,
-    )
+    dispatch_legacy_mode(input, mode, output, flags)
+}
+
+/// The legacy switches, which only some legacy modes accept.
+#[derive(Debug, Clone, Copy)]
+struct LegacyFlags {
+    overwrite_existing: bool,
+    restore_text_asset_extension: bool,
+    /// The managed CLI's `--l2d-smooth-motions`; the l2d and live2d modes only.
+    smooth_live2d_motions: bool,
 }
 
 fn dispatch_legacy_mode(
     input: PathBuf,
     mode: &str,
     output: Option<PathBuf>,
-    overwrite_existing: bool,
-    restore_text_asset_extension: bool,
+    flags: LegacyFlags,
 ) -> CliResult<CliCommand> {
+    let LegacyFlags {
+        overwrite_existing,
+        restore_text_asset_extension,
+        smooth_live2d_motions,
+    } = flags;
     let read_only = mode.eq_ignore_ascii_case("inspect") || mode.eq_ignore_ascii_case("info");
+    if mode.eq_ignore_ascii_case("l2d") || mode.eq_ignore_ascii_case("live2d") {
+        return parse_legacy_live2d(input, output, flags);
+    }
+    if smooth_live2d_motions {
+        return Err(CliError::Usage(format!(
+            "{SMOOTH_MOTIONS_FLAG} is only valid for the l2d and live2d modes"
+        )));
+    }
     if read_only && output.is_none() && !overwrite_existing && restore_text_asset_extension {
         return if mode.eq_ignore_ascii_case("inspect") {
             Ok(CliCommand::Inspect(input))
@@ -791,14 +810,6 @@ fn dispatch_legacy_mode(
     }
     if mode.eq_ignore_ascii_case("extract") {
         return parse_legacy_extract(
-            input,
-            output,
-            overwrite_existing,
-            restore_text_asset_extension,
-        );
-    }
-    if mode.eq_ignore_ascii_case("l2d") || mode.eq_ignore_ascii_case("live2d") {
-        return parse_legacy_live2d(
             input,
             output,
             overwrite_existing,
@@ -851,8 +862,7 @@ fn legacy_export_mode(mode: &str) -> Option<ExportMode> {
 fn parse_legacy_live2d(
     input: PathBuf,
     output: Option<PathBuf>,
-    overwrite_existing: bool,
-    restore_text_asset_extension: bool,
+    flags: LegacyFlags,
 ) -> CliResult<CliCommand> {
     let output = output.ok_or_else(|| {
         CliError::Usage(
@@ -860,18 +870,22 @@ fn parse_legacy_live2d(
                 .to_owned(),
         )
     })?;
-    if overwrite_existing {
+    if flags.overwrite_existing {
         return Err(CliError::Usage(
             "legacy Live2D overwrite is not supported; existing packages are never overwritten"
                 .to_owned(),
         ));
     }
-    if !restore_text_asset_extension {
+    if !flags.restore_text_asset_extension {
         return Err(CliError::Usage(
             "--not-restore-extension is not valid for Live2D mode".to_owned(),
         ));
     }
-    Ok(CliCommand::Live2dPackage(Live2dCommand { input, output }))
+    Ok(CliCommand::Live2dPackage(Live2dCommand {
+        input,
+        output,
+        force_bezier_motions: flags.smooth_live2d_motions,
+    }))
 }
 
 fn parse_legacy_fbx_batch(
@@ -943,7 +957,7 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          unity-rs export <file-or-directory> <output-directory> [options]\n  \
          unity-rs extract <file-or-directory> <output-directory> [--overwrite]\n  \
          unity-rs live2d <file-or-directory> <output-directory> [options]\n  \
-         unity-rs live2d-package <file-or-directory> <output-directory>\n\n\
+         unity-rs live2d-package <file-or-directory> <output-directory> [--l2d-smooth-motions]\n\n\
          Invocation limits: {MAX_CLI_ARGUMENTS} arguments, {MAX_CLI_ARGUMENT_BYTES} encoded\n  \
          bytes per argument, and {MAX_CLI_ARGUMENT_TOTAL_BYTES} encoded bytes in total.\n\n\
          Read-only commands:\n  inspect  Show container and serialized-file structure\n  \
@@ -1009,9 +1023,14 @@ fn print_help(output: &mut impl Write) -> Result<()> {
          the default is 67108864 and the maximum is 536870912.\n  \
          Existing files are never overwritten.\n  \
          live2d-package exports verified MOC, texture PNG, model3.json, expression, motion,\n  \
-         physics, pose, and display-info files when embedded or supplied schemas are available.\n\n\
+         physics, pose, and display-info files when embedded or supplied schemas are available.\n  \
+         --l2d-smooth-motions          Write every motion segment between two keys as a\n  \
+         Bezier, as the managed CLI option of that name does. By default a segment\n  \
+         whose tangents are both flat is written as a line, which Unity plays as an\n  \
+         ease-in-out; sampled AnimationClip curves carry flat tangents and are linear.\n\n\
          Legacy compatibility:\n  unity-rs <input> -m info\n  \
          unity-rs <input> -m <export|exportRaw|dump|extract|l2d|live2d|animator|splitObjects> -o <output>\n  \
+         The l2d and live2d modes also take --l2d-smooth-motions.\n  \
          Implicit ASExport/ASExtract directories are never created. Legacy Animator and\n  \
          SplitObjects modes require an explicit output directory.\n\n\
          The default export mode prefers TextAsset bytes and TypeTree JSON, with raw \
@@ -1034,6 +1053,10 @@ struct ExportCommand {
 struct Live2dCommand {
     input: PathBuf,
     output: PathBuf,
+    /// Write every Hermite segment of a motion as a Bezier
+    /// (`--l2d-smooth-motions`) instead of the managed default, which writes a
+    /// flat-tangent segment as a line.
+    force_bezier_motions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1359,9 +1382,12 @@ fn parse_live2d_write_arguments(
 ) -> Result<Live2dCommand> {
     let mut positional = positional_path_table(command_name)?;
     let mut parse_options = true;
+    let mut force_bezier_motions = false;
     for argument in arguments {
         if parse_options && argument == "--" {
             parse_options = false;
+        } else if parse_options && argument == SMOOTH_MOTIONS_FLAG {
+            force_bezier_motions = true;
         } else if parse_options
             && argument
                 .to_str()
@@ -1383,6 +1409,7 @@ fn parse_live2d_write_arguments(
     Ok(Live2dCommand {
         input: positional.remove(0),
         output: positional.remove(0),
+        force_bezier_motions,
     })
 }
 
@@ -3130,13 +3157,16 @@ struct Live2dPackageExportState {
 }
 
 fn export_live2d_packages(
-    input: &Path,
-    output_directory: &Path,
+    command: &Live2dCommand,
     load: &LoadOptions,
     output: &mut impl Write,
 ) -> CliResult<()> {
-    let collection = load_asset_collection(input, load, output)?;
-    let set = build_live2d_packages(&collection, live2d_package_limits())?;
+    let output_directory = command.output.as_path();
+    let collection = load_asset_collection(&command.input, load, output)?;
+    let set = build_live2d_packages(
+        &collection,
+        live2d_package_limits(command.force_bezier_motions),
+    )?;
     let mut state = Live2dPackageExportState::default();
     for diagnostic in set.diagnostics {
         state.failures = state.failures.checked_add(1).ok_or_else(|| {
@@ -3218,8 +3248,9 @@ fn export_live2d_packages(
     skipped_input_result("live2d-package", &collection)
 }
 
-fn live2d_package_limits() -> Live2dPackageLimits {
+fn live2d_package_limits(force_bezier_motions: bool) -> Live2dPackageLimits {
     Live2dPackageLimits {
+        force_bezier_motions,
         maximum_models: MAX_LIVE2D_PACKAGE_OUTPUTS,
         maximum_total_moc_bytes: MAX_LIVE2D_PACKAGE_TOTAL_BYTES,
         maximum_total_texture_payload_bytes: MAX_LIVE2D_PACKAGE_TOTAL_BYTES,
@@ -3261,7 +3292,7 @@ fn write_live2d_package_atomic(
     for texture in &package.textures {
         let decoded = texture
             .texture
-            .decode_mip_rgba8(0, live2d_package_limits().texture)?;
+            .decode_mip_rgba8(0, live2d_package_limits(false).texture)?;
         let destination = temporary.path().join(&texture.file_name);
         let texture_directory = destination.parent().ok_or_else(|| {
             Error::invalid_data("Live2D package texture path has no parent directory")
@@ -5489,7 +5520,27 @@ mod tests {
             parse_live2d_package_arguments(&arguments(&["--", "-input", "-output"])).unwrap();
         assert_eq!(command.input, PathBuf::from("-input"));
         assert_eq!(command.output, PathBuf::from("-output"));
+        assert!(!command.force_bezier_motions);
         assert!(parse_live2d_package_arguments(&arguments(&["input"])).is_err());
+        let command = parse_live2d_package_arguments(&arguments(&[
+            "input",
+            "--l2d-smooth-motions",
+            "output",
+        ]))
+        .unwrap();
+        assert!(command.force_bezier_motions);
+        assert_eq!(command.output, PathBuf::from("output"));
+        // After the separator the spelling is a path, not the switch.
+        let command =
+            parse_live2d_package_arguments(&arguments(&["input", "--", "--l2d-smooth-motions"]))
+                .unwrap();
+        assert!(!command.force_bezier_motions);
+        assert_eq!(command.output, PathBuf::from("--l2d-smooth-motions"));
+        // The MOC-only live2d command writes no motions, so it has no switch.
+        assert!(
+            parse_live2d_arguments(&arguments(&["--l2d-smooth-motions", "input", "output"]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -5693,6 +5744,7 @@ mod tests {
                 CliCommand::Live2dPackage(Live2dCommand {
                     input: PathBuf::from("input.assets"),
                     output: PathBuf::from("output"),
+                    force_bezier_motions: false,
                 })
             );
         }
@@ -5719,6 +5771,45 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_live2d_modes_take_the_smooth_motions_switch() {
+        for legacy_mode in ["l2d", "live2d"] {
+            // The managed CLI spells its forceBezier switch this way and takes
+            // it anywhere among the legacy arguments.
+            assert_eq!(
+                parse_cli_arguments(&arguments(&[
+                    "input.assets",
+                    "--l2d-smooth-motions",
+                    "-m",
+                    legacy_mode,
+                    "-o",
+                    "output",
+                ]))
+                .unwrap(),
+                CliCommand::Live2dPackage(Live2dCommand {
+                    input: PathBuf::from("input.assets"),
+                    output: PathBuf::from("output"),
+                    force_bezier_motions: true,
+                })
+            );
+        }
+        for other_mode in ["export", "extract", "info"] {
+            let error = parse_cli_arguments(&arguments(&[
+                "input.assets",
+                "-m",
+                other_mode,
+                "-o",
+                "output",
+                "--l2d-smooth-motions",
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(&error, CliError::Usage(message) if message.contains("l2d and live2d")),
+                "{other_mode}: {error:?}"
+            );
+        }
     }
 
     #[test]

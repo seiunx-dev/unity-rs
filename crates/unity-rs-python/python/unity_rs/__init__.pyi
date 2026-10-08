@@ -1110,6 +1110,7 @@ class UnityRs:
         acl_decoder: Optional[AclDecoder] = None,
         maximum_file_bytes: int = 536_870_912,
         maximum_total_bytes: int = 4_294_967_296,
+        force_bezier_motions: bool = False,
     ) -> Live2dPackageSet: ...
     def read_raw(
         self,

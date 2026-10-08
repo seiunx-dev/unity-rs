@@ -42,7 +42,13 @@ The first binding slice supports:
   `MonoBehaviour` schemas, plus a Promise worker that can combine those
   schemas with a caller ACL decoder for Tuanjie motions; single-file and
   aggregate output ceilings are independent, and partial package failures
-  remain visible through diagnostics;
+  remain visible through diagnostics. All three package readers take an
+  optional trailing `forceBezierMotions`, and `readCubismFadeMotion` a
+  trailing `forceBezier`: by default a motion segment whose tangents are both
+  flat is written as a line, as the managed extractor does, while the switch
+  writes every segment as the Bezier that reproduces Unity's ease-in-out
+  (the managed CLI's `--l2d-smooth-motions`). Sampled `AnimationClip` data
+  carries flat tangents too but plays linearly, so the default suits it;
 - Promise-returning worker variants for path/buffer opening and the main
   raw/text/TypeTree/shader/mesh/image reads, backed by libuv's worker pool;
   `openAsync` and `fromBufferAsync` accept the same trailing `OpenOptions` as

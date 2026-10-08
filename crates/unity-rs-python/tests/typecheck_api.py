@@ -256,6 +256,9 @@ def consume_public_api(
         schemas=schemas,
         acl_decoder=acl_decoder,
     )
+    smooth_packages: Live2dPackageSet = studio.read_live2d_packages(
+        force_bezier_motions=True
+    )
 
     export_report: ExportReport = studio.export(
         path,
@@ -358,6 +361,7 @@ def consume_public_api(
         motion,
         acl_motion,
         packages,
+        smooth_packages,
         export_report,
         extraction_report,
         extraction_metadata_bytes,

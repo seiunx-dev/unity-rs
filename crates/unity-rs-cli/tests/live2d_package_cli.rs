@@ -138,6 +138,100 @@ fn legacy_l2d_and_live2d_modes_export_the_complete_package() {
     }
 }
 
+/// The model of `Fixture::Complete` with one loose `CubismFadeMotionData`
+/// whose curve has keys (0, 0) and (1, 1) and flat tangents: Unity plays it as
+/// 3t^2 - 2t^3, the managed default writes it as a line, and its
+/// `--l2d-smooth-motions` writes the Bezier that reproduces the ease.
+#[test]
+fn smooth_motions_flag_writes_flat_tangent_segments_as_bezier() {
+    let root = TestDirectory::new("smooth");
+    let input = root.path().join("input");
+    write_fixture(&input, Fixture::CompleteWithMotion);
+
+    let default_output = root.path().join("default");
+    let default = cli(root.path(), package_arguments(&input, &default_output));
+    assert_success(&default);
+    let mut smooth_runs = Vec::new();
+    for (label, arguments) in [
+        (
+            "smooth",
+            vec![
+                OsString::from("live2d-package"),
+                OsString::from("--l2d-smooth-motions"),
+                input.as_os_str().to_owned(),
+                root.path().join("smooth").into_os_string(),
+            ],
+        ),
+        (
+            "legacy-smooth",
+            vec![
+                input.as_os_str().to_owned(),
+                OsString::from("-m"),
+                OsString::from("l2d"),
+                OsString::from("--l2d-smooth-motions"),
+                OsString::from("-o"),
+                root.path().join("legacy-smooth").into_os_string(),
+            ],
+        ),
+    ] {
+        let result = cli(root.path(), arguments);
+        assert_success(&result);
+        smooth_runs.push(root.path().join(label));
+    }
+
+    let motion_path = "Hero/motions/idle.fade.motion3.json";
+    let default_motion = fs::read_to_string(default_output.join(motion_path)).unwrap();
+    assert_eq!(
+        motion_segments(&default_motion),
+        ["0", "0", "0", "1", "1"],
+        "the default keeps the managed linear segment"
+    );
+    assert!(
+        default_motion.contains("\"TotalPointCount\": 2,"),
+        "{default_motion}"
+    );
+    for smooth in &smooth_runs {
+        let motion = fs::read_to_string(smooth.join(motion_path)).unwrap();
+        assert_eq!(
+            motion_segments(&motion),
+            ["0", "0", "1", "0.333", "0", "0.667", "1", "1", "1"],
+            "{}",
+            smooth.display()
+        );
+        assert!(motion.contains("\"TotalSegmentCount\": 1,"), "{motion}");
+        assert!(motion.contains("\"TotalPointCount\": 4,"), "{motion}");
+        // Only the motion differs: the switch reaches no other file.
+        for file in [
+            "Hero/Hero.moc3",
+            "Hero/Hero.model3.json",
+            "Hero/textures/face.png",
+        ] {
+            assert_eq!(
+                fs::read(smooth.join(file)).unwrap(),
+                fs::read(default_output.join(file)).unwrap(),
+                "{file}"
+            );
+        }
+        assert_no_work_files(smooth);
+    }
+    let manifest = fs::read_to_string(default_output.join("Hero/Hero.model3.json")).unwrap();
+    assert!(
+        manifest.contains("\"File\": \"motions/idle.fade.motion3.json\""),
+        "{manifest}"
+    );
+}
+
+/// The first curve's segment numbers as written, one per line.
+fn motion_segments(motion: &str) -> Vec<&str> {
+    let start = motion.find("\"Segments\": [").expect("a Segments array") + 14;
+    let end = start + motion[start..].find(']').expect("a closed Segments array");
+    motion[start..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 #[test]
 fn concurrent_publish_is_no_clobber_and_leaves_no_work_files() {
     let root = TestDirectory::new("concurrent");
@@ -316,6 +410,7 @@ const EXPECTED_FACE_PNG: &[u8] = &[
 #[derive(Clone, Copy)]
 enum Fixture {
     Complete,
+    CompleteWithMotion,
     ShortTexture,
     MissingModelTree,
     Empty,
@@ -333,7 +428,7 @@ fn write_fixture(directory: &Path, fixture: Fixture) {
 
     let model_nodes = (!matches!(fixture, Fixture::MissingModelTree))
         .then(|| mono_behaviour_tree("CubismMoc", "_moc"));
-    let types = vec![
+    let mut types = vec![
         TestType::plain(GAME_OBJECT),
         TestType::plain(TRANSFORM),
         TestType::behaviour(0x20, model_nodes),
@@ -341,7 +436,7 @@ fn write_fixture(directory: &Path, fixture: Fixture) {
         TestType::behaviour(0x30, None),
         TestType::plain(MONO_SCRIPT),
     ];
-    let objects = vec![
+    let mut objects = vec![
         TestObject::new(1, 0, game_object("Hero", &[(0, 10), (0, 20)])),
         TestObject::new(10, 1, transform((0, 1), &[(0, 11)], (0, 0))),
         TestObject::new(20, 2, mono_behaviour((0, 1), (0, 100), "", (0, 30))),
@@ -353,6 +448,11 @@ fn write_fixture(directory: &Path, fixture: Fixture) {
         TestObject::new(101, 5, mono_script("CubismRenderer")),
         TestObject::new(102, 5, mono_script("CubismMoc")),
     ];
+    if matches!(fixture, Fixture::CompleteWithMotion) {
+        types.push(TestType::behaviour(0x2A, Some(fade_motion_tree())));
+        objects.push(TestObject::new(32, 6, fade_motion_behaviour((0, 112))));
+        objects.push(TestObject::new(112, 5, mono_script("CubismFadeMotionData")));
+    }
     fs::write(
         directory.join("model.assets"),
         synthetic_v22(&types, &objects, &["archive:/textures.assets"]),
@@ -460,6 +560,86 @@ fn mono_behaviour_tree(pointer_type: &'static str, pointer_name: &'static str) -
         node("int", "m_FileID", 2, false),
         node("SInt64", "m_PathID", 2, false),
     ]
+}
+
+/// `CubismFadeMotionData`, whose field names come from the managed
+/// `CubismUnityClasses/CubismFadeMotionData.cs`.
+fn fade_motion_tree() -> Vec<TestNode> {
+    let mut nodes = mono_behaviour_tree("", "");
+    nodes.truncate(12);
+    nodes.extend_from_slice(&[
+        node("string", "MotionName", 1, false),
+        node("Array", "Array", 2, true),
+        node("int", "size", 3, false),
+        node("char", "data", 3, false),
+        node("float", "FadeInTime", 1, false),
+        node("float", "FadeOutTime", 1, false),
+        node("vector", "ParameterIds", 1, false),
+        node("Array", "Array", 2, false),
+        node("int", "size", 3, false),
+        node("string", "data", 3, false),
+        node("Array", "Array", 4, true),
+        node("int", "size", 5, false),
+        node("char", "data", 5, false),
+        node("vector", "ParameterCurves", 1, false),
+        node("Array", "Array", 2, false),
+        node("int", "size", 3, false),
+        node("AnimationCurve", "data", 3, false),
+        node("vector", "m_Curve", 4, false),
+        node("Array", "Array", 5, false),
+        node("int", "size", 6, false),
+        node("Keyframe", "data", 6, false),
+        node("float", "time", 7, false),
+        node("float", "value", 7, false),
+        node("float", "inSlope", 7, false),
+        node("float", "outSlope", 7, false),
+        node("int", "weightedMode", 7, false),
+        node("float", "inWeight", 7, false),
+        node("float", "outWeight", 7, false),
+        node("int", "m_PreInfinity", 4, false),
+        node("int", "m_PostInfinity", 4, false),
+        node("int", "m_RotationOrder", 4, false),
+        node("vector", "ParameterFadeInTimes", 1, false),
+        node("Array", "Array", 2, false),
+        node("int", "size", 3, false),
+        node("float", "data", 3, false),
+        node("vector", "ParameterFadeOutTimes", 1, false),
+        node("Array", "Array", 2, false),
+        node("int", "size", 3, false),
+        node("float", "data", 3, false),
+        node("float", "MotionLength", 1, false),
+    ]);
+    nodes
+}
+
+/// A loose fade motion with one `ParamAngleX` curve: keys (0, 0) and (1, 1),
+/// every tangent flat, unweighted.
+fn fade_motion_behaviour(script: (i32, i64)) -> Vec<u8> {
+    let mut output = mono_behaviour_prefix((0, 0), script, "idle.fade.asset");
+    push_aligned_string(&mut output, "idle");
+    output.extend_from_slice(&0.2_f32.to_le_bytes());
+    output.extend_from_slice(&0.3_f32.to_le_bytes());
+    push_i32(&mut output, 1);
+    push_aligned_string(&mut output, "ParamAngleX");
+    push_i32(&mut output, 1);
+    push_i32(&mut output, 2);
+    for key in [[0.0_f32, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]] {
+        for value in key {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        push_i32(&mut output, 0);
+        output.extend_from_slice(&0.0_f32.to_le_bytes());
+        output.extend_from_slice(&0.0_f32.to_le_bytes());
+    }
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 0);
+    push_i32(&mut output, 1);
+    output.extend_from_slice(&0.4_f32.to_le_bytes());
+    push_i32(&mut output, 1);
+    output.extend_from_slice(&0.5_f32.to_le_bytes());
+    output.extend_from_slice(&1.0_f32.to_le_bytes());
+    output
 }
 
 fn game_object(name: &str, components: &[(i32, i64)]) -> Vec<u8> {

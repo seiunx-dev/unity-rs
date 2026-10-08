@@ -227,8 +227,14 @@ export declare class UnityRs {
   readCubismPhysics(fileIndex: number, pathId: bigint, motionFps?: number | undefined | null, maximumBytes?: number | undefined | null): CubismDocument
   /** Reads a `CubismExpressionData` and writes its exp3.json. */
   readCubismExpression(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismDocument
-  /** Reads a `CubismFadeMotionData` and writes its motion3.json. */
-  readCubismFadeMotion(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismDocument
+  /**
+   * Reads a `CubismFadeMotionData` and writes its motion3.json.
+   *
+   * `forceBezier` writes every segment as a Bezier, as it does for
+   * `readCubismClipMotion`; by default a segment whose tangents are both
+   * flat is written as a line, as the managed extractor does.
+   */
+  readCubismFadeMotion(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null, forceBezier?: boolean | undefined | null): CubismDocument
   /** Reads one embedded-schema `CubismPosePart` component. */
   readCubismPosePart(fileIndex: number, pathId: bigint, maximumBytes?: number | undefined | null): CubismPosePart
   /** Reads one embedded-schema Cubism display-info component. */
@@ -337,8 +343,13 @@ export declare class UnityRs {
    *
    * Returned in memory rather than written, so the caller decides where the
    * files land and stays inside whatever budget it set.
+   *
+   * `forceBezierMotions` writes every motion segment as a Bezier, as
+   * `forceBezier` does for one motion; the default keeps the managed
+   * extractor's linear flat-tangent segments. The schema and ACL forms take
+   * it last too.
    */
-  readLive2DPackages(maximumBytes?: number | undefined | null): Live2DPackageSet
+  readLive2DPackages(maximumBytes?: number | undefined | null, forceBezierMotions?: boolean | undefined | null): Live2DPackageSet
   /**
    * Materializes every verified Live2D package using trusted external
    * MonoBehaviour schemas when a shipped build stripped its type trees.
@@ -346,7 +357,7 @@ export declare class UnityRs {
    * Schemas are inert data produced by an offline tool. Embedded type trees
    * retain priority, matching the Core and Python surfaces.
    */
-  readLive2DPackagesWithSchemas(schemas: Array<MonoBehaviourSchema>, maximumFileBytes?: number | undefined | null, maximumTotalBytes?: number | undefined | null): Live2DPackageSet
+  readLive2DPackagesWithSchemas(schemas: Array<MonoBehaviourSchema>, maximumFileBytes?: number | undefined | null, maximumTotalBytes?: number | undefined | null, forceBezierMotions?: boolean | undefined | null): Live2DPackageSet
   /**
    * Materializes every verified Live2D package on a worker while a
    * JavaScript callback decodes Tuanjie ACL animation tracks.
@@ -355,7 +366,7 @@ export declare class UnityRs {
    * managed layouts, or both. Core validates all decoded curves and output
    * budgets before JavaScript receives the package bytes.
    */
-  readLive2DPackagesWithAclDecoder(decoder: (request: AclDecodeRequest) => AclDecodedClip, schemas?: Array<MonoBehaviourSchema> | undefined | null, maximumFileBytes?: number | undefined | null, maximumTotalBytes?: number | undefined | null): Promise<Live2DPackageSet>
+  readLive2DPackagesWithAclDecoder(decoder: (request: AclDecodeRequest) => AclDecodedClip, schemas?: Array<MonoBehaviourSchema> | undefined | null, maximumFileBytes?: number | undefined | null, maximumTotalBytes?: number | undefined | null, forceBezierMotions?: boolean | undefined | null): Promise<Live2DPackageSet>
   /**
    * Writes the whole scene as one Wavefront OBJ, with the material library
    * it names and that library's textures.

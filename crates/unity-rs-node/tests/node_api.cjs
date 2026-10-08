@@ -2970,6 +2970,10 @@ console.log('node api: animation and live2d discovery ok')
   // carries its diagnostics: a package that could not include something has to
   // be able to say so, or a short package reads as a complete one.
   assert.deepEqual(barren.readLive2DPackages(), { packages: [], diagnostics: [] })
+  assert.deepEqual(
+    barren.readLive2DPackages(undefined, true),
+    { packages: [], diagnostics: [] },
+  )
 }
 
 // The load options, which have to combine: a UnityCN-encrypted archive whose
@@ -3330,7 +3334,56 @@ async function testLive2dPackageAdapters() {
   )
   const motion = decodedFiles.get('motions/node-acl-motion.motion3.json')
   assert.ok(motion)
-  assert.strictEqual(JSON.parse(motion.toString('utf8')).Meta.Fps, 60)
+  const motionDocument = JSON.parse(motion.toString('utf8'))
+  assert.strictEqual(motionDocument.Meta.Fps, 60)
+  // Decoded samples carry flat tangents, so the managed default writes the
+  // segment between them as a line, which is how Unity interpolates samples.
+  assert.deepStrictEqual(
+    motionDocument.Curves[0].Segments,
+    [0, 0.25, 0, 0.033, 0.75],
+  )
+
+  // forceBezierMotions reaches the worker: the same segment becomes the
+  // flat-tangent Bezier, and no other file changes.
+  const smooth = await studio.readLive2DPackagesWithAclDecoder(
+    () => ({
+      times: [0, 1 / 30],
+      bindingIndices: [0],
+      values: [0.25, 0.75],
+      followingCurveOffset: 1,
+    }),
+    schemas,
+    1024 * 1024,
+    4 * 1024 * 1024,
+    true,
+  )
+  assert.deepStrictEqual(smooth.diagnostics, [])
+  const smoothFiles = new Map(
+    smooth.packages[0].files.map(({ fileName, data }) => [fileName, data]),
+  )
+  assert.deepStrictEqual([...smoothFiles.keys()], [...decodedFiles.keys()])
+  for (const [fileName, data] of decodedFiles) {
+    if (fileName !== 'motions/node-acl-motion.motion3.json') {
+      assert.deepStrictEqual(smoothFiles.get(fileName), data, fileName)
+    }
+  }
+  assert.deepStrictEqual(
+    JSON.parse(
+      smoothFiles.get('motions/node-acl-motion.motion3.json').toString('utf8'),
+    ).Curves[0].Segments,
+    [0, 0.25, 1, 0.011, 0.25, 0.022, 0.75, 0.033, 0.75],
+  )
+  // The schema-only form takes the switch too; without a decoder this
+  // package has no motion for it to change.
+  assert.deepStrictEqual(
+    studio.readLive2DPackagesWithSchemas(
+      schemas,
+      1024 * 1024,
+      4 * 1024 * 1024,
+      true,
+    ),
+    schemaOnly,
+  )
   const manifest = JSON.parse(decodedFiles.get('Hero.model3.json').toString('utf8'))
   assert.deepStrictEqual(
     manifest.FileReferences.Motions['node-acl-motion'],

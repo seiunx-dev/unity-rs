@@ -544,6 +544,26 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   Multiply/Override 参数读回成加法。现按上一条的名称写出字符串。这是对托管提取器的声明式
   差分：托管差分在 Rust 侧把三个字符串映射回序数 0/1/2 后仍逐字节比较整份文档，并要求每个
   参数都写成字符串，差分一旦消失即失败；Python `.json` 与 Node `json` 随之变化；
+- **整包 motion3 的 `forceBezier` 开关已于 2026-10-08 开放给 Python、Node 与 CLI（#10）**：
+  `ProjectedCurve` 在左键出切线为 0、右键入切线绝对值小于 1e-4 时写直线段，这与托管
+  `CubismMotion3Json.AddSegments` 的默认一致；但 Unity `AnimationCurve` 的平切线段是
+  3s² − 2s³，与直线最多相差台阶的 √3/18 ≈ 9.6%，而 Bezier 段（控制点在区间三分点、
+  `AreBeziersRestricted: true`）是 Hermite 段的精确换算。此前只有单 motion 读取器能打开
+  `force_bezier`，Core 已有的 `Live2dPackageLimits::force_bezier_motions` 在整包路径上恒为
+  `false`。现 Python `read_live2d_packages` 新增仅关键字参数 `force_bezier_motions`，Node
+  `readLive2DPackages`/`readLive2DPackagesWithSchemas`/`readLive2DPackagesWithAclDecoder`
+  末尾新增可选 `forceBezierMotions`，Node `readCubismFadeMotion` 在 `maximumBytes` 之后新增
+  `forceBezier`（此前只有 `readCubismClipMotion` 有），CLI `live2d-package` 与旧式
+  `-m l2d`/`-m live2d` 接受托管 CLI 同名的 `--l2d-smooth-motions`（其他旧式模式以用法错误
+  拒绝）。默认值均为关闭，**默认输出逐字节不变**。注意 dense、constant 与 ACL 采样进入
+  writer 时同样是平切线，而 Unity 对采样做线性插值，所以这类 `AnimationClip` 的默认直线
+  反而更接近；开关对 inverse-stepped 推断没有影响。issue 第二条（另设跳过 inverse-stepped
+  推断的「精确」模式）**未实现**：它对 fade motion 也只在无权重切线时成立（reader 不读
+  `weightedMode`/`inWeight`/`outWeight`），对采样 clip 更不成立，需要按来源区分投影方式，
+  不适合作为又一个布尔开关。测试：Core 单测锁定该曲线默认 `[0,0,0,1,1]`、强制
+  `[0,0,1,0.333,0,0.667,1,1,1]`，并证明整包只有 motion 文件变化；Python、Node（Rust 单测
+  覆盖同步读取器，JS 覆盖 ACL worker）与 CLI 进程级测试各用带散件 `CubismFadeMotionData`
+  的合成模型验证同一结论；
 - **FBX 批量输出名称的错误上限与重复扫描已于 2026-08-25 收口**：SplitObjects/Animator
   规划允许最多 1,000,000 个候选，但 CLI 原先以 `HashSet<String>` 保存名称，并让每个同名
   候选从无后缀、`~1` 重新扫描；循环还误用“创建临时文件最多尝试 1,024 次”的常量，导致
