@@ -37,7 +37,9 @@ use unity_rs_core::loader::{
     DEFAULT_MAXIMUM_TOTAL_LOAD_PATH_BYTES, LoadFailurePolicy,
 };
 use unity_rs_core::material::MaterialReadLimits;
-use unity_rs_core::mesh::MeshReadLimits;
+use unity_rs_core::mesh::{
+    MeshBlendShapes as CoreMeshBlendShapes, MeshGeometry, MeshReadLimits, MeshVertexAttribute,
+};
 use unity_rs_core::model_export::{ModelExportCandidate, ModelExportPlanLimits};
 use unity_rs_core::mono_schema::{
     MonoBehaviourSchemaEntry, MonoBehaviourSchemaProvider, MonoBehaviourSchemaRegistry,
@@ -392,6 +394,89 @@ pub struct EncodeImageOptions {
     pub png_filter: Option<String>,
     /// Cap on the encoded output length in bytes. Defaults to 512 MiB.
     pub maximum_bytes: Option<i64>,
+}
+
+/// One floating-point vertex attribute of a `Mesh`.
+#[napi(object)]
+pub struct MeshAttribute {
+    /// Components per vertex, 1 through 4.
+    pub dimension: u32,
+    /// `dimension` little-endian float32 values per vertex, vertex-major, for
+    /// every vertex of the mesh.
+    pub data: Buffer,
+}
+
+/// One sub-mesh: its serialized ranges and its triangle-list indices.
+#[napi(object)]
+pub struct MeshSubMesh {
+    pub first_byte: u32,
+    pub index_count: u32,
+    pub first_vertex: u32,
+    pub vertex_count: u32,
+    /// Little-endian uint32 triangle-list indices.
+    pub indices: Buffer,
+}
+
+/// One blend-shape frame's range of shape vertices.
+#[napi(object)]
+pub struct MeshBlendShapeFrame {
+    pub first_vertex: u32,
+    pub vertex_count: u32,
+    pub has_normals: bool,
+    pub has_tangents: bool,
+}
+
+/// One named blend-shape channel and its range of frames.
+#[napi(object)]
+pub struct MeshBlendShapeChannel {
+    pub name: String,
+    pub name_hash: u32,
+    pub frame_index: u32,
+    pub frame_count: u32,
+}
+
+/// A mesh's blend shapes as little-endian arrays.
+#[napi(object)]
+pub struct MeshBlendShapes {
+    /// Three float32 position deltas per shape vertex.
+    pub vertices: Buffer,
+    /// Three float32 normal deltas per shape vertex.
+    pub normals: Buffer,
+    /// Three float32 tangent deltas per shape vertex.
+    pub tangents: Buffer,
+    /// One uint32 mesh-vertex index per shape vertex.
+    pub indices: Buffer,
+    pub frames: Vec<MeshBlendShapeFrame>,
+    pub channels: Vec<MeshBlendShapeChannel>,
+    /// One float32 full weight per frame.
+    pub full_weights: Buffer,
+}
+
+/// One `Mesh` as typed little-endian arrays, each covering `vertexCount`
+/// vertices.
+#[napi(object)]
+pub struct Mesh {
+    pub path_id: BigInt,
+    pub name: String,
+    pub vertex_count: u32,
+    pub positions: MeshAttribute,
+    pub normals: Option<MeshAttribute>,
+    pub tangents: Option<MeshAttribute>,
+    pub colors: Option<MeshAttribute>,
+    /// UV0 through UV7; `null` where the mesh has no such channel.
+    #[napi(ts_type = "Array<MeshAttribute | null>")]
+    pub uvs: Vec<Option<MeshAttribute>>,
+    pub sub_meshes: Vec<MeshSubMesh>,
+    /// 16 float32 values per bone in Unity's serialized column-major order.
+    pub bind_poses: Buffer,
+    /// One uint32 per bone.
+    pub bone_name_hashes: Buffer,
+    pub root_bone_name_hash: u32,
+    /// Four float32 weights per vertex.
+    pub skin_weights: Option<Buffer>,
+    /// Four uint32 bone indices per vertex.
+    pub skin_bone_indices: Option<Buffer>,
+    pub blend_shapes: Option<MeshBlendShapes>,
 }
 
 /// One `AudioClip`'s stored payload and the extension its container implies.
@@ -1796,6 +1881,42 @@ impl UnityRs {
         maximum_bytes: Option<i64>,
     ) -> Result<AsyncTask<ReadBytesTask>> {
         self.read_bytes_task(file_index, path_id, maximum_bytes, ByteReadKind::MeshObj)
+    }
+
+    /// Reads one supported resident or externally streamed Unity `Mesh` as
+    /// typed little-endian arrays: positions, normals, tangents, colours,
+    /// eight UV channels, per-sub-mesh indices, bind poses, bone hashes, skin
+    /// weights and blend shapes. `maximumBytes` bounds every parse budget
+    /// and the total size of the returned arrays.
+    #[napi]
+    pub fn read_mesh(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<Mesh> {
+        let limits = node_mesh_limits(byte_limit(maximum_bytes)?)?;
+        let geometry = self
+            .object(file_index, bigint_i64(path_id, "pathId")?)?
+            .read_mesh(limits)
+            .map_err(core_error)?;
+        convert_mesh(geometry)
+    }
+
+    /// Reads one `Mesh` like `readMesh` on a worker thread.
+    #[napi(ts_return_type = "Promise<Mesh>")]
+    pub fn read_mesh_async(
+        &self,
+        file_index: u32,
+        path_id: BigInt,
+        maximum_bytes: Option<i64>,
+    ) -> Result<AsyncTask<ReadMeshTask>> {
+        Ok(AsyncTask::new(ReadMeshTask {
+            studio: Arc::clone(&self.studio),
+            file_index: usize::try_from(file_index).expect("u32 fits usize"),
+            path_id: bigint_i64(path_id, "pathId")?,
+            limits: node_mesh_limits(byte_limit(maximum_bytes)?)?,
+        }))
     }
 
     #[napi]
@@ -3867,6 +3988,29 @@ impl Task for ReadMonoBehaviourJsonTask {
     }
 }
 
+pub struct ReadMeshTask {
+    studio: Arc<Studio>,
+    file_index: usize,
+    path_id: i64,
+    limits: MeshReadLimits,
+}
+
+impl Task for ReadMeshTask {
+    type Output = Mesh;
+    type JsValue = Mesh;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let geometry = studio_object(&self.studio, self.file_index, self.path_id)?
+            .read_mesh(self.limits)
+            .map_err(core_error)?;
+        convert_mesh(geometry)
+    }
+
+    fn resolve(&mut self, _env: Env, mesh: Self::Output) -> Result<Self::JsValue> {
+        Ok(mesh)
+    }
+}
+
 pub struct ReadTextureTask {
     studio: Arc<Studio>,
     file_index: usize,
@@ -5417,6 +5561,182 @@ fn usize_limit(value: Option<i64>) -> Result<usize> {
         .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))
 }
 
+/// Applies one byte budget to every byte-sized `Mesh` parse limit and to the
+/// returned arrays, keeping the default count limits.
+fn node_mesh_limits(maximum: u64) -> Result<MeshReadLimits> {
+    let maximum_usize = usize::try_from(maximum)
+        .map_err(|_| invalid_arg("maximumBytes does not fit this platform"))?;
+    Ok(MeshReadLimits {
+        maximum_object_bytes: maximum,
+        maximum_vertex_data_bytes: maximum_usize,
+        maximum_compressed_data_bytes: maximum,
+        maximum_auxiliary_bytes: maximum,
+        maximum_decoded_bytes: maximum,
+        maximum_output_bytes: maximum,
+        ..MeshReadLimits::default()
+    })
+}
+
+/// Packs the `M` values each record contributes as little-endian bytes, with
+/// a fallible allocation sized before any copy.
+fn pack_le<R, T, const M: usize, const N: usize>(
+    records: &[R],
+    select: impl Fn(&R) -> [T; M],
+    to_bytes: impl Fn(T) -> [u8; N],
+    field: &str,
+) -> Result<Buffer> {
+    let length = records
+        .len()
+        .checked_mul(M * N)
+        .ok_or_else(|| Error::from_reason(format!("{field} byte size overflowed")))?;
+    let mut bytes = reserve(length, field)?;
+    for record in records {
+        for value in select(record) {
+            bytes.extend_from_slice(&to_bytes(value));
+        }
+    }
+    Ok(bytes.into())
+}
+
+fn pack_f32(values: &[f32], field: &str) -> Result<Buffer> {
+    pack_le(values, |value| [*value], f32::to_le_bytes, field)
+}
+
+fn pack_u32(values: &[u32], field: &str) -> Result<Buffer> {
+    pack_le(values, |value| [*value], u32::to_le_bytes, field)
+}
+
+fn mesh_attribute(dimension: usize, values: &[f32], field: &str) -> Result<MeshAttribute> {
+    Ok(MeshAttribute {
+        dimension: count_u32(dimension, field)?,
+        data: pack_f32(values, field)?,
+    })
+}
+
+fn optional_mesh_attribute(
+    attribute: Option<&MeshVertexAttribute>,
+    field: &str,
+) -> Result<Option<MeshAttribute>> {
+    attribute
+        .map(|attribute| mesh_attribute(attribute.dimension, &attribute.values, field))
+        .transpose()
+}
+
+/// Packs one Core mesh into the Node shape. Every copy is sized and reserved
+/// fallibly, and the work runs wherever the caller runs it: on the event loop
+/// for `readMesh`, on a worker for `readMeshAsync`.
+fn convert_mesh(geometry: MeshGeometry) -> Result<Mesh> {
+    let MeshGeometry { mesh, channels, .. } = geometry;
+    let normals = mesh
+        .normals
+        .as_deref()
+        .map(|normals| mesh_attribute(3, normals.as_flattened(), "Mesh normals"))
+        .transpose()?;
+    let mut uvs = reserve(channels.uvs.len(), "Mesh UV channels")?;
+    for uv in &channels.uvs {
+        uvs.push(optional_mesh_attribute(uv.as_ref(), "Mesh UVs")?);
+    }
+    let mut sub_meshes = reserve(mesh.sub_meshes.len(), "Mesh sub-meshes")?;
+    for sub_mesh in &mesh.sub_meshes {
+        sub_meshes.push(MeshSubMesh {
+            first_byte: sub_mesh.first_byte,
+            index_count: sub_mesh.index_count,
+            first_vertex: sub_mesh.first_vertex,
+            vertex_count: sub_mesh.vertex_count,
+            indices: pack_u32(&sub_mesh.indices, "Mesh sub-mesh indices")?,
+        });
+    }
+    let (skin_weights, skin_bone_indices) = match &mesh.skin {
+        Some(skin) => (
+            Some(pack_le(
+                skin,
+                |influence| influence.weights,
+                f32::to_le_bytes,
+                "Mesh skin weights",
+            )?),
+            Some(pack_le(
+                skin,
+                |influence| influence.bone_indices,
+                u32::to_le_bytes,
+                "Mesh skin bone indices",
+            )?),
+        ),
+        None => (None, None),
+    };
+    let blend_shapes = mesh
+        .blend_shapes
+        .as_ref()
+        .map(convert_blend_shapes)
+        .transpose()?;
+    Ok(Mesh {
+        path_id: BigInt::from(mesh.path_id),
+        vertex_count: count_u32(mesh.vertices.len(), "Mesh vertex count")?,
+        positions: mesh_attribute(3, mesh.vertices.as_flattened(), "Mesh positions")?,
+        normals,
+        tangents: optional_mesh_attribute(channels.tangents.as_ref(), "Mesh tangents")?,
+        colors: optional_mesh_attribute(channels.colors.as_ref(), "Mesh colours")?,
+        uvs,
+        sub_meshes,
+        bind_poses: pack_f32(mesh.bind_poses.as_flattened(), "Mesh bind poses")?,
+        bone_name_hashes: pack_u32(&mesh.bone_name_hashes, "Mesh bone hashes")?,
+        root_bone_name_hash: mesh.root_bone_name_hash,
+        skin_weights,
+        skin_bone_indices,
+        blend_shapes,
+        name: mesh.name,
+    })
+}
+
+fn convert_blend_shapes(shapes: &CoreMeshBlendShapes) -> Result<MeshBlendShapes> {
+    let mut frames = reserve(shapes.frames.len(), "Mesh blend-shape frames")?;
+    for frame in &shapes.frames {
+        frames.push(MeshBlendShapeFrame {
+            first_vertex: frame.first_vertex,
+            vertex_count: frame.vertex_count,
+            has_normals: frame.has_normals,
+            has_tangents: frame.has_tangents,
+        });
+    }
+    let mut channels = reserve(shapes.channels.len(), "Mesh blend-shape channels")?;
+    for channel in &shapes.channels {
+        channels.push(MeshBlendShapeChannel {
+            name: channel.name.clone(),
+            name_hash: channel.name_hash,
+            frame_index: count_u32(channel.frame_index, "Mesh blend-shape frame index")?,
+            frame_count: count_u32(channel.frame_count, "Mesh blend-shape frame count")?,
+        });
+    }
+    Ok(MeshBlendShapes {
+        vertices: pack_le(
+            &shapes.vertices,
+            |vertex| vertex.vertex,
+            f32::to_le_bytes,
+            "Mesh blend-shape vertices",
+        )?,
+        normals: pack_le(
+            &shapes.vertices,
+            |vertex| vertex.normal,
+            f32::to_le_bytes,
+            "Mesh blend-shape normals",
+        )?,
+        tangents: pack_le(
+            &shapes.vertices,
+            |vertex| vertex.tangent,
+            f32::to_le_bytes,
+            "Mesh blend-shape tangents",
+        )?,
+        indices: pack_le(
+            &shapes.vertices,
+            |vertex| [vertex.index],
+            u32::to_le_bytes,
+            "Mesh blend-shape indices",
+        )?,
+        frames,
+        channels,
+        full_weights: pack_f32(&shapes.full_weights, "Mesh blend-shape weights")?,
+    })
+}
+
 fn count_u32(value: usize, field: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::from_reason(format!("{field} does not fit u32")))
 }
@@ -5932,12 +6252,16 @@ mod tests {
         // platforms, offsets, both lengths, blob, stage counts, object
         // dependencies, non-modifiable textures, aligned baked flag, GUID.
         payload.resize(payload.len() + 4 * 12 + 16, 0);
+        v22_asset("6000.2.0f1", 48, &payload)
+    }
 
-        let mut metadata = b"6000.2.0f1\0".to_vec();
+    /// Wraps one tree-less object payload, path ID 7, in a v22 serialized file.
+    fn v22_asset(version: &str, class_id: i32, payload: &[u8]) -> Vec<u8> {
+        let mut metadata = format!("{version}\0").into_bytes();
         metadata.extend_from_slice(&13_i32.to_le_bytes());
         metadata.push(0);
         metadata.extend_from_slice(&1_i32.to_le_bytes());
-        metadata.extend_from_slice(&48_i32.to_le_bytes());
+        metadata.extend_from_slice(&class_id.to_le_bytes());
         metadata.extend_from_slice(&[0, 0xff, 0xff]);
         metadata.extend_from_slice(&[0; 16]);
         metadata.extend_from_slice(&1_i32.to_le_bytes());
@@ -5955,8 +6279,245 @@ mod tests {
         file[32..40].copy_from_slice(&u64::try_from(data_offset).unwrap().to_be_bytes());
         file.extend_from_slice(&metadata);
         file.resize(data_offset, 0);
-        file.extend_from_slice(&payload);
+        file.extend_from_slice(payload);
         file
+    }
+
+    fn push_f32s(output: &mut Vec<u8>, values: &[f32]) {
+        for value in values {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn push_u32s(output: &mut Vec<u8>, values: &[u32]) {
+        for value in values {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn align4(output: &mut Vec<u8>) {
+        output.resize(output.len().next_multiple_of(4), 0);
+    }
+
+    const RICH_TANGENTS: [f32; 12] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0];
+    const RICH_COLORS: [u8; 12] = [255, 0, 0, 255, 0, 255, 0, 51, 0, 0, 255, 0];
+    const RICH_WEIGHTS: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.25, 0.25, 0.5, 0.0];
+    const RICH_BONES: [u8; 12] = [0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 2, 0];
+
+    /// The rich mesh of `tests/node_api.cjs`: one triangle with normals,
+    /// tangents, `UNorm8` colours, UV0, a `Float16` UV3, four-bone skinning, one
+    /// bind pose and one blend shape.
+    fn rich_mesh_asset() -> Vec<u8> {
+        let streams: [Vec<u8>; 8] = [
+            [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            [0.0_f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            RICH_TANGENTS
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            RICH_COLORS.to_vec(),
+            [0.0_f32, 0.0, 1.0, 0.0, 0.0, 1.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            [0x3800_u16, 0x3400, 0x3e00, 0x4000, 0xbc00, 0x3000]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            RICH_WEIGHTS
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            RICH_BONES.to_vec(),
+        ];
+        let mut vertex_data = Vec::new();
+        for stream in streams {
+            vertex_data.resize(vertex_data.len().next_multiple_of(16), 0);
+            vertex_data.extend_from_slice(&stream);
+        }
+
+        let mut payload = Vec::new();
+        aligned_string(&mut payload, "node rich");
+        push_u32s(&mut payload, &[1, 0, 3, 0, 0, 0, 3]);
+        payload.extend_from_slice(&[0; 24]);
+        push_u32s(&mut payload, &[1]);
+        push_f32s(
+            &mut payload,
+            &[0.5, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.125],
+        );
+        push_u32s(&mut payload, &[2, 1, 0, 1]);
+        payload.extend_from_slice(&[1, 1, 0, 0]);
+        push_u32s(&mut payload, &[1]);
+        aligned_string(&mut payload, "blendShape.smile");
+        push_u32s(&mut payload, &[0x00c0_ffee, 0, 1, 1]);
+        push_f32s(&mut payload, &[100.0]);
+        push_u32s(&mut payload, &[1]);
+        push_f32s(
+            &mut payload,
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        );
+        push_u32s(&mut payload, &[1, 0xb0e, 0xb0e, 0, 0]);
+        payload.extend_from_slice(&[0, 1, 0, 0]);
+        push_u32s(&mut payload, &[0, 6]);
+        payload.extend_from_slice(&[0, 0, 1, 0, 2, 0]);
+        align4(&mut payload);
+        push_u32s(&mut payload, &[3, 14]);
+        for channel in [
+            [0, 0, 0, 3],
+            [1, 0, 0, 3],
+            [2, 0, 0, 4],
+            [3, 0, 2, 4],
+            [4, 0, 0, 2],
+            [0; 4],
+            [0; 4],
+            [5, 0, 1, 2],
+            [0; 4],
+            [0; 4],
+            [0; 4],
+            [0; 4],
+            [6, 0, 0, 4],
+            [7, 0, 6, 4],
+        ] {
+            payload.extend_from_slice(&channel);
+        }
+        push_u32s(&mut payload, &[u32::try_from(vertex_data.len()).unwrap()]);
+        payload.extend_from_slice(&vertex_data);
+        align4(&mut payload);
+        // Ten empty packed vectors: (count, range, start, length, bit size)
+        // for the six floats and (count, length, bit size) for the ints.
+        for float_vector in [
+            true, true, true, true, false, false, false, true, false, false,
+        ] {
+            payload.extend_from_slice(&[0; 12][..if float_vector { 12 } else { 4 }]);
+            payload.extend_from_slice(&[0; 8]);
+        }
+        push_u32s(&mut payload, &[0]); // UV info
+        payload.extend_from_slice(&[0; 24]);
+        push_u32s(&mut payload, &[0, 0, 0, 0]);
+        payload.extend_from_slice(&[0; 8]);
+        payload.extend_from_slice(&[0; 12]);
+        aligned_string(&mut payload, "");
+        v22_asset("2022.3.62f1", 43, &payload)
+    }
+
+    fn floats(buffer: &[u8]) -> Vec<f32> {
+        buffer
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    fn uints(buffer: &[u8]) -> Vec<u32> {
+        buffer
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn typed_mesh_reads_pack_every_channel_on_both_paths() {
+        let studio = Arc::new(
+            Studio::open_region("rich.assets", Region::from_bytes(rich_mesh_asset()))
+                .expect("synthetic mesh asset"),
+        );
+        let addon = UnityRs {
+            studio: Arc::clone(&studio),
+        };
+        let mesh = addon
+            .read_mesh(0, BigInt::from(7_i64), None)
+            .expect("rich mesh");
+        assert_eq!(mesh.name, "node rich");
+        assert_eq!(mesh.vertex_count, 3);
+        assert_eq!(mesh.positions.dimension, 3);
+        assert_eq!(
+            floats(&mesh.positions.data),
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        );
+        assert_eq!(
+            floats(&mesh.normals.as_ref().unwrap().data),
+            [0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0]
+        );
+        let tangents = mesh.tangents.as_ref().unwrap();
+        assert_eq!(
+            (tangents.dimension, floats(&tangents.data)),
+            (4, RICH_TANGENTS.to_vec())
+        );
+        let colors = floats(&mesh.colors.as_ref().unwrap().data);
+        assert_eq!(colors.len(), 12);
+        assert!((colors[7] - 51.0 / 255.0).abs() < 1e-7);
+        let dimensions: Vec<Option<u32>> = mesh
+            .uvs
+            .iter()
+            .map(|uv| uv.as_ref().map(|uv| uv.dimension))
+            .collect();
+        assert_eq!(
+            dimensions,
+            [Some(2), None, None, Some(2), None, None, None, None]
+        );
+        assert_eq!(
+            floats(&mesh.uvs[3].as_ref().unwrap().data),
+            [0.5, 0.25, 1.5, 2.0, -1.0, 0.125]
+        );
+        assert_eq!(uints(&mesh.sub_meshes[0].indices), [0, 1, 2]);
+        assert_eq!(mesh.sub_meshes[0].index_count, 3);
+        assert_eq!(floats(mesh.skin_weights.as_ref().unwrap()), RICH_WEIGHTS);
+        assert_eq!(
+            uints(mesh.skin_bone_indices.as_ref().unwrap()),
+            RICH_BONES.map(u32::from)
+        );
+        assert_eq!(floats(&mesh.bind_poses).len(), 16);
+        assert_eq!(uints(&mesh.bone_name_hashes), [0xb0e]);
+        assert_eq!(mesh.root_bone_name_hash, 0xb0e);
+        let shapes = mesh.blend_shapes.as_ref().unwrap();
+        assert_eq!(floats(&shapes.vertices), [0.5, 0.0, 0.0]);
+        assert_eq!(floats(&shapes.normals), [0.0, 0.25, 0.0]);
+        assert_eq!(floats(&shapes.tangents), [0.0, 0.0, 0.125]);
+        assert_eq!(uints(&shapes.indices), [2]);
+        assert_eq!(floats(&shapes.full_weights), [100.0]);
+        assert_eq!(shapes.frames.len(), 1);
+        assert!(shapes.frames[0].has_normals && shapes.frames[0].has_tangents);
+        assert_eq!(shapes.channels[0].name, "blendShape.smile");
+        assert_eq!(
+            (
+                shapes.channels[0].name_hash,
+                shapes.channels[0].frame_index,
+                shapes.channels[0].frame_count
+            ),
+            (0x00c0_ffee, 0, 1)
+        );
+
+        let Err(error) = addon.read_mesh(0, BigInt::from(7_i64), Some(8)) else {
+            panic!("an eight-byte budget must refuse the mesh");
+        };
+        assert!(error.to_string().contains("exceeding limit 8"), "{error}");
+        assert!(addon.read_mesh(0, BigInt::from(8_i64), None).is_err());
+        assert!(
+            addon
+                .read_mesh_async(0, BigInt::from(7_i64), Some(-1))
+                .is_err()
+        );
+        assert!(addon.read_mesh_async(0, BigInt::from(7_i64), None).is_ok());
+
+        // The worker computes the same packed arrays under the same budget.
+        let mut task = super::ReadMeshTask {
+            studio,
+            file_index: 0,
+            path_id: 7,
+            limits: super::node_mesh_limits(1 << 20).unwrap(),
+        };
+        let worker = task.compute().expect("worker mesh");
+        assert_eq!(&worker.positions.data[..], &mesh.positions.data[..]);
+        assert_eq!(&worker.tangents.unwrap().data[..], &tangents.data[..]);
+        task.limits = super::node_mesh_limits(8).unwrap();
+        assert!(task.compute().is_err());
     }
 
     #[test]

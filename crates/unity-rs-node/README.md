@@ -16,6 +16,11 @@ The first binding slice supports:
   decompressed sub-programs included, by default), and `exportWithOptions`
   takes the same pair as `maximumShaderArrayElements` and
   `maximumShaderTotalArrayElements`;
+- typed `readMesh(fileIndex, pathId, maximumBytes?)` and `readMeshAsync`:
+  positions, normals, tangents, colours and `uvs[0..8]` as `{ dimension, data }`
+  with little-endian float32 `Buffer`s, per-sub-mesh uint32 indices, bind poses,
+  bone hashes, skin weights and blend shapes; `maximumBytes` bounds every parse
+  budget and the returned arrays;
 - bounded legacy `Animation`, `AnimatorOverrideController`, `AssetBundle`,
   `ResourceManager`, `PreloadData`, and complete `Sprite`/`SpriteAtlas`
   reference/metadata reads;

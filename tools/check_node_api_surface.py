@@ -121,6 +121,7 @@ CORE_TO_NODE = {
     "StudioObject.read_shader_text_with_limits": "UnityRs.readShader",
     "StudioObject.write_mesh_obj": "UnityRs.readMeshObj",
     "StudioObject.read_mesh_obj": "UnityRs.readMeshObj",
+    "StudioObject.read_mesh": "UnityRs.readMesh",
     "StudioObject.read_animation_clip": "UnityRs.readAnimationClipInfo",
     "StudioObject.read_legacy_animation": "UnityRs.readLegacyAnimation",
     "StudioObject.read_animator_override_controller": (

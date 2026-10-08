@@ -148,7 +148,9 @@ def synthetic_unity6_shader(unity_version: str = "6000.2.0f1", keywords: int = 0
     return finish_v22_asset(48, payload, unity_version)
 
 
-def synthetic_mesh(*, external: bool = False, tuanjie: bool = False) -> bytes:
+def synthetic_mesh(
+    *, external: bool = False, tuanjie: bool = False, rich: bool = False
+) -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "tri:mesh")
     push_i32(payload, 1)
@@ -160,11 +162,14 @@ def synthetic_mesh(*, external: bool = False, tuanjie: bool = False) -> bytes:
     push_u32(payload, 3)
     payload.extend(bytes(24))
 
-    for _ in range(4):
+    if rich:
+        push_rich_mesh_skeleton(payload)
+    else:
+        for _ in range(4):
+            push_i32(payload, 0)
         push_i32(payload, 0)
-    push_i32(payload, 0)
-    push_i32(payload, 0)
-    push_u32(payload, 0)
+        push_i32(payload, 0)
+        push_u32(payload, 0)
     push_i32(payload, 0)
     push_i32(payload, 0)
 
@@ -181,9 +186,15 @@ def synthetic_mesh(*, external: bool = False, tuanjie: bool = False) -> bytes:
     align(payload, 4)
 
     push_u32(payload, 3)
-    push_i32(payload, 1)
-    payload.extend((0, 0, 0, 3))
-    vertex_data = synthetic_mesh_vertex_data()
+    if rich:
+        push_i32(payload, len(RICH_MESH_CHANNELS))
+        for channel in RICH_MESH_CHANNELS:
+            payload.extend(channel)
+        vertex_data = rich_mesh_vertex_data()
+    else:
+        push_i32(payload, 1)
+        payload.extend((0, 0, 0, 3))
+        vertex_data = synthetic_mesh_vertex_data()
     push_i32(payload, 0 if external else len(vertex_data))
     if not external:
         payload.extend(vertex_data)
@@ -215,6 +226,88 @@ def synthetic_mesh(*, external: bool = False, tuanjie: bool = False) -> bytes:
     )
 
 
+# (stream, offset, format, dimension) for Unity 2019+ shader channels 0-13:
+# position, normal, tangent, UNorm8 colour, UV0, a Float16 UV3, and four
+# skin weights with UInt8 bone indices.
+RICH_MESH_CHANNELS = (
+    (0, 0, 0, 3),
+    (1, 0, 0, 3),
+    (2, 0, 0, 4),
+    (3, 0, 2, 4),
+    (4, 0, 0, 2),
+    (0, 0, 0, 0),
+    (0, 0, 0, 0),
+    (5, 0, 1, 2),
+    (0, 0, 0, 0),
+    (0, 0, 0, 0),
+    (0, 0, 0, 0),
+    (0, 0, 0, 0),
+    (6, 0, 0, 4),
+    (7, 0, 6, 4),
+)
+RICH_MESH_NORMALS = ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0))
+RICH_MESH_TANGENTS = (
+    (1.0, 0.0, 0.0, 1.0),
+    (0.0, 0.0, 1.0, -1.0),
+    (0.0, 1.0, 0.0, 1.0),
+)
+RICH_MESH_COLORS = (255, 0, 0, 255, 0, 255, 0, 51, 0, 0, 255, 0)
+RICH_MESH_UV0 = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+RICH_MESH_UV3 = ((0.5, 0.25), (1.5, 2.0), (-1.0, 0.125))
+RICH_MESH_WEIGHTS = (
+    (1.0, 0.0, 0.0, 0.0),
+    (0.5, 0.5, 0.0, 0.0),
+    (0.25, 0.25, 0.5, 0.0),
+)
+RICH_MESH_BONES = (0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 2, 0)
+
+
+def push_rich_mesh_skeleton(output: bytearray) -> None:
+    """One blend shape, one bind pose and its bone hash."""
+    push_i32(output, 1)
+    push_f32s(output, (0.5, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.125))
+    push_u32(output, 2)
+    push_i32(output, 1)
+    push_u32(output, 0)
+    push_u32(output, 1)
+    output.extend((1, 1))
+    align(output, 4)
+    push_i32(output, 1)
+    push_aligned_string(output, "blendShape.smile")
+    push_u32(output, 0xC0FFEE)
+    push_i32(output, 0)
+    push_i32(output, 1)
+    push_i32(output, 1)
+    push_f32s(output, (100.0,))
+    push_i32(output, 1)
+    push_f32s(output, tuple(float(index % 5 == 0) for index in range(16)))
+    push_i32(output, 1)
+    push_u32(output, 0xB0E)
+    push_u32(output, 0xB0E)
+
+
+def rich_mesh_vertex_data() -> bytes:
+    """Eight streams, each starting on the 16-byte boundary Unity uses."""
+    streams = [
+        b"".join(struct.pack("<3f", *vertex) for vertex in RICH_MESH_POSITIONS),
+        b"".join(struct.pack("<3f", *normal) for normal in RICH_MESH_NORMALS),
+        b"".join(struct.pack("<4f", *tangent) for tangent in RICH_MESH_TANGENTS),
+        bytes(RICH_MESH_COLORS),
+        b"".join(struct.pack("<2f", *uv) for uv in RICH_MESH_UV0),
+        b"".join(struct.pack("<2e", *uv) for uv in RICH_MESH_UV3),
+        b"".join(struct.pack("<4f", *weights) for weights in RICH_MESH_WEIGHTS),
+        bytes(RICH_MESH_BONES),
+    ]
+    vertex_data = bytearray()
+    for stream in streams:
+        vertex_data.extend(bytes(-len(vertex_data) % 16))
+        vertex_data.extend(stream)
+    return bytes(vertex_data)
+
+
+RICH_MESH_POSITIONS = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
 def push_tuanjie_mesh_cluster(output: bytearray) -> None:
     push_i32(output, 0)
     output.extend(struct.pack("<f", 1.0))
@@ -233,6 +326,117 @@ def synthetic_mesh_vertex_data() -> bytes:
         push_f32s(vertex_data, vertex)
     vertex_data.extend(bytes(48 - len(vertex_data)))
     return bytes(vertex_data)
+
+
+def unpack_rows(data: bytes, code: str, width: int) -> list[tuple[float, ...]]:
+    values = struct.unpack(f"<{len(data) // struct.calcsize(code)}{code}", data)
+    return [tuple(values[index : index + width]) for index in range(0, len(values), width)]
+
+
+def check_typed_mesh_reads(
+    directory: Path, mesh_studio: UnityRs, external_mesh: UnityRs, other: UnityRs
+) -> None:
+    mesh = mesh_studio.read_mesh(0, 7)
+    assert (mesh.path_id, mesh.name, mesh.vertex_count) == (7, "tri:mesh", 3)
+    assert mesh.positions.dimension == 3
+    assert unpack_rows(mesh.positions.data, "f", 3) == [
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    ]
+    assert mesh.normals is None and mesh.tangents is None and mesh.colors is None
+    assert mesh.uvs == [None] * 8
+    assert len(mesh.sub_meshes) == 1
+    sub_mesh = mesh.sub_meshes[0]
+    assert (
+        sub_mesh.first_byte,
+        sub_mesh.index_count,
+        sub_mesh.first_vertex,
+        sub_mesh.vertex_count,
+    ) == (0, 3, 0, 3)
+    assert struct.unpack("<3I", sub_mesh.indices) == (0, 1, 2)
+    assert mesh.bind_poses == b"" and mesh.bone_name_hashes == b""
+    assert mesh.root_bone_name_hash == 0
+    assert mesh.skin_weights is None and mesh.skin_bone_indices is None
+    assert mesh.blend_shapes is None
+    assert repr(mesh) == 'Mesh(path_id=7, name="tri:mesh", vertex_count=3, sub_meshes=1)'
+    assert repr(mesh.positions) == "MeshAttribute(dimension=3, bytes=36)"
+    assert external_mesh.read_mesh(0, 7).positions.data == mesh.positions.data
+
+    rich_path = directory / "mesh-rich.assets"
+    rich_path.write_bytes(synthetic_mesh(rich=True))
+    rich_studio = UnityRs(rich_path)
+    rich = rich_studio.read_mesh(0, 7)
+    # The OBJ carries positions, UV0 and normals only; the tangent, colour,
+    # UV3 and skin streams beside them change nothing in it.
+    assert rich_studio.read_mesh_obj(0, 7) == (
+        b"g tri:mesh\r\n"
+        b"v -1 0 0\r\n"
+        b"v -0 1 0\r\n"
+        b"v -0 0 1\r\n"
+        b"vt 0 0\r\n"
+        b"vt 1 0\r\n"
+        b"vt 0 1\r\n"
+        b"vn -0 0 1\r\n"
+        b"vn -0 1 0\r\n"
+        b"vn -1 0 0\r\n"
+        b"g tri:mesh_0\r\n"
+        b"f 3/3/3 2/2/2 1/1/1\r\n"
+    )
+    assert rich.normals is not None and rich.normals.dimension == 3
+    assert unpack_rows(rich.normals.data, "f", 3) == list(RICH_MESH_NORMALS)
+    assert rich.tangents is not None and rich.tangents.dimension == 4
+    assert unpack_rows(rich.tangents.data, "f", 4) == list(RICH_MESH_TANGENTS)
+    assert rich.colors is not None and rich.colors.dimension == 4
+    colors = struct.unpack("<12f", rich.colors.data)
+    assert all(
+        abs(actual - expected / 255.0) < 1e-7
+        for actual, expected in zip(colors, RICH_MESH_COLORS)
+    )
+    uv0, uv1, uv2, uv3, *rest = rich.uvs
+    assert uv0 is not None and unpack_rows(uv0.data, "f", 2) == list(RICH_MESH_UV0)
+    assert uv1 is None and uv2 is None and rest == [None] * 4
+    assert uv3 is not None and uv3.dimension == 2
+    assert unpack_rows(uv3.data, "f", 2) == list(RICH_MESH_UV3)
+    assert rich.skin_weights is not None and rich.skin_bone_indices is not None
+    assert unpack_rows(rich.skin_weights, "f", 4) == list(RICH_MESH_WEIGHTS)
+    assert struct.unpack("<12I", rich.skin_bone_indices) == RICH_MESH_BONES
+    assert struct.unpack("<16f", rich.bind_poses) == tuple(
+        float(index % 5 == 0) for index in range(16)
+    )
+    assert struct.unpack("<I", rich.bone_name_hashes) == (0xB0E,)
+    assert rich.root_bone_name_hash == 0xB0E
+    shapes = rich.blend_shapes
+    assert shapes is not None
+    assert struct.unpack("<3f", shapes.vertices) == (0.5, 0.0, 0.0)
+    assert struct.unpack("<3f", shapes.normals) == (0.0, 0.25, 0.0)
+    assert struct.unpack("<3f", shapes.tangents) == (0.0, 0.0, 0.125)
+    assert struct.unpack("<I", shapes.indices) == (2,)
+    assert shapes.frames == [(0, 1, True, True)]
+    assert shapes.channels == [("blendShape.smile", 0xC0FFEE, 0, 1)]
+    assert struct.unpack("<f", shapes.full_weights) == (100.0,)
+
+    # One byte budget bounds the object, every parse budget and the 436 bytes
+    # of returned arrays; the 840-byte object is the largest of them here.
+    try:
+        rich_studio.read_mesh(0, 7, maximum_bytes=839)
+    except ValueError as error:
+        assert str(error) == "Mesh object is 840 bytes, exceeding limit 839", error
+    else:
+        raise AssertionError("Mesh byte budget should be enforced")
+    assert rich_studio.read_mesh(0, 7, maximum_bytes=840).vertex_count == 3
+    try:
+        mesh_studio.read_mesh(0, 7, maximum_bytes=8)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Mesh byte budget should be enforced")
+    try:
+        other.read_mesh(0, 7)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("non-Mesh objects should be rejected")
 
 
 def synthetic_texture2d() -> bytes:
@@ -2754,6 +2958,7 @@ def main() -> None:
             pass
         else:
             raise AssertionError("Mesh OBJ output limit should be enforced")
+        check_typed_mesh_reads(Path(directory), mesh_studio, external_mesh, studio)
         try:
             studio.read_mesh_obj(0, 7)
         except NotImplementedError:

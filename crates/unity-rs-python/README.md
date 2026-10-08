@@ -210,6 +210,13 @@ Path("shader.shader").write_bytes(shader)
 
 mesh_obj = studio.read_mesh_obj(0, 43, maximum_bytes=256 * 1024 * 1024)
 Path("mesh.obj").write_bytes(mesh_obj)
+# The same mesh as typed arrays: each channel is packed little-endian float32
+# with its component count, and sub-mesh indices are packed uint32.
+mesh = studio.read_mesh(0, 43, maximum_bytes=256 * 1024 * 1024)
+positions = memoryview(mesh.positions.data).cast("f")
+uv1 = mesh.uvs[1]
+print(mesh.vertex_count, mesh.tangents and mesh.tangents.dimension, uv1 and uv1.dimension)
+triangles = [memoryview(sub.indices).cast("I") for sub in mesh.sub_meshes]
 
 clip = studio.read_animation_clip(0, 74)
 print(clip.name, clip.muscle_present, clip.acl_present, clip.streaming_path)
