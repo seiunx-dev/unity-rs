@@ -83,6 +83,18 @@ pub struct Live2dPackageLimits {
     pub motion: CubismFadeMotionReadLimits,
     pub clip_motion: CubismClipMotionReadLimits,
     pub animation_graph: AnimationGraphLimits,
+    /// Write every motion segment between two keys as a Bezier, the managed
+    /// extractor's `forceBezier` (its CLI's `--l2d-smooth-motions`).
+    ///
+    /// Off by default, which matches the managed default: a segment whose
+    /// left out-tangent and right in-tangent are both flat is written as a
+    /// line. Unity plays such a segment of an `AnimationCurve` as the ease
+    /// 3s^2 - 2s^3, up to 9.6% of the step away from that line, and the Bezier
+    /// reproduces it. Sampled `AnimationClip` data (dense, constant and ACL
+    /// tracks) also reaches the writer with flat tangents, and Unity
+    /// interpolates those samples linearly, so for such clips the default
+    /// form is the closer one. Inverse-stepped segments are inferred either
+    /// way.
     pub force_bezier_motions: bool,
     pub physics: CubismPhysicsReadLimits,
     pub auxiliary: CubismAuxiliaryReadLimits,
@@ -264,6 +276,8 @@ pub struct Live2dPackage {
     pub motion_targets: CubismMotionTargetNames,
     pub eye_blink_parameters: Vec<String>,
     pub lip_sync_parameters: Vec<String>,
+    /// The planning limits' `force_bezier_motions`, which writers pass to
+    /// [`Live2dPackageMotionSource::write_motion3_json`].
     pub force_bezier_motions: bool,
     pub physics: Option<Live2dPackageJsonFile>,
     pub pose: Option<Live2dPackageJsonFile>,
@@ -4674,6 +4688,50 @@ mod tests {
         assert!(
             motion_error.to_string().contains("Live2D motions"),
             "{motion_error}"
+        );
+    }
+
+    #[test]
+    fn force_bezier_motions_changes_only_flat_tangent_motion_segments() {
+        // The loose fade motion's one curve has keys (0, 0) and (1, 1) with flat
+        // tangents: Unity plays it as 3t^2 - 2t^3, the managed default writes a
+        // line, and force_bezier_motions the Bezier that reproduces the ease.
+        let collection = expression_package_collection_with(&[(0, 10), (0, 20)]);
+        let materialize = |force_bezier_motions| {
+            let set = build_live2d_packages(
+                &collection,
+                Live2dPackageLimits {
+                    force_bezier_motions,
+                    ..Live2dPackageLimits::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(set.packages[0].force_bezier_motions, force_bezier_motions);
+            materialize_live2d_packages(set, Live2dPackageMaterializeLimits::default()).unwrap()
+        };
+        let default = materialize(false);
+        let smooth = materialize(true);
+        let segments = |json: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(json).unwrap()["Curves"][0]["Segments"]
+                .clone()
+        };
+        let default_package = &default.packages[0];
+        let smooth_package = &smooth.packages[0];
+        assert_eq!(default_package.motions.len(), 1);
+        assert_eq!(
+            segments(&default_package.motions[0].json),
+            serde_json::json!([0, 0, 0, 1, 1])
+        );
+        assert_eq!(
+            segments(&smooth_package.motions[0].json),
+            serde_json::json!([0, 0, 1, 0.333, 0, 0.667, 1, 1, 1])
+        );
+        assert_eq!(default_package.manifest, smooth_package.manifest);
+        assert_eq!(default_package.expressions, smooth_package.expressions);
+        assert_eq!(default_package.physics, smooth_package.physics);
+        assert!(
+            !Live2dPackageLimits::default().force_bezier_motions,
+            "the managed linear form stays the default"
         );
     }
 

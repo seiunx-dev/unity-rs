@@ -4386,12 +4386,17 @@ impl PyUnityRs {
     }
 
     /// Materializes the verified Live2D package slice in memory.
+    ///
+    /// `force_bezier_motions` writes every motion segment as a Bezier, as
+    /// `force_bezier` does for one motion; the default keeps the managed
+    /// extractor's linear flat-tangent segments.
     #[pyo3(signature = (
         *,
         schemas=None,
         acl_decoder=None,
         maximum_file_bytes=536_870_912,
-        maximum_total_bytes=4_294_967_296
+        maximum_total_bytes=4_294_967_296,
+        force_bezier_motions=false
     ))]
     fn read_live2d_packages(
         &self,
@@ -4400,6 +4405,7 @@ impl PyUnityRs {
         acl_decoder: Option<Py<PyAny>>,
         maximum_file_bytes: u64,
         maximum_total_bytes: u64,
+        force_bezier_motions: bool,
     ) -> PyResult<PyLive2dPackageSet> {
         if acl_decoder
             .as_ref()
@@ -4415,6 +4421,7 @@ impl PyUnityRs {
                 maximum_output_bytes: maximum_file_bytes,
                 ..TextureReadLimits::default()
             },
+            force_bezier_motions,
             ..Live2dPackageLimits::default()
         };
         let materialize_limits = Live2dPackageMaterializeLimits {

@@ -385,6 +385,7 @@ function consumeEveryUnityRsMember(studio: UnityRs): void {
   void studio.readCubismPhysics(0, 1n, 60, 1024);
   void studio.readCubismExpression(0, 1n, 1024);
   void studio.readCubismFadeMotion(0, 1n, 1024);
+  void studio.readCubismFadeMotion(0, 1n, undefined, true);
   void studio.readCubismPosePart(0, 1n, 1024);
   void studio.readCubismDisplayInfo(0, 1n, 1024);
   void studio.readCubismClipMotion(0, 1n, undefined, false, 1024);
@@ -398,12 +399,21 @@ function consumeEveryUnityRsMember(studio: UnityRs): void {
   );
   void studio.live2DPackages();
   void studio.readLive2DPackages(1024);
+  void studio.readLive2DPackages(undefined, true);
   void studio.readLive2DPackagesWithSchemas(live2dSchemas, 1024, 4096);
+  void studio.readLive2DPackagesWithSchemas(live2dSchemas, 1024, 4096, true);
   void studio.readLive2DPackagesWithAclDecoder(
     decodeAcl,
     live2dSchemas,
     1024,
     4096,
+  );
+  void studio.readLive2DPackagesWithAclDecoder(
+    decodeAcl,
+    live2dSchemas,
+    1024,
+    4096,
+    true,
   );
   void studio.readModelObj("model.mtl", 1024, "png", textureLimits);
   void studio.readFbxWithTextures(1024, "png", textureLimits);

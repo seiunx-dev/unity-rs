@@ -112,7 +112,7 @@ Common commands:
 | `split-objects` | Export one FBX per managed-compatible GameObject candidate |
 | `animator` | Export one FBX per Animator candidate |
 | `live2d` | Export verified `.moc3` payloads |
-| `live2d-package` | Materialize verified Live2D packages |
+| `live2d-package` | Materialize verified Live2D packages (`--l2d-smooth-motions` writes Bezier motion segments) |
 
 Use `cargo run -p unity-rs-cli -- --help` or
 `cargo run -p unity-rs-cli -- <command> --help` for complete options and

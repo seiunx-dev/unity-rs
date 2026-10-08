@@ -2328,12 +2328,17 @@ impl UnityRs {
     }
 
     /// Reads a `CubismFadeMotionData` and writes its motion3.json.
+    ///
+    /// `forceBezier` writes every segment as a Bezier, as it does for
+    /// `readCubismClipMotion`; by default a segment whose tangents are both
+    /// flat is written as a line, as the managed extractor does.
     #[napi]
     pub fn read_cubism_fade_motion(
         &self,
         file_index: u32,
         path_id: BigInt,
         maximum_bytes: Option<i64>,
+        force_bezier: Option<bool>,
     ) -> Result<CubismDocument> {
         let maximum = byte_limit(maximum_bytes)?;
         let motion = self
@@ -2341,7 +2346,12 @@ impl UnityRs {
             .read_cubism_fade_motion(CubismFadeMotionReadLimits::default())
             .map_err(core_error)?;
         let json = materialize_core_bytes(maximum, "motion3 JSON", |output| {
-            motion.write_motion3_json(&CubismMotionTargetNames::default(), false, output, maximum)
+            motion.write_motion3_json(
+                &CubismMotionTargetNames::default(),
+                force_bezier.unwrap_or(false),
+                output,
+                maximum,
+            )
         })?;
         let entry_count = count_u32(motion.curves.len(), "Cubism fade-motion curve count")?;
         Ok(CubismDocument {
@@ -2904,9 +2914,19 @@ impl UnityRs {
     ///
     /// Returned in memory rather than written, so the caller decides where the
     /// files land and stays inside whatever budget it set.
+    ///
+    /// `forceBezierMotions` writes every motion segment as a Bezier, as
+    /// `forceBezier` does for one motion; the default keeps the managed
+    /// extractor's linear flat-tangent segments. The schema and ACL forms take
+    /// it last too.
     #[napi]
-    pub fn read_live2d_packages(&self, maximum_bytes: Option<i64>) -> Result<Live2dPackageSet> {
-        let (planning_limits, materialize_limits) = live2d_package_limits(None, maximum_bytes)?;
+    pub fn read_live2d_packages(
+        &self,
+        maximum_bytes: Option<i64>,
+        force_bezier_motions: Option<bool>,
+    ) -> Result<Live2dPackageSet> {
+        let (planning_limits, materialize_limits) =
+            live2d_package_limits(None, maximum_bytes, force_bezier_motions)?;
         let set = self
             .studio
             .read_live2d_packages(planning_limits, materialize_limits)
@@ -2926,10 +2946,14 @@ impl UnityRs {
         #[napi(ts_arg_type = "Array<MonoBehaviourSchema>")] schemas: Array<'_>,
         maximum_file_bytes: Option<i64>,
         maximum_total_bytes: Option<i64>,
+        force_bezier_motions: Option<bool>,
     ) -> Result<Live2dPackageSet> {
         let registry = build_schema_registry(env, schemas)?;
-        let (planning_limits, materialize_limits) =
-            live2d_package_limits(maximum_file_bytes, maximum_total_bytes)?;
+        let (planning_limits, materialize_limits) = live2d_package_limits(
+            maximum_file_bytes,
+            maximum_total_bytes,
+            force_bezier_motions,
+        )?;
         let set = self
             .studio
             .read_live2d_packages_with_schema_provider(
@@ -2957,12 +2981,16 @@ impl UnityRs {
         >,
         maximum_file_bytes: Option<i64>,
         maximum_total_bytes: Option<i64>,
+        force_bezier_motions: Option<bool>,
     ) -> Result<AsyncTask<Live2dPackagesWithAclTask>> {
         let schemas = schemas
             .map(|schemas| parse_schema_entries(env, schemas))
             .transpose()?;
-        let (planning_limits, materialize_limits) =
-            live2d_package_limits(maximum_file_bytes, maximum_total_bytes)?;
+        let (planning_limits, materialize_limits) = live2d_package_limits(
+            maximum_file_bytes,
+            maximum_total_bytes,
+            force_bezier_motions,
+        )?;
         Ok(AsyncTask::new(Live2dPackagesWithAclTask {
             studio: Arc::clone(&self.studio),
             planning_limits,
@@ -4067,6 +4095,7 @@ fn build_scene(studio: &Studio, limits: SceneHierarchyLimits) -> Result<Vec<Scen
 fn live2d_package_limits(
     maximum_file_bytes: Option<i64>,
     maximum_total_bytes: Option<i64>,
+    force_bezier_motions: Option<bool>,
 ) -> Result<(Live2dPackageLimits, Live2dPackageMaterializeLimits)> {
     let maximum_file_bytes = non_negative_limit(
         maximum_file_bytes,
@@ -4087,6 +4116,7 @@ fn live2d_package_limits(
         maximum_total_texture_payload_bytes: maximum_total_bytes,
         maximum_total_manifest_bytes: maximum_total_bytes,
         texture,
+        force_bezier_motions: force_bezier_motions.unwrap_or(false),
         ..Live2dPackageLimits::default()
     };
     let materialize = Live2dPackageMaterializeLimits {
@@ -5707,9 +5737,10 @@ fn core_error(error: unity_rs_core::Error) -> Error {
 mod tests {
     use super::{
         ByteReadKind, DisplayRowImage, DisplayRowImages, ExportConfiguration, ModelTextureLimits,
-        OpenOptions, ReadBytesTask, UnityRs, copy_path_string, export_configuration, load_options,
-        materialize_core_bytes, model_texture_limits, parse_audio_format, parse_export_mode,
-        parse_filename_format, parse_image_format, shader_array_limits,
+        OpenOptions, ReadBytesTask, UnityRs, copy_path_string, export_configuration,
+        live2d_package_limits, load_options, materialize_core_bytes, model_texture_limits,
+        parse_audio_format, parse_export_mode, parse_filename_format, parse_image_format,
+        shader_array_limits,
     };
     use napi::Task;
     use napi::bindgen_prelude::BigInt;
@@ -6050,6 +6081,329 @@ mod tests {
         let defaults = export_configuration(None).expect("default export options");
         assert_eq!(defaults.maximum_shader_array_elements, 1_000_000);
         assert_eq!(defaults.maximum_shader_total_array_elements, 4_000_000);
+    }
+
+    /// `MonoBehaviour` base fields, then one `PPtr` field when `pointer` names
+    /// it, as `(type, name, level, align)` `TypeTree` nodes.
+    fn behaviour_nodes(
+        pointer: Option<(&'static str, &'static str)>,
+    ) -> Vec<(&'static str, &'static str, u8, bool)> {
+        let mut nodes = vec![
+            ("MonoBehaviour", "Base", 0, false),
+            ("PPtr<GameObject>", "m_GameObject", 1, false),
+            ("int", "m_FileID", 2, false),
+            ("SInt64", "m_PathID", 2, false),
+            ("UInt8", "m_Enabled", 1, true),
+            ("PPtr<MonoScript>", "m_Script", 1, false),
+            ("int", "m_FileID", 2, false),
+            ("SInt64", "m_PathID", 2, false),
+            ("string", "m_Name", 1, false),
+            ("Array", "Array", 2, true),
+            ("int", "size", 3, false),
+            ("char", "data", 3, false),
+        ];
+        if let Some((type_name, field_name)) = pointer {
+            nodes.extend_from_slice(&[
+                (type_name, field_name, 1, false),
+                ("int", "m_FileID", 2, false),
+                ("SInt64", "m_PathID", 2, false),
+            ]);
+        }
+        nodes
+    }
+
+    /// The managed `CubismFadeMotionData` layout.
+    fn fade_motion_nodes() -> Vec<(&'static str, &'static str, u8, bool)> {
+        let mut nodes = behaviour_nodes(None);
+        nodes.extend_from_slice(&[
+            ("string", "MotionName", 1, false),
+            ("Array", "Array", 2, true),
+            ("int", "size", 3, false),
+            ("char", "data", 3, false),
+            ("float", "FadeInTime", 1, false),
+            ("float", "FadeOutTime", 1, false),
+            ("vector", "ParameterIds", 1, false),
+            ("Array", "Array", 2, false),
+            ("int", "size", 3, false),
+            ("string", "data", 3, false),
+            ("Array", "Array", 4, true),
+            ("int", "size", 5, false),
+            ("char", "data", 5, false),
+            ("vector", "ParameterCurves", 1, false),
+            ("Array", "Array", 2, false),
+            ("int", "size", 3, false),
+            ("AnimationCurve", "data", 3, false),
+            ("vector", "m_Curve", 4, false),
+            ("Array", "Array", 5, false),
+            ("int", "size", 6, false),
+            ("Keyframe", "data", 6, false),
+            ("float", "time", 7, false),
+            ("float", "value", 7, false),
+            ("float", "inSlope", 7, false),
+            ("float", "outSlope", 7, false),
+            ("int", "weightedMode", 7, false),
+            ("float", "inWeight", 7, false),
+            ("float", "outWeight", 7, false),
+            ("int", "m_PreInfinity", 4, false),
+            ("int", "m_PostInfinity", 4, false),
+            ("int", "m_RotationOrder", 4, false),
+            ("vector", "ParameterFadeInTimes", 1, false),
+            ("Array", "Array", 2, false),
+            ("int", "size", 3, false),
+            ("float", "data", 3, false),
+            ("vector", "ParameterFadeOutTimes", 1, false),
+            ("Array", "Array", 2, false),
+            ("int", "size", 3, false),
+            ("float", "data", 3, false),
+            ("float", "MotionLength", 1, false),
+        ]);
+        nodes
+    }
+
+    fn pptr(output: &mut Vec<u8>, path_id: i64) {
+        output.extend_from_slice(&0_i32.to_le_bytes());
+        output.extend_from_slice(&path_id.to_le_bytes());
+    }
+
+    fn behaviour_prefix(script: i64, name: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        pptr(&mut output, 1);
+        output.extend_from_slice(&[1, 0, 0, 0]);
+        pptr(&mut output, script);
+        aligned_string(&mut output, name);
+        output
+    }
+
+    fn cubism_script(class_name: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        aligned_string(&mut output, "Cubism script");
+        output.extend_from_slice(&[0; 4]);
+        output.extend_from_slice(&[0x55; 16]);
+        for value in [class_name, "Live2D.Cubism.Core", "Live2D.Cubism.dll"] {
+            aligned_string(&mut output, value);
+        }
+        output
+    }
+
+    /// A `Hero` model, its MOC, and one loose fade motion (path ID 32) whose
+    /// `ParamAngleX` curve has keys (0, 0) and (1, 1) and flat tangents, the
+    /// curve of issue #10, in one v22 file with embedded trees.
+    fn live2d_package_with_fade_motion() -> Vec<u8> {
+        type Nodes = Vec<(&'static str, &'static str, u8, bool)>;
+        let types: [(i32, Option<u8>, Option<Nodes>); 6] = [
+            (1, None, None),
+            (4, None, None),
+            (
+                114,
+                Some(0x20),
+                Some(behaviour_nodes(Some(("PPtr<CubismMoc>", "_moc")))),
+            ),
+            (114, Some(0x30), None),
+            (114, Some(0x2A), Some(fade_motion_nodes())),
+            (115, None, None),
+        ];
+        let mut game_object = 2_i32.to_le_bytes().to_vec();
+        pptr(&mut game_object, 10);
+        pptr(&mut game_object, 20);
+        game_object.extend_from_slice(&[0; 4]);
+        aligned_string(&mut game_object, "Hero");
+        let mut transform = Vec::new();
+        pptr(&mut transform, 1);
+        for value in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+            transform.extend_from_slice(&value.to_le_bytes());
+        }
+        transform.extend_from_slice(&[0; 4]);
+        pptr(&mut transform, 0);
+        let mut model = behaviour_prefix(100, "");
+        pptr(&mut model, 30);
+        let mut moc = behaviour_prefix(102, "moc");
+        moc.extend_from_slice(&5_i32.to_le_bytes());
+        moc.extend_from_slice(b"MOC3\x09");
+        let mut motion = behaviour_prefix(112, "idle.fade.asset");
+        aligned_string(&mut motion, "idle");
+        for value in [0.2_f32, 0.3] {
+            motion.extend_from_slice(&value.to_le_bytes());
+        }
+        motion.extend_from_slice(&1_i32.to_le_bytes());
+        aligned_string(&mut motion, "ParamAngleX");
+        motion.extend_from_slice(&1_i32.to_le_bytes());
+        motion.extend_from_slice(&2_i32.to_le_bytes());
+        for key in [[0.0_f32, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]] {
+            for value in key {
+                motion.extend_from_slice(&value.to_le_bytes());
+            }
+            motion.extend_from_slice(&[0; 12]); // weightedMode, inWeight, outWeight
+        }
+        motion.extend_from_slice(&[0; 12]); // pre/post infinity, rotation order
+        for fade_time in [0.4_f32, 0.5] {
+            motion.extend_from_slice(&1_i32.to_le_bytes());
+            motion.extend_from_slice(&fade_time.to_le_bytes());
+        }
+        motion.extend_from_slice(&1.0_f32.to_le_bytes()); // motion length
+        let objects: [(i64, i32, Vec<u8>); 8] = [
+            (1, 0, game_object),
+            (10, 1, transform),
+            (20, 2, model),
+            (30, 3, moc),
+            (32, 4, motion),
+            (100, 5, cubism_script("CubismModel")),
+            (102, 5, cubism_script("CubismMoc")),
+            (112, 5, cubism_script("CubismFadeMotionData")),
+        ];
+        v22_with_trees(&types, &objects)
+    }
+
+    /// A v22 serialized file whose types carry the given trees (none for a
+    /// native class) and `MonoBehaviour` script hashes.
+    #[allow(clippy::type_complexity)]
+    fn v22_with_trees(
+        types: &[(
+            i32,
+            Option<u8>,
+            Option<Vec<(&'static str, &'static str, u8, bool)>>,
+        )],
+        objects: &[(i64, i32, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut metadata = b"2022.3.62f1\0".to_vec();
+        metadata.extend_from_slice(&13_i32.to_le_bytes());
+        metadata.push(1);
+        metadata.extend_from_slice(&i32::try_from(types.len()).unwrap().to_le_bytes());
+        for (class_id, script_hash, nodes) in types {
+            metadata.extend_from_slice(&class_id.to_le_bytes());
+            metadata.extend_from_slice(&[0, 0xff, 0xff]);
+            if let Some(hash) = script_hash {
+                metadata.extend_from_slice(&[*hash; 16]);
+            }
+            metadata.extend_from_slice(&[0x42; 16]);
+            let nodes = nodes.as_deref().unwrap_or_default();
+            let mut strings = Vec::new();
+            let mut records = Vec::new();
+            for (index, (type_name, field_name, level, align)) in nodes.iter().enumerate() {
+                let type_offset = u32::try_from(strings.len()).unwrap();
+                strings.extend_from_slice(type_name.as_bytes());
+                strings.push(0);
+                let name_offset = u32::try_from(strings.len()).unwrap();
+                strings.extend_from_slice(field_name.as_bytes());
+                strings.push(0);
+                records.extend_from_slice(&1_u16.to_le_bytes());
+                records.extend_from_slice(&[*level, 0]);
+                records.extend_from_slice(&type_offset.to_le_bytes());
+                records.extend_from_slice(&name_offset.to_le_bytes());
+                records.extend_from_slice(&(-1_i32).to_le_bytes());
+                records.extend_from_slice(&i32::try_from(index).unwrap().to_le_bytes());
+                records.extend_from_slice(&(if *align { 0x4000_i32 } else { 0 }).to_le_bytes());
+                records.extend_from_slice(&[0; 8]);
+            }
+            metadata.extend_from_slice(&i32::try_from(nodes.len()).unwrap().to_le_bytes());
+            metadata.extend_from_slice(&i32::try_from(strings.len()).unwrap().to_le_bytes());
+            metadata.extend_from_slice(&records);
+            metadata.extend_from_slice(&strings);
+            metadata.extend_from_slice(&[0; 4]); // no type dependencies
+        }
+        metadata.extend_from_slice(&i32::try_from(objects.len()).unwrap().to_le_bytes());
+        let mut data = Vec::new();
+        for (path_id, type_index, payload) in objects {
+            data.resize(data.len().next_multiple_of(4), 0);
+            metadata.resize((48 + metadata.len()).next_multiple_of(4) - 48, 0);
+            metadata.extend_from_slice(&path_id.to_le_bytes());
+            metadata.extend_from_slice(&i64::try_from(data.len()).unwrap().to_le_bytes());
+            metadata.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            metadata.extend_from_slice(&type_index.to_le_bytes());
+            data.extend_from_slice(payload);
+        }
+        metadata.extend_from_slice(&[0; 13]); // scripts, externals, ref types, user info
+        let data_offset = (48 + metadata.len()).next_multiple_of(16);
+        let mut file = vec![0; 48];
+        file[8..12].copy_from_slice(&22_u32.to_be_bytes());
+        file[20..24].copy_from_slice(&u32::try_from(metadata.len()).unwrap().to_be_bytes());
+        let file_size = u64::try_from(data_offset + data.len()).unwrap();
+        file[24..32].copy_from_slice(&file_size.to_be_bytes());
+        file[32..40].copy_from_slice(&u64::try_from(data_offset).unwrap().to_be_bytes());
+        file.extend_from_slice(&metadata);
+        file.resize(data_offset, 0);
+        file.extend_from_slice(&data);
+        file
+    }
+
+    #[test]
+    fn force_bezier_reaches_fade_motions_and_whole_packages() {
+        let addon = UnityRs {
+            studio: Arc::new(
+                Studio::open_region(
+                    "live2d.assets",
+                    Region::from_bytes(live2d_package_with_fade_motion()),
+                )
+                .expect("synthetic Live2D package"),
+            ),
+        };
+        // The first curve's segment numbers as written, one per line.
+        let segments = |json: &[u8]| -> Vec<String> {
+            let text = std::str::from_utf8(json).unwrap();
+            let start = text.find("\"Segments\": [").unwrap() + 14;
+            let end = start + text[start..].find(']').unwrap();
+            text[start..end]
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let linear = ["0", "0", "0", "1", "1"];
+        let bezier = ["0", "0", "1", "0.333", "0", "0.667", "1", "1", "1"];
+
+        let default = addon
+            .read_cubism_fade_motion(0, BigInt::from(32_i64), None, None)
+            .expect("default fade motion");
+        assert_eq!(segments(&default.json), linear);
+        let unforced = addon
+            .read_cubism_fade_motion(0, BigInt::from(32_i64), None, Some(false))
+            .expect("explicitly unforced fade motion");
+        assert_eq!(&unforced.json[..], &default.json[..]);
+        let forced = addon
+            .read_cubism_fade_motion(0, BigInt::from(32_i64), None, Some(true))
+            .expect("forced fade motion");
+        assert_eq!(segments(&forced.json), bezier);
+
+        let motion_file = "motions/idle.fade.motion3.json";
+        let files = |force: Option<bool>| -> Vec<(String, Vec<u8>)> {
+            let set = addon
+                .read_live2d_packages(None, force)
+                .expect("Live2D packages");
+            assert!(set.diagnostics.is_empty());
+            assert_eq!(set.packages.len(), 1);
+            set.packages
+                .into_iter()
+                .flat_map(|package| package.files)
+                .map(|file| (file.file_name, file.data.to_vec()))
+                .collect()
+        };
+        let default_files = files(None);
+        assert_eq!(files(Some(false)), default_files);
+        let smooth_files = files(Some(true));
+        assert_eq!(smooth_files.len(), default_files.len());
+        for ((name, data), (smooth_name, smooth_data)) in default_files.iter().zip(&smooth_files) {
+            assert_eq!(name, smooth_name);
+            if name == motion_file {
+                // The package writes the per-motion reader's document.
+                assert_eq!(&data[..], &default.json[..]);
+                assert_eq!(&smooth_data[..], &forced.json[..]);
+            } else {
+                assert_eq!(data, smooth_data, "{name}");
+            }
+        }
+        assert!(default_files.iter().any(|(name, _)| name == motion_file));
+    }
+
+    #[test]
+    fn maps_the_live2d_force_bezier_switch() {
+        let (defaults, _) = live2d_package_limits(None, None, None).unwrap();
+        assert!(!defaults.force_bezier_motions);
+        let (unforced, _) = live2d_package_limits(None, None, Some(false)).unwrap();
+        assert!(!unforced.force_bezier_motions);
+        let (forced, materialize) = live2d_package_limits(Some(4), Some(8), Some(true)).unwrap();
+        assert!(forced.force_bezier_motions);
+        assert_eq!(materialize.maximum_file_bytes, 4);
+        assert_eq!(materialize.maximum_total_bytes, 8);
     }
 
     #[cfg(unix)]
