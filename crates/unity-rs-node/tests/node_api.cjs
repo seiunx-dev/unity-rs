@@ -8,7 +8,9 @@ const addon = require('../index.js')
 
 const compareNames = (left, right) => left.localeCompare(right, 'en')
 
-assert.deepStrictEqual(Object.keys(addon).sort(compareNames), ['UnityRs'])
+// `__napiBindingTarget` is the loader marker napi-rs CLI 3.10 generates.
+assert.deepStrictEqual(Object.keys(addon).sort(compareNames), ['__napiBindingTarget', 'UnityRs'])
+assert.strictEqual(addon.__napiBindingTarget, 'native')
 
 function u32(value) {
   const output = Buffer.alloc(4)
