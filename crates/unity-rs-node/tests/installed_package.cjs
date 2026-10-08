@@ -82,7 +82,9 @@ function verifyInstalledPackage(installedRoot, expectedVersion) {
   assert.equal(installedPackage.version, expectedVersion);
 
   const addon = require(installedRoot);
-  assert.deepEqual(Object.keys(addon), ["UnityRs"]);
+  // `__napiBindingTarget` is the loader marker napi-rs CLI 3.10 generates.
+  assert.deepEqual(Object.keys(addon).sort(), ["UnityRs", "__napiBindingTarget"]);
+  assert.equal(addon.__napiBindingTarget, "native");
   assert.equal(typeof addon.UnityRs, "function");
   const declaration = readFileSync(join(installedRoot, "index.d.ts"), "utf8");
   assertUnityRsSurface(addon.UnityRs, declaration);
