@@ -71,9 +71,23 @@ impl Region {
 
     #[must_use]
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Self {
-        let source = Arc::new(MemorySource {
+        Self::from_memory(MemorySource {
             bytes: bytes.into(),
-        });
+        })
+    }
+
+    /// [`Self::from_bytes`] for an owned buffer, taking it over in place.
+    ///
+    /// `Vec<u8>` into `Arc<[u8]>` allocates and copies the whole buffer, so
+    /// the decompressed entries and blocks this crate produces would briefly
+    /// exist twice.
+    #[must_use]
+    pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
+        Self::from_memory(MemorySource { bytes })
+    }
+
+    fn from_memory<B: AsRef<[u8]> + Send + Sync + 'static>(source: MemorySource<B>) -> Self {
+        let source = Arc::new(source);
         Self {
             length: source.len(),
             source,
@@ -330,13 +344,13 @@ impl Source for FileSource {
     }
 }
 
-struct MemorySource {
-    bytes: Arc<[u8]>,
+struct MemorySource<B> {
+    bytes: B,
 }
 
-impl Source for MemorySource {
+impl<B: AsRef<[u8]> + Send + Sync> Source for MemorySource<B> {
     fn len(&self) -> u64 {
-        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+        u64::try_from(self.bytes.as_ref().len()).unwrap_or(u64::MAX)
     }
 
     fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
@@ -349,7 +363,7 @@ impl Source for MemorySource {
         let end = start.checked_add(output.len()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "memory read range overflowed")
         })?;
-        let source = self.bytes.get(start..end).ok_or_else(|| {
+        let source = self.bytes.as_ref().get(start..end).ok_or_else(|| {
             io::Error::new(io::ErrorKind::UnexpectedEof, "memory read exceeds source")
         })?;
         output.copy_from_slice(source);
@@ -483,6 +497,26 @@ mod tests {
         assert_eq!(bytes, b"23456");
         assert!(cursor.seek(SeekFrom::Start(6)).is_err());
         assert!(root.subregion(8, 3).is_err());
+    }
+
+    #[test]
+    fn owned_vector_regions_read_like_shared_byte_regions() {
+        let bytes = b"0123456789".to_vec();
+        let owned = Region::from_vec(bytes.clone());
+        let shared = Region::from_bytes(bytes);
+        assert_eq!(owned.len(), shared.len());
+        assert_eq!(
+            owned.read_to_vec(10).unwrap(),
+            shared.read_to_vec(10).unwrap()
+        );
+        let owned_tail = owned.subregion(4, 6).unwrap();
+        let shared_tail = shared.subregion(4, 6).unwrap();
+        assert_eq!(
+            owned_tail.read_to_vec(6).unwrap(),
+            shared_tail.read_to_vec(6).unwrap()
+        );
+        assert!(owned.subregion(8, 3).is_err());
+        assert!(owned.read_to_vec(9).is_err());
     }
 
     #[test]

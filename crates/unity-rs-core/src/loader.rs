@@ -863,7 +863,7 @@ impl AssetCollection {
         let mut block_cache = crate::bundle::BlockDecodeCache::new();
         for index in 0..bundle.entries.len() {
             let entry = &bundle.entries[index];
-            let region = Region::from_bytes(bundle.read_entry_with_cache(index, &mut block_cache)?);
+            let region = Region::from_vec(bundle.read_entry_with_cache(index, &mut block_cache)?);
             enqueue_nested_input(
                 input,
                 &entry.path,
@@ -895,7 +895,7 @@ impl AssetCollection {
             enqueue_nested_input(
                 input,
                 &entry.path,
-                Region::from_bytes(bundle.read_entry(index)?),
+                Region::from_vec(bundle.read_entry(index)?),
                 true,
                 version_hint.clone(),
                 limits,
