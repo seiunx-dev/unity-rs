@@ -4,7 +4,9 @@ use std::io::{self, Write};
 
 use crate::managed_number::ManagedNumber;
 use crate::serialized::{TypeTree, TypeTreeNode};
-use crate::type_tree::{TypeField, TypeMapEntry, TypeTreeLayout, TypeValue, is_array_parent};
+use crate::type_tree::{
+    ByteElement, TypeField, TypeMapEntry, TypeTreeLayout, TypeValue, is_array_parent,
+};
 use crate::{Error, Result};
 
 /// Writes the legacy `TypeTreeHelper.ReadTypeString` representation.
@@ -75,6 +77,9 @@ impl<W: Write> DumpFormatter<'_, W> {
                 Ok(self.layout.subtree_end(index))
             }
             TypeValue::Array(values) => self.write_array(index, node, values),
+            TypeValue::ByteArray { element, bytes } => {
+                self.write_byte_array(index, node, *element, bytes)
+            }
             TypeValue::Map(entries) => {
                 require_type(node, "map", "map")?;
                 self.write_map(index, node, entries)
@@ -183,6 +188,31 @@ impl<W: Write> DumpFormatter<'_, W> {
             self.write_prefix(element_level)?;
             writeln_crlf(self.output, format_args!("[{element_index}]"))?;
             self.write_node(data_index, value)?;
+        }
+        Ok(self.layout.subtree_end(index))
+    }
+
+    /// Writes a byte array as the same lines `write_array` writes for the
+    /// element-wise array it stands for, one element at a time.
+    fn write_byte_array(
+        &mut self,
+        index: usize,
+        node: &TypeTreeNode,
+        element: ByteElement,
+        bytes: &[u8],
+    ) -> Result<usize> {
+        let data_index = array_shape(self.nodes, self.layout, index)?;
+        let array_level = checked_level(node.level, 1)?;
+        let element_level = checked_level(node.level, 2)?;
+        self.write_container(node)?;
+        self.write_prefix(array_level)?;
+        self.output.write_all(b"Array Array\r\n")?;
+        self.write_prefix(array_level)?;
+        writeln_crlf(self.output, format_args!("int size = {}", bytes.len()))?;
+        for (element_index, byte) in bytes.iter().copied().enumerate() {
+            self.write_prefix(element_level)?;
+            writeln_crlf(self.output, format_args!("[{element_index}]"))?;
+            self.write_node(data_index, &element.value(byte))?;
         }
         Ok(self.layout.subtree_end(index))
     }
@@ -549,7 +579,95 @@ impl<W: Write> Write for BoundedDumpWriter<'_, W> {
 mod tests {
     use super::write_type_tree_dump;
     use crate::serialized::{TypeTree, TypeTreeNode};
-    use crate::type_tree::{TypeField, TypeMapEntry, TypeValue};
+    use crate::type_tree::{ByteElement, TypeField, TypeMapEntry, TypeValue};
+
+    /// A byte array dumps the same lines as the element-wise array the 0.5
+    /// reader produced for it, for each element type and every byte value.
+    #[test]
+    fn writes_byte_arrays_exactly_as_their_element_wise_arrays() {
+        let every_byte = (0..=u8::MAX).collect::<Vec<_>>();
+        for (element, type_name) in [
+            (ByteElement::Unsigned8, "UInt8"),
+            (ByteElement::Signed8, "SInt8"),
+            (ByteElement::Character8, "char"),
+        ] {
+            let tree = TypeTree {
+                nodes: vec![
+                    node("Root", "Base", 0),
+                    node("vector", "_bytes", 1),
+                    node("Array", "Array", 2),
+                    node("int", "size", 3),
+                    node(type_name, "data", 3),
+                    node("int", "m_Trailing", 1),
+                ],
+                string_buffer: Vec::new(),
+            };
+            for bytes in [Vec::new(), every_byte.clone()] {
+                let dump = |value: TypeValue| {
+                    let root = TypeValue::Object(vec![
+                        field("_bytes", value),
+                        field("m_Trailing", TypeValue::Signed(3)),
+                    ]);
+                    let mut output = Vec::new();
+                    write_type_tree_dump(&tree, &root, &mut output, 1 << 20).unwrap();
+                    output
+                };
+                let element_wise =
+                    TypeValue::Array(bytes.iter().map(|b| element.value(*b)).collect());
+                assert_eq!(
+                    dump(TypeValue::ByteArray {
+                        element,
+                        bytes: bytes.clone()
+                    }),
+                    dump(element_wise),
+                    "{type_name}, {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+
+        let tree = TypeTree {
+            nodes: vec![
+                node("vector", "_bytes", 0),
+                node("Array", "Array", 1),
+                node("int", "size", 2),
+                node("SInt8", "data", 2),
+            ],
+            string_buffer: Vec::new(),
+        };
+        let mut output = Vec::new();
+        write_type_tree_dump(
+            &tree,
+            &TypeValue::ByteArray {
+                element: ByteElement::Signed8,
+                bytes: vec![0xff],
+            },
+            &mut output,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "vector _bytes\r\n\tArray Array\r\n\tint size = 1\r\n\t\t[0]\r\n\t\tSInt8 data = -1\r\n"
+        );
+
+        // A byte array decoded against a tree whose element is not that byte
+        // type is refused, as the element-wise array is.
+        let error = write_type_tree_dump(
+            &tree,
+            &TypeValue::ByteArray {
+                element: ByteElement::Unsigned8,
+                bytes: vec![1],
+            },
+            &mut Vec::new(),
+            4096,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not match SInt8 data"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn writes_classes_strings_arrays_maps_typeless_and_managed_scalars() {

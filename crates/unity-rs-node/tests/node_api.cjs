@@ -2367,6 +2367,65 @@ testAsyncWorkers().catch((error) => {
   assert.throws(() => cubismStudio.readCubismFadeMotion(0, 11n))
 }
 
+// From 0.6 a UInt8, SInt8 or one-byte char vector is read as one byte array
+// rather than one value per byte (#5). The JSON is the same document, and a
+// CubismMoc-sized `_bytes` that 0.5 refused reads with the default limits.
+async function testByteArrayTypeTrees() {
+  const byteArrayNodes = [
+    ...cubismMonoBehaviourNodes(),
+    { type: 'vector', name: '_bytes', level: 1, align: true },
+    { type: 'Array', name: 'Array', level: 2, array: true },
+    { type: 'int', name: 'size', size: 4, level: 3 },
+    { type: 'UInt8', name: 'data', size: 1, level: 3 },
+    { type: 'vector', name: 'signed', level: 1, align: true },
+    { type: 'Array', name: 'Array', level: 2, array: true },
+    { type: 'int', name: 'size', size: 4, level: 3 },
+    { type: 'SInt8', name: 'data', size: 1, level: 3 },
+    { type: 'vector', name: 'text', level: 1, align: true },
+    { type: 'Array', name: 'Array', level: 2, array: true },
+    { type: 'int', name: 'size', size: 4, level: 3 },
+    { type: 'char', name: 'data', size: 1, level: 3 },
+  ]
+  const byteArrayAsset = (moc) => typeTreeAsset(114, byteArrayNodes, Buffer.concat([
+    cubismMonoBehaviourPayload('moc'),
+    i32(moc.length),
+    moc,
+    Buffer.alloc((4 - (moc.length % 4)) % 4),
+    i32(3),
+    Buffer.from([0x80, 0xff, 0x7f, 0]),
+    i32(2),
+    Buffer.from([0x41, 0x22, 0, 0]),
+  ]))
+  const document = (body) => '{"m_GameObject":{"m_FileID":0,"m_PathID":0},"m_Enabled":1,' +
+    '"m_Script":{"m_FileID":0,"m_PathID":0},"m_Name":"moc",' +
+    `"_bytes":[${body}],"signed":[-128,-1,127],"text":["A","\\""]}`
+
+  const small = addon.UnityRs.fromBuffer(byteArrayAsset(Buffer.from([0, 1, 255])))
+  assert.strictEqual(small.readTypeTreeJson(0, 11n).toString('utf8'), document('0,1,255'))
+  assert.match(
+    small.readTypeTreeDump(0, 11n).toString('utf8'),
+    /\t\tint size = 3\r\n\t\t\t\[0\]\r\n\t\t\tUInt8 data = 0\r\n/,
+  )
+
+  const length = 44_999_616
+  const pattern = Buffer.from(Array.from({ length: 256 }, (_, index) => index))
+  const input = byteArrayAsset(Buffer.alloc(length, pattern))
+  const large = await addon.UnityRs.fromBufferAsync(input, 'moc.assets', input.length)
+  const chunk = Array.from({ length: 256 }, (_, index) => index).join(',')
+  const whole = Math.floor(length / 256)
+  const tail = Array.from({ length: length % 256 }, (_, index) => index).join(',')
+  const expected = `${chunk},`.repeat(whole) + tail
+  const json = await large.readTypeTreeJsonAsync(0, 11n)
+  assert.strictEqual(json.length, Buffer.byteLength(document(expected)))
+  assert.ok(json.equals(Buffer.from(document(expected))))
+  console.log('node api: byte-array type trees ok')
+}
+
+testByteArrayTypeTrees().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
+
 // The remaining direct Cubism readers. Whole-package materialization already
 // carried pose/display documents, but without these methods Node callers could
 // not inspect one component, and clip motion had no Node entry point at all.

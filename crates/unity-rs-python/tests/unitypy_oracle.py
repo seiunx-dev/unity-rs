@@ -238,6 +238,7 @@ def cases() -> list[tuple[str, bytes]]:
         ("sprite.assets", fixtures.synthetic_tight_sprite()),
         ("legacy-pcm.assets", fixtures.synthetic_legacy_pcm()),
         ("type-tree.assets", fixtures.synthetic_type_tree_object()),
+        ("byte-arrays.assets", fixtures.synthetic_byte_array_object()),
     ]
 
 

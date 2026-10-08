@@ -975,6 +975,27 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
   比所需少一的单数组/总量预算以原消息拒绝，恰好等于所需时输出与默认路径一致；1,000,001
   个 keyword 名在默认预算下被拒、调高单数组预算后完整读取。类型树字节数组的计费与 3,200 万
   元素上限属于 #5 的 0.6 部分，设计见 `docs/design/0.6-byte-array-values.md`；
+- **类型树字节数组已于 2026-10-08 改为按字节计费（#5 的 0.6 部分，破坏性变更，待 0.6.0 发布）**：
+  `TypeValue` 新增 `ByteArray { element: ByteElement, bytes: Vec<u8> }` 并改为
+  `#[non_exhaustive]`；数据节点为无对齐标志的叶子 `UInt8`/`SInt8`/声明 1 字节的 `char` 时，
+  数组以一次有界读取保留原始字节，不再为每个字节物化一个 32 字节的 `TypeValue`；`bool`、
+  2 字节或未声明大小的 `char`、带对齐标志的元素仍逐元素读取。`TypeTreeReadLimits` 新增
+  `maximum_byte_array_bytes`（默认 256 MiB），字节数组计 1 个 value、不再受
+  `maximum_array_elements` 约束，但非空时仍按元素层级检查深度；负长度、超出剩余输入
+  （分配前以 `UnexpectedEof` 拒绝）与超限各有稳定消息，root-field 投影的跳过路径使用同一规则。
+  同时修正双重计费：记录、数组、map 与 `SerializeReference` 注册表都由容器一次性预付槽位，
+  值本身不再二次计费（注册表改为按子节点数预留，而非逐个 push 计费）；
+  `maximum_materialized_bytes` 默认仍为 512 MiB，并已成为对保留堆的如实上界。新增
+  `TypeValue::as_bytes`/`array_len` 与 `ByteElement::value`/`type_name`。JSON 与 dump
+  writer 逐元素输出与旧路径相同的字节；Live2D 读取器经 crate 内 `element_values` 把空字节
+  数组视为空列表、非空视为“不是数组”。证据：135 个 Project Sekai bundle 的 2,822 个对象
+  （其中 1,590 个含 1,747 个 `UInt8` 字节数组）的 pretty/compact JSON、dump 与 534 个
+  MonoBehaviour JSON 共 9,000 份输出与 0.5.5 逐字节一致；托管差分 dump fixture 新增
+  `UInt8`/`SInt8` vector 后与 .NET 一致；UnityPy 差分新增字节数组 fixture 后 16 个 fixture
+  全部一致；`CubismMoc` 形状的 8,400,000–44,999,616 字节 `_bytes` 在默认预算下读取，计费
+  恰为长度加固定开销，峰值堆从 32 倍降为 1.0 倍。Python/Node 公开面与 `.pyi`/`index.d.ts`
+  不变，此前因字节数组被拒的对象现在可读；迁移说明见设计文档。私有 6000.3 Android 语料中
+  65 个被拒对象本次未复测；
 - **类型化 Mesh 读取已于 2026-10-08 加入 Studio、Python 与 Node（#11）**：Core 新增
   `mesh::read_mesh_geometry`/`read_mesh_geometry_with_collection` 与
   `StudioObject::read_mesh`，返回 `MeshGeometry { mesh, channels }`：`mesh` 与

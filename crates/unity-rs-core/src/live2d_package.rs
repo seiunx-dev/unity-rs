@@ -3011,7 +3011,7 @@ impl<'a> PackageState<'a> {
         let Some(field) = self.required_component_field(component, &value, field_name)? else {
             return Ok(None);
         };
-        let TypeValue::Array(values) = field else {
+        let Some(values) = field.element_values() else {
             self.push_diagnostic(
                 component.object,
                 Live2dPackageDiagnosticKind::MalformedRequiredField,
@@ -4865,6 +4865,59 @@ mod tests {
         assert!(build_live2d_packages(&collection, limits).is_err());
     }
 
+    /// From 0.6 a byte vector reads as a byte array. Where the package reads a
+    /// list of references, an empty one still means no references, as the
+    /// empty element-wise array did; one with bytes is a malformed field.
+    #[test]
+    fn treats_a_byte_array_reference_list_as_empty_or_malformed() {
+        let components = [(0, 10), (0, 20), (0, 22), (0, 28), (0, 29)];
+        let list = |tree: Vec<TestNode>, bytes: &[u8]| {
+            let mut output = mono_behaviour_prefix((0, 1), (0, 104), "expression list");
+            push_i32(&mut output, i32::try_from(bytes.len()).unwrap());
+            output.extend_from_slice(bytes);
+            align(&mut output, 4);
+            expression_package_collection_from(&components, tree, output)
+        };
+        let mut byte_tree = mono_behaviour_base_tree();
+        byte_tree.extend_from_slice(&[
+            node("vector", "CubismExpressionObjects", 1, false),
+            node("Array", "Array", 2, true),
+            node("int", "size", 3, false),
+            node("UInt8", "data", 3, false),
+        ]);
+
+        let element_wise = build_live2d_packages(
+            &list(expression_list_tree(), &[]),
+            Live2dPackageLimits::default(),
+        )
+        .unwrap();
+        let bytes = build_live2d_packages(
+            &list(byte_tree.clone(), &[]),
+            Live2dPackageLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(bytes.diagnostics, element_wise.diagnostics);
+        assert_eq!(bytes.packages.len(), element_wise.packages.len());
+        assert_eq!(
+            bytes.packages[0].expressions.len(),
+            element_wise.packages[0].expressions.len()
+        );
+
+        let malformed =
+            build_live2d_packages(&list(byte_tree, &[1, 2]), Live2dPackageLimits::default())
+                .unwrap();
+        assert!(
+            malformed.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == Live2dPackageDiagnosticKind::MalformedRequiredField
+                    && diagnostic
+                        .message
+                        .ends_with(".CubismExpressionObjects is not an array")
+            }),
+            "{:?}",
+            malformed.diagnostics
+        );
+    }
+
     #[test]
     fn external_schemas_project_expression_motion_physics_pose_and_display_info() {
         let mut collection = expression_package_collection();
@@ -5397,6 +5450,20 @@ mod tests {
     /// `GameObject`, so a test can make the controllers unreachable while the
     /// data objects stay in the file.
     fn expression_package_collection_with(hero_components: &[(i32, i64)]) -> AssetCollection {
+        expression_package_collection_from(
+            hero_components,
+            expression_list_tree(),
+            expression_list_behaviour(),
+        )
+    }
+
+    /// The same assets with a caller-chosen `CubismExpressionList` schema and
+    /// payload.
+    fn expression_package_collection_from(
+        hero_components: &[(i32, i64)],
+        list_tree: Vec<TestNode>,
+        list: Vec<u8>,
+    ) -> AssetCollection {
         let types = vec![
             TestType::plain(GAME_OBJECT),
             TestType::plain(TRANSFORM),
@@ -5409,7 +5476,7 @@ mod tests {
                     "ExpressionsList",
                 )),
             ),
-            TestType::behaviour(0x23, Some(expression_list_tree())),
+            TestType::behaviour(0x23, Some(list_tree)),
             TestType::behaviour(0x24, Some(expression_data_tree())),
             TestType::behaviour(0x25, Some(pose_part_tree())),
             TestType::behaviour(0x26, Some(display_info_tree())),
@@ -5430,7 +5497,7 @@ mod tests {
             TestObject::new(11, 1, transform((0, 2), &[], (0, 10))),
             TestObject::new(20, 2, mono_behaviour((0, 1), (0, 100), "", (0, 30))),
             TestObject::new(22, 4, mono_behaviour((0, 1), (0, 103), "", (0, 23))),
-            TestObject::new(23, 5, expression_list_behaviour()),
+            TestObject::new(23, 5, list),
             TestObject::new(24, 6, expression_data_behaviour()),
             TestObject::new(25, 7, pose_part_behaviour()),
             TestObject::new(

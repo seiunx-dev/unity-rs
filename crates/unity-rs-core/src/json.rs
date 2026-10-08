@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::type_tree::{TypeField, TypeMapEntry, TypeValue};
+use crate::type_tree::{ByteElement, TypeField, TypeMapEntry, TypeValue};
 use crate::{Error, Result};
 
 pub fn write_type_value_json<W: Write>(
@@ -34,7 +34,7 @@ impl<W: Write> JsonWriter<'_, W> {
             TypeValue::Character(value) => {
                 let character =
                     char::from_u32(u32::from(*value)).unwrap_or(char::REPLACEMENT_CHARACTER);
-                self.write_string(&character.to_string())?;
+                self.write_character(character)?;
             }
             // Serialize each at its source width, so a `float` field keeps its
             // own shortest round-trip form instead of the double expansion of
@@ -82,6 +82,7 @@ impl<W: Write> JsonWriter<'_, W> {
                 self.output.write_all(b"}")?;
             }
             TypeValue::Array(values) => self.write_array(values)?,
+            TypeValue::ByteArray { element, bytes } => self.write_byte_array(*element, bytes)?,
             TypeValue::Object(fields) => self.write_object(fields)?,
             TypeValue::Map(entries) => self.write_map(entries)?,
         }
@@ -98,6 +99,30 @@ impl<W: Write> JsonWriter<'_, W> {
                 }
                 self.newline_and_indent()?;
                 self.write_value(value)?;
+            }
+            self.depth -= 1;
+            self.newline_and_indent()?;
+        }
+        self.output.write_all(b"]")?;
+        Ok(())
+    }
+
+    /// Writes a byte array exactly as `write_array` writes the element-wise
+    /// array it stands for, streaming each element from the slice.
+    fn write_byte_array(&mut self, element: ByteElement, bytes: &[u8]) -> Result<()> {
+        self.output.write_all(b"[")?;
+        if !bytes.is_empty() {
+            self.depth += 1;
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                if index != 0 {
+                    self.output.write_all(b",")?;
+                }
+                self.newline_and_indent()?;
+                match element {
+                    ByteElement::Unsigned8 => write!(self.output, "{byte}")?,
+                    ByteElement::Signed8 => write!(self.output, "{}", byte.cast_signed())?,
+                    ByteElement::Character8 => self.write_character(char::from(byte))?,
+                }
             }
             self.depth -= 1;
             self.newline_and_indent()?;
@@ -157,6 +182,11 @@ impl<W: Write> JsonWriter<'_, W> {
         Ok(())
     }
 
+    fn write_character(&mut self, character: char) -> Result<()> {
+        let mut buffer = [0_u8; 4];
+        self.write_string(character.encode_utf8(&mut buffer))
+    }
+
     fn write_string(&mut self, value: &str) -> Result<()> {
         serde_json::to_writer(&mut self.output, value).map_err(json_error)
     }
@@ -190,7 +220,121 @@ fn json_error(error: serde_json::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::write_type_value_json;
-    use crate::type_tree::{TypeField, TypeMapEntry, TypeValue};
+    use crate::type_tree::{ByteElement, TypeField, TypeMapEntry, TypeValue};
+
+    const BYTE_ELEMENTS: [ByteElement; 3] = [
+        ByteElement::Unsigned8,
+        ByteElement::Signed8,
+        ByteElement::Character8,
+    ];
+
+    /// The element-wise array a byte array stands for.
+    fn expand(element: ByteElement, bytes: &[u8]) -> TypeValue {
+        TypeValue::Array(bytes.iter().map(|byte| element.value(*byte)).collect())
+    }
+
+    /// Replaces every byte array in a tree with its element-wise array, so the
+    /// writer's two paths can be compared on the same document.
+    fn expand_all(value: &TypeValue) -> TypeValue {
+        match value {
+            TypeValue::ByteArray { element, bytes } => expand(*element, bytes),
+            TypeValue::Array(values) => TypeValue::Array(values.iter().map(expand_all).collect()),
+            TypeValue::Object(fields) => TypeValue::Object(
+                fields
+                    .iter()
+                    .map(|field| TypeField {
+                        name: field.name.clone(),
+                        value: expand_all(&field.value),
+                    })
+                    .collect(),
+            ),
+            TypeValue::Map(entries) => TypeValue::Map(
+                entries
+                    .iter()
+                    .map(|entry| TypeMapEntry {
+                        key: expand_all(&entry.key),
+                        value: expand_all(&entry.value),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    fn json(value: &TypeValue, pretty: bool) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_type_value_json(value, &mut output, pretty).unwrap();
+        output
+    }
+
+    /// The acceptance rule for 0.6: a byte array writes the same bytes as the
+    /// element-wise array the 0.5 reader produced for it, for every byte value,
+    /// every element type, both layouts, empty or not, and at any depth.
+    #[test]
+    fn byte_arrays_write_exactly_what_the_element_wise_array_writes() {
+        let every_byte = (0..=u8::MAX).collect::<Vec<_>>();
+        for element in BYTE_ELEMENTS {
+            for bytes in [&[][..], &[0x41][..], &every_byte[..]] {
+                let value = TypeValue::Object(vec![
+                    TypeField {
+                        name: "_bytes".to_owned(),
+                        value: TypeValue::ByteArray {
+                            element,
+                            bytes: bytes.to_vec(),
+                        },
+                    },
+                    TypeField {
+                        name: "nested".to_owned(),
+                        value: TypeValue::Array(vec![TypeValue::Map(vec![TypeMapEntry {
+                            key: TypeValue::ByteArray {
+                                element,
+                                bytes: bytes.to_vec(),
+                            },
+                            value: TypeValue::Signed(1),
+                        }])]),
+                    },
+                ]);
+                let expanded = expand_all(&value);
+                for pretty in [false, true] {
+                    assert_eq!(
+                        json(&value, pretty),
+                        json(&expanded, pretty),
+                        "{element:?}, {} bytes, pretty {pretty}",
+                        bytes.len()
+                    );
+                }
+                let root = TypeValue::ByteArray {
+                    element,
+                    bytes: bytes.to_vec(),
+                };
+                for pretty in [false, true] {
+                    assert_eq!(json(&root, pretty), json(&expand_all(&root), pretty));
+                }
+            }
+        }
+        let mut output = Vec::new();
+        write_type_value_json(
+            &TypeValue::ByteArray {
+                element: ByteElement::Signed8,
+                bytes: vec![0x00, 0x7f, 0x80, 0xff],
+            },
+            &mut output,
+            false,
+        )
+        .unwrap();
+        assert_eq!(output, b"[0,127,-128,-1]");
+        output.clear();
+        write_type_value_json(
+            &TypeValue::ByteArray {
+                element: ByteElement::Character8,
+                bytes: vec![0x00, 0x22, 0x41, 0xe9],
+            },
+            &mut output,
+            false,
+        )
+        .unwrap();
+        assert_eq!(output, "[\"\\u0000\",\"\\\"\",\"A\",\"\u{e9}\"]".as_bytes());
+    }
 
     #[test]
     fn floats_serialize_at_their_source_width() {
@@ -378,7 +522,7 @@ mod tests {
     const CHARACTERS: &[u16] = &[0x0000, 0x0041, 0x00e9, 0x4e2d, 0xd800, 0xdfff, 0xfffd];
 
     fn sample_leaf(rng: &mut Rng, seen: &mut Seen) -> TypeValue {
-        match rng.below(8) {
+        match rng.below(9) {
             0 => TypeValue::Signed(rng.next().cast_signed()),
             1 => TypeValue::Unsigned(rng.next()),
             2 => {
@@ -404,6 +548,13 @@ mod tests {
             }
             5 => TypeValue::Boolean(rng.below(2) == 1),
             6 => TypeValue::String(STRINGS[rng.below(STRINGS.len() as u64)].to_owned()),
+            7 => {
+                let length = sample_container_length(rng, seen);
+                TypeValue::ByteArray {
+                    element: BYTE_ELEMENTS[rng.below(BYTE_ELEMENTS.len() as u64)],
+                    bytes: (0..length).map(|_| rng.next().to_le_bytes()[0]).collect(),
+                }
+            }
             _ => TypeValue::TypelessData {
                 offset: rng.next(),
                 size: rng.next(),
@@ -413,9 +564,9 @@ mod tests {
 
     fn sample(rng: &mut Rng, depth: usize, seen: &mut Seen) -> TypeValue {
         // Containers only above the depth limit, so recursion terminates.
-        let value = match if depth == 0 { 0 } else { rng.below(11) } {
-            0..=7 => sample_leaf(rng, seen),
-            8 => {
+        let value = match if depth == 0 { 0 } else { rng.below(12) } {
+            0..=8 => sample_leaf(rng, seen),
+            9 => {
                 let length = sample_container_length(rng, seen);
                 TypeValue::Array(
                     (0..length)
@@ -423,7 +574,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                 )
             }
-            9 => {
+            10 => {
                 let length = sample_container_length(rng, seen);
                 TypeValue::Object(
                     (0..length)
@@ -459,6 +610,7 @@ mod tests {
             TypeValue::Boolean(_) => "Boolean",
             TypeValue::String(_) => "String",
             TypeValue::TypelessData { .. } => "TypelessData",
+            TypeValue::ByteArray { .. } => "ByteArray",
             TypeValue::Array(values) => {
                 if values.iter().any(is_container) {
                     seen.nested_containers += 1;
@@ -495,7 +647,10 @@ mod tests {
     fn is_container(value: &TypeValue) -> bool {
         matches!(
             value,
-            TypeValue::Array(_) | TypeValue::Object(_) | TypeValue::Map(_)
+            TypeValue::Array(_)
+                | TypeValue::ByteArray { .. }
+                | TypeValue::Object(_)
+                | TypeValue::Map(_)
         )
     }
 
@@ -546,6 +701,13 @@ mod tests {
                 serde_json::json!({"Offset": offset, "Size": size})
             }
             TypeValue::Array(values) => Value::Array(values.iter().map(expected).collect()),
+            // The same array the element-wise reader produced for these bytes.
+            TypeValue::ByteArray { element, bytes } => Value::Array(
+                bytes
+                    .iter()
+                    .map(|byte| expected(&element.value(*byte)))
+                    .collect(),
+            ),
             TypeValue::Object(fields) => Value::Object(
                 fields
                     .iter()
@@ -619,7 +781,7 @@ mod tests {
         // Everything above is vacuous if the generator never reached these.
         assert_eq!(
             seen.variants.len(),
-            11,
+            12,
             "the generator missed a TypeValue variant: {:?}",
             seen.variants
         );

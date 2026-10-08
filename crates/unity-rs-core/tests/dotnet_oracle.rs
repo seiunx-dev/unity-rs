@@ -1930,6 +1930,17 @@ fn synthetic_v22() -> Vec<u8> {
                     TestNode::new("Array", "Array", 2, false),
                     TestNode::new("int", "size", 3, false),
                     TestNode::new("SInt32", "data", 3, false),
+                    // One-byte vectors, which the Rust reader keeps as byte
+                    // arrays from 0.6: the dump must still print them element
+                    // by element, as the managed dump does.
+                    TestNode::new("vector", "bytes", 1, false),
+                    TestNode::new("Array", "Array", 2, true),
+                    TestNode::new("int", "size", 3, false),
+                    TestNode::new("UInt8", "data", 3, false),
+                    TestNode::new("vector", "signed", 1, false),
+                    TestNode::new("Array", "Array", 2, true),
+                    TestNode::new("int", "size", 3, false),
+                    TestNode::new("SInt8", "data", 3, false),
                     TestNode::new("bool", "enabled", 1, false),
                     TestNode::new("float", "weight", 1, false),
                     // The dump renders numbers as text through .NET's general
@@ -3901,6 +3912,10 @@ fn dump_object() -> Vec<u8> {
     push_i32(&mut output, 2);
     push_i32(&mut output, -4);
     push_i32(&mut output, 7);
+    push_i32(&mut output, 4);
+    output.extend_from_slice(&[0x00, 0x01, 0x7f, 0xff]);
+    push_i32(&mut output, 3);
+    output.extend_from_slice(&[0x80, 0xff, 0x7f, 0x00]);
     output.push(1);
     output.extend_from_slice(&1.25_f32.to_le_bytes());
     // 1298351.25 exactly, which ties between ...2 and ...3 at the last digit.

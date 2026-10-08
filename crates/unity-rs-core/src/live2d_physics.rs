@@ -508,12 +508,9 @@ fn field<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a TypeVa
 }
 
 fn array_field<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a [TypeValue]> {
-    match field(value, name, owner)? {
-        TypeValue::Array(values) => Ok(values),
-        _ => Err(Error::invalid_data(format!(
-            "{owner} {name} is not an array"
-        ))),
-    }
+    field(value, name, owner)?
+        .element_values()
+        .ok_or_else(|| Error::invalid_data(format!("{owner} {name} is not an array")))
 }
 
 fn string_field<'a>(value: &'a TypeValue, name: &str, owner: &str) -> Result<&'a str> {
@@ -847,6 +844,52 @@ mod tests {
         assert!(
             rig.write_physics3_json(60.0, &mut Vec::new(), written - 1)
                 .is_err()
+        );
+    }
+
+    /// From 0.6 a byte vector reads as a byte array. An empty one is still an
+    /// empty list, as the element-wise array was; one with bytes is refused.
+    #[test]
+    fn treats_byte_arrays_as_empty_lists_or_refuses_them() {
+        let with_sub_rigs = |sub_rigs: TypeValue| {
+            let mut value = physics_value();
+            let TypeValue::Object(root) = &mut value else {
+                unreachable!()
+            };
+            let TypeValue::Object(rig) = &mut root[0].value else {
+                unreachable!()
+            };
+            rig[0].value = sub_rigs;
+            value
+        };
+        let bytes = |bytes: Vec<u8>| TypeValue::ByteArray {
+            element: crate::type_tree::ByteElement::Unsigned8,
+            bytes,
+        };
+        let empty = project_cubism_physics(
+            1,
+            &with_sub_rigs(bytes(Vec::new())),
+            CubismPhysicsReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty,
+            project_cubism_physics(
+                1,
+                &with_sub_rigs(TypeValue::Array(Vec::new())),
+                CubismPhysicsReadLimits::default()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            project_cubism_physics(
+                1,
+                &with_sub_rigs(bytes(vec![0])),
+                CubismPhysicsReadLimits::default()
+            )
+            .unwrap_err()
+            .to_string(),
+            "CubismPhysicsRig SubRigs is not an array"
         );
     }
 

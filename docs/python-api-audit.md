@@ -36,7 +36,12 @@ methods:
   duplicate path IDs therefore keep first-match collection semantics instead
   of pretending Python can preserve a Rust borrow;
 - low-level provider traits remain explicit Python callables or schema registry
-  objects rather than exposing Rust trait objects.
+  objects rather than exposing Rust trait objects;
+- the dynamic `TypeValue` tree and `TypeTreeReadLimits` are not exposed: type
+  trees reach Python only as bounded JSON or dump text read with Core's default
+  limits. If a structured reader is added, `TypeValue::ByteArray` must become
+  `bytes`, not a list of `int`, because a 45 MB moc as Python integers is
+  gigabytes of objects (see `docs/design/0.6-byte-array-values.md`).
 
 ## Enforced evidence
 
