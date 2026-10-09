@@ -347,3 +347,17 @@ Workflow maintenance rules:
 - Third-party actions in caller-side custom steps are pinned to a full commit SHA with a
   `# vX.Y.Z` comment; Dependabot (`github-actions`) updates them and the template refs.
 - Do not add a placeholder `docker.yml`: the repository has no Docker build input.
+
+## Release notes
+
+GitHub Releases follow the org standard,
+[RELEASE_NOTES.md](https://github.com/seiunx-dev/ci-templates/blob/main/RELEASE_NOTES.md),
+and are written in English.
+
+- Title every release with the tag only, for example `v0.6.0`.
+- Publish a tag as a pre-release if and only if it has an `-alpha`, `-beta` or
+  `-rc` suffix; every tag gets a release.
+- Omit empty sections, and end every item with its PR number `(#123)` (the
+  short commit SHA when there is no PR).
+- After the `Release` workflow publishes a release with auto-generated notes,
+  rewrite them to the standard with `gh release edit <tag> --notes-file <file>`.
