@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::endian::{Endian, EndianReader, checked_length};
-use crate::source::{Region, Source};
+use crate::source::{Region, Source, check_source_read};
 use crate::unity_cn::{
     ARCHIVE_ENCRYPTED_FLAG as UNITY_CN_ENCRYPTED_FLAG, ArchiveDecryptor,
     HEADER_BYTES as UNITY_CN_HEADER_BYTES, UnityCnHeader, UnityCnKey,
@@ -1015,20 +1015,8 @@ impl Source for EntryBlockSource {
     }
 
     fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
-        let output_length = u64::try_from(output.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflowed"))?;
-        let end = offset.checked_add(output_length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "entry read range overflowed")
-        })?;
-        if end > self.length {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "entry read {offset}..{end} exceeds entry length {}",
-                    self.length
-                ),
-            ));
-        }
+        let output_length =
+            check_source_read(offset, output.len(), self.length, "entry read", "entry")?;
         let invalid =
             |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_owned());
         let mut logical = self
