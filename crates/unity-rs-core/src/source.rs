@@ -376,6 +376,30 @@ struct SourceSegment {
     region: Region,
 }
 
+/// Checks that a [`Source`] read of `output_length` bytes at `offset` stays
+/// within `length`, returning the read's length. Errors name `context` (for
+/// example "segmented read") and the `what` whose length was exceeded.
+pub(crate) fn check_source_read(
+    offset: u64,
+    output_length: usize,
+    length: u64,
+    context: &str,
+    what: &str,
+) -> io::Result<u64> {
+    let output_length = u64::try_from(output_length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflowed"))?;
+    let end = offset.checked_add(output_length).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{context} overflowed"))
+    })?;
+    if end > length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{context} {offset}..{end} exceeds {what} length {length}"),
+        ));
+    }
+    Ok(output_length)
+}
+
 struct SegmentedSource {
     segments: Vec<SourceSegment>,
     length: u64,
@@ -410,20 +434,13 @@ impl Source for SegmentedSource {
     }
 
     fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
-        let output_length = u64::try_from(output.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflowed"))?;
-        let end = offset.checked_add(output_length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "segmented read overflowed")
-        })?;
-        if end > self.length {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "segmented read {offset}..{end} exceeds source length {}",
-                    self.length
-                ),
-            ));
-        }
+        check_source_read(
+            offset,
+            output.len(),
+            self.length,
+            "segmented read",
+            "source",
+        )?;
 
         let mut source_offset = offset;
         let mut output_offset = 0_usize;

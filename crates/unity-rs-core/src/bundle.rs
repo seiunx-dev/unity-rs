@@ -1,11 +1,12 @@
 use std::cmp::{max, min};
+use std::collections::VecDeque;
 use std::fmt;
-use std::io::{Cursor, Read, Seek, Write};
+use std::io::{self, Cursor, Read, Seek, Write};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::endian::{Endian, EndianReader, checked_length};
-use crate::source::Region;
+use crate::source::{Region, Source, check_source_read};
 use crate::unity_cn::{
     ARCHIVE_ENCRYPTED_FLAG as UNITY_CN_ENCRYPTED_FLAG, ArchiveDecryptor,
     HEADER_BYTES as UNITY_CN_HEADER_BYTES, UnityCnHeader, UnityCnKey,
@@ -203,12 +204,80 @@ pub struct UnityFsBundle {
     pub data_offset: u64,
     /// Position immediately after this bundle, relative to its bound region.
     pub bundle_end: u64,
-    region: Region,
     entry_read_limit: u64,
+    decoder: BlockDecoder,
+}
+
+/// Everything needed to turn one storage block back into its bytes: the
+/// bundle's bound region, the decompression limits, the injected Oodle
+/// decoder and the `UnityCN` decryptor. Cheap to clone, so a lazily decoded
+/// entry region can own one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockDecoder {
+    region: Region,
     max_lzma_memory_kib: u32,
     max_zstd_window_log: u32,
     oodle_decoder: OodleDecoderSlot,
     decryptor: Option<ArchiveDecryptor>,
+}
+
+impl BlockDecoder {
+    /// Reads one block's stored bytes, decrypting them when the block is
+    /// marked encrypted.
+    ///
+    /// `UnityCN` obfuscates only compressed blocks; an uncompressed block is
+    /// stored in the clear and never reaches here.
+    fn block_bytes(&self, block: &StorageBlock, block_index: usize) -> Result<Vec<u8>> {
+        let mut bytes = self
+            .region
+            .subregion(block.compressed_offset, u64::from(block.compressed_size))?
+            .read_to_vec(u64::from(block.compressed_size))?;
+        if let Some(decryptor) = &self.decryptor
+            && u32::from(block.flags) & UNITY_CN_ENCRYPTED_FLAG != 0
+        {
+            decryptor.decrypt_block(&mut bytes, block_index)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Decodes one compressed storage block to exactly its declared size.
+    /// LZHAM and unknown codes are refused as `Unsupported`, as
+    /// `copy_entry` refuses them.
+    fn decode(&self, block: &StorageBlock, block_index: usize) -> Result<Vec<u8>> {
+        if !matches!(
+            block.compression,
+            CompressionType::Lz4
+                | CompressionType::Lz4Hc
+                | CompressionType::Lzma
+                | CompressionType::Zstd
+                | CompressionType::Oodle
+        ) {
+            return Err(Error::unsupported(format!(
+                "UnityFS {:?} data block decompression",
+                block.compression
+            )));
+        }
+        let compressed = self.block_bytes(block, block_index)?;
+        match block.compression {
+            CompressionType::Lz4 | CompressionType::Lz4Hc => decompress_lz4(
+                &compressed,
+                u64::from(block.uncompressed_size),
+                "UnityFS data block",
+            ),
+            _ => decompress_unity_block(
+                block.compression,
+                &compressed,
+                u64::from(block.uncompressed_size),
+                BundleParseLimits {
+                    max_lzma_memory_kib: self.max_lzma_memory_kib,
+                    max_zstd_window_log: self.max_zstd_window_log,
+                    ..BundleParseLimits::default()
+                },
+                "UnityFS data block",
+                self.oodle_decoder.as_deref(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,12 +569,14 @@ impl UnityFsBundle {
             entries,
             data_offset,
             bundle_end,
-            region: bundle_region,
             entry_read_limit: limits.max_entry_read_size,
-            max_lzma_memory_kib: limits.max_lzma_memory_kib,
-            max_zstd_window_log: limits.max_zstd_window_log,
-            oodle_decoder: OodleDecoderSlot(oodle_decoder),
-            decryptor,
+            decoder: BlockDecoder {
+                region: bundle_region,
+                max_lzma_memory_kib: limits.max_lzma_memory_kib,
+                max_zstd_window_log: limits.max_zstd_window_log,
+                oodle_decoder: OodleDecoderSlot(oodle_decoder),
+                decryptor,
+            },
         })
     }
 
@@ -514,26 +585,37 @@ impl UnityFsBundle {
         self.entries.iter().find(|entry| entry.path == path)
     }
 
-    /// Streams one bundle entry to `output` without materializing the complete
-    /// uncompressed bundle.
-    /// Reads one block's stored bytes, decrypting them when the block is marked
-    /// encrypted.
+    /// Opens one entry as a random-access [`Region`] that decodes storage
+    /// blocks on demand.
     ///
-    /// `UnityCN` obfuscates only compressed blocks; an uncompressed block is
-    /// stored in the clear and never reaches here.
-    fn block_bytes(&self, block: &StorageBlock, block_index: usize) -> Result<Vec<u8>> {
-        let mut bytes = self
-            .region
-            .subregion(block.compressed_offset, u64::from(block.compressed_size))?
-            .read_to_vec(u64::from(block.compressed_size))?;
-        if let Some(decryptor) = &self.decryptor
-            && u32::from(block.flags) & UNITY_CN_ENCRYPTED_FLAG != 0
-        {
-            decryptor.decrypt_block(&mut bytes, block_index)?;
-        }
-        Ok(bytes)
+    /// [`Self::copy_entry`] and [`Self::read_entry`] walk an entry front to
+    /// back, so reading one small object deep inside a large entry decodes
+    /// (and, over a remote source, fetches) every block before it. A read
+    /// from the returned region touches only the blocks it overlaps.
+    /// Uncompressed blocks are read in place; compressed ones (LZ4/LZ4HC,
+    /// LZMA, Zstd, injected Oodle, `UnityCN`-decrypted) are decoded whole and
+    /// kept in a small least-recently-used cache of at most
+    /// [`ENTRY_REGION_CACHE_BYTES`] and 64 blocks, always holding the latest
+    /// block, so a single-block LZMA entry is decoded once rather than once
+    /// per read.
+    ///
+    /// Nothing is materialized up front, so [`BundleParseLimits::max_entry_read_size`]
+    /// does not apply; each decoded block stays bounded by
+    /// `max_uncompressed_block_size`. Errors while reading the region surface
+    /// as I/O errors whose kind keeps the family: `InvalidData` for corrupt
+    /// blocks, `Unsupported` for a compression `copy_entry` refuses too
+    /// (LZHAM, unknown codes).
+    pub fn entry_region(&self, index: usize) -> Result<Region> {
+        let entry = self.entries.get(index).ok_or_else(|| {
+            Error::invalid_data(format!("UnityFS entry index {index} is out of range"))
+        })?;
+        let source = EntryBlockSource::new(&self.decoder, &self.blocks, entry)?;
+        let length = source.length;
+        Region::new(Arc::new(source), 0, length)
     }
 
+    /// Streams one bundle entry to `output` without materializing the complete
+    /// uncompressed bundle.
     pub fn copy_entry<W: Write>(&self, index: usize, output: &mut W) -> Result<u64> {
         self.copy_entry_with_cache(index, output, &mut BlockDecodeCache::new())
     }
@@ -600,7 +682,9 @@ impl UnityFsBundle {
                         .compressed_offset
                         .checked_add(overlap_start - block.uncompressed_offset)
                         .ok_or_else(|| Error::invalid_data("UnityFS source offset overflowed"))?;
-                    self.region.copy_range(source_offset, length, output)?;
+                    self.decoder
+                        .region
+                        .copy_range(source_offset, length, output)?;
                 }
                 CompressionType::Lz4 | CompressionType::Lz4Hc => {
                     let decoded = self.decoded_block(block, block_index, cache)?;
@@ -658,26 +742,7 @@ impl UnityFsBundle {
         cache: &'cache mut BlockDecodeCache,
     ) -> Result<&'cache [u8]> {
         if cache.slot.as_ref().map(|(cached, _)| *cached) != Some(block_index) {
-            let compressed = self.block_bytes(block, block_index)?;
-            let decoded = match block.compression {
-                CompressionType::Lz4 | CompressionType::Lz4Hc => decompress_lz4(
-                    &compressed,
-                    u64::from(block.uncompressed_size),
-                    "UnityFS data block",
-                )?,
-                _ => decompress_unity_block(
-                    block.compression,
-                    &compressed,
-                    u64::from(block.uncompressed_size),
-                    BundleParseLimits {
-                        max_lzma_memory_kib: self.max_lzma_memory_kib,
-                        max_zstd_window_log: self.max_zstd_window_log,
-                        ..BundleParseLimits::default()
-                    },
-                    "UnityFS data block",
-                    self.oodle_decoder.as_deref(),
-                )?,
-            };
+            let decoded = self.decoder.decode(block, block_index)?;
             cache.slot = Some((block_index, decoded));
         }
         Ok(&cache.slot.as_ref().expect("slot was just filled").1)
@@ -829,6 +894,204 @@ impl BlockDecodeCache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Decoded-block budget of one [`UnityFsBundle::entry_region`]. The most
+/// recently decoded block is always kept, even when it alone is larger.
+pub const ENTRY_REGION_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most decoded blocks one entry region keeps, whatever their size, so a
+/// bundle of many tiny blocks cannot make every cache lookup a long scan.
+const ENTRY_REGION_CACHE_BLOCKS: usize = 64;
+
+/// The [`Source`] behind [`UnityFsBundle::entry_region`]: the storage blocks
+/// covering one entry, decoded only when a read overlaps them.
+struct EntryBlockSource {
+    decoder: BlockDecoder,
+    /// Logical (uncompressed-stream) offset of the entry.
+    entry_offset: u64,
+    length: u64,
+    /// Index in the bundle of `blocks[0]`; `UnityCN` keys decryption on it.
+    first_block: usize,
+    /// The contiguous run of blocks covering the entry.
+    blocks: Vec<StorageBlock>,
+    cache: Mutex<DecodedBlocks>,
+}
+
+/// Least-recently-used decoded blocks, most recent last.
+#[derive(Default)]
+struct DecodedBlocks {
+    blocks: VecDeque<(usize, Arc<Vec<u8>>)>,
+    bytes: usize,
+}
+
+impl EntryBlockSource {
+    fn new(decoder: &BlockDecoder, blocks: &[StorageBlock], entry: &BundleEntry) -> Result<Self> {
+        let entry_end = entry
+            .offset
+            .checked_add(entry.size)
+            .ok_or_else(|| Error::invalid_data("UnityFS entry range overflowed"))?;
+        // The last block starting at or before the entry: zero-sized blocks
+        // sharing that offset are skipped.
+        let first_block = blocks
+            .partition_point(|block| block.uncompressed_offset <= entry.offset)
+            .saturating_sub(1);
+        let mut covered = blocks
+            .get(first_block)
+            .map_or(0, |block| block.uncompressed_offset);
+        let mut run = Vec::new();
+        if entry.size > 0 {
+            if covered > entry.offset {
+                return Err(Error::invalid_data(format!(
+                    "UnityFS entry {:?} starts before the first data block",
+                    entry.path
+                )));
+            }
+            for block in &blocks[first_block..] {
+                if covered >= entry_end {
+                    break;
+                }
+                if block.uncompressed_offset != covered {
+                    return Err(Error::invalid_data(format!(
+                        "UnityFS blocks covering entry {:?} are not contiguous",
+                        entry.path
+                    )));
+                }
+                covered = covered
+                    .checked_add(u64::from(block.uncompressed_size))
+                    .ok_or_else(|| Error::invalid_data("UnityFS block range overflowed"))?;
+                run.try_reserve(1).map_err(|error| {
+                    Error::invalid_data(format!("cannot allocate UnityFS block table: {error}"))
+                })?;
+                run.push(block.clone());
+            }
+            if covered < entry_end {
+                return Err(Error::invalid_data(format!(
+                    "UnityFS entry {:?} ends at {entry_end}, beyond its data blocks at {covered}",
+                    entry.path
+                )));
+            }
+        }
+        Ok(Self {
+            decoder: decoder.clone(),
+            entry_offset: entry.offset,
+            length: entry.size,
+            first_block,
+            blocks: run,
+            cache: Mutex::new(DecodedBlocks::default()),
+        })
+    }
+
+    /// The decoded bytes of `blocks[index]`, from the cache when present.
+    fn decoded(&self, index: usize) -> io::Result<Arc<Vec<u8>>> {
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(position) = cache.blocks.iter().position(|(cached, _)| *cached == index) {
+                let hit = cache.blocks.remove(position).expect("position is in range");
+                let data = Arc::clone(&hit.1);
+                cache.blocks.push_back(hit);
+                return Ok(data);
+            }
+        }
+        // Decode outside the lock: concurrent readers of different blocks do
+        // not wait on each other. Two readers of the same block may both
+        // decode it; the cache keeps one copy.
+        let block_index = self
+            .first_block
+            .checked_add(index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block index overflowed"))?;
+        let data = Arc::new(
+            self.decoder
+                .decode(&self.blocks[index], block_index)
+                .map_err(into_io_error)?,
+        );
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if !cache.blocks.iter().any(|(cached, _)| *cached == index) {
+            cache.bytes = cache.bytes.saturating_add(data.len());
+            cache.blocks.push_back((index, Arc::clone(&data)));
+            while (cache.bytes > ENTRY_REGION_CACHE_BYTES
+                || cache.blocks.len() > ENTRY_REGION_CACHE_BLOCKS)
+                && cache.blocks.len() > 1
+            {
+                if let Some((_, evicted)) = cache.blocks.pop_front() {
+                    cache.bytes = cache.bytes.saturating_sub(evicted.len());
+                }
+            }
+        }
+        Ok(data)
+    }
+}
+
+/// Keeps the error family visible through the `io::Error` a [`Source`]
+/// returns.
+fn into_io_error(error: Error) -> io::Error {
+    match error {
+        Error::Io(error) => error,
+        Error::InvalidData(message) => io::Error::new(io::ErrorKind::InvalidData, message),
+        Error::Unsupported(message) => io::Error::new(io::ErrorKind::Unsupported, message),
+    }
+}
+
+impl Source for EntryBlockSource {
+    fn len(&self) -> u64 {
+        self.length
+    }
+
+    fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
+        let output_length =
+            check_source_read(offset, output.len(), self.length, "entry read", "entry")?;
+        let invalid =
+            |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_owned());
+        let mut logical = self
+            .entry_offset
+            .checked_add(offset)
+            .ok_or_else(|| invalid("entry read offset overflowed"))?;
+        let mut written = 0_usize;
+        while written < output.len() {
+            let index = self
+                .blocks
+                .partition_point(|block| block.uncompressed_offset <= logical)
+                .checked_sub(1)
+                .ok_or_else(|| invalid("entry read does not map to a data block"))?;
+            let block = &self.blocks[index];
+            let within = logical - block.uncompressed_offset;
+            let available = u64::from(block.uncompressed_size)
+                .checked_sub(within)
+                .filter(|available| *available > 0)
+                .ok_or_else(|| invalid("entry read does not map to a data block"))?;
+            let remaining = output_length
+                - u64::try_from(written).map_err(|_| invalid("entry read is too large"))?;
+            let take = usize::try_from(available.min(remaining))
+                .map_err(|_| invalid("entry read chunk is too large"))?;
+            let target = &mut output[written..written + take];
+            if block.compression == CompressionType::None {
+                let source_offset = block
+                    .compressed_offset
+                    .checked_add(within)
+                    .ok_or_else(|| invalid("UnityFS source offset overflowed"))?;
+                self.decoder
+                    .region
+                    .read_exact_at(source_offset, target)
+                    .map_err(into_io_error)?;
+            } else {
+                let data = self.decoded(index)?;
+                let start =
+                    usize::try_from(within).map_err(|_| invalid("block offset is too large"))?;
+                let stop = start
+                    .checked_add(take)
+                    .ok_or_else(|| invalid("entry read range overflowed"))?;
+                target.copy_from_slice(
+                    data.get(start..stop)
+                        .ok_or_else(|| invalid("entry read exceeds the decoded block"))?,
+                );
+            }
+            written += take;
+            logical = logical
+                .checked_add(u64::try_from(take).map_err(|_| invalid("chunk is too large"))?)
+                .ok_or_else(|| invalid("entry read offset overflowed"))?;
+        }
+        Ok(())
     }
 }
 
@@ -1230,7 +1493,7 @@ mod tests {
 
     use crate::Error;
     use crate::endian::{Endian, EndianReader};
-    use crate::source::Region;
+    use crate::source::{Region, Source};
 
     use super::{
         ArchiveFlags, BLOCK_INFO_NEEDS_PADDING_AT_START, BLOCKS_AND_DIRECTORY_INFO_COMBINED,
@@ -1882,26 +2145,7 @@ mod tests {
         };
         let flags = BLOCKS_AND_DIRECTORY_INFO_COMBINED | u32::from(info_compression.code());
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"UnityFS\0");
-        bytes.extend_from_slice(&6_u32.to_be_bytes());
-        bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
-        let size_position = bytes.len();
-        bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(
-            &u32::try_from(stored_blocks_info.len())
-                .unwrap()
-                .to_be_bytes(),
-        );
-        bytes.extend_from_slice(&u32::try_from(raw_blocks_info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&flags.to_be_bytes());
-        bytes.extend_from_slice(&stored_blocks_info);
-        bytes.extend_from_slice(&data);
-
-        let bundle_size = i64::try_from(bytes.len()).unwrap();
-        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
-        bytes
+        v6_bundle(flags, &stored_blocks_info, raw_blocks_info.len(), &data)
     }
 
     fn make_oodle_bundle() -> (Vec<u8>, Vec<u8>) {
@@ -1913,21 +2157,7 @@ mod tests {
         );
         let flags = BLOCKS_AND_DIRECTORY_INFO_COMBINED | u32::from(CompressionType::Oodle.code());
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"UnityFS\0");
-        bytes.extend_from_slice(&6_u32.to_be_bytes());
-        bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
-        let size_position = bytes.len();
-        bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(OODLE_INFO_INPUT.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(blocks_info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&flags.to_be_bytes());
-        bytes.extend_from_slice(OODLE_INFO_INPUT);
-        bytes.extend_from_slice(OODLE_DATA_INPUT);
-
-        let bundle_size = i64::try_from(bytes.len()).unwrap();
-        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
+        let bytes = v6_bundle(flags, OODLE_INFO_INPUT, blocks_info.len(), OODLE_DATA_INPUT);
         (bytes, blocks_info)
     }
 
@@ -1957,20 +2187,12 @@ mod tests {
             info.push(0);
         }
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"UnityFS\0");
-        bytes.extend_from_slice(&6_u32.to_be_bytes());
-        bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
-        let size_position = bytes.len();
-        bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&BLOCKS_AND_DIRECTORY_INFO_COMBINED.to_be_bytes());
-        bytes.extend_from_slice(&info);
-        bytes.extend_from_slice(&compressed);
-        let bundle_size = i64::try_from(bytes.len()).unwrap();
-        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
+        let bytes = v6_bundle(
+            BLOCKS_AND_DIRECTORY_INFO_COMBINED,
+            &info,
+            info.len(),
+            &compressed,
+        );
 
         let bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
         assert_eq!(bundle.entries.len(), 2);
@@ -2004,6 +2226,330 @@ mod tests {
         );
     }
 
+    /// A version 6 bundle with the given raw blocks (stored as `compression`)
+    /// and entries `(offset, size, path)`, block info inline and uncompressed.
+    fn make_multi_block_bundle(
+        blocks: &[(&[u8], CompressionType)],
+        entries: &[(u64, u64, &str)],
+    ) -> Vec<u8> {
+        let stored: Vec<Vec<u8>> = blocks
+            .iter()
+            .map(|(raw, compression)| match compression {
+                CompressionType::Lz4 | CompressionType::Lz4Hc => compress(raw),
+                CompressionType::Zstd => zstd::bulk::compress(raw, 1).unwrap(),
+                // Stored as is: uncompressed, or a codec the reader refuses
+                // and so never decodes.
+                _ => raw.to_vec(),
+            })
+            .collect();
+        let mut info = vec![0_u8; 16];
+        info.extend_from_slice(&i32::try_from(blocks.len()).unwrap().to_be_bytes());
+        for ((raw, compression), data) in blocks.iter().zip(&stored) {
+            info.extend_from_slice(&u32::try_from(raw.len()).unwrap().to_be_bytes());
+            info.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+            info.extend_from_slice(&u16::from(compression.code()).to_be_bytes());
+        }
+        info.extend_from_slice(&i32::try_from(entries.len()).unwrap().to_be_bytes());
+        for (offset, size, path) in entries {
+            info.extend_from_slice(&i64::try_from(*offset).unwrap().to_be_bytes());
+            info.extend_from_slice(&i64::try_from(*size).unwrap().to_be_bytes());
+            info.extend_from_slice(&0_u32.to_be_bytes());
+            info.extend_from_slice(path.as_bytes());
+            info.push(0);
+        }
+
+        v6_bundle(
+            BLOCKS_AND_DIRECTORY_INFO_COMBINED,
+            &info,
+            info.len(),
+            &stored.concat(),
+        )
+    }
+
+    /// Bytes behind a [`Source`] that records every read.
+    struct CountingSource {
+        bytes: Vec<u8>,
+        reads: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl CountingSource {
+        fn region(bytes: Vec<u8>) -> (Arc<Self>, Region) {
+            let source = Arc::new(Self {
+                bytes,
+                reads: Mutex::new(Vec::new()),
+            });
+            let length = source.bytes.len() as u64;
+            let region = Region::new(source.clone(), 0, length).unwrap();
+            (source, region)
+        }
+
+        fn take_reads(&self) -> Vec<(u64, usize)> {
+            std::mem::take(&mut *self.reads.lock().unwrap())
+        }
+    }
+
+    impl Source for CountingSource {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> std::io::Result<()> {
+            self.reads.lock().unwrap().push((offset, output.len()));
+            let start = usize::try_from(offset).unwrap();
+            output.copy_from_slice(&self.bytes[start..start + output.len()]);
+            Ok(())
+        }
+    }
+
+    fn blocks_with<'raw>(
+        raw: &'raw [Vec<u8>],
+        kinds: &[CompressionType],
+    ) -> Vec<(&'raw [u8], CompressionType)> {
+        raw.iter()
+            .zip(kinds)
+            .map(|(data, kind)| (data.as_slice(), *kind))
+            .collect()
+    }
+
+    /// Opens entry 0 of a bundle behind a [`CountingSource`] whose reads so
+    /// far (header, blocks info) are discarded.
+    fn counted_entry(
+        blocks: &[(&[u8], CompressionType)],
+        entries: &[(u64, u64, &str)],
+    ) -> (Arc<CountingSource>, UnityFsBundle, Region) {
+        let (source, region) = CountingSource::region(make_multi_block_bundle(blocks, entries));
+        let bundle = UnityFsBundle::open(&region).unwrap();
+        let entry = bundle.entry_region(0).unwrap();
+        source.take_reads();
+        (source, bundle, entry)
+    }
+
+    fn patterned(length: usize, seed: u32) -> Vec<u8> {
+        (0..length)
+            .map(|i| u8::try_from((u32::try_from(i).unwrap() * 31 + seed) % 251).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn entry_regions_read_the_same_bytes_as_full_entry_reads() {
+        let raw: Vec<Vec<u8>> = (0..5).map(|seed| patterned(256, seed)).collect();
+        let kinds = [
+            CompressionType::Lz4,
+            CompressionType::None,
+            CompressionType::Lz4Hc,
+            CompressionType::Zstd,
+            CompressionType::None,
+        ];
+        let blocks = blocks_with(&raw, &kinds);
+        let entries = [
+            (0, 300, "a"),
+            (300, 700, "b"),
+            (1000, 280, "c"),
+            (1280, 0, "empty"),
+        ];
+        let bundle_bytes = make_multi_block_bundle(&blocks, &entries);
+        // Embedded after unrelated bytes, so the bundle region does not start
+        // at offset 0 of its source.
+        let mut embedded = vec![0xee_u8; 13];
+        embedded.extend_from_slice(&bundle_bytes);
+        let length = bundle_bytes.len() as u64;
+        let region = Region::from_bytes(embedded).subregion(13, length).unwrap();
+        let bundle = UnityFsBundle::open(&region).unwrap();
+        let stream: Vec<u8> = raw.concat();
+
+        for (index, (offset, size, _)) in entries.iter().enumerate() {
+            let entry = bundle.entry_region(index).unwrap();
+            assert_eq!(entry.len(), *size);
+            let whole = entry.read_to_vec(u64::MAX).unwrap();
+            assert_eq!(whole, bundle.read_entry(index).unwrap());
+            let (start, end) = (
+                usize::try_from(*offset).unwrap(),
+                usize::try_from(offset + size).unwrap(),
+            );
+            assert_eq!(whole, &stream[start..end]);
+            // Reads at every alignment, within and across block boundaries.
+            for read_length in [1_usize, 7, 64, 255, 257] {
+                for read_offset in (0..*size).step_by(37) {
+                    let available = usize::try_from(size - read_offset).unwrap();
+                    let take = read_length.min(available);
+                    let mut output = vec![0_u8; take];
+                    entry.read_exact_at(read_offset, &mut output).unwrap();
+                    let from = start + usize::try_from(read_offset).unwrap();
+                    assert_eq!(output, &stream[from..from + take]);
+                }
+            }
+            // Past the end is an end-of-input error, not a short read.
+            let mut one = [0_u8; 1];
+            match entry.read_exact_at(*size, &mut one) {
+                Err(Error::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                }
+                other => panic!("expected an end-of-input error, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            bundle.entry_region(entries.len()),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn entry_regions_decode_only_the_blocks_a_read_overlaps() {
+        let raw: Vec<Vec<u8>> = (0..5).map(|seed| patterned(512, seed)).collect();
+        let kinds = [
+            CompressionType::Lz4,
+            CompressionType::Lz4,
+            CompressionType::Lz4,
+            CompressionType::Lz4,
+            CompressionType::None,
+        ];
+        let blocks = blocks_with(&raw, &kinds);
+        let (source, bundle, entry) = counted_entry(&blocks, &[(0, 2560, "all")]);
+        let stored = |index: usize| {
+            let block = &bundle.blocks[index];
+            (block.compressed_offset, block.compressed_size as usize)
+        };
+
+        // Ten bytes inside block 3: only block 3's stored bytes are read.
+        let mut output = [0_u8; 10];
+        entry.read_exact_at(3 * 512 + 100, &mut output).unwrap();
+        assert_eq!(output, raw[3][100..110]);
+        assert_eq!(source.take_reads(), [stored(3)]);
+        // The decoded block is cached.
+        entry.read_exact_at(3 * 512 + 400, &mut output).unwrap();
+        assert!(source.take_reads().is_empty());
+        // An uncompressed block is read in place, exactly the bytes asked for.
+        entry.read_exact_at(4 * 512 + 7, &mut output).unwrap();
+        assert_eq!(output, raw[4][7..17]);
+        assert_eq!(
+            source.take_reads(),
+            [(bundle.blocks[4].compressed_offset + 7, 10)]
+        );
+        // A read spanning blocks 0 and 1 decodes exactly those two.
+        let mut spanning = [0_u8; 20];
+        entry.read_exact_at(502, &mut spanning).unwrap();
+        assert_eq!(spanning[..10], raw[0][502..]);
+        assert_eq!(spanning[10..], raw[1][..10]);
+        assert_eq!(source.take_reads(), [stored(0), stored(1)]);
+    }
+
+    #[test]
+    fn entry_region_cache_is_bounded_but_keeps_the_latest_block() {
+        // Zeros compress to almost nothing, so the stored bundle stays small.
+        let big = vec![0_u8; super::ENTRY_REGION_CACHE_BYTES + 1];
+        let (source, _, entry) = counted_entry(
+            &[(big.as_slice(), CompressionType::Lz4)],
+            &[(0, big.len() as u64, "single")],
+        );
+        let mut output = [1_u8; 8];
+        for offset in [0, 4096, big.len() as u64 - 8] {
+            entry.read_exact_at(offset, &mut output).unwrap();
+            assert_eq!(output, [0; 8]);
+        }
+        // One block over the budget is still decoded only once.
+        assert_eq!(source.take_reads().len(), 1);
+
+        let third = super::ENTRY_REGION_CACHE_BYTES / 3 + 1;
+        let block = vec![0_u8; third];
+        let (source, _, entry) = counted_entry(
+            &[(block.as_slice(), CompressionType::Lz4); 3],
+            &[(0, 3 * third as u64, "three")],
+        );
+        let at = |index: usize| (index * third) as u64;
+        for index in 0..3 {
+            entry.read_exact_at(at(index), &mut output).unwrap();
+        }
+        assert_eq!(source.take_reads().len(), 3);
+        // Three blocks exceed the budget: the least recently used one went.
+        entry.read_exact_at(at(2), &mut output).unwrap();
+        entry.read_exact_at(at(1), &mut output).unwrap();
+        assert!(source.take_reads().is_empty());
+        entry.read_exact_at(at(0), &mut output).unwrap();
+        assert_eq!(source.take_reads().len(), 1);
+    }
+
+    #[test]
+    fn entry_region_cache_holds_a_bounded_number_of_blocks() {
+        let raw: Vec<Vec<u8>> = (0..200).map(|seed| patterned(4, seed)).collect();
+        let kinds = [CompressionType::Lz4; 200];
+        let blocks = blocks_with(&raw, &kinds);
+        let (source, _, entry) = counted_entry(&blocks, &[(0, 800, "tiny")]);
+        assert_eq!(entry.read_to_vec(800).unwrap(), raw.concat());
+        assert_eq!(source.take_reads().len(), 200);
+        // Far under the byte budget, the slot cap still evicted block 0.
+        let mut output = [0_u8; 4];
+        entry.read_exact_at(199 * 4, &mut output).unwrap();
+        assert!(source.take_reads().is_empty());
+        entry.read_exact_at(0, &mut output).unwrap();
+        assert_eq!(output, raw[0][..]);
+        assert_eq!(source.take_reads().len(), 1);
+    }
+
+    #[test]
+    fn entry_regions_refuse_lzham_and_unknown_blocks_as_unsupported() {
+        let raw = patterned(64, 3);
+        for kind in [CompressionType::Lzham, CompressionType::Unknown(9)] {
+            let bytes = make_multi_block_bundle(&[(&raw, kind)], &[(0, 64, "entry")]);
+            let bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
+            let entry = bundle.entry_region(0).unwrap();
+            match entry.read_exact_at(0, &mut [0_u8; 8]) {
+                Err(Error::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{kind:?}");
+                }
+                other => panic!("{kind:?}: expected unsupported, got {other:?}"),
+            }
+            assert!(matches!(bundle.read_entry(0), Err(Error::Unsupported(_))));
+        }
+    }
+
+    #[test]
+    fn entry_regions_report_corrupt_blocks_as_invalid_data() {
+        let raw = patterned(512, 9);
+        let mut bytes = make_multi_block_bundle(
+            &[(&raw, CompressionType::None), (&raw, CompressionType::Lz4)],
+            &[(0, 1024, "entry")],
+        );
+        let bundle = UnityFsBundle::open(&Region::from_bytes(bytes.clone())).unwrap();
+        let start = usize::try_from(bundle.blocks[1].compressed_offset).unwrap();
+        // A literal run longer than the block: LZ4 refuses it.
+        bytes[start] = 0xf0;
+        for byte in &mut bytes[start + 1..] {
+            *byte = 0xff;
+        }
+        let bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
+        let entry = bundle.entry_region(0).unwrap();
+        let mut output = [0_u8; 16];
+        // The intact block still reads.
+        entry.read_exact_at(0, &mut output).unwrap();
+        assert_eq!(output, raw[..16]);
+        match entry.read_exact_at(600, &mut output) {
+            Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("expected invalid data, got {other:?}"),
+        }
+        assert!(bundle.read_entry(0).is_err());
+    }
+
+    #[test]
+    fn entry_regions_refuse_entries_their_blocks_do_not_cover() {
+        let raw = patterned(256, 1);
+        let bytes = make_multi_block_bundle(&[(&raw, CompressionType::Lz4)], &[(0, 256, "a")]);
+        let mut bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
+        // The public fields can be edited after open; the region re-checks
+        // them instead of trusting them.
+        bundle.entries[0].size = 300;
+        let error = bundle.entry_region(0).unwrap_err();
+        assert!(
+            error.to_string().contains("beyond its data blocks"),
+            "{error}"
+        );
+        bundle.entries[0].size = 256;
+        bundle.blocks[0].uncompressed_offset = 8;
+        let error = bundle.entry_region(0).unwrap_err();
+        assert!(error.to_string().contains("starts before"), "{error}");
+        bundle.entries[0].offset = u64::MAX;
+        assert!(bundle.entry_region(0).is_err());
+    }
+
     fn make_encoded_data_bundle(data: &[u8], compression: CompressionType) -> Vec<u8> {
         let raw_blocks_info = make_blocks_info_record(
             u64::try_from(PAYLOAD.len()).unwrap(),
@@ -2011,8 +2557,18 @@ mod tests {
             u32::try_from(data.len()).unwrap(),
             compression,
         );
-        let flags = BLOCKS_AND_DIRECTORY_INFO_COMBINED;
+        v6_bundle(
+            BLOCKS_AND_DIRECTORY_INFO_COMBINED,
+            &raw_blocks_info,
+            raw_blocks_info.len(),
+            data,
+        )
+    }
 
+    /// A version 6 `UnityFS` bundle (revision 2018.4.0f1) with the given
+    /// archive flags, stored blocks info (`raw_info_length` bytes once
+    /// decompressed) and block data, its size field filled in.
+    fn v6_bundle(flags: u32, stored_info: &[u8], raw_info_length: usize, data: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"UnityFS\0");
         bytes.extend_from_slice(&6_u32.to_be_bytes());
@@ -2020,12 +2576,11 @@ mod tests {
         bytes.extend_from_slice(b"2018.4.0f1\0");
         let size_position = bytes.len();
         bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(raw_blocks_info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(raw_blocks_info.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(stored_info.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(raw_info_length).unwrap().to_be_bytes());
         bytes.extend_from_slice(&flags.to_be_bytes());
-        bytes.extend_from_slice(&raw_blocks_info);
+        bytes.extend_from_slice(stored_info);
         bytes.extend_from_slice(data);
-
         let bundle_size = i64::try_from(bytes.len()).unwrap();
         bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
         bytes

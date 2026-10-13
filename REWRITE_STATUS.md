@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-10-08（Asia/Shanghai）
+最后更新：2026-10-14（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。逐格式兼容矩阵与证据维护在本文，[`README.md`](README.md) 只保留简要能力概览；私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -74,6 +74,13 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 
 - SerializedFile v5-v22，支持大小端、32/64 位 PathID、TypeTree、外部引用和有界对象区间；
 - UnityFS v6-v8，支持 None、LZ4/LZ4HC、LZMA、Zstd；
+- `UnityFsBundle::entry_region` 把单个 entry 作为惰性随机访问 `Region` 打开：一次读取只
+  解码与之重叠的存储块（None 块原地读取；LZ4/LZ4HC、LZMA、Zstd、注入的 Oodle 与 UnityCN
+  解密后的块整块解码），解码结果进入上限 `ENTRY_REGION_CACHE_BYTES`（8 MiB）的 LRU 缓存且
+  始终保留最近一块，单块 LZMA entry 因此只解一次。读大 entry 深处的小对象时不再像
+  `copy_entry`/`read_entry` 那样从头解码（远程源下即从头下载）全部前序块；不预先物化，故不受
+  `max_entry_read_size` 约束。entry 的块覆盖在打开时复核（公开字段可被调用方改动），损坏块以
+  `InvalidData` 类 I/O 错误报告；
 - UnityWeb/UnityRaw v1-v6、UnityWebData/TuanjieWebData；
 - gzip、Brotli、ZIP Stored/Deflate；
 - `.split0`...`.splitN` 惰性拼接、递归容器发现、外部资源和跨文件 PPtr；
