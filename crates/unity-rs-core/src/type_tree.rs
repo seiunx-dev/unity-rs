@@ -375,6 +375,39 @@ impl SerializedFile {
                     object.path_id
                 ))
             })?;
+        self.read_type_tree_value_with_tree(object_index, tree, limits)
+    }
+
+    /// Reads one object with a caller-supplied `TypeTree` instead of the
+    /// tree the file embeds for its type.
+    ///
+    /// Player builds strip type trees, and a `MonoBehaviour`'s script layout
+    /// normally comes from resolving its `m_Script` against the managed
+    /// metadata of the whole asset set. A caller that already knows the
+    /// layout -- it reads one known script type, or tries a few candidate
+    /// layouts -- can read the object from this file alone. Nothing is
+    /// resolved: neither the object's own type metadata nor `m_Script` is
+    /// consulted, so the object may come from a file without type trees.
+    ///
+    /// The read is otherwise [`Self::read_type_tree_value_with_limits`]: the
+    /// file's endianness, the object's absolute alignment and the file's
+    /// reference types apply, `tree` is validated and bounded like an
+    /// embedded one, and it must consume the payload exactly. A tree that
+    /// does not describe the object therefore fails -- `Unsupported` when
+    /// bytes are left over, an end-of-input error when it reads past the
+    /// payload -- rather than returning a partial value, which also makes
+    /// this usable to tell candidate layouts apart.
+    pub fn read_type_tree_value_with_tree(
+        &self,
+        object_index: usize,
+        tree: &TypeTree,
+        limits: TypeTreeReadLimits,
+    ) -> Result<TypeValue> {
+        let object = self.objects.get(object_index).ok_or_else(|| {
+            Error::invalid_data(format!(
+                "serialized object index {object_index} is out of range"
+            ))
+        })?;
         let payload = self.object_region(object_index)?;
         let endian = if self.header.endianness == 0 {
             Endian::Little
