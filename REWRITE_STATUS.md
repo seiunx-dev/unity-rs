@@ -73,6 +73,11 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 ### 输入、容器和资源
 
 - SerializedFile v5-v22，支持大小端、32/64 位 PathID、TypeTree、外部引用和有界对象区间；
+- `SerializedFile::read_type_tree_value_with_tree` 用调用方提供的 TypeTree 读取单个对象，
+  不查询对象自身的类型元数据，也不解析 `m_Script`，因此剥离了类型树的 player 构建中，已知
+  布局的 MonoBehaviour 可以只凭所在文件读出，无需加载整套资产解析脚本。字节序、绝对对齐、
+  reference types、读取预算以及"必须恰好消费完 payload"的规则与内嵌 TypeTree 路径完全相同
+  （内嵌路径现即经由它读取），剩余字节报 `Unsupported`、越界读报输入结束，可据此区分候选布局；
 - UnityFS v6-v8，支持 None、LZ4/LZ4HC、LZMA、Zstd；
 - `UnityFsBundle::entry_region` 把单个 entry 作为惰性随机访问 `Region` 打开：一次读取只
   解码与之重叠的存储块（None 块原地读取；LZ4/LZ4HC、LZMA、Zstd、注入的 Oodle 与 UnityCN

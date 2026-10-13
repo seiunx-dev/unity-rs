@@ -401,7 +401,10 @@ impl Write for BoundedJsonOutput {
 
 #[cfg(test)]
 mod tests {
+    use crate::Error;
+    use crate::serialized::{TypeTree, TypeTreeNode};
     use crate::source::Region;
+    use crate::type_tree::{TypeTreeReadLimits, TypeValue};
 
     use super::{
         MONO_BEHAVIOUR_CLASS_ID, MONO_SCRIPT_CLASS_ID, MonoBehaviourReadLimits, ObjectReference,
@@ -525,6 +528,136 @@ mod tests {
         let error =
             read_mono_behaviour(&script_file, 0, MonoBehaviourReadLimits::default()).unwrap_err();
         assert!(error.to_string().contains("not MonoBehaviour (114)"));
+    }
+
+    /// The object of `reads_v22_base_fields_and_prefers_embedded_type_tree_json`.
+    fn hero_object() -> Vec<u8> {
+        let mut object = Vec::new();
+        push_pptr(&mut object, 0, 41);
+        object.push(1);
+        align(&mut object, 4);
+        push_pptr(&mut object, 2, 99);
+        push_aligned_string(&mut object, "Hero");
+        push_i32(&mut object, 123);
+        object
+    }
+
+    fn type_tree(nodes: &[TestNode]) -> TypeTree {
+        TypeTree {
+            nodes: nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| TypeTreeNode {
+                    type_name: node.type_name.to_owned(),
+                    field_name: node.field_name.to_owned(),
+                    byte_size: -1,
+                    index: i32::try_from(index).unwrap(),
+                    type_flags: 0,
+                    version: 1,
+                    meta_flags: if node.align { 0x4000 } else { 0 },
+                    level: u32::from(node.level),
+                    type_string_offset: None,
+                    name_string_offset: None,
+                    reference_type_hash: 0,
+                })
+                .collect(),
+            string_buffer: Vec::new(),
+        }
+    }
+
+    fn root_field<'value>(value: &'value TypeValue, name: &str) -> Option<&'value TypeValue> {
+        match value {
+            TypeValue::Object(fields) => fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| &field.value),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_stripped_object_reads_with_a_caller_supplied_tree() {
+        let object = hero_object();
+        let stripped = parse_v22(MONO_BEHAVIOUR_CLASS_ID, "2022.3.62f1", &object, None);
+        let limits = TypeTreeReadLimits::default();
+        assert!(matches!(
+            stripped.read_type_tree_value(0),
+            Err(Error::Unsupported(_))
+        ));
+
+        // The supplied tree reads exactly what the embedded one would.
+        let nodes = mono_behaviour_tree();
+        let tree = type_tree(&nodes);
+        let value = stripped
+            .read_type_tree_value_with_tree(0, &tree, limits)
+            .unwrap();
+        let embedded = parse_v22(
+            MONO_BEHAVIOUR_CLASS_ID,
+            "2022.3.62f1",
+            &object,
+            Some(&nodes),
+        );
+        assert_eq!(value, embedded.read_type_tree_value(0).unwrap());
+        assert_eq!(root_field(&value, "score"), Some(&TypeValue::Signed(123)));
+        assert_eq!(
+            root_field(&value, "m_Name"),
+            Some(&TypeValue::String("Hero".to_owned()))
+        );
+
+        // An embedded tree is not consulted: the supplied names win.
+        let mut renamed = nodes.clone();
+        renamed[12].field_name = "points";
+        let value = embedded
+            .read_type_tree_value_with_tree(0, &type_tree(&renamed), limits)
+            .unwrap();
+        assert_eq!(root_field(&value, "points"), Some(&TypeValue::Signed(123)));
+        assert_eq!(root_field(&value, "score"), None);
+    }
+
+    #[test]
+    fn a_supplied_tree_must_describe_the_object_exactly() {
+        let file = parse_v22(MONO_BEHAVIOUR_CLASS_ID, "2022.3.62f1", &hero_object(), None);
+        let limits = TypeTreeReadLimits::default();
+        let nodes = mono_behaviour_tree();
+
+        // Too short: the trailing int is left over.
+        let short = type_tree(&nodes[..12]);
+        let error = file
+            .read_type_tree_value_with_tree(0, &short, limits)
+            .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error}");
+
+        // Too long: it reads past the payload.
+        let mut long = nodes.clone();
+        long.push(node("int", "extra", 1, false));
+        assert!(
+            file.read_type_tree_value_with_tree(0, &type_tree(&long), limits)
+                .is_err()
+        );
+
+        // A malformed tree, an empty one and a missing object are invalid data.
+        let mut skipping = nodes.clone();
+        skipping[1].level = 3;
+        for tree in [type_tree(&skipping), type_tree(&[])] {
+            let error = file
+                .read_type_tree_value_with_tree(0, &tree, limits)
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidData(_)), "{error}");
+        }
+        let error = file
+            .read_type_tree_value_with_tree(1, &type_tree(&nodes), limits)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidData(_)), "{error}");
+
+        // Limits apply to a supplied tree as to an embedded one.
+        let tight = TypeTreeReadLimits {
+            maximum_string_bytes: 3,
+            ..limits
+        };
+        assert!(
+            file.read_type_tree_value_with_tree(0, &type_tree(&nodes), tight)
+                .is_err()
+        );
     }
 
     #[derive(Clone, Copy)]
