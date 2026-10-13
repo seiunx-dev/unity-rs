@@ -241,7 +241,22 @@ impl BlockDecoder {
     }
 
     /// Decodes one compressed storage block to exactly its declared size.
+    /// LZHAM and unknown codes are refused as `Unsupported`, as
+    /// `copy_entry` refuses them.
     fn decode(&self, block: &StorageBlock, block_index: usize) -> Result<Vec<u8>> {
+        if !matches!(
+            block.compression,
+            CompressionType::Lz4
+                | CompressionType::Lz4Hc
+                | CompressionType::Lzma
+                | CompressionType::Zstd
+                | CompressionType::Oodle
+        ) {
+            return Err(Error::unsupported(format!(
+                "UnityFS {:?} data block decompression",
+                block.compression
+            )));
+        }
         let compressed = self.block_bytes(block, block_index)?;
         match block.compression {
             CompressionType::Lz4 | CompressionType::Lz4Hc => decompress_lz4(
@@ -580,14 +595,16 @@ impl UnityFsBundle {
     /// Uncompressed blocks are read in place; compressed ones (LZ4/LZ4HC,
     /// LZMA, Zstd, injected Oodle, `UnityCN`-decrypted) are decoded whole and
     /// kept in a small least-recently-used cache of at most
-    /// [`ENTRY_REGION_CACHE_BYTES`], always holding the latest block, so a
-    /// single-block LZMA entry is decoded once rather than once per read.
+    /// [`ENTRY_REGION_CACHE_BYTES`] and 64 blocks, always holding the latest
+    /// block, so a single-block LZMA entry is decoded once rather than once
+    /// per read.
     ///
     /// Nothing is materialized up front, so [`BundleParseLimits::max_entry_read_size`]
     /// does not apply; each decoded block stays bounded by
     /// `max_uncompressed_block_size`. Errors while reading the region surface
     /// as I/O errors whose kind keeps the family: `InvalidData` for corrupt
-    /// blocks, `Unsupported` for a compression this build cannot decode.
+    /// blocks, `Unsupported` for a compression `copy_entry` refuses too
+    /// (LZHAM, unknown codes).
     pub fn entry_region(&self, index: usize) -> Result<Region> {
         let entry = self.entries.get(index).ok_or_else(|| {
             Error::invalid_data(format!("UnityFS entry index {index} is out of range"))
@@ -884,6 +901,10 @@ impl BlockDecodeCache {
 /// recently decoded block is always kept, even when it alone is larger.
 pub const ENTRY_REGION_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Most decoded blocks one entry region keeps, whatever their size, so a
+/// bundle of many tiny blocks cannot make every cache lookup a long scan.
+const ENTRY_REGION_CACHE_BLOCKS: usize = 64;
+
 /// The [`Source`] behind [`UnityFsBundle::entry_region`]: the storage blocks
 /// covering one entry, decoded only when a read overlaps them.
 struct EntryBlockSource {
@@ -989,7 +1010,10 @@ impl EntryBlockSource {
         if !cache.blocks.iter().any(|(cached, _)| *cached == index) {
             cache.bytes = cache.bytes.saturating_add(data.len());
             cache.blocks.push_back((index, Arc::clone(&data)));
-            while cache.bytes > ENTRY_REGION_CACHE_BYTES && cache.blocks.len() > 1 {
+            while (cache.bytes > ENTRY_REGION_CACHE_BYTES
+                || cache.blocks.len() > ENTRY_REGION_CACHE_BLOCKS)
+                && cache.blocks.len() > 1
+            {
                 if let Some((_, evicted)) = cache.blocks.pop_front() {
                     cache.bytes = cache.bytes.saturating_sub(evicted.len());
                 }
@@ -2211,10 +2235,11 @@ mod tests {
         let stored: Vec<Vec<u8>> = blocks
             .iter()
             .map(|(raw, compression)| match compression {
-                CompressionType::None => raw.to_vec(),
                 CompressionType::Lz4 | CompressionType::Lz4Hc => compress(raw),
                 CompressionType::Zstd => zstd::bulk::compress(raw, 1).unwrap(),
-                other => panic!("test helper cannot encode {other:?}"),
+                // Stored as is: uncompressed, or a codec the reader refuses
+                // and so never decodes.
+                _ => raw.to_vec(),
             })
             .collect();
         let mut info = vec![0_u8; 16];
@@ -2441,6 +2466,40 @@ mod tests {
         assert!(source.take_reads().is_empty());
         entry.read_exact_at(at(0), &mut output).unwrap();
         assert_eq!(source.take_reads().len(), 1);
+    }
+
+    #[test]
+    fn entry_region_cache_holds_a_bounded_number_of_blocks() {
+        let raw: Vec<Vec<u8>> = (0..200).map(|seed| patterned(4, seed)).collect();
+        let kinds = [CompressionType::Lz4; 200];
+        let blocks = blocks_with(&raw, &kinds);
+        let (source, _, entry) = counted_entry(&blocks, &[(0, 800, "tiny")]);
+        assert_eq!(entry.read_to_vec(800).unwrap(), raw.concat());
+        assert_eq!(source.take_reads().len(), 200);
+        // Far under the byte budget, the slot cap still evicted block 0.
+        let mut output = [0_u8; 4];
+        entry.read_exact_at(199 * 4, &mut output).unwrap();
+        assert!(source.take_reads().is_empty());
+        entry.read_exact_at(0, &mut output).unwrap();
+        assert_eq!(output, raw[0][..]);
+        assert_eq!(source.take_reads().len(), 1);
+    }
+
+    #[test]
+    fn entry_regions_refuse_lzham_and_unknown_blocks_as_unsupported() {
+        let raw = patterned(64, 3);
+        for kind in [CompressionType::Lzham, CompressionType::Unknown(9)] {
+            let bytes = make_multi_block_bundle(&[(&raw, kind)], &[(0, 64, "entry")]);
+            let bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
+            let entry = bundle.entry_region(0).unwrap();
+            match entry.read_exact_at(0, &mut [0_u8; 8]) {
+                Err(Error::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{kind:?}");
+                }
+                other => panic!("{kind:?}: expected unsupported, got {other:?}"),
+            }
+            assert!(matches!(bundle.read_entry(0), Err(Error::Unsupported(_))));
+        }
     }
 
     #[test]
