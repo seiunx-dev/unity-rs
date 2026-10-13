@@ -2133,26 +2133,7 @@ mod tests {
         };
         let flags = BLOCKS_AND_DIRECTORY_INFO_COMBINED | u32::from(info_compression.code());
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"UnityFS\0");
-        bytes.extend_from_slice(&6_u32.to_be_bytes());
-        bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
-        let size_position = bytes.len();
-        bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(
-            &u32::try_from(stored_blocks_info.len())
-                .unwrap()
-                .to_be_bytes(),
-        );
-        bytes.extend_from_slice(&u32::try_from(raw_blocks_info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&flags.to_be_bytes());
-        bytes.extend_from_slice(&stored_blocks_info);
-        bytes.extend_from_slice(&data);
-
-        let bundle_size = i64::try_from(bytes.len()).unwrap();
-        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
-        bytes
+        v6_bundle(flags, &stored_blocks_info, raw_blocks_info.len(), &data)
     }
 
     fn make_oodle_bundle() -> (Vec<u8>, Vec<u8>) {
@@ -2164,21 +2145,7 @@ mod tests {
         );
         let flags = BLOCKS_AND_DIRECTORY_INFO_COMBINED | u32::from(CompressionType::Oodle.code());
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"UnityFS\0");
-        bytes.extend_from_slice(&6_u32.to_be_bytes());
-        bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
-        let size_position = bytes.len();
-        bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(OODLE_INFO_INPUT.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(blocks_info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&flags.to_be_bytes());
-        bytes.extend_from_slice(OODLE_INFO_INPUT);
-        bytes.extend_from_slice(OODLE_DATA_INPUT);
-
-        let bundle_size = i64::try_from(bytes.len()).unwrap();
-        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
+        let bytes = v6_bundle(flags, OODLE_INFO_INPUT, blocks_info.len(), OODLE_DATA_INPUT);
         (bytes, blocks_info)
     }
 
@@ -2208,20 +2175,12 @@ mod tests {
             info.push(0);
         }
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"UnityFS\0");
-        bytes.extend_from_slice(&6_u32.to_be_bytes());
-        bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
-        let size_position = bytes.len();
-        bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&BLOCKS_AND_DIRECTORY_INFO_COMBINED.to_be_bytes());
-        bytes.extend_from_slice(&info);
-        bytes.extend_from_slice(&compressed);
-        let bundle_size = i64::try_from(bytes.len()).unwrap();
-        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
+        let bytes = v6_bundle(
+            BLOCKS_AND_DIRECTORY_INFO_COMBINED,
+            &info,
+            info.len(),
+            &compressed,
+        );
 
         let bundle = UnityFsBundle::open(&Region::from_bytes(bytes)).unwrap();
         assert_eq!(bundle.entries.len(), 2);
@@ -2286,23 +2245,12 @@ mod tests {
             info.push(0);
         }
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"UnityFS\0");
-        bytes.extend_from_slice(&6_u32.to_be_bytes());
-        bytes.extend_from_slice(b"5.x.x\0");
-        bytes.extend_from_slice(b"2018.4.0f1\0");
-        let size_position = bytes.len();
-        bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&BLOCKS_AND_DIRECTORY_INFO_COMBINED.to_be_bytes());
-        bytes.extend_from_slice(&info);
-        for data in &stored {
-            bytes.extend_from_slice(data);
-        }
-        let bundle_size = i64::try_from(bytes.len()).unwrap();
-        bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
-        bytes
+        v6_bundle(
+            BLOCKS_AND_DIRECTORY_INFO_COMBINED,
+            &info,
+            info.len(),
+            &stored.concat(),
+        )
     }
 
     /// Bytes behind a [`Source`] that records every read.
@@ -2340,6 +2288,29 @@ mod tests {
         }
     }
 
+    fn blocks_with<'raw>(
+        raw: &'raw [Vec<u8>],
+        kinds: &[CompressionType],
+    ) -> Vec<(&'raw [u8], CompressionType)> {
+        raw.iter()
+            .zip(kinds)
+            .map(|(data, kind)| (data.as_slice(), *kind))
+            .collect()
+    }
+
+    /// Opens entry 0 of a bundle behind a [`CountingSource`] whose reads so
+    /// far (header, blocks info) are discarded.
+    fn counted_entry(
+        blocks: &[(&[u8], CompressionType)],
+        entries: &[(u64, u64, &str)],
+    ) -> (Arc<CountingSource>, UnityFsBundle, Region) {
+        let (source, region) = CountingSource::region(make_multi_block_bundle(blocks, entries));
+        let bundle = UnityFsBundle::open(&region).unwrap();
+        let entry = bundle.entry_region(0).unwrap();
+        source.take_reads();
+        (source, bundle, entry)
+    }
+
     fn patterned(length: usize, seed: u32) -> Vec<u8> {
         (0..length)
             .map(|i| u8::try_from((u32::try_from(i).unwrap() * 31 + seed) % 251).unwrap())
@@ -2356,11 +2327,7 @@ mod tests {
             CompressionType::Zstd,
             CompressionType::None,
         ];
-        let blocks: Vec<(&[u8], CompressionType)> = raw
-            .iter()
-            .zip(kinds)
-            .map(|(data, kind)| (data.as_slice(), kind))
-            .collect();
+        let blocks = blocks_with(&raw, &kinds);
         let entries = [
             (0, 300, "a"),
             (300, 700, "b"),
@@ -2423,16 +2390,8 @@ mod tests {
             CompressionType::Lz4,
             CompressionType::None,
         ];
-        let blocks: Vec<(&[u8], CompressionType)> = raw
-            .iter()
-            .zip(kinds)
-            .map(|(data, kind)| (data.as_slice(), kind))
-            .collect();
-        let (source, region) =
-            CountingSource::region(make_multi_block_bundle(&blocks, &[(0, 2560, "all")]));
-        let bundle = UnityFsBundle::open(&region).unwrap();
-        let entry = bundle.entry_region(0).unwrap();
-        source.take_reads();
+        let blocks = blocks_with(&raw, &kinds);
+        let (source, bundle, entry) = counted_entry(&blocks, &[(0, 2560, "all")]);
         let stored = |index: usize| {
             let block = &bundle.blocks[index];
             (block.compressed_offset, block.compressed_size as usize)
@@ -2465,13 +2424,10 @@ mod tests {
     fn entry_region_cache_is_bounded_but_keeps_the_latest_block() {
         // Zeros compress to almost nothing, so the stored bundle stays small.
         let big = vec![0_u8; super::ENTRY_REGION_CACHE_BYTES + 1];
-        let (source, region) = CountingSource::region(make_multi_block_bundle(
-            &[(&big, CompressionType::Lz4)],
+        let (source, _, entry) = counted_entry(
+            &[(big.as_slice(), CompressionType::Lz4)],
             &[(0, big.len() as u64, "single")],
-        ));
-        let bundle = UnityFsBundle::open(&region).unwrap();
-        let entry = bundle.entry_region(0).unwrap();
-        source.take_reads();
+        );
         let mut output = [1_u8; 8];
         for offset in [0, 4096, big.len() as u64 - 8] {
             entry.read_exact_at(offset, &mut output).unwrap();
@@ -2482,17 +2438,10 @@ mod tests {
 
         let third = super::ENTRY_REGION_CACHE_BYTES / 3 + 1;
         let block = vec![0_u8; third];
-        let (source, region) = CountingSource::region(make_multi_block_bundle(
-            &[
-                (&block, CompressionType::Lz4),
-                (&block, CompressionType::Lz4),
-                (&block, CompressionType::Lz4),
-            ],
+        let (source, _, entry) = counted_entry(
+            &[(block.as_slice(), CompressionType::Lz4); 3],
             &[(0, 3 * third as u64, "three")],
-        ));
-        let bundle = UnityFsBundle::open(&region).unwrap();
-        let entry = bundle.entry_region(0).unwrap();
-        source.take_reads();
+        );
         let at = |index: usize| (index * third) as u64;
         for index in 0..3 {
             entry.read_exact_at(at(index), &mut output).unwrap();
@@ -2561,8 +2510,18 @@ mod tests {
             u32::try_from(data.len()).unwrap(),
             compression,
         );
-        let flags = BLOCKS_AND_DIRECTORY_INFO_COMBINED;
+        v6_bundle(
+            BLOCKS_AND_DIRECTORY_INFO_COMBINED,
+            &raw_blocks_info,
+            raw_blocks_info.len(),
+            data,
+        )
+    }
 
+    /// A version 6 `UnityFS` bundle (revision 2018.4.0f1) with the given
+    /// archive flags, stored blocks info (`raw_info_length` bytes once
+    /// decompressed) and block data, its size field filled in.
+    fn v6_bundle(flags: u32, stored_info: &[u8], raw_info_length: usize, data: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"UnityFS\0");
         bytes.extend_from_slice(&6_u32.to_be_bytes());
@@ -2570,12 +2529,11 @@ mod tests {
         bytes.extend_from_slice(b"2018.4.0f1\0");
         let size_position = bytes.len();
         bytes.extend_from_slice(&0_i64.to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(raw_blocks_info.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(&u32::try_from(raw_blocks_info.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(stored_info.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&u32::try_from(raw_info_length).unwrap().to_be_bytes());
         bytes.extend_from_slice(&flags.to_be_bytes());
-        bytes.extend_from_slice(&raw_blocks_info);
+        bytes.extend_from_slice(stored_info);
         bytes.extend_from_slice(data);
-
         let bundle_size = i64::try_from(bytes.len()).unwrap();
         bytes[size_position..size_position + 8].copy_from_slice(&bundle_size.to_be_bytes());
         bytes
