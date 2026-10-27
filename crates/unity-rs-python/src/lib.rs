@@ -57,8 +57,8 @@ use unity_rs_core::project_settings::ProjectSettingsReadLimits;
 use unity_rs_core::scene_hierarchy::{SceneHierarchyLimits, SceneHierarchyNode, SceneObjectKey};
 use unity_rs_core::scene_textures::{SceneTexture, SceneTextureLimits, SceneTextureSkip};
 use unity_rs_core::serialized::{
-    AssetBundleMetadata, ContainerMetadataReadLimits, PreloadDataMetadata, ResourceManagerMetadata,
-    TypeTree, TypeTreeNode,
+    AssetBundleMetadata, ContainerMetadataReadLimits, ExternalFile, PreloadDataMetadata,
+    ResourceManagerMetadata, TypeTree, TypeTreeNode,
 };
 use unity_rs_core::shader::ShaderReadLimits;
 use unity_rs_core::simple_assets::{
@@ -251,6 +251,37 @@ struct PyFileInfo {
     path: String,
     unity_version: String,
     object_count: usize,
+}
+
+/// One entry from a serialized file's ordered external-file table.
+///
+/// These paths are serialized metadata, not `AssetBundle.dependencies`; they
+/// are returned verbatim without sorting, deduplication, basename matching,
+/// builtin filtering, or classification.
+#[pyclass(name = "ExternalFileInfo", frozen)]
+#[derive(Debug)]
+struct PyExternalFileInfo {
+    #[pyo3(get)]
+    file_id: usize,
+    #[pyo3(get)]
+    path: String,
+    guid: Option<[u8; 16]>,
+    #[pyo3(get)]
+    kind: Option<i32>,
+    #[pyo3(get)]
+    prefix: Option<String>,
+}
+
+#[pymethods]
+impl PyExternalFileInfo {
+    /// The serialized GUID as 16 bytes, or `None` when the format omits it.
+    #[getter]
+    fn guid<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        self.guid
+            .as_ref()
+            .map(|guid| python_bytes(py, guid))
+            .transpose()
+    }
 }
 
 #[pyclass(name = "ObjectInfo", frozen, get_all)]
@@ -2941,6 +2972,24 @@ impl PyUnityRs {
         py.detach(|| prepare_object_page(&self.studio, file_index, offset, limit))
     }
 
+    /// Returns a bounded page of one serialized file's ordered external table.
+    ///
+    /// `file_id` is the one-based original serialized external slot, not a
+    /// collection file index. These paths are independent of
+    /// `AssetBundle.dependencies`; they are not sorted, deduplicated, matched
+    /// by basename, or classified as builtin. Empty, duplicate, and builtin
+    /// paths remain visible and in their original order.
+    #[pyo3(signature = (file_index, *, offset=0, limit=4_096))]
+    fn file_external_page(
+        &self,
+        py: Python<'_>,
+        file_index: usize,
+        offset: usize,
+        limit: usize,
+    ) -> PyResult<Vec<PyExternalFileInfo>> {
+        py.detach(|| prepare_external_page(&self.studio, file_index, offset, limit))
+    }
+
     /// Returns a bounded page of external resource metadata.
     #[pyo3(signature = (*, offset=0, limit=4_096))]
     fn resource_page(
@@ -5295,6 +5344,32 @@ fn prepare_object_page(
     Ok(output)
 }
 
+fn prepare_external_page(
+    studio: &Studio,
+    file_index: usize,
+    offset: usize,
+    limit: usize,
+) -> PyResult<Vec<PyExternalFileInfo>> {
+    check_metadata_page_limit(limit)?;
+    let file = studio
+        .file(file_index)
+        .ok_or_else(|| PyKeyError::new_err(format!("file index {file_index} was not found")))?;
+    let externals = file.externals();
+    let available = externals.len().saturating_sub(offset);
+    let count = available.min(limit);
+    let mut output = reserve_metadata(count, "Python serialized external metadata page")?;
+    for (page_index, external) in externals.iter().skip(offset).take(count).enumerate() {
+        let external_index = offset
+            .checked_add(page_index)
+            .ok_or_else(|| PyValueError::new_err("serialized external index overflowed"))?;
+        let file_id = external_index
+            .checked_add(1)
+            .ok_or_else(|| PyValueError::new_err("serialized external file ID overflowed"))?;
+        output.push(python_external_file_info(file_id, external)?);
+    }
+    Ok(output)
+}
+
 fn prepare_resource_page(
     studio: &Studio,
     offset: usize,
@@ -5316,6 +5391,19 @@ fn python_file_info(file: StudioFile<'_>) -> PyResult<PyFileInfo> {
         path: try_copy_string(file.path(), "file path")?,
         unity_version: try_copy_string(file.unity_version(), "Unity version")?,
         object_count: file.object_count(),
+    })
+}
+
+fn python_external_file_info(
+    file_id: usize,
+    external: &ExternalFile,
+) -> PyResult<PyExternalFileInfo> {
+    Ok(PyExternalFileInfo {
+        file_id,
+        path: try_copy_string(&external.path, "serialized external path")?,
+        guid: external.guid,
+        kind: external.kind,
+        prefix: try_copy_optional_string(external.prefix.as_deref(), "serialized external prefix")?,
     })
 }
 
@@ -6971,6 +7059,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyObjectIterator>()?;
     module.add_class::<PyResourceIterator>()?;
     module.add_class::<PyFileInfo>()?;
+    module.add_class::<PyExternalFileInfo>()?;
     module.add_class::<PyObjectInfo>()?;
     module.add_class::<PyResourceInfo>()?;
     module.add_class::<PyLoadDiagnostic>()?;

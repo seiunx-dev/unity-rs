@@ -19,6 +19,18 @@ class FileInfo:
     @property
     def object_count(self) -> int: ...
 
+class ExternalFileInfo:
+    @property
+    def file_id(self) -> int: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def guid(self) -> Optional[bytes]: ...
+    @property
+    def kind(self) -> Optional[int]: ...
+    @property
+    def prefix(self) -> Optional[str]: ...
+
 class ObjectInfo:
     @property
     def file_index(self) -> int: ...
@@ -1118,6 +1130,13 @@ class UnityRs:
         offset: int = 0,
         limit: int = 4096,
     ) -> list[ObjectInfo]: ...
+    def file_external_page(
+        self,
+        file_index: int,
+        *,
+        offset: int = 0,
+        limit: int = 4096,
+    ) -> list[ExternalFileInfo]: ...
     def resource_page(
         self,
         *,
