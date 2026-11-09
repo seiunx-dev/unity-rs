@@ -32,6 +32,7 @@ from unity_rs import (
     ExportReport,
     ExtractionLimits,
     ExtractionReport,
+    ExternalFileInfo,
     FbxCandidate,
     FileInfo,
     LegacyAnimation,
@@ -141,7 +142,20 @@ def consume_public_api(
     resource_iterator = studio.iter_resources()
     file_page: list[FileInfo] = studio.file_page()
     object_page: list[ObjectInfo] = studio.object_page(0)
+    external_page: list[ExternalFileInfo] = studio.file_external_page(0)
     resource_page: list[ResourceInfo] = studio.resource_page()
+    if external_page:
+        external: ExternalFileInfo = external_page[0]
+        external_fields: tuple[
+            int, str, Optional[bytes], Optional[int], Optional[str]
+        ] = (
+            external.file_id,
+            external.path,
+            external.guid,
+            external.kind,
+            external.prefix,
+        )
+        del external_fields
     scene_limits = SceneLimits(
         maximum_game_objects=100_000,
         maximum_index_bytes=64 * 1024 * 1024,

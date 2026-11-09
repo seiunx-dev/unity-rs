@@ -63,8 +63,8 @@ use crate::scene_hierarchy::{
     SceneHierarchy, SceneHierarchyLimits, SceneObjectKey, build_scene_hierarchy,
 };
 use crate::serialized::{
-    AssetBundleMetadata, ContainerMetadataReadLimits, ObjectInfo, PreloadDataMetadata,
-    ResourceManagerMetadata,
+    AssetBundleMetadata, ContainerMetadataReadLimits, ExternalFile, ObjectInfo,
+    PreloadDataMetadata, ResourceManagerMetadata,
 };
 use crate::shader::{ShaderReadLimits, read_shader};
 use crate::simple_assets::{
@@ -799,6 +799,16 @@ impl StudioFile<'_> {
     pub fn object_count(&self) -> usize {
         self.loaded.file.objects.len()
     }
+
+    /// Returns file-level external metadata in its original serialized order.
+    ///
+    /// External index 0 corresponds to `PPtr` `file_id` 1 (index `i` to
+    /// `file_id` `i + 1`). This is separate from `AssetBundle.dependencies`.
+    /// Duplicate entries, empty paths, and built-in paths are preserved.
+    #[must_use]
+    pub fn externals(&self) -> &[ExternalFile] {
+        &self.loaded.file.externals
+    }
 }
 
 /// Borrowed, source-bound access to one discovered external resource.
@@ -1496,7 +1506,59 @@ mod tests {
         assert!(studio.resource(1).is_none());
     }
 
+    #[test]
+    fn studio_file_exposes_serialized_external_metadata_in_order() {
+        let guid = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let studio = Studio::open_region(
+            "externals.assets",
+            Region::from_bytes(synthetic_v22_text_asset_with_externals(&[
+                ("shared", guid, 3, "shared.assets"),
+                ("shared", guid, 3, "shared.assets"),
+                ("", [0x10; 16], 0, ""),
+                ("archive:/", [0x20; 16], 2, "archive:/unity_builtin_extra"),
+            ])),
+        )
+        .unwrap();
+        let file = studio.file(0).unwrap();
+        let externals = file.externals();
+
+        assert_eq!(externals.len(), 4);
+        assert_eq!(externals[0].prefix.as_deref(), Some("shared"));
+        assert_eq!(externals[0].guid, Some(guid));
+        assert_eq!(externals[0].kind, Some(3));
+        assert_eq!(externals[0].path, "shared.assets");
+        assert_eq!(externals[1], externals[0]);
+        assert_eq!(externals[2].prefix.as_deref(), Some(""));
+        assert_eq!(externals[2].guid, Some([0x10; 16]));
+        assert_eq!(externals[2].kind, Some(0));
+        assert_eq!(externals[2].path, "");
+        assert_eq!(externals[3].prefix.as_deref(), Some("archive:/"));
+        assert_eq!(externals[3].guid, Some([0x20; 16]));
+        assert_eq!(externals[3].kind, Some(2));
+        assert_eq!(externals[3].path, "archive:/unity_builtin_extra");
+    }
+
+    #[test]
+    fn studio_file_with_no_externals_returns_an_empty_slice() {
+        let studio = Studio::open_region(
+            "no-externals.assets",
+            Region::from_bytes(synthetic_v22_text_asset()),
+        )
+        .unwrap();
+
+        assert!(studio.file(0).unwrap().externals().is_empty());
+    }
+
     fn synthetic_v22_text_asset() -> Vec<u8> {
+        synthetic_v22_text_asset_with_externals(&[])
+    }
+
+    fn synthetic_v22_text_asset_with_externals(
+        externals: &[(&str, [u8; 16], i32, &str)],
+    ) -> Vec<u8> {
         let mut object = Vec::new();
         push_aligned_string(&mut object, "hello");
         push_i32(&mut object, 7);
@@ -1531,9 +1593,15 @@ mod tests {
         metadata.extend_from_slice(&0_i64.to_le_bytes());
         metadata.extend_from_slice(&u32::try_from(object.len()).unwrap().to_le_bytes());
         push_i32(&mut metadata, 0);
-        for _ in 0..3 {
-            push_i32(&mut metadata, 0);
+        push_i32(&mut metadata, 0);
+        push_i32(&mut metadata, i32::try_from(externals.len()).unwrap());
+        for (prefix, guid, kind, path) in externals {
+            push_c_string(&mut metadata, prefix);
+            metadata.extend_from_slice(guid);
+            push_i32(&mut metadata, *kind);
+            push_c_string(&mut metadata, path);
         }
+        push_i32(&mut metadata, 0);
         metadata.push(0);
 
         let metadata_size = u32::try_from(metadata.len()).unwrap();
@@ -1561,6 +1629,11 @@ mod tests {
 
     fn push_i32(output: &mut Vec<u8>, value: i32) {
         output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_c_string(output: &mut Vec<u8>, value: &str) {
+        output.extend_from_slice(value.as_bytes());
+        output.push(0);
     }
 
     fn push_blob_tree(output: &mut Vec<u8>, nodes: &[(&str, &str, u8)]) {

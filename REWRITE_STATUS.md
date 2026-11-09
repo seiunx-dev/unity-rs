@@ -1,6 +1,6 @@
 # unity-rs 重写进度与缺口
 
-最后更新：2026-10-14（Asia/Shanghai）
+最后更新：2026-10-27（Asia/Shanghai）
 
 本文记录 Rust 重写的交付范围、当前能力、验证证据和剩余缺口。逐格式兼容矩阵与证据维护在本文，[`README.md`](README.md) 只保留简要能力概览；私有真实游戏语料的运行方式见 [`corpus/README.md`](corpus/README.md)。
 
@@ -73,6 +73,17 @@ Python 的 wheel/sdist 发布元数据与本表统一使用 PyPI 的 Beta classi
 ### 输入、容器和资源
 
 - SerializedFile v5-v22，支持大小端、32/64 位 PathID、TypeTree、外部引用和有界对象区间；
+- `StudioFile::externals` 借用已解析的有序外部引用表；Python
+  `file_external_page(file_index, offset=0, limit=4096)` 将其投影为独立、只读的
+  `ExternalFileInfo` 记录，保留原始一基 PPtr `file_id`、路径以及可选 GUID、kind、prefix。
+  分页复用元数据页上限并在 GIL 外复制，不扩充 `files()` 的急切物化范围；不以
+  `AssetBundle.dependencies` 代替序列化外部表，也不自动匹配目标或过滤内置资源路径。
+  v22 合成回归覆盖顺序、重复/空/内置路径、GUID/kind/prefix、分页边界与结果生命周期。
+  本地未发布 wheel 的私有实样核验分别加载舞台 16 文件与角色 2 文件集合：分页与完整
+  外部表逐字段一致，7 处舞台纹理 PPtr 通过真实槽位及精确 CAB 身份核对到 class 28
+  对象并成功解码；角色 2 处 Shader 引用的原始路径均为
+  `Resources/unity_builtin_extra`，仅作为路径证据，不代表内置目标已解析。
+  私有 Bundle 与核验报告未纳入仓库；该结果不宣称完整模型发布或动画验收通过。
 - `SerializedFile::read_type_tree_value_with_tree` 用调用方提供的 TypeTree 读取单个对象，
   不查询对象自身的类型元数据，也不解析 `m_Script`，因此剥离了类型树的 player 构建中，已知
   布局的 MonoBehaviour 可以只凭所在文件读出，无需加载整套资产解析脚本。字节序、绝对对齐、

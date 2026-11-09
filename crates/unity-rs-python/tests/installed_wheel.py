@@ -34,6 +34,11 @@ def forbidden_delivery_path(name: str) -> bool:
 
 def main() -> None:
     assert unity_rs.__version__ == version("unity-rs")
+    assert unity_rs.ExternalFileInfo.__name__ == "ExternalFileInfo"
+    assert all(
+        hasattr(unity_rs.ExternalFileInfo, name)
+        for name in ("file_id", "path", "guid", "kind", "prefix")
+    )
     assert unity_rs.__all__.count("__version__") == 1
     assert len(unity_rs.__all__) == len(set(unity_rs.__all__))
     for name in unity_rs.__all__:

@@ -11,6 +11,8 @@ The initial API supports:
 - direct bounded in-memory asset, bundle, and web-container loading with
   `UnityRs.from_bytes(...)`;
 - deterministic lazy or bounded-paged serialized-file and object enumeration;
+- bounded pages of each serialized file's original external-reference table,
+  including PPtr file IDs, paths, optional GUIDs, kinds, and prefixes;
 - deterministic lazy or bounded-paged external-resource enumeration plus
   bounded reads by stable index or portable path;
 - safe recursive bundle/web/ZIP/gzip/Brotli extraction with cumulative limits,
@@ -124,6 +126,21 @@ for diagnostic in studio.load_diagnostic_page(offset=0, limit=4096):
 
 # Page one serialized file without copying the rest of its object table.
 page = studio.object_page(0, offset=0, limit=4096)
+
+# Inspect the actual serialized external table, not AssetBundle.dependencies.
+# file_id is one-based and retains its original value across pages. Paths,
+# including empty, duplicate, or builtin-resource paths, are returned verbatim;
+# these records do not themselves claim that a target file/object is loaded.
+# Page limits above 1,000,000 raise ValueError; unknown file indices raise
+# KeyError. A zero limit or an offset beyond the table returns an empty page.
+offset = 0
+while True:
+    externals = studio.file_external_page(0, offset=offset, limit=4096)
+    for external in externals:
+        print(external.file_id, external.path, external.guid, external.kind, external.prefix)
+    if len(externals) < 4096:
+        break
+    offset += len(externals)
 
 extraction = extract(
     "bundle.ab",
