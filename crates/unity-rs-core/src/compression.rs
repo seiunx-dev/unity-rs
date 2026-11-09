@@ -361,6 +361,203 @@ mod tests {
         assert!(ZipContainer::open(&Region::from_bytes(bytes), limits).is_err());
     }
 
+    #[test]
+    fn lists_stored_and_deflated_entries_in_order_and_skips_directories() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let deflated =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        writer.add_directory("assets/", stored).unwrap();
+        writer.start_file("assets/b.bundle", stored).unwrap();
+        writer.write_all(b"stored bytes").unwrap();
+        writer.start_file("assets/a.bundle", deflated).unwrap();
+        writer.write_all(&[7_u8; 4096]).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let archive =
+            ZipContainer::open(&Region::from_bytes(bytes), CompressionLimits::default()).unwrap();
+
+        let paths: Vec<&str> = archive
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(paths, ["assets/b.bundle", "assets/a.bundle"]);
+        assert_eq!(archive.entries[0].size, 12);
+        assert_eq!(archive.entries[0].compressed_size, 12);
+        assert_eq!(archive.entries[1].size, 4096);
+        assert!(archive.entries[1].compressed_size < 4096);
+        assert_eq!(
+            archive.read_entry(0).unwrap().read_to_vec(64).unwrap(),
+            b"stored bytes"
+        );
+        assert_eq!(
+            archive.read_entry(1).unwrap().read_to_vec(8192).unwrap(),
+            vec![7_u8; 4096]
+        );
+        // Entries can be read again, in any order, from the kept archive.
+        assert_eq!(
+            archive.read_entry(0).unwrap().read_to_vec(64).unwrap(),
+            b"stored bytes"
+        );
+        assert!(archive.read_entry(2).is_err());
+    }
+
+    #[test]
+    fn rejects_symbolic_link_entries() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_symlink("link", "/etc/passwd", SimpleFileOptions::default())
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let error = ZipContainer::open(&Region::from_bytes(bytes), CompressionLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symbolic-link"), "{error}");
+    }
+
+    #[test]
+    fn rejects_entries_sharing_compressed_data() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("original", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"shared payload").unwrap();
+        writer.shallow_copy_file("original", "alias").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let error = ZipContainer::open(&Region::from_bytes(bytes), CompressionLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlapping"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unsupported_compression_methods() {
+        let bytes = stored_zip("data", b"payload");
+        // Rewrite the method (2 bytes at offset 8 of the local header and 10 of
+        // the central header) to 12, BZIP2, which this crate does not decode.
+        let bytes = patch_u16(bytes, LOCAL_HEADER, 8, 12);
+        let bytes = patch_u16(bytes, CENTRAL_HEADER, 10, 12);
+        let error = ZipContainer::open(&Region::from_bytes(bytes), CompressionLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("compression"), "{error}");
+    }
+
+    #[test]
+    fn enforces_entry_count_path_and_total_limits() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for name in ["one", "two", "three"] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"12345").unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let region = Region::from_bytes(bytes);
+        assert!(ZipContainer::open(&region, CompressionLimits::default()).is_ok());
+        for limits in [
+            CompressionLimits {
+                maximum_zip_entries: 2,
+                ..CompressionLimits::default()
+            },
+            CompressionLimits {
+                maximum_zip_path_bytes: 4,
+                ..CompressionLimits::default()
+            },
+            CompressionLimits {
+                maximum_zip_total_bytes: 14,
+                ..CompressionLimits::default()
+            },
+            CompressionLimits {
+                maximum_input_bytes: 16,
+                ..CompressionLimits::default()
+            },
+        ] {
+            assert!(ZipContainer::open(&region, limits).is_err(), "{limits:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_entries_that_decode_past_their_declared_size() {
+        let bytes = stored_zip("data", b"0123456789");
+        // Declare 4 uncompressed bytes in both headers while 10 are stored.
+        let bytes = patch_u32(bytes, LOCAL_HEADER, 22, 4);
+        let bytes = patch_u32(bytes, CENTRAL_HEADER, 24, 4);
+        let archive =
+            ZipContainer::open(&Region::from_bytes(bytes), CompressionLimits::default()).unwrap();
+        assert_eq!(archive.entries[0].size, 4);
+        assert!(archive.read_entry(0).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_and_non_zip_input() {
+        let bytes = stored_zip("data", b"payload");
+        let truncated = bytes[..bytes.len() - 8].to_vec();
+        assert!(
+            ZipContainer::open(&Region::from_bytes(truncated), CompressionLimits::default())
+                .is_err()
+        );
+        assert!(
+            ZipContainer::open(
+                &Region::from_bytes(b"not a zip archive".to_vec()),
+                CompressionLimits::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn names_entries_by_their_central_directory_record() {
+        let bytes = stored_zip("good", b"payload");
+        // A local header that claims another name must not change the listed
+        // path: the central directory is authoritative for this reader.
+        let local = find(&bytes, LOCAL_HEADER);
+        let mut bytes = bytes;
+        bytes[local + 30..local + 34].copy_from_slice(b"evil");
+        let archive =
+            ZipContainer::open(&Region::from_bytes(bytes), CompressionLimits::default()).unwrap();
+        assert_eq!(archive.entries[0].path, "good");
+        assert_eq!(
+            archive.read_entry(0).unwrap().read_to_vec(64).unwrap(),
+            b"payload"
+        );
+    }
+
+    const LOCAL_HEADER: [u8; 4] = *b"PK\x03\x04";
+    const CENTRAL_HEADER: [u8; 4] = *b"PK\x01\x02";
+
+    fn stored_zip(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                name,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(payload).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn find(bytes: &[u8], signature: [u8; 4]) -> usize {
+        bytes
+            .windows(4)
+            .position(|window| window == signature.as_slice())
+            .expect("ZIP record signature present")
+    }
+
+    fn patch_u16(mut bytes: Vec<u8>, signature: [u8; 4], offset: usize, value: u16) -> Vec<u8> {
+        let at = find(&bytes, signature) + offset;
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    fn patch_u32(mut bytes: Vec<u8>, signature: [u8; 4], offset: usize, value: u32) -> Vec<u8> {
+        let at = find(&bytes, signature) + offset;
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
     fn gzip_member(payload: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(payload).unwrap();

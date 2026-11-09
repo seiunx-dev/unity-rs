@@ -1,6 +1,6 @@
 {
   "name": "unity-rs-node",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Native Node.js bindings for unity-rs",
   "license": "MIT",
   "repository": {
@@ -29,8 +29,8 @@
     "test:package": "node tests/package_contents.cjs && node tests/installed_package.cjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "3.10.6",
-    "@types/node": "26.6.4",
+    "@napi-rs/cli": "3.10.8",
+    "@types/node": "26.6.5",
     "typescript": "6.0.3"
   },
   "napi": {
