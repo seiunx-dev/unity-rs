@@ -168,6 +168,10 @@ INTENTIONAL_RUST_ONLY = {
         "returns a borrowed Rust StudioObject; Node reads use the stable "
         "file/path key and expose objectIndex as metadata"
     ),
+    "StudioFile.externals": (
+        "ordered serialized-file metadata currently exposed as bounded Python "
+        "page; Node binding not part of this additive change"
+    ),
 }
 
 MAPPED_OBJECTS = ("FileInfo", "ObjectInfo", "ResourceInfo")
