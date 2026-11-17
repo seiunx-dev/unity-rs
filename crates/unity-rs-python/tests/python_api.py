@@ -33,6 +33,7 @@ from unity_rs import (
     CubismPhysics,
     ExportLimits,
     ExtractionLimits,
+    ExternalFileInfo,
     FbxCandidate,
     LegacyAnimation,
     Live2dPackage,
@@ -105,13 +106,15 @@ def align(output: bytearray, alignment: int) -> None:
         output.append(0)
 
 
-def synthetic_text_asset() -> bytes:
+def synthetic_text_asset(
+    externals: tuple[tuple[str, bytes, int, str], ...] = (),
+) -> bytes:
     payload = bytearray()
     push_aligned_string(payload, "python")
     push_i32(payload, 12)
     payload.extend(b"hello python")
 
-    return finish_v22_asset(49, payload)
+    return finish_v22_asset(49, payload, externals=externals)
 
 
 def synthetic_unity6_shader(unity_version: str = "6000.2.0f1", keywords: int = 0) -> bytes:
@@ -2376,6 +2379,7 @@ def finish_v22_asset(
     payload: bytearray,
     unity_version: str = "2022.3.62f1",
     target_platform: int = 13,
+    externals: tuple[tuple[str, bytes, int, str], ...] = (),
 ) -> bytes:
 
     metadata = bytearray(unity_version.encode("ascii") + b"\0")
@@ -2392,8 +2396,16 @@ def finish_v22_asset(
     metadata.extend(struct.pack("<q", 0))
     metadata.extend(struct.pack("<I", len(payload)))
     push_i32(metadata, 0)
-    for _ in range(3):
-        push_i32(metadata, 0)
+    push_i32(metadata, 0)  # no script types
+    push_i32(metadata, len(externals))
+    for prefix, guid, kind, path in externals:
+        if len(guid) != 16:
+            raise ValueError("serialized external GUIDs must contain 16 bytes")
+        metadata.extend(prefix.encode("utf-8") + b"\0")
+        metadata.extend(guid)
+        push_i32(metadata, kind)
+        metadata.extend(path.encode("utf-8") + b"\0")
+    push_i32(metadata, 0)  # no reference types
     metadata.append(0)
 
     metadata_size = len(metadata)
@@ -2577,6 +2589,7 @@ def main() -> None:
     assert CubismClipMotion.__name__ == "CubismClipMotion"
     assert AudioClip.__name__ == "AudioClip"
     assert BinaryAsset.__name__ == "BinaryAsset"
+    assert ExternalFileInfo.__name__ == "ExternalFileInfo"
     assert Material.__name__ == "Material"
     assert MonoScript.__name__ == "MonoScript"
     assert ResourceInfo.__name__ == "ResourceInfo"
@@ -2617,6 +2630,102 @@ def main() -> None:
         assert memory_studio.file_count == 1
         assert memory_studio.files()[0].path == "memory-fixture.assets"
         assert memory_studio.read_text(0, 7) == b"hello python"
+
+        # Named inputs are sorted by the collection, but each serialized
+        # external table keeps its own original slot order and values.
+        external_guid = bytes(range(16))
+        duplicate_guid = bytes(range(16, 32))
+        external_directory = Path(directory) / "external-order"
+        external_directory.mkdir()
+        (external_directory / "z-source.assets").write_bytes(
+            synthetic_text_asset(
+                externals=(
+                    ("prefix-z", external_guid, 17, "z-target.assets"),
+                    ("prefix-a", duplicate_guid, 2, "a-target.assets"),
+                    (
+                        "builtin",
+                        bytes(16),
+                        -1,
+                        "library/unity default resources",
+                    ),
+                    ("duplicate", external_guid, 17, "z-target.assets"),
+                    ("", bytes(16), 0, ""),
+                ),
+            )
+        )
+        (external_directory / "a-empty.assets").write_bytes(synthetic_text_asset())
+        external_studio = UnityRs(external_directory)
+        external_files = external_studio.file_page()
+        assert [Path(file.path).name for file in external_files] == [
+            "a-empty.assets",
+            "z-source.assets",
+        ]
+        empty_file_index, source_file_index = [file.index for file in external_files]
+        assert external_studio.file_external_page(empty_file_index) == []
+        externals = external_studio.file_external_page(source_file_index, limit=10)
+        assert [external.file_id for external in externals] == [1, 2, 3, 4, 5]
+        assert [external.path for external in externals] == [
+            "z-target.assets",
+            "a-target.assets",
+            "library/unity default resources",
+            "z-target.assets",
+            "",
+        ]
+        assert externals[0].prefix == "prefix-z"
+        assert externals[0].guid == external_guid
+        assert type(externals[0].guid) is bytes
+        assert externals[0].kind == 17
+        assert externals[1].prefix == "prefix-a"
+        assert externals[1].guid == duplicate_guid
+        assert externals[1].kind == 2
+        assert externals[2].path == "library/unity default resources"
+        assert externals[3].path == externals[0].path
+        assert externals[4].path == ""
+        page = external_studio.file_external_page(
+            source_file_index, offset=1, limit=2
+        )
+        assert [external.file_id for external in page] == [2, 3]
+        assert [external.path for external in page] == [
+            "a-target.assets",
+            "library/unity default resources",
+        ]
+        assert external_studio.file_external_page(source_file_index, offset=50) == []
+        assert external_studio.file_external_page(source_file_index, limit=0) == []
+        assert len(
+            external_studio.file_external_page(source_file_index, limit=1_000_000)
+        ) == 5
+        try:
+            external_studio.file_external_page(len(external_files))
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("missing external-page file should raise KeyError")
+        try:
+            external_studio.file_external_page(
+                len(external_files) + 1, limit=1_000_001
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "external page limit must be checked before file lookup"
+            )
+        try:
+            external_studio.file_external_page(source_file_index, offset=-1)
+        except OverflowError:
+            pass
+        else:
+            raise AssertionError("negative external page offsets must be rejected")
+        try:
+            externals[0].path = "mutated"
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("external metadata must be read-only")
+        del external_studio
+        assert externals[0].path == "z-target.assets"
+        assert externals[0].guid == external_guid
+
         try:
             UnityRs.from_bytes(
                 b"resource", name="12345", maximum_path_bytes=4
