@@ -296,6 +296,11 @@ artifacts.
 
 Minimum supported Rust version: **1.88**.
 
+On macOS, the build disables Rust's post-link symbol stripping: the Rust 1.88
+tool can produce a Mach-O string table rejected by macOS 27 with
+`mis-aligned LINKEDIT string pool`. The Python source distribution carries the
+same setting. Release optimization remains enabled; macOS artifacts may be larger.
+
 ```shell
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
