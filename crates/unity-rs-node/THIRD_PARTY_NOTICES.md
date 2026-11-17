@@ -135,3 +135,12 @@ compatible macro crate or removes the generated decoder wrappers.
 Regenerate and review this file whenever `Cargo.lock` changes. In particular,
 do not assume that a semver-compatible update preserves licenses, native-code
 content, safety properties, or redistribution terms.
+
+The napi-rs fallback includes both upstream MIT notices (LongYinan and GitHub).
+It was verified against the published crates' `.cargo_vcs_info.json` commits:
+`417375ad5ef1d8cb4c49edf13d2cc6c0204bb5b1` (napi 3.16.1),
+`a94cef33f62e74682963dd085e283f52dcec2600` (napi-build 2.6.0),
+`f89400d99b136c5c8a27818654b91256832b5bd6` (napi-derive 3.7.0 and
+napi-derive-backend 7.0.0), and
+`d9cb526c15e63ba30e06b4d169068c9854180595` (napi-sys 3.4.1) in
+https://github.com/napi-rs/napi-rs.
