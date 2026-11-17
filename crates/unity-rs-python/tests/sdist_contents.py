@@ -34,6 +34,17 @@ def main() -> None:
     assert len(archives) == 1, archives
     with tarfile.open(archives[0], "r:gz") as archive:
         names = archive.getnames()
+        # Cargo must discover this at the extracted workspace root. A copy
+        # only inside the Rust crate does not protect a PEP 517 sdist build.
+        root = names[0].split("/", 1)[0]
+        config = archive.extractfile(f"{root}/.cargo/config.toml")
+        assert config is not None, "sdist is missing its root Cargo configuration"
+        source = Path(__file__).resolve()
+        expected = (source.parents[1] / ".cargo/config.toml").read_bytes()
+        assert config.read() == expected, "sdist Cargo configuration is stale"
+        assert expected == (source.parents[3] / ".cargo/config.toml").read_bytes(), (
+            "Python and workspace Cargo configurations differ"
+        )
 
     native_binary_suffixes = (".dll", ".dylib", ".exe", ".lib", ".pyd", ".so")
     forbidden = [

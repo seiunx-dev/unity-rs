@@ -26,6 +26,8 @@ features = ["extension-module"]
 module-name = "unity_rs._native"
 python-source = "python"
 strip = true
+# Keep the macOS build configuration in source distributions too.
+include = [{ path = ".cargo/config.toml", format = "sdist" }]
 exclude = [
     "dist/**",
     "sdist-dist/**",

@@ -1,0 +1,6 @@
+# Rust 1.88's post-link strip can misalign the Mach-O string table, which
+# macOS 27 rejects at dlopen. Keep the linker's layout on macOS, including
+# when maturin requests symbol stripping for a release wheel.
+# Keep the Python sdist copy in crates/unity-rs-python/.cargo synchronized.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "strip=none"]
