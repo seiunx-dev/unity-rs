@@ -29,7 +29,7 @@
     "test:package": "node tests/package_contents.cjs && node tests/installed_package.cjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "3.10.9",
+    "@napi-rs/cli": "3.10.12",
     "@types/node": "26.6.6",
     "typescript": "6.0.3"
   },
