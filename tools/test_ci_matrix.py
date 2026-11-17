@@ -41,10 +41,10 @@ class CiMatrixAuditTests(unittest.TestCase):
         self.assert_release_rejected(
             '         {"label":"windows-arm64","os":"windows-11-arm","target":"aarch64-pc-windows-msvc"},\n'
             '         {"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},\n'
-            '         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]\n\n'
+            '         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]\n\n'
             "  wheels:",
             '         {"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},\n'
-            '         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]\n\n'
+            '         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]\n\n'
             "  wheels:",
         )
 
@@ -52,20 +52,20 @@ class CiMatrixAuditTests(unittest.TestCase):
         self.assert_release_rejected(
             '         {"label":"windows-arm64","os":"windows-11-arm","target":"aarch64-pc-windows-msvc"},\n'
             '         {"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},\n'
-            '         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]\n'
+            '         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]\n'
             '      python-version: "3.14"',
             '         {"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},\n'
-            '         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]\n'
+            '         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]\n'
             '      python-version: "3.14"',
         )
 
     def test_untested_wheel_target_is_rejected(self) -> None:
         self.assert_release_rejected(
             '{"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},\n'
-            '         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]\n'
+            '         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]\n'
             '      python-version',
             '{"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin","test":false},\n'
-            '         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]\n'
+            '         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]\n'
             '      python-version',
         )
 

@@ -33,7 +33,7 @@ EXPECTED_PLATFORMS = [
     ("windows-latest", "windows-x64"),
     ("windows-11-arm", "windows-arm64"),
     ("macos-15-intel", "macos-x64"),
-    ("macos-latest", "macos-arm64"),
+    ("macos-15", "macos-arm64"),
 ]
 BLOCK_INDICATORS = {"|", "|-", "|+", ">", ">-", ">+"}
 
