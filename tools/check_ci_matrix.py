@@ -264,7 +264,7 @@ def validate_release(workflow: str) -> None:
             "id-token: write",
             "pattern: wheels-*",
             "merge-multiple: true",
-            "uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
+            "uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086",
             "packages-dir: dist/",
         ),
     )
