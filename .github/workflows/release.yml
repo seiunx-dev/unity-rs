@@ -52,7 +52,7 @@ jobs:
          {"label":"windows-x64","os":"windows-latest","target":"x86_64-pc-windows-msvc"},
          {"label":"windows-arm64","os":"windows-11-arm","target":"aarch64-pc-windows-msvc"},
          {"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},
-         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]
+         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]
 
   wheels:
     name: Python wheels
@@ -66,7 +66,7 @@ jobs:
          {"label":"windows-x64","os":"windows-latest","target":"x64"},
          {"label":"windows-arm64","os":"windows-11-arm","target":"aarch64-pc-windows-msvc"},
          {"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},
-         {"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]
+         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]
       python-version: "3.14"
       smoke-import: unity_rs
       test-command: |
@@ -94,7 +94,7 @@ jobs:
             label: windows-arm64
           - os: macos-15-intel
             label: macos-x64
-          - os: macos-latest
+          - os: macos-15
             label: macos-arm64
     defaults:
       run:

@@ -39,3 +39,8 @@ environment.
 
 Publishing jobs never run for pull requests, branch pushes, or manual runs.
 `tools/check_ci_matrix.py` (run in CI) audits this shape.
+
+The macOS matrices pin `macos-15` for ARM64 and `macos-15-intel` for x86-64.
+Both architectures retain native build and smoke tests. The explicit ARM64 image
+avoids relying on the moving `macos-latest` label, whose hosted-runner capacity
+prevented the initial 0.6.3 CI runs from starting.

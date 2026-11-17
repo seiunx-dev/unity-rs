@@ -53,7 +53,7 @@ jobs:
     name: Rust (macOS)
     uses: seiunx-dev/ci-templates/.github/workflows/rust-ci.yml@v1
     with:
-      runs-on: macos-latest
+      runs-on: macos-15
       cache-key-prefix: rust-macos
       lint: false # tests only, as before; the Linux call lints the workspace
 
@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-15]
     defaults:
       run:
         working-directory: crates/unity-rs-node
@@ -109,7 +109,7 @@ jobs:
     with:
       working-directory: crates/unity-rs-python
       targets: >-
-        ${{ github.event_name == 'pull_request' && '[{"label":"linux-x64","os":"ubuntu-latest","target":"x86_64","manylinux":"2_28"},{"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]' || '[{"label":"linux-x64","os":"ubuntu-latest","target":"x86_64","manylinux":"2_28"},{"label":"linux-arm64","os":"ubuntu-24.04-arm","target":"aarch64","manylinux":"2_28"},{"label":"windows-x64","os":"windows-latest","target":"x64"},{"label":"windows-arm64","os":"windows-11-arm","target":"aarch64-pc-windows-msvc"},{"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},{"label":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin"}]' }}
+        ${{ github.event_name == 'pull_request' && '[{"label":"linux-x64","os":"ubuntu-latest","target":"x86_64","manylinux":"2_28"},{"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]' || '[{"label":"linux-x64","os":"ubuntu-latest","target":"x86_64","manylinux":"2_28"},{"label":"linux-arm64","os":"ubuntu-24.04-arm","target":"aarch64","manylinux":"2_28"},{"label":"windows-x64","os":"windows-latest","target":"x64"},{"label":"windows-arm64","os":"windows-11-arm","target":"aarch64-pc-windows-msvc"},{"label":"macos-x64","os":"macos-15-intel","target":"x86_64-apple-darwin"},{"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]' }}
       python-version: "3.14"
       sdist: false
       smoke-import: unity_rs
